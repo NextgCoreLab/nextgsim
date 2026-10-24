@@ -545,6 +545,28 @@ impl MeasurementManager {
         result.rsrp = Some(rsrp);
     }
 
+    /// Record the real `physCellId` of a measured cell (#324): `nci % 1008` from
+    /// its SIB1. Until it is known a cell's PCI is its local RLS cell id, which
+    /// names nothing on the network side.
+    pub fn set_phys_cell_id(&mut self, cell_id: i32, pci: u16) {
+        if let Some(result) = self.measurements.get_mut(&cell_id) {
+            result.pci = u32::from(pci);
+        }
+    }
+
+    /// The local cell id of the measured cell carrying `pci`, if any (#324).
+    pub fn cell_id_for_pci(&self, pci: u16) -> Option<i32> {
+        let mut ids: Vec<i32> = self
+            .measurements
+            .iter()
+            .filter(|(_, m)| m.pci == u32::from(pci))
+            .map(|(&id, _)| id)
+            .collect();
+        // Deterministic should two cells ever share a PCI.
+        ids.sort_unstable();
+        ids.first().copied()
+    }
+
     /// Remove measurement for a cell
     pub fn remove_measurement(&mut self, cell_id: i32) {
         self.measurements.remove(&cell_id);
@@ -1053,6 +1075,31 @@ mod tests {
         manager.update_measurement(1, -80);
         assert_eq!(manager.measurements().len(), 1);
         assert_eq!(manager.measurements()[&1].rsrp, Some(-80));
+    }
+
+    /// #324: a measured cell carries its real PCI once known, and is found by it.
+    /// Before, the report named the local RLS index (0, 1, ...).
+    #[test]
+    fn a_measured_cell_carries_its_real_pci() {
+        let mut manager = MeasurementManager::new();
+        manager.update_measurement(0, -60);
+        manager.update_measurement(1, -80);
+        assert_eq!(
+            manager.measurements()[&1].pci,
+            1,
+            "until SIB1: the local id"
+        );
+        manager.set_phys_cell_id(1, 32);
+        manager.update_measurement(1, -70);
+        assert_eq!(manager.measurements()[&1].pci, 32, "kept across updates");
+        assert_eq!(manager.cell_id_for_pci(32), Some(1));
+        assert_eq!(manager.cell_id_for_pci(16), None);
+        manager.set_phys_cell_id(9, 5);
+        assert_eq!(
+            manager.cell_id_for_pci(5),
+            None,
+            "an unmeasured cell is not invented"
+        );
     }
 
     #[test]

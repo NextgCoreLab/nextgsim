@@ -125,10 +125,12 @@ pub struct NeighborMeasurement {
 /// Handover configuration parameters
 #[derive(Debug, Clone)]
 pub struct HandoverConfig {
-    /// A3 offset threshold (dB)
-    pub a3_offset: i32,
-    /// Hysteresis (dB)
-    pub hysteresis: i32,
+    /// A3 offset threshold (dB). The RRC task sets it from
+    /// `GnbConfig::cho_a3_offset_db`, the value the UE's A3 measurement
+    /// configuration carries, so the UE's report and this decision agree (#324).
+    pub a3_offset: f64,
+    /// Hysteresis (dB), from `GnbConfig::cho_hysteresis_db`.
+    pub hysteresis: f64,
     /// Time-to-trigger (ms)
     pub time_to_trigger: u64,
     /// T304 timer duration (ms)
@@ -138,8 +140,8 @@ pub struct HandoverConfig {
 impl Default for HandoverConfig {
     fn default() -> Self {
         Self {
-            a3_offset: 3,
-            hysteresis: 1,
+            a3_offset: 3.0,
+            hysteresis: 1.0,
             time_to_trigger: 640,
             t304_duration: 100,
         }
@@ -201,9 +203,12 @@ impl GnbHandoverManager {
         let mut best_candidate: Option<(u32, i32)> = None;
 
         for neighbor in &report.neighbors {
-            // Check A3 condition: neighbor > serving + offset - hysteresis
-            let threshold = report.serving_rsrp + self.config.a3_offset - self.config.hysteresis;
-            if neighbor.rsrp > threshold
+            // A3 entering condition, TS 38.331 §5.5.4.4 Inequality A3-1:
+            // "Mn + Ofn + Ocn – Hys > Mp + Ofp + Ocp + Off", so the neighbour must
+            // beat serving + Off + Hys (no cell offsets are configured here).
+            let threshold =
+                f64::from(report.serving_rsrp) + self.config.a3_offset + self.config.hysteresis;
+            if f64::from(neighbor.rsrp) > threshold
                 && best_candidate.is_none_or(|(_, rsrp)| neighbor.rsrp > rsrp)
             {
                 best_candidate = Some((neighbor.pci, neighbor.rsrp));
@@ -215,7 +220,9 @@ impl GnbHandoverManager {
                 "Handover decision for UE {}: target_pci={}, rsrp={} (serving={})",
                 ue_id, pci, rsrp, report.serving_rsrp
             );
-            // For now, use PCI as cell_id (in real impl, would lookup cell_id from PCI)
+            // The target is named by the PCI the UE reported. The RRC task
+            // resolves it (#324): this gNB's own SCell is intra-gNB, a configured
+            // neighbour's cell inter-gNB, anything else is not handed over to.
             HandoverDecision::IntraGnbHandover {
                 target_cell_id: pci as i32,
             }
@@ -972,8 +979,8 @@ mod tests {
     fn test_measurement_report_processing() {
         let mut manager = GnbHandoverManager::new(1);
         manager.set_config(HandoverConfig {
-            a3_offset: 3,
-            hysteresis: 1,
+            a3_offset: 3.0,
+            hysteresis: 1.0,
             ..Default::default()
         });
 
@@ -994,6 +1001,33 @@ mod tests {
             }
             _ => panic!("Expected handover decision"),
         }
+    }
+
+    /// #324: the margin is the configured one, fractional values included, and the
+    /// hysteresis is ADDED (TS 38.331 §5.5.4.4 A3-1). With offset -3 dB and
+    /// hysteresis 0.5 dB a neighbour 2 dB worse qualifies (-92 > -90 - 3 + 0.5);
+    /// one 3 dB worse does not, though it would if the hysteresis were subtracted.
+    #[test]
+    fn the_a3_margin_is_the_configured_one() {
+        let mut manager = GnbHandoverManager::new(1);
+        manager.set_config(HandoverConfig {
+            a3_offset: -3.0,
+            hysteresis: 0.5,
+            ..Default::default()
+        });
+        let report = |rsrp| MeasurementReport {
+            meas_id: 1,
+            serving_rsrp: -90,
+            neighbors: vec![NeighborMeasurement { pci: 7, rsrp }],
+        };
+        assert!(matches!(
+            manager.process_measurement_report(1, &report(-92)),
+            HandoverDecision::IntraGnbHandover { target_cell_id: 7 }
+        ));
+        assert!(matches!(
+            manager.process_measurement_report(1, &report(-93)),
+            HandoverDecision::NoHandover
+        ));
     }
 
     #[test]

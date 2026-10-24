@@ -6,6 +6,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use thiserror::Error;
 
+/// Tag of the optional C-RNTI trailer of a PDU transmission (#355 review).
+const C_RNTI_TRAILER_TAG: u8 = 0x01;
+
 use crate::protocol::{
     version, MessageType, PduType, RlsHeartbeat, RlsHeartbeatAck, RlsMessage, RlsPduTransmission,
     RlsPduTransmissionAck, SimCoord,
@@ -100,6 +103,12 @@ pub fn encode_into(msg: &RlsMessage, buf: &mut BytesMut) {
             buf.put_u32(m.payload);
             buf.put_u32(m.pdu.len() as u32);
             buf.extend_from_slice(&m.pdu);
+            // Optional trailer (#355 review): tag 0x01, then the C-RNTI. A
+            // decoder that predates it reads the PDU by its length and stops.
+            if let Some(c_rnti) = m.c_rnti {
+                buf.put_u8(C_RNTI_TRAILER_TAG);
+                buf.put_u16(c_rnti);
+            }
         }
         RlsMessage::PduTransmissionAck(m) => {
             buf.put_u32(m.pdu_ids.len() as u32);
@@ -230,6 +239,11 @@ fn decode_pdu_transmission(sti: u64, mut buf: &[u8]) -> Result<RlsMessage> {
     }
 
     let pdu = Bytes::copy_from_slice(&buf[..pdu_length]);
+    let trailer = &buf[pdu_length..];
+    let c_rnti = match trailer {
+        [C_RNTI_TRAILER_TAG, hi, lo, ..] => Some(u16::from_be_bytes([*hi, *lo])),
+        _ => None,
+    };
 
     Ok(RlsMessage::PduTransmission(RlsPduTransmission {
         sti,
@@ -237,6 +251,7 @@ fn decode_pdu_transmission(sti: u64, mut buf: &[u8]) -> Result<RlsMessage> {
         pdu_id,
         payload,
         pdu,
+        c_rnti,
     }))
 }
 
@@ -319,12 +334,45 @@ mod tests {
             pdu_id: 42,
             payload: 7,
             pdu: Bytes::from_static(b"test pdu data"),
+            c_rnti: None,
         });
 
         let encoded = encode(&msg);
         let decoded = decode(&encoded).unwrap();
 
         assert_eq!(msg, decoded);
+    }
+
+    /// #355 review: an uplink RRC PDU carries the UE's C-RNTI as an optional
+    /// trailer; it round-trips, and the PDU before it is unchanged, so a decoder
+    /// that reads the PDU by its length is not disturbed.
+    #[test]
+    fn a_c_rnti_trailer_round_trips_and_leaves_the_pdu_alone() {
+        let with = RlsPduTransmission {
+            sti: 12345,
+            pdu_type: PduType::Rrc,
+            pdu_id: 42,
+            payload: 7,
+            pdu: Bytes::from_static(b"rrc"),
+            c_rnti: Some(0x03E8),
+        };
+        let without = RlsPduTransmission {
+            c_rnti: None,
+            ..with.clone()
+        };
+        let encoded = encode(&RlsMessage::PduTransmission(with.clone()));
+        assert_eq!(decode(&encoded).unwrap(), RlsMessage::PduTransmission(with));
+        let plain = encode(&RlsMessage::PduTransmission(without.clone()));
+        assert_eq!(
+            &encoded[..plain.len()],
+            &plain[..],
+            "the trailer only appends"
+        );
+        assert_eq!(&encoded[plain.len()..], &[0x01, 0x03, 0xE8]);
+        assert_eq!(
+            decode(&plain).unwrap(),
+            RlsMessage::PduTransmission(without)
+        );
     }
 
     #[test]
@@ -348,6 +396,7 @@ mod tests {
             pdu_id: 1,
             payload: 0,
             pdu: Bytes::new(),
+            c_rnti: None,
         });
 
         let encoded = encode(&msg);

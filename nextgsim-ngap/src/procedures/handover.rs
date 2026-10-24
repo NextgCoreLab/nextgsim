@@ -866,6 +866,25 @@ pub fn encode_source_to_target_container(
     Ok(encode_aper(&container)?)
 }
 
+/// Encode a `TargetNGRANNode-ToSourceNGRANNode-TransparentContainer`
+/// (TS 38.413 §9.3.1.21): its `rRCContainer` is the RRC HandoverCommand
+/// (TS 38.331 §11.2.2) the source delivers to the UE (#324).
+pub fn encode_target_to_source_container(rrc_container: &[u8]) -> Result<Vec<u8>, HandoverError> {
+    Ok(encode_aper(
+        &TargetNGRANNode_ToSourceNGRANNode_TransparentContainer {
+            rrc_container: RRCContainer(rrc_container.to_vec()),
+            ie_extensions: None,
+        },
+    )?)
+}
+
+/// Decode a `TargetNGRANNode-ToSourceNGRANNode-TransparentContainer` and return
+/// its `rRCContainer` (#324).
+pub fn decode_target_to_source_container(bytes: &[u8]) -> Result<Vec<u8>, HandoverError> {
+    let container: TargetNGRANNode_ToSourceNGRANNode_TransparentContainer = decode_aper(bytes)?;
+    Ok(container.rrc_container.0)
+}
+
 /// Decode a `SourceNGRANNode-ToTargetNGRANNode-TransparentContainer`.
 ///
 /// A non-NR target cell yields an error rather than a zeroed CGI: an NR target handed a
@@ -1328,6 +1347,11 @@ pub struct HandoverFailureParams {
     pub amf_ue_ngap_id: u64,
     /// Cause of failure
     pub cause: HandoverCause,
+    /// Criticality Diagnostics (TS 38.413 §9.2.3.6, optional): for a HANDOVER
+    /// REQUEST rejected for a missing or not understood IE, the IEs at fault
+    /// (§10.3.5, #355 review).
+    pub criticality_diagnostics:
+        Option<crate::procedures::error_indication::CriticalityDiagnosticsInfo>,
 }
 
 /// Parsed Handover Failure data
@@ -1359,6 +1383,17 @@ pub fn build_handover_failure(params: &HandoverFailureParams) -> Result<NGAP_PDU
         criticality: Criticality(Criticality::IGNORE),
         value: HandoverFailureProtocolIEs_EntryValue::Id_Cause(cause),
     });
+
+    // IE: Criticality Diagnostics (optional)
+    if let Some(diag) = &params.criticality_diagnostics {
+        protocol_ies.push(HandoverFailureProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CRITICALITY_DIAGNOSTICS),
+            criticality: Criticality(Criticality::IGNORE),
+            value: HandoverFailureProtocolIEs_EntryValue::Id_CriticalityDiagnostics(
+                crate::procedures::error_indication::build_criticality_diagnostics(diag),
+            ),
+        });
+    }
 
     let handover_failure = HandoverFailure {
         protocol_i_es: HandoverFailureProtocolIEs(protocol_ies),
@@ -2162,6 +2197,7 @@ mod tests {
             cause: NgSetupFailureCause::RadioNetwork(
                 RadioNetworkCause::NoRadioResourcesAvailableInTargetCell,
             ),
+            criticality_diagnostics: None,
         }
     }
 

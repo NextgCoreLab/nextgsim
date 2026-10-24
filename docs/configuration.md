@@ -132,8 +132,10 @@ si_broadcast_period_ms: 80
 | `dl_arfcn` | u32 | 632448 | Downlink ARFCN of this cell, bound into the KgNB* derivation of a handover and an RRC re-establishment; every gNB and UE must hold the same value (RLS carries no carrier frequency) |
 | `scell_phys_cell_id` | u16 | none | `physCellId` of a secondary cell to configure on each UE (event A6) |
 | `conditional_handover` | bool | false | Nominate the configured intra-frequency neighbours as conditional-handover candidates |
-| `cho_a3_offset_db` | f64 | 3.0 | CHO execution `a3-Offset` in dB |
-| `cho_hysteresis_db` | f64 | 1.0 | CHO execution hysteresis in dB |
+| `cho_a3_offset_db` | f64 | 3.0 | `a3-Offset` in dB: of the UE's A3 measurement configuration, the CHO execution condition, and the gNB's handover decision on a MeasurementReport |
+| `cho_hysteresis_db` | f64 | 1.0 | Hysteresis in dB, for the same three |
+| `sim_position` | `{x, y, z}` (metres, i32) | origin | Where the gNB stands. Each UE's received level is -1 dBm per metre of distance to its own `sim_position`; levels above -31 dBm all report as -31 (RSRP-Range), and a cell below -120 dBm is not heard |
+| `handover_neighbours` | list of `{nci, tac, gnb_id_length?}` | `[]` | Other gNBs' cells a measurement-triggered handover may target. A reported `physCellId` (`nci % 1008`) is matched against them; the match names the target gNB ID (top `gnb_id_length` bits of `nci`, default this gNB's) and TAC for HANDOVER REQUIRED. A PCI matching none is not handed over to |
 | `rlc_am_psis` | list of u8 | `[]` | PDU sessions whose DRB uses RLC Acknowledged Mode instead of Unacknowledged Mode. Must match the UE's value |
 | `ims_voice_over_nr` | bool | false | Answer the AMF's UE Radio Capability Check with "IMS voice supported" when the UE also supports it |
 | `nrppa_serving_rsrp_dbm` | i32 | -85 | SS-RSRP reported in an NRPPa E-CID measurement result (configured, not measured) |
@@ -261,6 +263,8 @@ tun_name: null
 | `require_broadcast_sib1` | bool | false | Require a decoded broadcast SIB1 before a cell is selectable. With `false` a detected cell is selectable at once on a simulated SIB1, but an RRC re-establishment still waits for the selected cell's broadcast SIB1 (its shortMAC-I covers the broadcast cell identity, TS 38.331 §5.3.7.3-4): against a gNB that never broadcasts SIB1 the request is not sent, T311 expires and the UE recovers through RRC_IDLE and a new RRCSetup |
 | `rlc_am_psis` | list of u8 | `[]` | PDU sessions whose DRB uses RLC AM. Must match the gNB |
 | `conditional_handover` | bool | false | Store CHO candidates from RRCReconfiguration and execute one when its condition holds |
+| `sim_position` | `{x, y, z}` (metres, i32) | origin | Where the UE starts; see the gNB's `sim_position` |
+| `sim_movement` | `{target: {x, y, z}, speed_mps, start_after_secs}` | none | Straight-line movement from `sim_position` to `target`, starting `start_after_secs` (default 0) after start-up. Drives measurement-triggered handover; `config/ue-n2ho.yaml` is an example |
 | `eutra_neighbours` | list | `[]` | E-UTRA neighbour cells the UE measures for events B1/B2 |
 | `eutra_b1_threshold_dbm` | i32 | -110 | `b1-ThresholdEUTRA` of the default B1 measurement |
 | `lpp_arfcn_eutra` | u32 | 0 | `arfcnEUTRA` reported in an LPP E-CID measurement (configured, not measured) |

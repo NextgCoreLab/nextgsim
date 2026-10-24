@@ -157,7 +157,7 @@ pub struct RrcTask {
     /// A set rather than a flag on `RrcUeContext`, because the admission happens in
     /// the NGAP task before this task has any context for the UE at all -- the
     /// arriving UE's first message to the target IS the RRCReconfigurationComplete.
-    pending_handover_arrivals: std::collections::HashSet<i32>,
+    pending_handover_arrivals: std::collections::HashMap<i32, u16>,
     /// The local Remote UE IDs assigned per relay UE, for L2 UE-to-Network relay
     /// (TS 38.300 §16.12.2.1; issue #190).
     ///
@@ -240,9 +240,19 @@ impl RrcTask {
             ntn_config: sib19_params(&task_base_config),
             scell_configured_ues: std::collections::HashSet::new(),
             cho_configured_ues: std::collections::HashSet::new(),
-            pending_handover_arrivals: std::collections::HashSet::new(),
+            pending_handover_arrivals: std::collections::HashMap::new(),
             relay_local_ue_ids: std::collections::HashMap::new(),
-            handover_manager: GnbHandoverManager::new(own_cell),
+            handover_manager: {
+                // The decision margin is the one the UE's A3 measurement
+                // configuration carries (#324); it was a fixed 3/1 dB.
+                let mut manager = GnbHandoverManager::new(own_cell);
+                manager.set_config(crate::rrc::handover::HandoverConfig {
+                    a3_offset: task_base_config.cho_a3_offset_db,
+                    hysteresis: task_base_config.cho_hysteresis_db,
+                    ..Default::default()
+                });
+                manager
+            },
         }
     }
 
@@ -463,6 +473,20 @@ impl RrcTask {
     /// directly by the in-process strict-peer harness
     /// (`tests/src/rrc_handshake.rs`, Wave-6 C3).
     pub async fn handle_uplink_rrc(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
+        self.handle_uplink_rrc_with_c_rnti(ue_id, channel, data, None)
+            .await;
+    }
+
+    /// [`Self::handle_uplink_rrc`] for a PDU that carried the UE's C-RNTI on RLS
+    /// (#355 review): it is what binds a handover arrival to its admission
+    /// (`bind_handover_arrival`).
+    pub async fn handle_uplink_rrc_with_c_rnti(
+        &mut self,
+        ue_id: i32,
+        channel: RrcChannel,
+        data: OctetString,
+        c_rnti: Option<u16>,
+    ) {
         debug!(
             "Uplink RRC: ue_id={}, channel={:?}, len={}",
             ue_id,
@@ -475,6 +499,7 @@ impl RrcTask {
                 self.handle_ul_ccch_message(ue_id, &data).await;
             }
             RrcChannel::UlDcch => {
+                let ue_id = self.bind_handover_arrival(ue_id, c_rnti, data.data()).await;
                 self.handle_ul_dcch_message(ue_id, &data).await;
             }
             _ => warn!("Unexpected uplink channel: {:?}", channel),
@@ -1076,32 +1101,105 @@ impl RrcTask {
         );
     }
 
+    /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
+    /// records that this UE was admitted on a handover-in with C-RNTI `c_rnti`, so
+    /// the next `RRCReconfigurationComplete` from it is an ARRIVAL.
+    ///
+    /// Public because it is a real message-handler entry point, like the others the
+    /// in-process tests drive directly.
+    pub fn handle_expect_handover_arrival(&mut self, ue_id: i32, c_rnti: u16) {
+        info!(
+            "Expecting a handover arrival for UE[{}] (C-RNTI {:#06x}): its next \
+             RRCReconfigurationComplete will be reported to the AMF",
+            ue_id, c_rnti
+        );
+        self.pending_handover_arrivals.insert(ue_id, c_rnti);
+    }
+
+    /// The source side of an N2 handover (#324): send the target's
+    /// RRCReconfiguration with reconfigurationWithSync to the UE on SRB1.
+    pub async fn handle_send_handover_command(&mut self, ue_id: i32, pdu: OctetString) {
+        info!(
+            "RRC: sending the N2 handover command to UE[{ue_id}] ({} bytes)",
+            pdu.len()
+        );
+        self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+        self.handover_manager.mark_executing(ue_id);
+    }
+
+    /// Binds an N2 handover arrival to its admission (#324, #355 review).
+    ///
+    /// RLS assigns UE ids by what it hears, and the NGAP admission allocated its
+    /// own, so the arriving UE speaks first under an id with no RRC context. It is
+    /// tied to the admission by the C-RNTI the target allocated in the
+    /// reconfigurationWithSync, which the UE presents with its uplink. That is the
+    /// RLS equivalent of the C-RNTI MAC CE (TS 38.321 §6.1.3.2) in the msg3 of the
+    /// random access that completes a handover.
+    ///
+    /// Only an RRCReconfigurationComplete carrying the C-RNTI of a pending
+    /// admission binds. On a bind, RLS is told to use the admitted id from now on,
+    /// and the PDU is handled under it. Anything else is left alone, never guessed:
+    /// two concurrent arrivals must not be able to take each other's NGAP context,
+    /// sessions and tunnels.
+    async fn bind_handover_arrival(&mut self, ue_id: i32, c_rnti: Option<u16>, data: &[u8]) -> i32 {
+        if self.ue_manager.try_find_ue(ue_id).is_some()
+            || self.pending_handover_arrivals.contains_key(&ue_id)
+        {
+            return ue_id;
+        }
+        let Some(c_rnti) = c_rnti else {
+            return ue_id;
+        };
+        let Some(admitted) = self
+            .pending_handover_arrivals
+            .iter()
+            .find(|(_, pending)| **pending == c_rnti)
+            .map(|(id, _)| *id)
+        else {
+            debug!("UE[{ue_id}] presents C-RNTI {c_rnti:#06x}, which no pending handover-in holds");
+            return ue_id;
+        };
+        if !matches!(
+            dispatch_ul_dcch(data),
+            Ok(UlDcchMessage::RrcReconfigurationComplete(_))
+        ) {
+            debug!(
+                "UE[{ue_id}] with handover C-RNTI {c_rnti:#06x}: not an \
+                 RRCReconfigurationComplete, not bound yet"
+            );
+            return ue_id;
+        }
+        info!(
+            "UE[{ue_id}] arrives with C-RNTI {c_rnti:#06x}: the handover admission UE[{admitted}]"
+        );
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::RebindUe {
+                from: ue_id,
+                to: admitted,
+            })
+            .await
+        {
+            error!("Failed to rebind UE[{ue_id}] as UE[{admitted}]: {e}");
+            return ue_id;
+        }
+        let ctx = self.ue_manager.find_or_create_ue(admitted);
+        ctx.on_setup_complete();
+        admitted
+    }
+
+    /// Whether a handover arrival is still expected for `ue_id`.
+    pub fn expects_handover_arrival(&self, ue_id: i32) -> bool {
+        self.pending_handover_arrivals.contains_key(&ue_id)
+    }
+
     /// Handles a typed RRCReconfigurationComplete (TS 38.331 §5.3.5).
     ///
     /// Verifies the echoed tid against the UE's outstanding Reconfiguration
     /// transaction. Like SecurityModeComplete, the Reconfiguration tid is
     /// allocated on the NGAP task context, so the RRC context typically reports
     /// `NoOutstanding` (framing/plumbing confirmation only).
-    /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
-    /// records that this UE was admitted on a handover-in, so the next
-    /// `RRCReconfigurationComplete` from it is an ARRIVAL.
-    ///
-    /// Public because it is a real message-handler entry point, like the others the
-    /// in-process tests drive directly.
-    pub fn handle_expect_handover_arrival(&mut self, ue_id: i32) {
-        info!(
-            "Expecting a handover arrival for UE[{}]: its next \
-             RRCReconfigurationComplete will be reported to the AMF",
-            ue_id
-        );
-        self.pending_handover_arrivals.insert(ue_id);
-    }
-
-    /// Whether a handover arrival is still expected for `ue_id`.
-    pub fn expects_handover_arrival(&self, ue_id: i32) -> bool {
-        self.pending_handover_arrivals.contains(&ue_id)
-    }
-
     async fn handle_rrc_reconfiguration_complete_asn1(&mut self, ue_id: i32, echoed_tid: u8) {
         if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
             match ctx
@@ -1127,7 +1225,7 @@ impl RrcTask {
         // A handover ARRIVAL, not an ordinary acknowledgement (TS 38.413 §8.4.3,
         // issue #156). `remove` rather than `contains`: an arrival is reported ONCE,
         // and a later reconfiguration of the same UE must not notify again.
-        if self.pending_handover_arrivals.remove(&ue_id) {
+        if self.pending_handover_arrivals.remove(&ue_id).is_some() {
             info!(
                 "UE[{}] has accessed this target cell; reporting HANDOVER NOTIFY",
                 ue_id
@@ -2050,6 +2148,12 @@ impl RrcTask {
     }
 
     async fn handle_an_release(&mut self, ue_id: i32) {
+        // A released handover-in admission (cancelled, failed, or released before
+        // the UE arrived) is no longer awaited, so nothing can be bound to it
+        // (#355 review).
+        if self.pending_handover_arrivals.remove(&ue_id).is_some() {
+            info!("UE[{ue_id}]: the pending handover arrival is withdrawn by the release");
+        }
         if let Some(result) = self.connection_manager.initiate_rrc_release(
             &mut self.ue_manager,
             ue_id,
@@ -2672,12 +2776,10 @@ impl RrcTask {
                     ue_id
                 );
             }
-            HandoverDecision::IntraGnbHandover { target_cell_id } => {
-                info!(
-                    "UE[{}] measurement-triggered handover to cell {}",
-                    ue_id, target_cell_id
-                );
-                self.execute_handover(ue_id, target_cell_id).await;
+            HandoverDecision::IntraGnbHandover {
+                target_cell_id: reported_pci,
+            } => {
+                self.handover_to_reported_pci(ue_id, reported_pci).await;
             }
             other => {
                 // The manager models Xn and inter-gNB decisions its A3 evaluator does
@@ -2690,6 +2792,49 @@ impl RrcTask {
                 );
             }
         }
+    }
+
+    /// Act on the A3 winner of a measurement report, named by the `physCellId` the
+    /// UE reported (#324).
+    ///
+    /// - This gNB's configured SCell: intra-gNB, as before.
+    /// - A configured `handover_neighbours` cell (`nci % 1008`): inter-gNB, HANDOVER
+    ///   REQUIRED naming that neighbour's gNB ID, cell and TAC (TS 38.413 §8.4.1).
+    /// - Anything else: not handed over to. The PCI used to be passed on as a cell
+    ///   ID, and from there as the target gNB ID, so the AMF was asked to route to
+    ///   a gNB whose ID was a PCI.
+    async fn handover_to_reported_pci(&mut self, ue_id: i32, reported_pci: i32) {
+        let Ok(pci) = u16::try_from(reported_pci) else {
+            warn!("UE[{ue_id}] reported PCI {reported_pci}, out of range; staying");
+            return;
+        };
+        if self.task_base.config.scell_phys_cell_id == Some(pci) {
+            info!("UE[{ue_id}] measurement-triggered intra-gNB handover to PCI {pci}");
+            self.execute_handover(ue_id, i32::from(pci)).await;
+            return;
+        }
+        let neighbour = self
+            .task_base
+            .config
+            .handover_neighbours
+            .iter()
+            .find(|n| n.phys_cell_id() == pci)
+            .copied();
+        let Some(neighbour) = neighbour else {
+            info!(
+                "UE[{ue_id}] reports PCI {pci} better than its serving cell, but no \
+                 configured handover neighbour has it; staying"
+            );
+            return;
+        };
+        let target_gnb_id = neighbour.gnb_id(self.task_base.config.gnb_id_length);
+        info!(
+            "UE[{ue_id}] measurement-triggered N2 handover to PCI {pci}: gNB {target_gnb_id}, \
+             cell {:#x}, TAC {}",
+            neighbour.nci, neighbour.tac
+        );
+        self.start_n2_handover(ue_id, target_gnb_id, neighbour.nci, neighbour.tac)
+            .await;
     }
 
     /// Hand a UE over to `target_cell`, intra-gNB or inter-gNB (issue #39).
@@ -2731,22 +2876,47 @@ impl RrcTask {
             return;
         }
 
-        // Inter-gNB: HANDOVER REQUIRED through NGAP. The UE's capability container comes
-        // from this context because the NGAP task does not hold it, and the target needs
-        // it to configure the UE at all.
+        // Inter-gNB. A configured neighbour names the target node (#324); a cell
+        // that matches none falls back to the old stand-in, the cell's own identity
+        // as the gNB ID, which an AMF can route only by coincidence.
+        if let Some(neighbour) = self
+            .task_base
+            .config
+            .handover_neighbours
+            .iter()
+            .find(|n| (n.nci & 0xF_FFFF_FFFF) as i32 == target_cell)
+            .copied()
+        {
+            let gnb_id = neighbour.gnb_id(self.task_base.config.gnb_id_length);
+            self.start_n2_handover(ue_id, gnb_id, neighbour.nci, neighbour.tac)
+                .await;
+            return;
+        }
+        let tac = self.task_base.config.tac;
+        self.start_n2_handover(ue_id, target_cell as u32, target_cell as u64, tac)
+            .await;
+    }
+
+    /// Ask NGAP to send HANDOVER REQUIRED for `ue_id` toward `target_gnb_id`
+    /// (TS 38.413 §8.4.1).
+    async fn start_n2_handover(
+        &mut self,
+        ue_id: i32,
+        target_gnb_id: u32,
+        target_cell_identity: u64,
+        target_tac: u32,
+    ) {
+        // The UE's capability container comes from this context because the NGAP task
+        // does not hold it, and the target needs it to configure the UE at all.
         let ue_nr_capability = self
             .ue_manager
             .try_find_ue(ue_id)
             .and_then(|ctx| ctx.nr_capability.clone());
         let msg = NgapMessage::InitiateHandover(Box::new(HandoverInitiation {
             ue_id,
-            // The simulator has no inter-gNB topology, so the recommended cell's own
-            // identity stands in for the target node's. Stated rather than hidden: an
-            // AMF routes on the gNB ID, and with no neighbour table this is the only
-            // value this gNB has.
-            target_gnb_id: target_cell as u32,
-            target_tac: self.task_base.config.tac,
-            target_cell_identity: target_cell as u64,
+            target_gnb_id,
+            target_tac,
+            target_cell_identity: target_cell_identity & 0xF_FFFF_FFFF,
             ue_nr_capability,
             // Time on the source cell is not tracked per UE, so 0 is reported: "no
             // measured dwell time" rather than an invented one.
@@ -2794,8 +2964,9 @@ impl Task for RrcTask {
                         TaskMessage::Message(rrc_msg) => match rrc_msg {
                             RrcMessage::RadioPowerOn => self.handle_radio_power_on(),
                             RrcMessage::SignalDetected { ue_id } => self.handle_signal_detected(ue_id),
-                            RrcMessage::UplinkRrc { ue_id, rrc_channel, data } => {
-                                self.handle_uplink_rrc(ue_id, rrc_channel, data).await;
+                            RrcMessage::UplinkRrc { ue_id, rrc_channel, data, c_rnti } => {
+                                self.handle_uplink_rrc_with_c_rnti(ue_id, rrc_channel, data, c_rnti)
+                                    .await;
                             }
                             RrcMessage::NasDelivery { ue_id, pdu } => {
                                 self.handle_nas_delivery(ue_id, pdu).await;
@@ -2879,8 +3050,11 @@ impl Task for RrcTask {
                                 self.send_conditional_handover_configuration(ue_id)
                                     .await;
                             }
-                            RrcMessage::ExpectHandoverArrival { ue_id } => {
-                                self.handle_expect_handover_arrival(ue_id);
+                            RrcMessage::ExpectHandoverArrival { ue_id, c_rnti } => {
+                                self.handle_expect_handover_arrival(ue_id, c_rnti);
+                            }
+                            RrcMessage::SendHandoverCommand { ue_id, pdu } => {
+                                self.handle_send_handover_command(ue_id, pdu).await;
                             }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
@@ -4890,8 +5064,17 @@ mod tests {
     /// `execute_handover`).
     #[test]
     fn a_measurement_report_with_a_better_neighbour_triggers_a_handover() {
+        // #324: the reported PCI is resolved through the configured neighbours.
+        // The neighbour is NCI 1050, whose PCI is 1050 % 1008 = 42 and whose gNB ID
+        // is 1050 >> 4 = 65 with this gNB's 32-bit ID length; TAC 7.
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+        }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
-            GnbTaskBase::new(test_config(), 16);
+            GnbTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
 
         run_async(async {
@@ -4917,9 +5100,82 @@ mod tests {
             initiated.expect("a report naming a much better neighbour must start a handover");
         assert_eq!(init.ue_id, 7);
         assert_eq!(
-            init.target_cell_identity, 42,
-            "and it must target the cell the UE reported"
+            init.target_cell_identity, 1050,
+            "the neighbour cell whose PCI the UE reported"
         );
+        assert_eq!(init.target_gnb_id, 1050 >> 4, "that neighbour's gNB ID");
+        assert_eq!(init.target_tac, 7, "and its TAC");
+    }
+
+    /// #324: a better neighbour whose PCI no configured neighbour carries is not
+    /// handed over to. Before, the PCI itself became the target gNB ID.
+    #[test]
+    fn a_better_neighbour_that_is_not_configured_triggers_nothing() {
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+        }];
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                ctx.on_setup_complete();
+            }
+            while ngap_rx.try_recv().is_ok() {}
+            let pdu = measurement_report_pdu(-100, 43, -80);
+            task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+        });
+        while let Ok(msg) = ngap_rx.try_recv() {
+            assert!(
+                !matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_))),
+                "PCI 43 is no configured neighbour"
+            );
+        }
+    }
+
+    /// #324: the decision margin is the configured `cho_a3_offset_db` /
+    /// `cho_hysteresis_db`, the values the UE's measurement configuration carries.
+    /// A neighbour 2 dB better triggers nothing under the default 3/1 dB margin and
+    /// a handover under a configured 1/0.5 dB one.
+    #[test]
+    fn the_handover_decision_uses_the_configured_a3_margin() {
+        for (offset, hysteresis, expect) in [(3.0, 1.0, false), (1.0, 0.5, true)] {
+            let mut config = test_config();
+            config.cho_a3_offset_db = offset;
+            config.cho_hysteresis_db = hysteresis;
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+            }];
+            let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                    ctx.on_setup_complete();
+                }
+                while ngap_rx.try_recv().is_ok() {}
+                let pdu = measurement_report_pdu(-90, 42, -88);
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            });
+            let mut handed_over = false;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                handed_over |=
+                    matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_)));
+            }
+            assert_eq!(
+                handed_over, expect,
+                "offset {offset}, hysteresis {hysteresis}"
+            );
+        }
     }
 
     /// The negative control: a neighbour that does NOT beat the serving cell by the A3
@@ -5206,7 +5462,7 @@ mod tests {
             while ngap_rx.try_recv().is_ok() {}
 
             // The NGAP task arms the detection after HANDOVER REQUEST ACKNOWLEDGE.
-            task.handle_expect_handover_arrival(7);
+            task.handle_expect_handover_arrival(7, 7);
             assert!(task.expects_handover_arrival(7));
 
             // The UE echoes the tid the SOURCE issued, which this target never
@@ -5236,6 +5492,131 @@ mod tests {
             !task.expects_handover_arrival(7),
             "and the expectation is spent"
         );
+    }
+
+    /// The uplink PDUs an RRC task under test asks RLS to rebind, as (from, to).
+    fn rebinds(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RlsMessage>>,
+    ) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RlsMessage::RebindUe { from, to }) = msg {
+                out.push((from, to));
+            }
+        }
+        out
+    }
+
+    /// The HANDOVER NOTIFYs an RRC task under test reported, by UE id.
+    fn notified(rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>) -> Vec<i32> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let TaskMessage::Message(NgapMessage::HandoverAccessCompleted { ue_id }) = msg {
+                out.push(ue_id);
+            }
+        }
+        out
+    }
+
+    fn reconfiguration_complete() -> OctetString {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+        OctetString::from_slice(
+            &encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                rrc_transaction_id: 1,
+            })
+            .expect("encode RRCReconfigurationComplete"),
+        )
+    }
+
+    /// #324, #355 review: two concurrent handovers into one target. Each arriving
+    /// UE speaks first under an RLS id of its own, and is bound to the admission
+    /// whose C-RNTI it presents, whatever the order of arrival. The binding used to
+    /// take the lowest pending admission, so the second admission's UE, arriving
+    /// first, took the first one's NGAP context, sessions and tunnels.
+    #[test]
+    fn concurrent_handover_arrivals_are_bound_by_their_c_rnti() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.handle_expect_handover_arrival(1000, 0x03E8);
+            task.handle_expect_handover_arrival(1001, 0x03E9);
+            // UE B (admitted as 1001) arrives first, heard as RLS UE 9.
+            task.handle_uplink_rrc_with_c_rnti(
+                9,
+                RrcChannel::UlDcch,
+                reconfiguration_complete(),
+                Some(0x03E9),
+            )
+            .await;
+            assert_eq!(rebinds(&mut rls_rx), vec![(9, 1001)]);
+            assert_eq!(notified(&mut ngap_rx), vec![1001]);
+            // Then UE A, heard as RLS UE 8.
+            task.handle_uplink_rrc_with_c_rnti(
+                8,
+                RrcChannel::UlDcch,
+                reconfiguration_complete(),
+                Some(0x03E8),
+            )
+            .await;
+            assert_eq!(rebinds(&mut rls_rx), vec![(8, 1000)]);
+            assert_eq!(notified(&mut ngap_rx), vec![1000]);
+        });
+        assert!(!task.expects_handover_arrival(1000));
+        assert!(!task.expects_handover_arrival(1001));
+    }
+
+    /// #355 review: nothing is bound by guesswork. With an admission pending, none
+    /// of these binds, and the admission stays pending:
+    /// - a PDU with no C-RNTI;
+    /// - a PDU with a C-RNTI no admission holds;
+    /// - a PDU with the right C-RNTI that is not an RRCReconfigurationComplete.
+    #[test]
+    fn an_arrival_is_not_bound_without_its_c_rnti_and_its_complete() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.handle_expect_handover_arrival(1000, 0x03E8);
+            for (c_rnti, pdu) in [
+                (None, reconfiguration_complete()),
+                (Some(0x0BAD), reconfiguration_complete()),
+                (Some(0x03E8), OctetString::from_slice(&[0xFF, 0x00])),
+            ] {
+                task.handle_uplink_rrc_with_c_rnti(9, RrcChannel::UlDcch, pdu, c_rnti)
+                    .await;
+                assert!(rebinds(&mut rls_rx).is_empty(), "{c_rnti:?}");
+                assert!(notified(&mut ngap_rx).is_empty(), "{c_rnti:?}");
+            }
+        });
+        assert!(task.expects_handover_arrival(1000));
+        assert!(task.ue_manager.try_find_ue(1000).is_none());
+    }
+
+    /// #355 review: a released admission (the handover was cancelled or failed
+    /// before the UE arrived) is no longer awaited, so a later PDU presenting its
+    /// C-RNTI is bound to nothing.
+    #[test]
+    fn a_released_admission_is_not_bound_to() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.handle_expect_handover_arrival(1000, 0x03E8);
+            task.handle_an_release(1000).await;
+            task.handle_uplink_rrc_with_c_rnti(
+                9,
+                RrcChannel::UlDcch,
+                reconfiguration_complete(),
+                Some(0x03E8),
+            )
+            .await;
+            assert!(rebinds(&mut rls_rx).is_empty());
+            assert!(notified(&mut ngap_rx).is_empty());
+        });
+        assert!(!task.expects_handover_arrival(1000));
     }
 
     /// The negative control: an ORDINARY RRCReconfigurationComplete, with no admission
@@ -5293,7 +5674,7 @@ mod tests {
         let notifies = run_async(async {
             establish_pending_setup(&mut task, 7).await;
             while ngap_rx.try_recv().is_ok() {}
-            task.handle_expect_handover_arrival(7);
+            task.handle_expect_handover_arrival(7, 7);
 
             for tid in [2u8, 3] {
                 let complete =

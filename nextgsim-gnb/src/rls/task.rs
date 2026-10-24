@@ -122,6 +122,9 @@ pub struct RlsTask {
     /// grant is handed to RLC, which is what makes the ceiling enforced rather
     /// than merely stored -- the defect issue #57 was filed about.
     ue_grant_ceiling: HashMap<i32, usize>,
+    /// Tracker UE id -> the id the upper tasks know the UE by, for a UE that
+    /// arrived on a handover-in (#324, `RlsMessage::RebindUe`).
+    ue_alias: HashMap<i32, i32>,
 }
 
 impl RlsTask {
@@ -129,7 +132,10 @@ impl RlsTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
         // Generate STI from gNB NCI
         let sti = task_base.config.nci;
-        let phy_location = SimCoord::new(0, 0, 0);
+        // The configured antenna position (#324). Fixed at the origin before, so
+        // every gNB measured the same to every UE and no handover could trigger.
+        let pos = task_base.config.sim_position;
+        let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
@@ -152,13 +158,17 @@ impl RlsTask {
             load_window_octets: 0,
             load_window_start: Instant::now(),
             ue_grant_ceiling: HashMap::new(),
+            ue_alias: HashMap::new(),
         }
     }
 
     /// Creates a new RLS task with custom bind address
     pub fn with_bind_address(task_base: GnbTaskBase, bind_address: SocketAddr) -> Self {
         let sti = task_base.config.nci;
-        let phy_location = SimCoord::new(0, 0, 0);
+        // The configured antenna position (#324). Fixed at the origin before, so
+        // every gNB measured the same to every UE and no handover could trigger.
+        let pos = task_base.config.sim_position;
+        let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
 
         Self {
             task_base,
@@ -178,6 +188,7 @@ impl RlsTask {
             load_window_octets: 0,
             load_window_start: Instant::now(),
             ue_grant_ceiling: HashMap::new(),
+            ue_alias: HashMap::new(),
         }
     }
 
@@ -471,6 +482,7 @@ impl RlsTask {
             pdu_id: 0,
             payload: drb_id as u32,
             pdu: Bytes::from(pdu),
+            c_rnti: None,
         };
         self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
             .await;
@@ -560,7 +572,7 @@ impl RlsTask {
                 }
                 GnbTrackerEvent::UeLost { ue_id } => {
                     info!("UE lost: ue_id={}", ue_id);
-                    let ue_id_i32 = ue_id as i32;
+                    let ue_id_i32 = self.external_ue_id(ue_id as i32);
                     self.ue_addresses.remove(&ue_id_i32);
                     // Note: sti_to_ue_id cleanup happens in check_lost_ues
                 }
@@ -728,6 +740,7 @@ impl RlsTask {
             ue_id,
             rrc_channel: channel,
             data,
+            c_rnti: pdu.c_rnti,
         };
 
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
@@ -881,6 +894,7 @@ impl RlsTask {
             pdu_id,
             payload: rrc_channel as u32,
             pdu: Bytes::copy_from_slice(data.data()),
+            c_rnti: None,
         };
 
         let msg = RlsProtocolMessage::PduTransmission(pdu);
@@ -937,6 +951,7 @@ impl RlsTask {
             pdu_id,
             payload: rrc_channel as u32,
             pdu: Bytes::copy_from_slice(data.data()),
+            c_rnti: None,
         };
         let msg = RlsProtocolMessage::PduTransmission(pdu);
 
@@ -1019,6 +1034,7 @@ impl RlsTask {
                 // its own entity maps on, so the two ends have to name the same thing.
                 payload: drb_id as u32,
                 pdu: Bytes::from(rlc_pdu),
+                c_rnti: None,
             };
             let msg = RlsProtocolMessage::PduTransmission(transmission);
             self.send_rls_message(dest, &msg).await;
@@ -1061,13 +1077,80 @@ impl RlsTask {
         }
     }
 
+    /// The id the upper tasks know tracker UE `tracker_id` by (#324).
+    fn external_ue_id(&self, tracker_id: i32) -> i32 {
+        self.ue_alias
+            .get(&tracker_id)
+            .copied()
+            .unwrap_or(tracker_id)
+    }
+
+    /// `RlsMessage::RebindUe` (#324): the UE known here as `from` is the one a
+    /// handover-in admitted as `to`. Its address, STI mapping, pending
+    /// acknowledgements, grant ceiling and any L2 entities move to `to`, and the
+    /// tracker id is aliased, so a later loss is reported as `to` as well.
+    fn rebind_ue(&mut self, from: i32, to: i32) {
+        if from == to {
+            return;
+        }
+        let tracker = self
+            .ue_alias
+            .iter()
+            .find(|(_, ext)| **ext == from)
+            .map(|(t, _)| *t)
+            .unwrap_or(from);
+        self.ue_alias.insert(tracker, to);
+        if let Some(addr) = self.ue_addresses.remove(&from) {
+            self.ue_addresses.insert(to, addr);
+        }
+        for id in self.sti_to_ue_id.values_mut() {
+            if *id == from {
+                *id = to;
+            }
+        }
+        if let Some(acks) = self.pending_acks.remove(&from) {
+            self.pending_acks.insert(to, acks);
+        }
+        if let Some(c) = self.ue_grant_ceiling.remove(&from) {
+            self.ue_grant_ceiling.insert(to, c);
+        }
+        let moved: Vec<(i32, i32)> = self
+            .rlc_entities
+            .keys()
+            .filter(|(u, _)| *u == from)
+            .copied()
+            .collect();
+        for key in moved {
+            if let Some(e) = self.rlc_entities.remove(&key) {
+                self.rlc_entities.insert((to, key.1), e);
+            }
+        }
+        #[cfg(feature = "drb-pdcp")]
+        {
+            let moved: Vec<(i32, i32)> = self
+                .pdcp_entities
+                .keys()
+                .filter(|(u, _)| *u == from)
+                .copied()
+                .collect();
+            for key in moved {
+                if let Some(e) = self.pdcp_entities.remove(&key) {
+                    self.pdcp_entities.insert((to, key.1), e);
+                }
+            }
+        }
+        self.drb_to_psi.retain(|(u, _), _| *u != from);
+        info!("UE[{from}] is the handover arrival UE[{to}]: rebound");
+    }
+
     /// Checks for lost UEs and handles cleanup
     async fn check_lost_ues(&mut self) {
         let events = self.cell_tracker.check_lost_ues();
 
         for event in events {
             if let GnbTrackerEvent::UeLost { ue_id } = event {
-                let ue_id_i32 = ue_id as i32;
+                let ue_id_i32 = self.external_ue_id(ue_id as i32);
+                self.ue_alias.remove(&(ue_id as i32));
                 info!("UE[{}] lost due to heartbeat timeout", ue_id_i32);
 
                 self.ue_addresses.remove(&ue_id_i32);
@@ -1169,6 +1252,7 @@ impl Task for RlsTask {
                                 RlsMessage::SetUeGrantCeiling { ue_id, grant_octets } => {
                                     self.set_ue_grant_ceiling(ue_id, grant_octets);
                                 }
+                                RlsMessage::RebindUe { from, to } => self.rebind_ue(from, to),
                                 RlsMessage::SignalDetected { ue_id } => {
                                     debug!("Signal detected notification for UE[{}]", ue_id);
                                 }
@@ -1178,7 +1262,7 @@ impl Task for RlsTask {
                                 }
                                 RlsMessage::UplinkRrc { ue_id, rrc_channel, data } => {
                                     // Internal uplink RRC (forwarded from receive handler)
-                                    let msg = RrcMessage::UplinkRrc { ue_id, rrc_channel, data };
+                                    let msg = RrcMessage::UplinkRrc { ue_id, rrc_channel, data, c_rnti: None };
                                     if let Err(e) = self.task_base.rrc_tx.send(msg).await {
                                         error!("Failed to forward uplink RRC: {}", e);
                                     }
@@ -1596,6 +1680,35 @@ mod tests {
         );
     }
 
+    /// #324: a handover arrival heard as UE 9 and admitted as UE 1000 is addressed,
+    /// acknowledged, granted and reported lost as 1000 once rebound, because 1000 is
+    /// the id every upper task holds its contexts under.
+    #[test]
+    fn a_rebound_ue_is_known_by_its_admitted_id() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+        let addr: SocketAddr = "127.0.0.1:4997".parse().unwrap();
+        task.ue_addresses.insert(9, addr);
+        task.sti_to_ue_id.insert(0xABC, 9);
+        task.pending_acks.insert(9, vec![3]);
+        task.set_ue_grant_ceiling(9, Some(300));
+
+        task.rebind_ue(9, 1000);
+
+        assert_eq!(task.ue_addresses.get(&1000), Some(&addr));
+        assert!(!task.ue_addresses.contains_key(&9));
+        assert_eq!(task.sti_to_ue_id.get(&0xABC), Some(&1000));
+        assert_eq!(task.pending_acks.get(&1000), Some(&vec![3]));
+        assert_eq!(task.mac_grant_for(1000), 300);
+        assert_eq!(
+            task.external_ue_id(9),
+            1000,
+            "a loss of tracker UE 9 is UE 1000's"
+        );
+        assert_eq!(task.external_ue_id(8), 8, "other UEs keep their ids");
+    }
+
     /// A zero ceiling is refused, because `build_pdu(0)` yields nothing at all: it would
     /// silence the bearer rather than narrow it. The previously installed ceiling stays
     /// in force, which is the safe answer -- a UE with a tiny carrier still has capacity.
@@ -1854,6 +1967,7 @@ mod tests {
                 pdu_id: 0,
                 payload: 1, // PSI 1
                 pdu: Bytes::from(pdu),
+                c_rnti: None,
             }))
         };
         let um = |si: nextgsim_rlc::SegmentationInfo, sn: u16, so: Option<u16>, data: Vec<u8>| {
@@ -1986,6 +2100,7 @@ mod tests {
             pdu_id: 0,
             payload: 5,
             pdu: Bytes::from(polled),
+            c_rnti: None,
         }));
         ue.send_to(&framed, gnb_addr).await.unwrap();
 
@@ -2058,6 +2173,7 @@ mod tests {
                 pdu_id: 0,
                 payload: 5, // PSI 5 — the AM bearer
                 pdu: Bytes::from(pdu),
+                c_rnti: None,
             }))
         };
 
@@ -2220,6 +2336,7 @@ mod tests {
             pdu_id: 0,
             payload: 1, // PSI 1
             pdu: Bytes::from(rlc),
+            c_rnti: None,
         }));
         ue.send_to(&framed, gnb_addr).await.expect("the lone PDU");
 
@@ -2265,6 +2382,7 @@ mod tests {
                 pdu_id: 0,
                 payload: psi,
                 pdu: Bytes::from(first_segment.clone()),
+                c_rnti: None,
             };
             task.handle_uplink_data(1, &pdu).await;
         }
@@ -2406,6 +2524,7 @@ mod tests {
             pdu_id: 0,
             payload: psi as u32,
             pdu: Bytes::from(pdu_bytes.clone()),
+            c_rnti: None,
         };
         task.handle_uplink_data(1, &pdu).await;
         assert_eq!(task.load_window_octets, uplink_len, "uplink counted");

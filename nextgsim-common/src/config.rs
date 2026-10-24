@@ -229,6 +229,23 @@ pub struct GnbConfig {
     /// Hysteresis in dB for the CHO execution condition. Defaults to 1 dB.
     #[serde(default = "default_cho_hysteresis_db")]
     pub cho_hysteresis_db: f64,
+    /// Where this gNB's antenna stands in the simulation, in metres (#324).
+    ///
+    /// The RLS link derives every UE's received level from the distance between
+    /// this and the UE's own `sim_position`. Before #324 it was fixed at the
+    /// origin for every gNB, so all cells measured the same and no measurement
+    /// could ever favour one. Default: the origin.
+    #[serde(default)]
+    pub sim_position: SimPosition,
+    /// The neighbouring gNBs' cells a measurement-triggered handover may target
+    /// (#324): a reported `physCellId` is matched against `nci % 1008` of each
+    /// entry, and the match names the target gNB and TAI for HANDOVER REQUIRED
+    /// (TS 38.413 §8.4.1). A PCI matching none is not handed over to.
+    ///
+    /// Empty (the default) keeps measurement reports from starting an inter-gNB
+    /// handover at all.
+    #[serde(default)]
+    pub handover_neighbours: Vec<HandoverNeighbourConfig>,
     /// Default paging cycle in radio frames (TS 38.331
     /// `PCCH-Config.defaultPagingCycle`), used when the AMF's NGAP
     /// `(default)PagingDRX` does not supply one. Must be 32, 64, 128 or 256.
@@ -558,6 +575,8 @@ impl Default for GnbConfig {
             conditional_handover: false,
             cho_a3_offset_db: default_cho_a3_offset_db(),
             cho_hysteresis_db: default_cho_hysteresis_db(),
+            sim_position: SimPosition::default(),
+            handover_neighbours: Vec::new(),
             pqc_config: PqcConfig::default(),
             ntn_config: None,
             as_security_enabled: false,
@@ -609,6 +628,86 @@ impl GnbConfig {
         let cell_id_bits = 36 - self.gnb_id_length;
         let mask = (1u64 << cell_id_bits) - 1;
         (self.nci & mask) as u32
+    }
+}
+
+/// A point in the simulation, in metres (#324). `z` may be omitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct SimPosition {
+    /// X, metres.
+    pub x: i32,
+    /// Y, metres.
+    pub y: i32,
+    /// Z, metres.
+    #[serde(default)]
+    pub z: i32,
+}
+
+/// A UE's straight-line movement (#324): after `start_after_secs` it moves from
+/// its `sim_position` toward `target` at `speed_mps`, and stops there.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SimMovement {
+    /// Where the movement ends.
+    pub target: SimPosition,
+    /// Speed in metres per second. Zero or negative: the UE does not move.
+    pub speed_mps: f64,
+    /// Seconds after start-up before the UE starts moving.
+    #[serde(default)]
+    pub start_after_secs: f64,
+}
+
+impl SimMovement {
+    /// The position `elapsed` after start-up, for a UE that started at `start`.
+    pub fn position_at(&self, start: SimPosition, elapsed: std::time::Duration) -> SimPosition {
+        let moving_for = elapsed.as_secs_f64() - self.start_after_secs.max(0.0);
+        if moving_for <= 0.0 || !(self.speed_mps > 0.0) {
+            return start;
+        }
+        let (dx, dy, dz) = (
+            f64::from(self.target.x) - f64::from(start.x),
+            f64::from(self.target.y) - f64::from(start.y),
+            f64::from(self.target.z) - f64::from(start.z),
+        );
+        let length = (dx * dx + dy * dy + dz * dz).sqrt();
+        let travelled = self.speed_mps * moving_for;
+        if length == 0.0 || travelled >= length {
+            return self.target;
+        }
+        let f = travelled / length;
+        SimPosition {
+            x: (f64::from(start.x) + dx * f).round() as i32,
+            y: (f64::from(start.y) + dy * f).round() as i32,
+            z: (f64::from(start.z) + dz * f).round() as i32,
+        }
+    }
+}
+
+/// One neighbouring gNB cell a handover may target (#324).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoverNeighbourConfig {
+    /// The neighbour cell's NR Cell Identity (36 bits). Its PCI is `nci % 1008`,
+    /// this tree's convention (#37), and its gNB ID the top `gnb_id_length` bits.
+    pub nci: u64,
+    /// The neighbour cell's Tracking Area Code.
+    pub tac: u32,
+    /// The neighbour's gNB ID length in bits (22..32). Absent: this gNB's own.
+    #[serde(default)]
+    pub gnb_id_length: Option<u8>,
+}
+
+impl HandoverNeighbourConfig {
+    /// The neighbour cell's `physCellId` (`nci % 1008`).
+    pub fn phys_cell_id(&self) -> u16 {
+        (self.nci % 1008) as u16
+    }
+
+    /// The neighbour's gNB ID, given this gNB's own ID length as the default.
+    pub fn gnb_id(&self, own_gnb_id_length: u8) -> u32 {
+        let len = self
+            .gnb_id_length
+            .unwrap_or(own_gnb_id_length)
+            .clamp(22, 32);
+        ((self.nci & 0xF_FFFF_FFFF) >> (36 - u32::from(len))) as u32
     }
 }
 
@@ -1864,6 +1963,15 @@ pub struct UeConfig {
     pub supported_algs: SupportedAlgs,
     /// List of gNB addresses to search for
     pub gnb_search_list: Vec<String>,
+    /// Where the UE starts in the simulation, in metres (#324). Each gNB derives
+    /// the UE's received level from the distance to its own `sim_position`.
+    /// Default: the origin.
+    #[serde(default)]
+    pub sim_position: SimPosition,
+    /// Optional straight-line movement from `sim_position` (#324), so a
+    /// measurement-triggered handover can be driven deterministically.
+    #[serde(default)]
+    pub sim_movement: Option<SimMovement>,
     /// Default PDU sessions to establish
     pub sessions: Vec<SessionConfig>,
     /// Configured NSSAI (network slices)
@@ -2216,6 +2324,8 @@ impl Default for UeConfig {
             imei_sv: None,
             supported_algs: SupportedAlgs::default(),
             gnb_search_list: Vec::new(),
+            sim_position: SimPosition::default(),
+            sim_movement: None,
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
@@ -2426,6 +2536,77 @@ mod tests {
         let config = AmfConfig::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 38412);
         assert_eq!(config.address, "192.168.1.1");
         assert_eq!(config.port, 38412);
+    }
+
+    /// #324: a UE moves in a straight line toward its target at the configured
+    /// speed, after the configured delay, and stops there.
+    #[test]
+    fn sim_movement_moves_in_a_line_and_stops_at_the_target() {
+        use std::time::Duration;
+        let start = SimPosition { x: 35, y: 0, z: 0 };
+        let m = SimMovement {
+            target: SimPosition { x: 85, y: 0, z: 0 },
+            speed_mps: 5.0,
+            start_after_secs: 10.0,
+        };
+        assert_eq!(m.position_at(start, Duration::from_secs(0)), start);
+        assert_eq!(m.position_at(start, Duration::from_secs(10)), start);
+        assert_eq!(m.position_at(start, Duration::from_secs(12)).x, 45);
+        assert_eq!(m.position_at(start, Duration::from_secs(20)).x, 85);
+        assert_eq!(m.position_at(start, Duration::from_secs(3600)), m.target);
+        let still = SimMovement {
+            speed_mps: 0.0,
+            ..m
+        };
+        assert_eq!(still.position_at(start, Duration::from_secs(3600)), start);
+        let diagonal = SimMovement {
+            target: SimPosition { x: 30, y: 40, z: 0 },
+            speed_mps: 25.0,
+            start_after_secs: 0.0,
+        };
+        assert_eq!(
+            diagonal.position_at(SimPosition::default(), Duration::from_secs(1)),
+            SimPosition { x: 15, y: 20, z: 0 },
+            "half of the 50 m"
+        );
+    }
+
+    /// #324: a handover neighbour's PCI is `nci % 1008` and its gNB ID the top
+    /// `gnb_id_length` bits, defaulting to this gNB's length.
+    #[test]
+    fn a_handover_neighbour_derives_its_pci_and_gnb_id() {
+        let n = HandoverNeighbourConfig {
+            nci: 0x000000020,
+            tac: 1,
+            gnb_id_length: None,
+        };
+        assert_eq!(n.phys_cell_id(), 32);
+        assert_eq!(n.gnb_id(32), 2);
+        let n = HandoverNeighbourConfig {
+            nci: 0x123456789,
+            tac: 1,
+            gnb_id_length: Some(24),
+        };
+        assert_eq!(n.gnb_id(32), 0x123456);
+        assert_eq!(n.phys_cell_id(), (0x123456789u64 % 1008) as u16);
+    }
+
+    /// #324: the new keys parse from YAML, and configs without them still do.
+    #[test]
+    fn position_movement_and_neighbours_parse_from_yaml() {
+        let pos: SimPosition = serde_yaml::from_str("{x: 120, y: -5}").unwrap();
+        assert_eq!(
+            pos,
+            SimPosition {
+                x: 120,
+                y: -5,
+                z: 0
+            }
+        );
+        let m: SimMovement = serde_yaml::from_str("{target: {x: 85, y: 0}, speed_mps: 5}").unwrap();
+        assert_eq!(m.start_after_secs, 0.0);
+        let n: HandoverNeighbourConfig = serde_yaml::from_str("{nci: 0x20, tac: 1}").unwrap();
+        assert_eq!(n.gnb_id_length, None);
     }
 
     #[test]
@@ -2998,6 +3179,8 @@ configured_nssai:
             imei_sv: None,
             supported_algs: SupportedAlgs::default(),
             gnb_search_list: Vec::new(),
+            sim_position: SimPosition::default(),
+            sim_movement: None,
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,

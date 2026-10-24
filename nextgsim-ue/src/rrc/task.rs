@@ -1277,6 +1277,11 @@ impl RrcTask {
         for (&cell_id, cell) in cells.iter() {
             self.measurement_manager
                 .update_measurement(cell_id, cell.dbm);
+            // The real PCI, so a MeasurementReport names the cell the gNB knows
+            // (#324). It used to carry the local RLS index (0, 1, ...).
+            if let Some(pci) = self.cell_selector.phys_cell_id_of(cell_id) {
+                self.measurement_manager.set_phys_cell_id(cell_id, pci);
+            }
         }
 
         // Inter-RAT (E-UTRA) measurements, for events B1/B2. Configured rather
@@ -2028,6 +2033,9 @@ impl RrcTask {
                 debug!("Signal updated: cell_id={}, dbm={}", id, dbm);
                 // Update measurement manager
                 self.measurement_manager.update_measurement(id, dbm);
+                if let Some(pci) = self.cell_selector.phys_cell_id_of(id) {
+                    self.measurement_manager.set_phys_cell_id(id, pci);
+                }
             }
             CellChangeEvent::None => {}
         }
@@ -4097,9 +4105,12 @@ impl RrcTask {
                     }
                 }
                 for addition in &config.to_add {
-                    // physCellId is the simulator cell id throughout the UE
-                    // measurement path (see `candidate_cell_id`).
-                    let cell_id = i32::from(addition.phys_cell_id);
+                    // The SCell is named by its physCellId; the measured cell
+                    // carrying it is found by PCI (#324). A cell not heard yet
+                    // keeps the PCI as its key, so it matches nothing until then.
+                    let cell_id = self
+                        .resolve_target_cell(u32::from(addition.phys_cell_id))
+                        .unwrap_or(i32::from(addition.phys_cell_id));
                     self.configured_scells.insert(addition.scell_index, cell_id);
                     info!(
                         "SCell configured: sCellIndex={}, physCellId={}, measured={}",
@@ -4345,6 +4356,14 @@ impl RrcTask {
         let Some(transaction_id) = self.handover_manager.transaction_id() else {
             return;
         };
+        // The C-RNTI the target allocated (`newUE-Identity`), read before
+        // `complete()` clears the command: RLS stamps it on the uplink, as the
+        // C-RNTI MAC CE identifies the arriving UE to the target (#355 review).
+        let new_c_rnti = self
+            .handover_manager
+            .target_cell()
+            .and_then(|cell| cell.new_ue_id)
+            .and_then(|id| u16::try_from(id).ok());
 
         self.handover_manager.sync_complete();
 
@@ -4387,6 +4406,16 @@ impl RrcTask {
                 .await
             {
                 error!("Failed to notify RLS of handover: {}", e);
+            }
+            if let Some(c_rnti) = new_c_rnti {
+                if let Err(e) = self
+                    .task_base
+                    .rls_tx
+                    .send(RlsMessage::SetCRnti { c_rnti })
+                    .await
+                {
+                    error!("Failed to give RLS the target C-RNTI: {}", e);
+                }
             }
 
             info!(
@@ -10304,6 +10333,41 @@ mod tests {
                 "and it completed through the handover manager rather than by some other \
                  route changing the serving cell"
             );
+        });
+    }
+
+    /// #355 review: a completed handover gives RLS the C-RNTI the target allocated
+    /// (`newUE-Identity`), after the new serving cell, so the uplink that completes
+    /// the handover presents it and the target binds the arrival to its admission.
+    #[test]
+    fn a_completed_handover_gives_rls_the_target_c_rnti() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -70).await;
+            while rls_rx.try_recv().is_ok() {}
+            let pdu = handover_command_pdu(2, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(task.serving_cell_id, Some(2), "precondition: completed");
+            let mut order = Vec::new();
+            while let Ok(msg) = rls_rx.try_recv() {
+                match msg {
+                    TaskMessage::Message(RlsMessage::AssignCurrentCell { cell_id }) => {
+                        order.push(format!("cell {cell_id}"));
+                    }
+                    TaskMessage::Message(RlsMessage::SetCRnti { c_rnti }) => {
+                        order.push(format!("c-rnti {c_rnti}"));
+                    }
+                    TaskMessage::Message(RlsMessage::RrcPduDelivery { .. }) => {
+                        order.push("rrc".into());
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(order, vec!["cell 2", "c-rnti 1", "rrc"]);
         });
     }
 

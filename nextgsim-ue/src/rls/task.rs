@@ -25,7 +25,7 @@ use nextgsim_common::OctetString;
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel,
+    codec, CellSearchEvent, RlsMessage as RlsProtocolMessage, RlsTransport, RrcChannel, SimCoord,
     TransportEvent, UeCellSearch,
 };
 
@@ -98,6 +98,9 @@ pub struct RlsTask {
     transport: RlsTransport,
     cell_addresses: HashMap<i32, SocketAddr>,
     serving_cell: Option<i32>,
+    /// The C-RNTI a handover assigned in the serving cell, stamped on uplink RRC
+    /// PDUs (`RlsMessage::SetCRnti`, #355 review).
+    serving_c_rnti: Option<u16>,
     socket: Option<Arc<UdpSocket>>,
     config: RlsTaskConfig,
     /// The last successful resolution of each `gnb_search_hosts` entry (#286).
@@ -149,8 +152,8 @@ pub struct RlsTask {
     /// of the gNB's policy, which would be a second copy of it.
     #[cfg(feature = "sdap-dataplane")]
     sdap_uplink: HashMap<i32, SdapUplinkBinding>,
-    /// When this task started, the origin for the PDCP timers.
-    #[cfg(feature = "drb-pdcp")]
+    /// When this task started: the origin for the PDCP timers and for the
+    /// UE's `sim_movement` (#324).
     started_at: std::time::Instant,
     /// The NTN uplink pre-compensation in force, derived from SIB19
     /// (TS 38.300 §16.14.2.2, issue #56).
@@ -244,6 +247,7 @@ impl RlsTask {
             transport: RlsTransport::new(sti),
             cell_addresses: HashMap::new(),
             serving_cell: None,
+            serving_c_rnti: None,
             socket: None,
             config,
             resolved_hosts: HashMap::new(),
@@ -262,7 +266,6 @@ impl RlsTask {
             drb_to_psi: HashMap::new(),
             #[cfg(feature = "sdap-dataplane")]
             sdap_uplink: HashMap::new(),
-            #[cfg(feature = "drb-pdcp")]
             started_at: std::time::Instant::now(),
             // No pre-compensation until a SIB19 says otherwise (issue #56). A
             // terrestrial UE never leaves this state, which is what keeps every
@@ -715,6 +718,17 @@ impl RlsTask {
         // next heartbeat ~2 s out — exceeding the 2 s cell-lost threshold and
         // spuriously dropping the serving cell (SignalLostToConnectedCell) right
         // after registration, before the PDU session could complete.
+        // The UE's simulated position now (#324): its configured start, moved
+        // along `sim_movement` if one is set. Each gNB derives this UE's received
+        // level from it, so a moving UE's measurements change and a handover can
+        // be driven. Carried in every heartbeat.
+        let cfg = &self.task_base.config;
+        let pos = match cfg.sim_movement {
+            Some(movement) => movement.position_at(cfg.sim_position, self.started_at.elapsed()),
+            None => cfg.sim_position,
+        };
+        self.cell_search
+            .set_position(SimCoord::new(pos.x, pos.y, pos.z));
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {
             self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat))
                 .await;
@@ -1108,6 +1122,7 @@ impl RlsTask {
         if self.cell_search.get_cell(cell_id as u32).is_some() {
             info!("Assigning serving cell: cell_id={}", cell_id);
             self.serving_cell = Some(cell_id);
+            self.serving_c_rnti = None;
             self.transport.set_serving_endpoint(cell_id as u32);
         } else {
             warn!("Cannot assign unknown cell as serving: cell_id={}", cell_id);
@@ -1166,7 +1181,8 @@ impl RlsTask {
             Bytes::copy_from_slice(pdu.data()),
             require_ack,
         ) {
-            Ok(transmission) => {
+            Ok(mut transmission) => {
+                transmission.c_rnti = self.serving_c_rnti;
                 self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
                     .await
             }
@@ -1321,6 +1337,10 @@ impl RlsTask {
     async fn handle_rls_message(&mut self, msg: RlsMessage) {
         match msg {
             RlsMessage::AssignCurrentCell { cell_id } => self.handle_assign_current_cell(cell_id),
+            RlsMessage::SetCRnti { c_rnti } => {
+                debug!("Serving cell C-RNTI {c_rnti:#06x}");
+                self.serving_c_rnti = Some(c_rnti);
+            }
             #[cfg(feature = "up-security")]
             RlsMessage::InstallDrbSecurity {
                 psi,
@@ -1940,6 +1960,58 @@ mod tests {
             }
         }
         assert!(rlf, "losing the serving cell is a radio link failure");
+    }
+
+    /// #355 review: after `SetCRnti`, uplink RRC PDUs to the serving cell carry
+    /// the C-RNTI on RLS, which is how a handover target recognises the arriving
+    /// UE. A new serving cell clears it.
+    #[tokio::test]
+    async fn uplink_rrc_carries_the_handover_c_rnti_until_the_cell_changes() {
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.expect("gNB socket");
+        let gnb_addr = gnb.local_addr().unwrap();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![gnb_addr],
+                ..Default::default()
+            },
+        );
+        task.socket = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let ack = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60);
+        task.handle_heartbeat_ack(gnb_addr, &ack).await;
+        task.handle_rls_message(RlsMessage::AssignCurrentCell { cell_id: 0 })
+            .await;
+        task.handle_rls_message(RlsMessage::SetCRnti { c_rnti: 0x03E8 })
+            .await;
+
+        let mut buf = [0u8; 2048];
+        let pdu = || OctetString::from_slice(&[0x10, 0x00]);
+        task.handle_rrc_pdu_delivery(RrcChannel::UlDcch, 0, pdu())
+            .await;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv(&mut buf))
+            .await
+            .expect("an uplink datagram")
+            .unwrap();
+        let Ok(RlsProtocolMessage::PduTransmission(t)) = nextgsim_rls::codec::decode(&buf[..n])
+        else {
+            panic!("not a PDU transmission");
+        };
+        assert_eq!(t.c_rnti, Some(0x03E8));
+
+        task.handle_rls_message(RlsMessage::AssignCurrentCell { cell_id: 0 })
+            .await;
+        task.handle_rrc_pdu_delivery(RrcChannel::UlDcch, 0, pdu())
+            .await;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv(&mut buf))
+            .await
+            .expect("an uplink datagram")
+            .unwrap();
+        let Ok(RlsProtocolMessage::PduTransmission(t)) = nextgsim_rls::codec::decode(&buf[..n])
+        else {
+            panic!("not a PDU transmission");
+        };
+        assert_eq!(t.c_rnti, None, "a new serving cell clears it");
     }
 
     /// #337: a serving gNB that restarted at the SAME address (same NCI, so the

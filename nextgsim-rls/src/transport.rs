@@ -185,6 +185,7 @@ impl RlsTransport {
             pdu_id,
             payload: channel as u32,
             pdu: data,
+            c_rnti: None,
         })
     }
 
@@ -198,6 +199,7 @@ impl RlsTransport {
             pdu_id: 0,
             payload: psi,
             pdu: data,
+            c_rnti: None,
         }
     }
 
@@ -413,6 +415,7 @@ mod tests {
             pdu_id: 1,
             payload: RrcChannel::DlDcch as u32,
             pdu: Bytes::from_static(b"rrc message"),
+            c_rnti: None,
         };
 
         let events = transport.process_pdu_transmission(1, &pdu);
@@ -439,6 +442,7 @@ mod tests {
             pdu_id: 0,
             payload: 5,
             pdu: Bytes::from_static(b"user data"),
+            c_rnti: None,
         };
 
         let events = transport.process_pdu_transmission(1, &pdu);
@@ -461,6 +465,7 @@ mod tests {
             pdu_id: 0,
             payload: 5,
             pdu: Bytes::from_static(b"user data"),
+            c_rnti: None,
         };
 
         // Data from non-serving endpoint should be ignored
@@ -498,6 +503,7 @@ mod tests {
             pdu_id: 1,
             payload: 0,
             pdu: Bytes::new(),
+            c_rnti: None,
         };
         let pdu2 = RlsPduTransmission {
             sti: 67890,
@@ -505,6 +511,7 @@ mod tests {
             pdu_id: 2,
             payload: 0,
             pdu: Bytes::new(),
+            c_rnti: None,
         };
 
         transport.process_pdu_transmission(1, &pdu1);
