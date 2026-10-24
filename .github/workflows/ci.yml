@@ -307,8 +307,16 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libsctp-dev
       - name: cargo test
         run: cargo test -p nextgsim-enb --features kernel-sctp
+      # The kernel backend itself (non-blocking connect, #311) and the gNB's
+      # kernel-sctp arm, which no other job tests.
+      - name: cargo test (kernel backend and gNB)
+        run: |
+          cargo test -p nextgsim-sctp --features kernel-sctp
+          cargo test -p nextgsim-gnb --features kernel-sctp sctp::
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets
+        run: |
+          cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets
+          cargo clippy -p nextgsim-gnb --features kernel-sctp --all-targets
 
   up-security:
     name: UP security (feature-gated)

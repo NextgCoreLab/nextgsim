@@ -242,6 +242,14 @@ pub struct EnbConfig {
     /// to `s1ap_ip`.
     #[serde(default)]
     pub gtp_ip: Option<IpAddr>,
+    /// User-inactivity release (#350): after this many seconds with no user
+    /// data and no signalling for an RRC-connected UE, the eNB asks the MME to
+    /// release it, UE CONTEXT RELEASE REQUEST with cause user-inactivity
+    /// (TS 36.413 §8.3.2, TS 23.401 §5.3.5). The MME's UE CONTEXT RELEASE
+    /// COMMAND then releases RRC and the UE goes ECM-IDLE. Absent (the
+    /// default): no inactivity release.
+    #[serde(default)]
+    pub inactivity_timer_secs: Option<u64>,
 }
 
 fn default_s1_setup_retry_secs() -> u64 {
@@ -334,6 +342,7 @@ pub fn load_with_env_and_validate<P: AsRef<Path>>(path: P) -> Result<EnbConfig, 
 /// | `NEXTGSIM_ENB_IP` | `s1ap_ip` and `radio.link_ip` |
 /// | `NEXTGSIM_ENB_GTP_IP` | `gtp_ip` (the S1-U address; defaults to `s1ap_ip`) |
 /// | `NEXTGSIM_ENB_ID` | `enb_id`, decimal or `0x` hex |
+/// | `NEXTGSIM_ENB_INACTIVITY_TIMER_SECS` | `inactivity_timer_secs` (#350); empty or `off` disables it |
 /// | `NEXTGSIM_PLMN` | `plmn`, written `MCC-MNC` |
 /// | `NEXTGSIM_TAC` | `tac` |
 ///
@@ -373,6 +382,19 @@ pub fn apply_env_overrides(
     }
     if let Some(v) = lookup("NEXTGSIM_ENB_ID") {
         c.enb_id = parse_u32(v.trim()).map_err(|e| bad("NEXTGSIM_ENB_ID", e))?;
+    }
+    if let Some(v) = lookup("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS") {
+        let v = v.trim();
+        c.inactivity_timer_secs = if v.is_empty() || v.eq_ignore_ascii_case("off") {
+            None
+        } else {
+            Some(v.parse::<u64>().map_err(|_| {
+                bad(
+                    "NEXTGSIM_ENB_INACTIVITY_TIMER_SECS",
+                    format!("{v:?} is not a number of seconds"),
+                )
+            })?)
+        };
     }
     let plmn = lookup("NEXTGSIM_PLMN");
     let tac = lookup("NEXTGSIM_TAC");
@@ -426,6 +448,11 @@ pub fn validate_enb_config(c: &EnbConfig) -> Result<(), ConfigError> {
         )));
     }
     validate_plmn(&c.plmn, "plmn")?;
+    if c.inactivity_timer_secs == Some(0) {
+        return Err(ConfigError::Invalid(
+            "inactivity_timer_secs 0 would release every UE at once; omit it to disable".into(),
+        ));
+    }
 
     let tas = c.effective_supported_tas();
     if tas.len() > MAX_TACS {
@@ -545,6 +572,7 @@ mod tests {
             radio: RadioConfig::default(),
             security: AsSecurityConfig::default(),
             gtp_ip: None,
+            inactivity_timer_secs: None,
         }
     }
 
@@ -566,6 +594,7 @@ mod tests {
                 ("NEXTGSIM_ENB_IP", "172.24.0.50"),
                 ("NEXTGSIM_ENB_GTP_IP", "172.24.0.51"),
                 ("NEXTGSIM_ENB_ID", "0x1A0"),
+                ("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS", "15"),
                 ("NEXTGSIM_PLMN", "001-01"),
                 ("NEXTGSIM_TAC", "7"),
             ]),
@@ -584,6 +613,7 @@ mod tests {
         assert_eq!(c.radio.link_ip, ip("172.24.0.50"));
         assert_eq!(c.gtp_ip, Some(ip("172.24.0.51")));
         assert_eq!(c.enb_id, 0x1A0);
+        assert_eq!(c.inactivity_timer_secs, Some(15));
         assert_eq!(c.plmn, Plmn::new(1, 1, false));
         assert_eq!(c.tac, 7);
     }
@@ -602,6 +632,7 @@ mod tests {
             ("NEXTGSIM_ENB_MME_ADDR", "mme.local"),
             ("NEXTGSIM_ENB_IP", "x"),
             ("NEXTGSIM_ENB_ID", "0xZZ"),
+            ("NEXTGSIM_ENB_INACTIVITY_TIMER_SECS", "soon"),
             ("NEXTGSIM_PLMN", "99970"),
             ("NEXTGSIM_TAC", "70000"),
         ] {
@@ -748,6 +779,20 @@ s1ap_ip: 127.0.0.1
         assert_eq!(c.mme_configs[0].port, 36412);
         assert_eq!(c.s1_setup_retry_secs, 10);
         assert_eq!(c.s1_setup_response_timeout_ms, 5000);
+        assert_eq!(c.inactivity_timer_secs, None, "#350: off unless configured");
         validate_enb_config(&c).unwrap();
+    }
+
+    /// #350: `inactivity_timer_secs` parses, and 0 is refused.
+    #[test]
+    fn inactivity_timer_parses_and_zero_is_refused() {
+        let mut c = valid();
+        c.inactivity_timer_secs = Some(0);
+        assert!(validate_enb_config(&c).is_err());
+        c.inactivity_timer_secs = Some(20);
+        validate_enb_config(&c).unwrap();
+        let y = "enb_id: 1\nplmn: { mcc: 999, mnc: 70, long_mnc: false }\ntac: 1\nmme_configs: [{ address: 127.0.0.1 }]\ns1ap_ip: 127.0.0.1\ninactivity_timer_secs: 20\n";
+        let c: EnbConfig = serde_yaml::from_str(y).unwrap();
+        assert_eq!(c.inactivity_timer_secs, Some(20));
     }
 }
