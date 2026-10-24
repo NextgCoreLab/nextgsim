@@ -148,6 +148,15 @@ async fn complete_discovery(h: &mut Harness) -> i32 {
     gnb_saw_ue
 }
 
+/// Empties every channel the RLS tasks report into, so no task can block on a
+/// full 64-deep report channel during a long run.
+fn drain_all(h: &mut Harness) {
+    while h.ue_nas_rx.try_recv().is_ok() {}
+    while h.gnb_gtp_rx.try_recv().is_ok() {}
+    while h.ue_rrc_rx.try_recv().is_ok() {}
+    while h.gnb_rrc_rx.try_recv().is_ok() {}
+}
+
 /// Collects `count` downlink SDUs the UE handed up to NAS.
 async fn collect_at_ue(
     rx: &mut mpsc::Receiver<UeTaskMessage<NasMessage>>,
@@ -365,7 +374,11 @@ async fn a_long_downlink_burst_stays_in_order() {
 /// that follows must arrive. Before #315 no entity was ever released or
 /// re-established: the UE kept RX_DELIV at 2100, read the new COUNT 0..9 as
 /// older than that, and discarded every PDU.
-#[tokio::test]
+// Multi-threaded, so the two RLS tasks keep answering each other's heartbeats
+// while this test pushes 4200 SDUs: on a single-threaded runtime they only run
+// when the test yields, and on a loaded host a missed heartbeat window loses the
+// cell (UE) or the UE (gNB), after which nothing is delivered at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
     let mut h = start_harness().await;
     let ue_id = complete_discovery(&mut h).await;
@@ -392,14 +405,12 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
             })
             .await
             .expect("UE RLS task alive");
-        // Drain as we go, so neither 64-deep channel fills.
-        while let Ok(_msg) = h.ue_nas_rx.try_recv() {}
-        while let Ok(_msg) = h.gnb_gtp_rx.try_recv() {}
+        // Drain as we go, so no 64-deep channel fills.
+        drain_all(&mut h);
     }
     // Long enough for t-Reordering to flush anything the old entities still held.
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    while let Ok(_msg) = h.ue_nas_rx.try_recv() {}
-    while let Ok(_msg) = h.gnb_gtp_rx.try_recv() {}
+    drain_all(&mut h);
 
     // The new connection: the gNB's entities go (a restart, or AN release then
     // RRCSetup), and the UE's go on its RRCSetup.
@@ -407,10 +418,29 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
         .send(GnbRlsMessage::ReleaseUeDrbs { ue_id })
         .await
         .expect("gNB RLS task alive");
+    // The gNB task reads its channel in order, so its release precedes the
+    // downlink below. Its uplink RX entity must also be gone before the probe
+    // further down reaches it; a channel message is processed in microseconds.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drain_all(&mut h);
     h.ue_rls_tx
         .send(UeRlsMessage::ReleaseDrbs)
         .await
         .expect("UE RLS task alive");
+    // Barrier: the UE task processes its channel in order, so once this probe
+    // (sent after the release) reaches the gNB, the UE's entities are the new
+    // ones. Without it the downlink below could reach the UE's OLD RX entity
+    // (at COUNT 2100), which reads SN 0 as COUNT 4096 and holds it -- the order
+    // a real UE never sees, since its RRCSetup precedes any DRB data.
+    const PROBE: [u8; 8] = [0x77; 8];
+    h.ue_rls_tx
+        .send(UeRlsMessage::DataPduDelivery {
+            psi: PSI,
+            pdu: OctetString::from_slice(&PROBE),
+        })
+        .await
+        .expect("UE RLS task alive");
+    collect_at_gnb_where(&mut h.gnb_gtp_rx, 1, |sdu| sdu == PROBE).await;
 
     let after: Vec<Vec<u8>> = (0..10u8).map(|i| vec![0xE0 + i; 24]).collect();
     for payload in &after {
@@ -433,7 +463,8 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
         "traffic on the new connection arrives in order"
     );
 
-    // And the uplink: the UE's TX entity had reached COUNT 2100 too.
+    // And the uplink: the UE's TX entity had reached COUNT 2100 too. The probe
+    // was COUNT 0 of the new entity; these follow it.
     for payload in &after {
         h.ue_rls_tx
             .send(UeRlsMessage::DataPduDelivery {
@@ -443,6 +474,9 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
             .await
             .expect("UE RLS task alive");
     }
-    let at_gnb = collect_at_gnb_where(&mut h.gnb_gtp_rx, after.len(), |sdu| sdu.len() != 4).await;
+    let at_gnb = collect_at_gnb_where(&mut h.gnb_gtp_rx, after.len(), |sdu| {
+        sdu.len() != 4 && sdu != PROBE
+    })
+    .await;
     assert_eq!(at_gnb, after, "and so does the uplink");
 }
