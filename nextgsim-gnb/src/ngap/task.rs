@@ -138,8 +138,9 @@ use nextgsim_ngap::procedures::ng_setup::{
     NasCause, NgSetupFailureCause, ProtocolCause, RadioNetworkCause,
 };
 use nextgsim_ngap::procedures::nrppa::{
-    build_nrppa_response, encode_uplink_nrppa_transport, parse_downlink_nrppa_transport,
-    NrppaAssociation, NrppaCellInfo, NrppaError, NrppaProcedure,
+    build_nrppa_answer, encode_uplink_nrppa_transport, parse_downlink_nrppa_transport, srs_point_a,
+    CellTime, NrppaAssociation, NrppaCellInfo, NrppaDecision, NrppaError, NrppaProcedure,
+    NrppaRadioCause, NrppaRequest, TrpRxTxMeasurement, TRP_MEASUREMENT_GNB_RX_TX_TIME_DIFF,
 };
 use nextgsim_ngap::procedures::overload::{
     decode_overload_start, decode_overload_stop, OverloadData,
@@ -257,6 +258,11 @@ pub struct NgapTask {
     /// outstanding — and a global counter cannot collide across UEs the way a
     /// per-UE one would once two UEs were measured concurrently.
     next_nrppa_measurement_id: u16,
+    /// The next NRPPa `RAN-Measurement-ID ::= INTEGER (1..65536, ...)` of a
+    /// TRP measurement (TS 38.455 §8.5.1).
+    next_nrppa_ran_measurement_id: u32,
+    /// The positioning SRS each UE was given (#347).
+    positioning_srs: super::positioning::PositioningSrsTable,
     /// NGAP guard timers: TNGRELOCoverall, TNGRELOCprep and the NG Setup retry gated by
     /// an NG Setup Failure's Time to Wait (TS 38.413 §8.3.3.4, §8.4.1.2, §8.7.1.3).
     guard_timers: GuardTimers,
@@ -343,6 +349,8 @@ impl NgapTask {
             mbs_ngap_sessions: NgapMbsManager::new(),
             // UE-Measurement-ID is INTEGER (1..256, ...), so ids start at 1.
             next_nrppa_measurement_id: 1,
+            next_nrppa_ran_measurement_id: 1,
+            positioning_srs: super::positioning::PositioningSrsTable::default(),
             guard_timers: GuardTimers::new(),
             racs_cache: super::racs::RacsCache::default(),
             racs_pending: HashMap::new(),
@@ -5782,6 +5790,15 @@ impl NgapTask {
     /// - **9** `id-positioningInformationExchange` (§8.2.6): reply with the SFN
     ///   timing reference.
     /// - **16** `id-tRPInformationExchange` (§8.2.8): reply with this node's TRPs.
+    ///
+    /// And the gNB's half of Multi-RTT (#347), which depends on what this node
+    /// configured for the UE ([`Self::nrppa_decision`]):
+    ///
+    /// - **9** with Requested SRS Transmission Characteristics: the UE's SRS
+    ///   Configuration as well.
+    /// - **17** `id-positioningActivation` (§8.2.9) and **18**
+    ///   `id-positioningDeactivation` (§8.2.10).
+    /// - **11** `id-Measurement` (§8.5.1): a gNB Rx-Tx time difference per TRP.
     async fn handle_nrppa_transport(&mut self, amf_id: i32, pdu_bytes: &[u8]) -> bool {
         let request = match parse_downlink_nrppa_transport(pdu_bytes) {
             Ok(request) => request,
@@ -5807,13 +5824,23 @@ impl NgapTask {
         let sfn_initialisation_time = 0;
 
         let procedure = request.procedure.clone();
-        let response = match build_nrppa_response(
+        let decision = self.nrppa_decision(&request);
+        let response = match build_nrppa_answer(
             &request,
             &self.nrppa_cell_info(),
             ran_ue_measurement_id,
             sfn_initialisation_time,
+            &decision,
         ) {
-            Ok(response) => response,
+            Ok(Some(response)) => response,
+            Ok(None) => {
+                info!(
+                    "NRPPa {} from AMF[{}] applied",
+                    nrppa_procedure_name(&procedure),
+                    amf_id
+                );
+                return true;
+            }
             Err(e) => {
                 warn!("Failed to build the NRPPa response for AMF[{amf_id}]: {e}");
                 return false;
@@ -5870,6 +5897,113 @@ impl NgapTask {
     ///
     /// Wraps at 256 back to 1 rather than to 0: the constraint's lower bound is 1,
     /// so 0 is not an encodable measurement id.
+    /// What this node decides for an NRPPa request that depends on its state:
+    /// the UE's positioning SRS, and the TRP measurement of the UE transmitting
+    /// it (#347).
+    fn nrppa_decision(&mut self, request: &NrppaRequest) -> NrppaDecision {
+        // The NGAP UE id of a UE-associated request's target.
+        let target = match &request.association {
+            NrppaAssociation::UeAssociated { ran_ue_ngap_id, .. } => self
+                .ue_contexts
+                .values()
+                .find(|ctx| ctx.ran_ue_ngap_id == i64::from(*ran_ue_ngap_id))
+                .map(|ctx| ctx.ue_id),
+            NrppaAssociation::NonUeAssociated { .. } => None,
+        };
+        let live: std::collections::HashSet<i32> =
+            self.ue_contexts.values().map(|ctx| ctx.ue_id).collect();
+        let cell = self.nrppa_cell_info();
+
+        match &request.procedure {
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: Some(resource_type),
+            } => NrppaDecision::PositioningInformation(match target {
+                Some(ue_id) => self.positioning_srs.configure(
+                    ue_id,
+                    *resource_type,
+                    cell.nr_pci,
+                    srs_point_a(cell.nr_arfcn),
+                    |id| live.contains(&id),
+                ),
+                // An SRS is configured in a UE this node serves.
+                None => Err(NrppaRadioCause::Unspecified),
+            }),
+            NrppaProcedure::PositioningActivation(activation) => {
+                NrppaDecision::PositioningActivation(
+                    target
+                        .ok_or(NrppaRadioCause::Unspecified)
+                        .and_then(|ue_id| self.positioning_srs.activate(ue_id, *activation))
+                        .map(|()| nrppa_cell_time_now()),
+                )
+            }
+            NrppaProcedure::PositioningDeactivation(deactivation) => {
+                if let Some(ue_id) = target {
+                    self.positioning_srs.deactivate(ue_id, *deactivation);
+                }
+                NrppaDecision::PositioningDeactivation
+            }
+            NrppaProcedure::Measurement(req) => {
+                NrppaDecision::Measurement(self.measure_trps(req, &cell, &live))
+            }
+            _ => NrppaDecision::FromCell,
+        }
+    }
+
+    /// The gNB Rx-Tx time difference (§8.5.1) of each requested TRP of this
+    /// node, measured on the UE whose active SRS the request names.
+    ///
+    /// The simulated UE applies no timing advance: it transmits aligned to the
+    /// downlink it receives, so the uplink reaches the TRP one round trip after
+    /// the TRP's downlink went out, and the gNB Rx-Tx time difference is
+    /// 2 d / c for the UE at distance d. Every TRP of this node is at the cell.
+    fn measure_trps(
+        &mut self,
+        req: &nextgsim_ngap::procedures::nrppa::TrpMeasurementRequest,
+        cell: &NrppaCellInfo,
+        live: &std::collections::HashSet<i32>,
+    ) -> Result<(u32, Vec<TrpRxTxMeasurement>), NrppaRadioCause> {
+        // Periodic reporting (the Measurement Report procedure) is not
+        // supported, and gNB Rx-Tx is the one quantity measured.
+        if !req.on_demand
+            || !req
+                .quantities
+                .contains(&TRP_MEASUREMENT_GNB_RX_TX_TIME_DIFF)
+        {
+            return Err(NrppaRadioCause::RequestedItemNotSupported);
+        }
+        let trps: Vec<u16> = req
+            .trp_ids
+            .iter()
+            .copied()
+            .filter(|id| *id >= 1 && cell.trp_ids.contains(id))
+            .collect();
+        if trps.is_empty() {
+            return Err(NrppaRadioCause::RequestedItemNotSupported);
+        }
+        let ue_id = self
+            .positioning_srs
+            .measured_ue(&req.srs_resource_sets, |id| live.contains(&id))?;
+        let metres = self
+            .task_base
+            .ue_distances
+            .get(ue_id)
+            .ok_or(NrppaRadioCause::RequestedItemTemporarilyNotAvailable)?;
+        let rx_tx_seconds = 2.0 * metres / SPEED_OF_LIGHT_M_PER_S;
+        let time = nrppa_cell_time_now();
+        let ran_measurement_id = self.next_nrppa_ran_measurement_id;
+        self.next_nrppa_ran_measurement_id = ran_measurement_id % 65_536 + 1;
+        Ok((
+            ran_measurement_id,
+            trps.into_iter()
+                .map(|trp_id| TrpRxTxMeasurement {
+                    trp_id,
+                    rx_tx_seconds,
+                    time,
+                })
+                .collect(),
+        ))
+    }
+
     fn next_nrppa_measurement_id(&mut self) -> u16 {
         // UE-Measurement-ID is INTEGER (1..15, ..., 16..256) (TS 38.455 §9.2.4):
         // 16..256 are extension values, encodable since #231.
@@ -6188,12 +6322,32 @@ fn serialize_five_g_s_tmsi(identity: &UePagingIdentityValue) -> Vec<u8> {
     }
 }
 
+/// The speed of light in vacuum, m/s.
+const SPEED_OF_LIGHT_M_PER_S: f64 = 299_792_458.0;
+
+/// Seconds from the NTP epoch (1900) to the Unix epoch (1970).
+const NTP_TO_UNIX_SECONDS: u128 = 2_208_988_800;
+
+/// This cell's SFN and 30 kHz slot now. The Positioning Information Response
+/// gives SFN Initialisation Time 0, i.e. SFN 0 began at the NTP epoch, so the
+/// cell clock is the wall clock counted from 1900.
+fn nrppa_cell_time_now() -> CellTime {
+    let since_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    CellTime::from_micros_since_sfn0(since_unix + NTP_TO_UNIX_SECONDS * 1_000_000)
+}
+
 /// The spec name of an NRPPa procedure, for logging (TS 38.455 §8.2).
 fn nrppa_procedure_name(procedure: &NrppaProcedure) -> &'static str {
     match procedure {
         NrppaProcedure::ECidMeasurementInitiation { .. } => "E-CID Measurement Initiation",
-        NrppaProcedure::PositioningInformationExchange => "Positioning Information Exchange",
+        NrppaProcedure::PositioningInformationExchange { .. } => "Positioning Information Exchange",
         NrppaProcedure::TrpInformationExchange { .. } => "TRP Information Exchange",
+        NrppaProcedure::PositioningActivation(_) => "Positioning Activation",
+        NrppaProcedure::PositioningDeactivation(_) => "Positioning Deactivation",
+        NrppaProcedure::Measurement(_) => "Measurement",
     }
 }
 
@@ -10859,6 +11013,384 @@ mod tests {
         });
 
         encode_ngap_pdu(&pdu).expect("DL non-UE NRPPa transport encodes")
+    }
+
+    /// A downlink NRPPa transport carrying `nrppa_pdu`: UE-associated for
+    /// `Some((amf_ue_ngap_id, ran_ue_ngap_id))`, non-UE-associated (routing id
+    /// 0x0001) for `None`.
+    fn encode_dl_nrppa(
+        nrppa_pdu: &nextgsim_ngap::codec::nrppa_generated::NRPPA_PDU,
+        ue: Option<(u64, u32)>,
+    ) -> Vec<u8> {
+        use nextgsim_ngap::codec::generated::{
+            Criticality, DownlinkNonUEAssociatedNRPPaTransport,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_Entry as NonUeEntry,
+            DownlinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as NonUeV,
+            DownlinkUEAssociatedNRPPaTransport, DownlinkUEAssociatedNRPPaTransportProtocolIEs,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as UeEntry,
+            DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as UeV, InitiatingMessage,
+            InitiatingMessageValue, NRPPa_PDU, ProcedureCode, ProtocolIE_ID, RoutingID,
+            AMF_UE_NGAP_ID, RAN_UE_NGAP_ID,
+        };
+        let payload = nextgsim_ngap::codec::encode_aper(nrppa_pdu).expect("NRPPa encodes");
+        let pdu = match ue {
+            Some((amf, ran)) => NGAP_PDU::InitiatingMessage(InitiatingMessage {
+                procedure_code: ProcedureCode(8),
+                criticality: Criticality(1),
+                value: InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+                    DownlinkUEAssociatedNRPPaTransport {
+                        protocol_i_es: DownlinkUEAssociatedNRPPaTransportProtocolIEs(vec![
+                            UeEntry {
+                                id: ProtocolIE_ID(10),
+                                criticality: Criticality(0),
+                                value: UeV::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(amf)),
+                            },
+                            UeEntry {
+                                id: ProtocolIE_ID(85),
+                                criticality: Criticality(0),
+                                value: UeV::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran)),
+                            },
+                            UeEntry {
+                                id: ProtocolIE_ID(46),
+                                criticality: Criticality(0),
+                                value: UeV::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                            },
+                        ]),
+                    },
+                ),
+            }),
+            None => NGAP_PDU::InitiatingMessage(InitiatingMessage {
+                procedure_code: ProcedureCode(5),
+                criticality: Criticality(1),
+                value: InitiatingMessageValue::Id_DownlinkNonUEAssociatedNRPPaTransport(
+                    DownlinkNonUEAssociatedNRPPaTransport {
+                        protocol_i_es: DownlinkNonUEAssociatedNRPPaTransportProtocolIEs(vec![
+                            NonUeEntry {
+                                id: ProtocolIE_ID(89),
+                                criticality: Criticality(0),
+                                value: NonUeV::Id_RoutingID(RoutingID(vec![0x00, 0x01])),
+                            },
+                            NonUeEntry {
+                                id: ProtocolIE_ID(46),
+                                criticality: Criticality(0),
+                                value: NonUeV::Id_NRPPa_PDU(NRPPa_PDU(payload)),
+                            },
+                        ]),
+                    },
+                ),
+            }),
+        };
+        encode_ngap_pdu(&pdu).expect("DL NRPPa transport encodes")
+    }
+
+    /// The NRPPa PDU of the uplink NRPPa transport the task sent, or `None`
+    /// when it sent nothing.
+    fn sent_nrppa(
+        sctp_rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<SctpMessage>>,
+    ) -> Option<nextgsim_ngap::codec::nrppa_generated::NRPPA_PDU> {
+        use nextgsim_ngap::codec::generated::{
+            InitiatingMessageValue as I,
+            UplinkNonUEAssociatedNRPPaTransportProtocolIEs_EntryValue as NonUeV,
+            UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as UeV,
+        };
+        let Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) = sctp_rx.try_recv()
+        else {
+            return None;
+        };
+        let NGAP_PDU::InitiatingMessage(init) = decode_ngap_pdu(buffer.data()).expect("NGAP")
+        else {
+            panic!("an uplink NRPPa transport");
+        };
+        let payload = match init.value {
+            I::Id_UplinkUEAssociatedNRPPaTransport(ul) => {
+                ul.protocol_i_es
+                    .0
+                    .into_iter()
+                    .find_map(|ie| match ie.value {
+                        UeV::Id_NRPPa_PDU(p) => Some(p.0),
+                        _ => None,
+                    })
+            }
+            I::Id_UplinkNonUEAssociatedNRPPaTransport(ul) => ul
+                .protocol_i_es
+                .0
+                .into_iter()
+                .find_map(|ie| match ie.value {
+                    NonUeV::Id_NRPPa_PDU(p) => Some(p.0),
+                    _ => None,
+                }),
+            other => panic!("an uplink NRPPa transport, got {other:?}"),
+        };
+        Some(nextgsim_ngap::codec::decode_aper(&payload.expect("NRPPa-PDU")).expect("NRPPa"))
+    }
+
+    fn hex_nrppa(s: &str) -> nextgsim_ngap::codec::nrppa_generated::NRPPA_PDU {
+        let bytes: Vec<u8> = s
+            .split_whitespace()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect();
+        nextgsim_ngap::codec::decode_aper(&bytes).expect("lmfd's vector decodes")
+    }
+
+    /// A MEASUREMENT REQUEST as lmfd sends it: TRP 1, onDemand, gNB-RxTxTimeDiff,
+    /// and the SRS Configuration the gNB gave.
+    fn lmfd_measurement_request(
+        srs: Option<nextgsim_ngap::codec::nrppa_generated::SRSConfiguration>,
+    ) -> nextgsim_ngap::codec::nrppa_generated::NRPPA_PDU {
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+        use nrppa::MeasurementRequestProtocolIEs_EntryValue as V;
+        let ie = |id: u16, value: V| nrppa::MeasurementRequestProtocolIEs_Entry {
+            id: nrppa::ProtocolIE_ID(id),
+            criticality: nrppa::Criticality(0),
+            value,
+        };
+        let mut ies = vec![
+            ie(39, V::Id_LMF_Measurement_ID(nrppa::Measurement_ID(5))),
+            ie(
+                41,
+                V::Id_TRP_MeasurementRequestList(nrppa::TRP_MeasurementRequestList(vec![
+                    nrppa::TRP_MeasurementRequestItem {
+                        trp_id: nrppa::TRP_ID(1),
+                        search_window_information: None,
+                        ie_extensions: None,
+                    },
+                ])),
+            ),
+            ie(
+                3,
+                V::Id_ReportCharacteristics(nrppa::ReportCharacteristics(0)),
+            ),
+            ie(
+                52,
+                V::Id_TRPMeasurementQuantities(nrppa::TRPMeasurementQuantities(vec![
+                    nrppa::TRPMeasurementQuantitiesList_Item {
+                        trp_measurement_type: nrppa::TRPMeasurementType(0),
+                        timing_reporting_granularity_factor: None,
+                        ie_extensions: None,
+                    },
+                ])),
+            ),
+        ];
+        if let Some(srs) = srs {
+            ies.push(ie(26, V::Id_SRSConfiguration(srs)));
+        }
+        nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(11),
+            criticality: nrppa::Criticality(0),
+            nrppatransaction_id: nrppa::NRPPATransactionID(30),
+            value: nrppa::InitiatingMessageValue::Id_Measurement(nrppa::MeasurementRequest {
+                protocol_i_es: nrppa::MeasurementRequestProtocolIEs(ies),
+            }),
+        })
+    }
+
+    fn deactivation(set: u8) -> nextgsim_ngap::codec::nrppa_generated::NRPPA_PDU {
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+        use nrppa::PositioningDeactivationProtocolIEs_EntryValue as V;
+        nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+            procedure_code: nrppa::ProcedureCode(18),
+            criticality: nrppa::Criticality(1),
+            nrppatransaction_id: nrppa::NRPPATransactionID(31),
+            value: nrppa::InitiatingMessageValue::Id_positioningDeactivation(
+                nrppa::PositioningDeactivation {
+                    protocol_i_es: nrppa::PositioningDeactivationProtocolIEs(vec![
+                        nrppa::PositioningDeactivationProtocolIEs_Entry {
+                            id: nrppa::ProtocolIE_ID(53),
+                            criticality: nrppa::Criticality(1),
+                            value: V::Id_AbortTransmission(
+                                nrppa::AbortTransmission::DeactivateSRSResourceSetID(
+                                    nrppa::SRSResourceSetID(set),
+                                ),
+                            ),
+                        },
+                    ]),
+                },
+            ),
+        })
+    }
+
+    /// #347: lmfd's Multi-RTT run against the gNB, in its order. Positioning
+    /// Information (with SRS), Positioning Activation, Measurement, Positioning
+    /// Deactivation; then a second Measurement finds no SRS transmitting.
+    #[tokio::test]
+    async fn a_multi_rtt_run_measures_the_gnb_rx_tx_of_the_srs_ue() {
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+        let ue = Some((777, ran as u32));
+        // The UE is 150 m away: a 1000.7 ns round trip.
+        task.task_base.ue_distances.set(10, 150.0);
+
+        // 1. Positioning Information (lmfd's vector): the SRS Configuration.
+        let dl = encode_dl_nrppa(
+            &hex_nrppa("00 09 00 00 01 09 00 00 01 00 0c 40 02 01 08"),
+            ue,
+        );
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&dl))
+            .await;
+        let Some(nrppa::NRPPA_PDU::SuccessfulOutcome(info)) = sent_nrppa(&mut sctp_rx) else {
+            panic!("a PositioningInformationResponse");
+        };
+        let nrppa::SuccessfulOutcomeValue::Id_positioningInformationExchange(info) = info.value
+        else {
+            panic!("a PositioningInformationResponse");
+        };
+        let srs = info
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| {
+                match ie.value {
+                nrppa::PositioningInformationResponseProtocolIEs_EntryValue::Id_SRSConfiguration(
+                    c,
+                ) => Some(c),
+                _ => None,
+            }
+            })
+            .expect("§8.2.6.2: the SRS Configuration");
+        let set =
+            nextgsim_ngap::procedures::nrppa::multi_rtt::srs_configuration_resource_sets(&srs)[0].0;
+
+        // Before the activation, nothing is transmitting.
+        let dl = encode_dl_nrppa(&lmfd_measurement_request(Some(srs.clone())), None);
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::UnsuccessfulOutcome(_))
+        ));
+
+        // 2. Positioning Activation of that set (lmfd's vector, set id replaced).
+        let mut activation = hex_nrppa("00 11 00 00 00 09 00 00 01 00 2c 00 02 01 80");
+        if let nrppa::NRPPA_PDU::InitiatingMessage(init) = &mut activation {
+            if let nrppa::InitiatingMessageValue::Id_positioningActivation(req) = &mut init.value {
+                for ie in &mut req.protocol_i_es.0 {
+                    if let nrppa::PositioningActivationRequestProtocolIEs_EntryValue::Id_SRSType(
+                        nrppa::SRSType::SemipersistentSRS(sp),
+                    ) = &mut ie.value
+                    {
+                        sp.srs_resource_set_id = nrppa::SRSResourceSetID(set);
+                    }
+                }
+            }
+        }
+        let dl = encode_dl_nrppa(&activation, ue);
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::SuccessfulOutcome(
+                nrppa::SuccessfulOutcome {
+                    value: nrppa::SuccessfulOutcomeValue::Id_positioningActivation(_),
+                    ..
+                }
+            ))
+        ));
+
+        // 3. The Measurement: gNB Rx-Tx = 2 * 150 m / c.
+        let dl = encode_dl_nrppa(&lmfd_measurement_request(Some(srs.clone())), None);
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&dl))
+            .await;
+        let Some(nrppa::NRPPA_PDU::SuccessfulOutcome(m)) = sent_nrppa(&mut sctp_rx) else {
+            panic!("a MeasurementResponse");
+        };
+        let nrppa::SuccessfulOutcomeValue::Id_Measurement(m) = m.value else {
+            panic!("a MeasurementResponse");
+        };
+        let list = m
+            .protocol_i_es
+            .0
+            .into_iter()
+            .find_map(|ie| {
+                match ie.value {
+                nrppa::MeasurementResponseProtocolIEs_EntryValue::Id_TRP_MeasurementResponseList(
+                    l,
+                ) => Some(l),
+                _ => None,
+            }
+            })
+            .expect("the TRP Measurement Response List");
+        assert_eq!(list.0.len(), 1);
+        assert_eq!(list.0[0].trp_id.0, 1);
+        let nrppa::TrpMeasuredResultsValue::GNB_RxTxTimeDiff(rx_tx) =
+            &list.0[0].measurement_result.0[0].measured_results_value
+        else {
+            panic!("a gNB Rx-Tx time difference");
+        };
+        let nrppa::GNBRxTxTimeDiffMeas::K0(v) = &rx_tx.rx_tx_time_diff else {
+            panic!("k0");
+        };
+        // lmfd: ns = (v - 985024) * T_c.
+        let ns = (f64::from(v.0) - 985_024.0) * 1e9 / (480_000.0 * 4096.0);
+        let expected_ns = 2.0 * 150.0 / 299_792_458.0 * 1e9;
+        assert!(
+            (ns - expected_ns).abs() < 0.6,
+            "{ns} ns vs {expected_ns} ns"
+        );
+
+        // 4. Deactivation: not answered, and the SRS stops.
+        let dl = encode_dl_nrppa(&deactivation(set), ue);
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&dl))
+            .await;
+        assert!(sent_nrppa(&mut sctp_rx).is_none(), "§8.2.10 is class 2");
+        let dl = encode_dl_nrppa(&lmfd_measurement_request(Some(srs)), None);
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::UnsuccessfulOutcome(_))
+        ));
+    }
+
+    /// #347: a UE the RLS does not hear cannot be measured, and an SRS request
+    /// for a UE this node does not serve gets a Positioning Information Failure.
+    #[tokio::test]
+    async fn the_gnb_answers_failure_when_it_cannot_measure() {
+        use nextgsim_ngap::codec::nrppa_generated as nrppa;
+        let (mut task, mut sctp_rx, ran) = seed_task_with_ue().await;
+
+        let dl = encode_dl_nrppa(
+            &hex_nrppa("00 09 00 00 01 09 00 00 01 00 0c 40 02 01 08"),
+            Some((777, ran as u32 + 1)),
+        );
+        task.handle_ngap_pdu(1, 2, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::UnsuccessfulOutcome(_))
+        ));
+
+        // Configured and periodic (transmitting), but no distance: no measurement.
+        let srs = task
+            .positioning_srs
+            .configure(
+                10,
+                nextgsim_ngap::procedures::nrppa::SrsResourceType::Periodic,
+                0,
+                0,
+                |_| true,
+            )
+            .unwrap();
+        let dl = encode_dl_nrppa(
+            &lmfd_measurement_request(Some(
+                nextgsim_ngap::procedures::nrppa::build_srs_configuration(&srs),
+            )),
+            None,
+        );
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::UnsuccessfulOutcome(_))
+        ));
+        // With the distance it is measured.
+        task.task_base.ue_distances.set(10, 30.0);
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&dl))
+            .await;
+        assert!(matches!(
+            sent_nrppa(&mut sctp_rx),
+            Some(nrppa::NRPPA_PDU::SuccessfulOutcome(_))
+        ));
     }
 
     /// An E-CID Measurement Initiation Request fed into the SCTP-facing dispatch

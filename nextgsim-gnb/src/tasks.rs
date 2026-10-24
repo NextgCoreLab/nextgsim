@@ -1386,6 +1386,40 @@ pub struct GnbTaskBase {
     pub sixg: Option<GnbSixgHandles>,
     /// Rel-18 task handles (initialized via `init_rel18_tasks()`)
     pub rel18: Option<GnbRel18Handles>,
+    /// How far each UE the RLS hears is from this gNB (written by RLS, read by
+    /// NGAP for the NRPPa gNB Rx-Tx measurement, #347).
+    pub ue_distances: UeDistances,
+}
+
+/// The distance in metres between this gNB and each UE the RLS hears, keyed by
+/// the RLS UE id (the NGAP UE context's `ue_id`).
+///
+/// The RLS updates it from every heartbeat, which carries the UE's position,
+/// and forgets a UE it loses. Shared rather than messaged: a reader only ever
+/// needs the latest value, and NGAP must not wait on the RLS task.
+#[derive(Debug, Clone, Default)]
+pub struct UeDistances(Arc<std::sync::RwLock<HashMap<i32, f64>>>);
+
+impl UeDistances {
+    /// Records `ue_id` at `metres`.
+    pub fn set(&self, ue_id: i32, metres: f64) {
+        if let Ok(mut map) = self.0.write() {
+            map.insert(ue_id, metres);
+        }
+    }
+
+    /// Forgets `ue_id`.
+    pub fn remove(&self, ue_id: i32) {
+        if let Ok(mut map) = self.0.write() {
+            map.remove(&ue_id);
+        }
+    }
+
+    /// The last distance recorded for `ue_id`.
+    #[must_use]
+    pub fn get(&self, ue_id: i32) -> Option<f64> {
+        self.0.read().ok().and_then(|map| map.get(&ue_id).copied())
+    }
 }
 
 /// Rel-18 5G-Advanced task handles for gNB
@@ -1468,6 +1502,7 @@ impl GnbTaskBase {
             sctp_tx: TaskHandle::new(sctp_tx),
             sixg: None,
             rel18: None,
+            ue_distances: UeDistances::default(),
         };
 
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)

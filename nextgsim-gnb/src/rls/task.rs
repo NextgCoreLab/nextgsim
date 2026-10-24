@@ -552,6 +552,15 @@ impl RlsTask {
             }
         }
 
+        // Where the UE is, for the NRPPa gNB Rx-Tx measurement (#347).
+        if ack.is_some() {
+            if let Some(ue_id) = self.sti_to_ue_id.get(&sti) {
+                self.task_base
+                    .ue_distances
+                    .set(*ue_id, self.cell_tracker.distance_m(&heartbeat.sim_pos));
+            }
+        }
+
         // Send heartbeat acknowledgment
         if let Some(ack) = ack {
             self.forward_measurement_to_nwdaf(sti, &ack, heartbeat)
@@ -1057,6 +1066,7 @@ impl RlsTask {
 
                 self.ue_addresses.remove(&ue_id_i32);
                 self.pending_acks.remove(&ue_id_i32);
+                self.task_base.ue_distances.remove(ue_id_i32);
                 // A capability-derived ceiling belongs to the UE, not to the id. Left
                 // behind, it would narrow the grants of whichever UE is allocated this
                 // id next -- which may not be RedCap at all.
@@ -1807,6 +1817,39 @@ mod tests {
         {
             payload
         }
+    }
+
+    /// #347: the RLS records how far each UE it hears is, from the position in
+    /// its heartbeat, for the NRPPa gNB Rx-Tx measurement.
+    #[tokio::test]
+    async fn a_heartbeat_records_the_ue_distance() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let gnb_addr = {
+            let probe = UdpSocket::bind("127.0.0.1:0").await.expect("probe");
+            probe.local_addr().unwrap()
+        };
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 32);
+        let distances = task_base.ue_distances.clone();
+        let mut task = RlsTask::with_bind_address(task_base, gnb_addr);
+        tokio::spawn(async move { task.run(rls_rx).await });
+
+        let heartbeat = codec::encode(&RlsProtocolMessage::Heartbeat(nextgsim_rls::RlsHeartbeat {
+            sti: 0xFEED,
+            sim_pos: SimCoord::new(30, 40, 0),
+        }));
+        let measured = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                ue.send_to(&heartbeat, gnb_addr).await.expect("heartbeat");
+                if let Some(d) = distances.get(0) {
+                    return d;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat's UE gets a distance");
+        assert!((measured - 50.0).abs() < 1e-9, "{measured}");
     }
 
     #[tokio::test]
