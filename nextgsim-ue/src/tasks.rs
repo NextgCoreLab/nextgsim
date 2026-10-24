@@ -834,6 +834,14 @@ pub enum RlsMessage {
     },
     /// Reset STI (from RRC)
     ResetSti,
+    /// Release every DRB's L2 entities (from RRC, #315): the RRC connection was
+    /// released or lost, or a new one is being set up, and neither leaves a DRB
+    /// behind (TS 38.331 §5.3.11, §5.3.3.4). The next DRB starts at COUNT 0.
+    ReleaseDrbs,
+    /// Re-establish every DRB's PDCP and RLC entity (from RRC, #315): a
+    /// reconfiguration with sync (handover) moved the UE to a target whose
+    /// entities start fresh (TS 38.323 §5.1.2, TS 38.322 §5.1.2).
+    ReestablishDrbs,
     /// Data PDU delivery (from NAS)
     DataPduDelivery {
         /// PDU session ID
