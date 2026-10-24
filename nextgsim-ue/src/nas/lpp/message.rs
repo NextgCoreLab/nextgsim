@@ -531,6 +531,85 @@ fn read_r16_group_nr_ecid(r: &mut UperReader<'_>, members: usize) -> UperResult<
     Ok(present[0])
 }
 
+/// The root of a `RequestCapabilities-r9-IEs`, read through its last root member.
+/// Returns `(additions, ecid_requested)`.
+///
+/// TS 37.355 §5.1.3 answers each requested method the UE supports, so the
+/// requests for the methods it does not (A-GNSS, OTDOA, an EPDU) are read past
+/// rather than refused (#377 review): `A-GNSS-RequestCapabilities` is three
+/// BOOLEANs, `OTDOA-RequestCapabilities` and `ECID-RequestCapabilities` are empty,
+/// all extensible, and `epdu-RequestCapabilities` is an `EPDU-Sequence`.
+fn read_capability_request_root(r: &mut UperReader<'_>) -> UperResult<(bool, bool)> {
+    let (additions, opts) = r.read_sequence_preamble(true, 5)?;
+    let skip_extensible = |r: &mut UperReader<'_>, booleans: usize| -> UperResult<()> {
+        let (inner_additions, _) = r.read_sequence_preamble(true, 0)?;
+        for _ in 0..booleans {
+            r.read_bit()?;
+        }
+        if inner_additions {
+            r.skip_extension_additions()?;
+        }
+        Ok(())
+    };
+    if opts[0] {
+        skip_extensible(r, 0)?; // CommonIEsRequestCapabilities
+    }
+    if opts[1] {
+        skip_extensible(r, 3)?; // A-GNSS-RequestCapabilities
+    }
+    if opts[2] {
+        skip_extensible(r, 0)?; // OTDOA-RequestCapabilities
+    }
+    if opts[3] {
+        skip_extensible(r, 0)?; // ECID-RequestCapabilities
+    }
+    if opts[4] {
+        skip_epdu_sequence(r)?;
+    }
+    Ok((additions, opts[3]))
+}
+
+/// Reads past an `EPDU-Sequence` (TS 37.355 §6.4.1): 1..16 `EPDU`s, each an
+/// extensible `EPDU-Identifier` (an id, an optional name) and an OCTET STRING body.
+fn skip_epdu_sequence(r: &mut UperReader<'_>) -> UperResult<()> {
+    let count = r.read_constrained(1, 16)?;
+    for _ in 0..count {
+        let (ext, opts) = r.read_sequence_preamble(true, 1)?;
+        r.read_constrained(1, 256)?;
+        if opts[0] {
+            let len = r.read_constrained(1, 32)?;
+            for _ in 0..len {
+                r.read_bits(7)?;
+            }
+        }
+        if ext {
+            r.skip_extension_additions()?;
+        }
+        let len = read_unconstrained_length(r)?;
+        for _ in 0..len {
+            r.read_bits(8)?;
+        }
+    }
+    Ok(())
+}
+
+/// A `RequestCapabilities`' extension additions: whether its r16 group asks for
+/// the NR E-CID capabilities. TS 37.355 §5.1.3 has the target answer for each
+/// requested method it supports, so a request that also names methods this UE
+/// lacks (Multi-RTT, DL-TDOA, the r13 sensor/TBS/WLAN/Bluetooth group, ...) is
+/// answered for E-CID and NR E-CID alone rather than refused (#377).
+fn read_capability_request_nr_ecid(r: &mut UperReader<'_>) -> UperResult<bool> {
+    let mut additions = r.read_extension_additions()?;
+    let Some(group) = additions.get_mut(R16_GROUP).and_then(Option::take) else {
+        return Ok(false);
+    };
+    let mut g = UperReader::new(&group);
+    let (_, present) = g.read_sequence_preamble(false, R16_CAPABILITY_MEMBERS)?;
+    // NR-ECID-RequestCapabilities-r16 is the group's first member, so nothing
+    // after it needs reading.
+    Ok(present[0])
+}
+
 /// What a present `commonIEs` root member means for a given `-r9` body.
 ///
 /// The distinction is not cosmetic: the two shapes have different *content*, so
@@ -903,8 +982,10 @@ pub enum LppBody {
     },
     /// `ProvideCapabilities` (§5.1.3).
     ProvideCapabilities {
-        /// The E-UTRA E-CID measurements this UE supports.
-        ecid_supported: EcidMeasurementBits,
+        /// The E-UTRA E-CID measurements this UE supports, when it reports them:
+        /// a reply carries only the capabilities the request asked for (TS 37.355
+        /// §5.1.1, §5.1.3; #377).
+        ecid_supported: Option<EcidMeasurementBits>,
         /// The NR E-CID measurements it supports, when it reports them (#330).
         nr_ecid_supported: Option<NrEcidMeasurementBits>,
     },
@@ -983,9 +1064,11 @@ impl LppBody {
                 write_critical_extensions(w)?;
                 w.write_sequence_preamble(
                     Some(nr_ecid_supported.is_some()),
-                    &[false, false, false, true, false],
+                    &[false, false, false, ecid_supported.is_some(), false],
                 );
-                ecid_supported.write(w)?;
+                if let Some(ecid) = ecid_supported {
+                    ecid.write(w)?;
+                }
                 if let Some(nr) = nr_ecid_supported {
                     // NR-ECID-ProvideCapabilities-r16: extensible, optionals
                     // [periodicalReporting, triggeredReporting], then the bit map.
@@ -1076,26 +1159,8 @@ impl LppBody {
         match index {
             c1::REQUEST_CAPABILITIES => {
                 read_critical_extensions(r)?;
-                let (additions, ecid) = read_r9_body_preamble(r, CommonIes::EmptySequence)?;
-                if ecid {
-                    let (inner_additions, _) = r.read_sequence_preamble(true, 0)?;
-                    if inner_additions {
-                        r.skip_extension_additions()?;
-                    }
-                }
-                let mut nr_ecid_requested = false;
-                if additions {
-                    if let Some(group) = read_r16_group(r)? {
-                        let mut g = UperReader::new(&group);
-                        if read_r16_group_nr_ecid(&mut g, R16_CAPABILITY_MEMBERS)? {
-                            let (inner_additions, _) = g.read_sequence_preamble(true, 0)?;
-                            if inner_additions {
-                                g.skip_extension_additions()?;
-                            }
-                            nr_ecid_requested = true;
-                        }
-                    }
-                }
+                let (additions, ecid) = read_capability_request_root(r)?;
+                let nr_ecid_requested = additions && read_capability_request_nr_ecid(r)?;
                 Ok(Self::RequestCapabilities {
                     ecid_requested: ecid,
                     nr_ecid_requested,
@@ -1105,9 +1170,9 @@ impl LppBody {
                 read_critical_extensions(r)?;
                 let (additions, ecid) = read_r9_body_preamble(r, CommonIes::EmptySequence)?;
                 let ecid_supported = if ecid {
-                    EcidMeasurementBits::read(r)?
+                    Some(EcidMeasurementBits::read(r)?)
                 } else {
-                    EcidMeasurementBits::default()
+                    None
                 };
                 let mut nr_ecid_supported = None;
                 if additions {
