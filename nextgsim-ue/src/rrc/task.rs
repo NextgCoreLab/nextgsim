@@ -4990,6 +4990,22 @@ impl Task for RrcTask {
                                 info!("Cell selection will now search for PLMN {plmn}");
                                 self.cell_selector.set_selected_plmn(Some(plmn));
                             }
+                            RrcMessage::SetForbiddenTais {
+                                roaming,
+                                regional_service,
+                            } => {
+                                info!(
+                                    "Forbidden TAs now {} for roaming, {} for regional \
+                                     provision of service",
+                                    roaming.len(),
+                                    regional_service.len()
+                                );
+                                self.cell_selector
+                                    .set_forbidden_tais(roaming, regional_service);
+                                // Re-evaluate now: the serving cell may be in a TA
+                                // that just became forbidden (nextgsim #322).
+                                self.last_cell_selection = None;
+                            }
                             RrcMessage::AsSecurityKey { kgnb } => {
                                 debug!("Received KgNB for AS security from NAS plane");
                                 self.set_pending_kgnb(kgnb);

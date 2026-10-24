@@ -504,6 +504,15 @@ pub enum RrcMessage {
         /// The chosen PLMN.
         plmn: crate::rrc::cell_selection::Plmn,
     },
+    /// NAS's "5GS forbidden tracking areas" lists changed (TS 24.501 §5.3.13,
+    /// nextgsim #322). Replaces both lists in the cell selector; a cell in one
+    /// of them is not suitable (TS 38.304 §4.5).
+    SetForbiddenTais {
+        /// "5GS forbidden tracking areas for roaming".
+        roaming: Vec<crate::rrc::cell_selection::Tai>,
+        /// "5GS forbidden tracking areas for regional provision of service".
+        regional_service: Vec<crate::rrc::cell_selection::Tai>,
+    },
     /// Local release connection (from NAS)
     LocalReleaseConnection {
         /// Treat as barred

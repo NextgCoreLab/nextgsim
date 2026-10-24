@@ -1647,6 +1647,25 @@ async fn process_mm_outputs(
                     })
                     .await;
             }
+            MmOutput::ForbiddenTaisChanged { roaming, service } => {
+                // TS 38.304 §4.5 (nextgsim #322): cell selection must not treat a
+                // cell in a forbidden TA as suitable, or the UE stays in the TA it
+                // was told to leave.
+                use nextgsim_ue::rrc::cell_selection::{plmn_from_bcd, Tai};
+                let to_tai = |t: &[u8; 6]| {
+                    Tai::new(
+                        plmn_from_bcd(&[t[0], t[1], t[2]]),
+                        u32::from_be_bytes([0, t[3], t[4], t[5]]),
+                    )
+                };
+                let _ = task_base
+                    .rrc_tx
+                    .send(RrcMessage::SetForbiddenTais {
+                        roaming: roaming.iter().map(to_tai).collect(),
+                        regional_service: service.iter().map(to_tai).collect(),
+                    })
+                    .await;
+            }
         }
     }
 
@@ -1912,6 +1931,12 @@ async fn process_secondary_mm_outputs(
                     "MINT: secondary subscription {index} T3510 expired; shared RRC connection kept"
                 );
             }
+            MmOutput::ForbiddenTaisChanged { .. } => {
+                // Cell selection follows the primary subscription.
+                tracing::debug!(
+                    "MINT: secondary subscription {index} forbidden-TA lists changed (not applied to cell selection)"
+                );
+            }
         }
     }
 }
@@ -2064,7 +2089,23 @@ async fn perform_plmn_selection(
                 .rrc_tx
                 .send(RrcMessage::SetSelectedPlmn { plmn })
                 .await;
-            let outs = orch.start_registration(RegistrationType::InitialRegistration);
+            // A UE still registered (5GMM-REGISTERED.PLMN-SEARCH after a #13
+            // reject) updates its registration; a de-registered one registers
+            // afresh (TS 24.501 §5.2.3.2.5). On a cell in a forbidden TA it does
+            // neither: cell selection, which now excludes that TA, moves it and
+            // the cell change triggers the registration (nextgsim #322). Before,
+            // it registered at once in the TA just forbidden, and a #13
+            // registration reject came straight back, without end.
+            if orch.serving_tai_forbidden() {
+                info!("Serving cell is in a forbidden TA: registering after reselection");
+                return;
+            }
+            let registration_type = if orch.state().is_registered() {
+                RegistrationType::MobilityRegistrationUpdating
+            } else {
+                RegistrationType::InitialRegistration
+            };
+            let outs = orch.start_registration(registration_type);
             for out in outs {
                 if let MmOutput::SendNasPdu(nas_pdu) = out {
                     *pdu_counter += 1;

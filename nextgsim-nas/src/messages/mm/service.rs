@@ -84,6 +84,18 @@ mod service_reject_iei {
     pub const T3346_VALUE: u8 = 0x5F;
     /// EAP message
     pub const EAP_MESSAGE: u8 = 0x78;
+    /// Forbidden TAI(s) for the list of "5GS forbidden tracking areas for roaming"
+    /// (TS 24.501 Table 8.2.18.1.1). AMFs of 17.7.0/17.8.0 may send it as 0x3B.
+    pub const FORBIDDEN_TAIS_ROAMING: u8 = 0x1D;
+    /// The pre-17.9 IEI of the same IE (Table 8.2.18.1.1 NOTE).
+    pub const FORBIDDEN_TAIS_ROAMING_OLD: u8 = 0x3B;
+    /// Forbidden TAI(s) for the list of "5GS forbidden tracking areas for regional
+    /// provision of service". AMFs of 17.7.0/17.8.0 may send it as 0x3C.
+    pub const FORBIDDEN_TAIS_SERVICE: u8 = 0x1E;
+    /// The pre-17.9 IEI of the same IE.
+    pub const FORBIDDEN_TAIS_SERVICE_OLD: u8 = 0x3C;
+    /// Access technology utilization control (TLV, §9.11.3.110).
+    pub const ACCESS_TECH_UTILIZATION_CONTROL: u8 = 0x63;
 }
 
 // ============================================================================
@@ -459,6 +471,16 @@ pub struct ServiceReject {
     pub t3346_value: Option<u8>,
     /// EAP message (optional, Type 6, IEI 0x78)
     pub eap_message: Option<Vec<u8>>,
+    /// Forbidden TAI(s) for the "5GS forbidden tracking areas for roaming" list
+    /// (optional, TLV, IEI 0x1D): the value part, a 5GS TAI list (§9.11.3.9).
+    pub forbidden_tais_roaming: Option<Vec<u8>>,
+    /// Forbidden TAI(s) for the "5GS forbidden tracking areas for regional
+    /// provision of service" list (optional, TLV, IEI 0x1E): the value part.
+    pub forbidden_tais_service: Option<Vec<u8>>,
+    /// Access technology utilization control (optional, TLV, IEI 0x63): the
+    /// value part. Kept because its presence changes the #15 handling
+    /// (TS 24.501 §5.6.1.5).
+    pub access_tech_utilization_control: Option<Vec<u8>>,
 }
 
 impl Default for ServiceReject {
@@ -468,6 +490,9 @@ impl Default for ServiceReject {
             pdu_session_status: None,
             t3346_value: None,
             eap_message: None,
+            forbidden_tais_roaming: None,
+            forbidden_tais_service: None,
+            access_tech_utilization_control: None,
         }
     }
 }
@@ -538,15 +563,57 @@ impl ServiceReject {
                     buf.copy_to_slice(&mut data);
                     msg.eap_message = Some(data);
                 }
-                _ => {
-                    // Skip unknown IEs
+                service_reject_iei::FORBIDDEN_TAIS_ROAMING
+                | service_reject_iei::FORBIDDEN_TAIS_ROAMING_OLD
+                | service_reject_iei::FORBIDDEN_TAIS_SERVICE
+                | service_reject_iei::FORBIDDEN_TAIS_SERVICE_OLD
+                | service_reject_iei::ACCESS_TECH_UTILIZATION_CONTROL => {
                     buf.advance(1);
-                    if buf.remaining() > 0 {
-                        let len = buf.get_u8() as usize;
-                        if buf.remaining() >= len {
-                            buf.advance(len);
-                        }
+                    if buf.remaining() < 1 {
+                        break;
                     }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut value = vec![0u8; len];
+                    buf.copy_to_slice(&mut value);
+                    match iei {
+                        service_reject_iei::FORBIDDEN_TAIS_ROAMING
+                        | service_reject_iei::FORBIDDEN_TAIS_ROAMING_OLD => {
+                            msg.forbidden_tais_roaming = Some(value);
+                        }
+                        service_reject_iei::ACCESS_TECH_UTILIZATION_CONTROL => {
+                            msg.access_tech_utilization_control = Some(value);
+                        }
+                        _ => msg.forbidden_tais_service = Some(value),
+                    }
+                }
+                _ => {
+                    // Skip an IE this decoder does not keep, by its format
+                    // (TS 24.501 §11.2.4): IEIs 0x80 and up are type 1 TV (one
+                    // octet), 0x7x are TLV-E (two-octet length), the rest TLV.
+                    // Treating a TLV-E (CAG information list, 0x75/0x71) as TLV used
+                    // to desynchronise the walk and lose every IE after it.
+                    buf.advance(1);
+                    if iei >= 0x80 {
+                        continue;
+                    }
+                    let len = if iei & 0xF0 == 0x70 {
+                        if buf.remaining() < 2 {
+                            break;
+                        }
+                        buf.get_u16() as usize
+                    } else {
+                        if buf.remaining() < 1 {
+                            break;
+                        }
+                        buf.get_u8() as usize
+                    };
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    buf.advance(len);
                 }
             }
         }
@@ -580,6 +647,27 @@ impl ServiceReject {
             buf.put_u8(service_reject_iei::EAP_MESSAGE);
             buf.put_u16(eap.len() as u16);
             buf.put_slice(eap);
+        }
+
+        for (iei, value) in [
+            (
+                service_reject_iei::FORBIDDEN_TAIS_ROAMING,
+                &self.forbidden_tais_roaming,
+            ),
+            (
+                service_reject_iei::FORBIDDEN_TAIS_SERVICE,
+                &self.forbidden_tais_service,
+            ),
+            (
+                service_reject_iei::ACCESS_TECH_UTILIZATION_CONTROL,
+                &self.access_tech_utilization_control,
+            ),
+        ] {
+            if let Some(v) = value {
+                buf.put_u8(iei);
+                buf.put_u8(v.len() as u8);
+                buf.put_slice(v);
+            }
         }
     }
 
@@ -735,6 +823,58 @@ mod tests {
         assert_eq!(decoded.mm_cause.value, MmCause::FiveGsServicesNotAllowed);
         assert_eq!(decoded.pdu_session_status, Some(0x0003));
         assert_eq!(decoded.t3346_value, Some(0x1E));
+    }
+
+    /// TS 24.501 Table 8.2.18.1.1: the forbidden-TAI IEs (0x1D, 0x1E) and the
+    /// access technology utilization control IE (0x63) survive a round trip.
+    #[test]
+    fn service_reject_forbidden_tai_ies_round_trip() {
+        let mut msg = ServiceReject::new(MmCause::NoSuitableCellsInTa);
+        msg.forbidden_tais_roaming = Some(vec![0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x07]);
+        msg.forbidden_tais_service = Some(vec![0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x08]);
+        msg.access_tech_utilization_control = Some(vec![0x01, 0x02]);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        let decoded = ServiceReject::decode(&mut &buf[3..]).unwrap();
+        assert_eq!(decoded.forbidden_tais_roaming, msg.forbidden_tais_roaming);
+        assert_eq!(decoded.forbidden_tais_service, msg.forbidden_tais_service);
+        assert_eq!(
+            decoded.access_tech_utilization_control,
+            msg.access_tech_utilization_control
+        );
+    }
+
+    /// Table 8.2.18.1.1 NOTE: AMFs of 17.7.0/17.8.0 send the forbidden-TAI IEs
+    /// as 0x3B/0x3C. Those decode into the same fields.
+    #[test]
+    fn service_reject_decodes_the_pre_17_9_forbidden_tai_ieis() {
+        let body = [
+            22u8, // 5GMM cause
+            0x3B, 7, 0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x07, //
+            0x3C, 7, 0x00, 0x00, 0xF1, 0x10, 0x00, 0x00, 0x08,
+        ];
+        let decoded = ServiceReject::decode(&mut &body[..]).unwrap();
+        assert_eq!(
+            decoded.forbidden_tais_roaming.as_deref(),
+            Some(&body[3..10])
+        );
+        assert_eq!(
+            decoded.forbidden_tais_service.as_deref(),
+            Some(&body[12..19])
+        );
+    }
+
+    /// An unknown TLV-E IE (a CAG information list, 0x75, longer than 255
+    /// octets) is skipped by its two-octet length, so an IE after it still
+    /// decodes. Read as TLV, its first length octet (0x01) made the walk land
+    /// inside the list and lose the T3346 value.
+    #[test]
+    fn service_reject_skips_a_tlv_e_ie_by_its_two_octet_length() {
+        let mut body = vec![22u8, 0x75, 0x01, 0x2C];
+        body.extend(std::iter::repeat_n(0xAA, 300));
+        body.extend([0x5F, 0x01, 0x21]);
+        let decoded = ServiceReject::decode(&mut &body[..]).unwrap();
+        assert_eq!(decoded.t3346_value, Some(0x21));
     }
 
     #[test]
