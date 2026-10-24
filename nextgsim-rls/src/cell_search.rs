@@ -299,6 +299,12 @@ impl UeCellSearch {
     }
 }
 
+/// The end of the UE id range a [`GnbCellTracker`] hands out: detected UEs get
+/// ids in `0..DETECTED_UE_ID_LIMIT`, wrapping and skipping live ids. The gNB
+/// gives handover-in admissions ids from this value up, so the two never meet
+/// (nextgsim #355 review).
+pub const DETECTED_UE_ID_LIMIT: u32 = 1 << 24;
+
 /// Cell tracking state manager for gNB
 ///
 /// Manages UE discovery and tracking via heartbeat messages.
@@ -437,8 +443,7 @@ impl GnbCellTracker {
             ue.update(address);
         } else {
             // New UE detected
-            let ue_id = self.next_ue_id;
-            self.next_ue_id += 1;
+            let ue_id = self.allocate_ue_id();
 
             let ue = UeInfo::new(ue_id, sti, address);
             self.ues.insert(sti, ue);
@@ -449,6 +454,18 @@ impl GnbCellTracker {
 
         let ack = RlsHeartbeatAck::with_dbm(self.sti, dbm);
         (Some(ack), events)
+    }
+
+    /// The next detected-UE id: below [`DETECTED_UE_ID_LIMIT`], wrapping to 0,
+    /// and never one a tracked UE still holds.
+    fn allocate_ue_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_ue_id;
+            self.next_ue_id = (id + 1) % DETECTED_UE_ID_LIMIT;
+            if !self.ue_id_to_sti.contains_key(&id) {
+                return id;
+            }
+        }
     }
 
     /// Checks for lost UEs and returns events for any that are lost
@@ -503,6 +520,27 @@ mod tests {
 
     fn test_addr(port: u16) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port)
+    }
+
+    #[test]
+    fn detected_ue_ids_stay_below_the_limit_and_skip_live_ones() {
+        let mut tracker = GnbCellTracker::new(1, SimCoord::default());
+        let hb = RlsHeartbeat::new(99);
+        let (_, ev) = tracker.process_heartbeat(10, test_addr(5000), &hb);
+        assert!(matches!(
+            ev[0],
+            GnbTrackerEvent::UeDetected { ue_id: 0, .. }
+        ));
+        // The counter at the top of the range wraps, and passes over the live id 0.
+        tracker.next_ue_id = DETECTED_UE_ID_LIMIT - 1;
+        let (_, ev) = tracker.process_heartbeat(11, test_addr(5001), &hb);
+        let top = DETECTED_UE_ID_LIMIT - 1;
+        assert!(matches!(ev[0], GnbTrackerEvent::UeDetected { ue_id, .. } if ue_id == top));
+        let (_, ev) = tracker.process_heartbeat(12, test_addr(5002), &hb);
+        assert!(matches!(
+            ev[0],
+            GnbTrackerEvent::UeDetected { ue_id: 1, .. }
+        ));
     }
 
     #[test]

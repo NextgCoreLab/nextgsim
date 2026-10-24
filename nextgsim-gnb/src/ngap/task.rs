@@ -330,8 +330,10 @@ fn handover_c_rnti(ue_id: i32) -> u16 {
     ((ue_id as u32).wrapping_sub(FIRST_HANDOVER_UE_ID as u32) % USABLE + 1) as u16
 }
 
-/// The first UE id a handover-in admission allocates.
-const FIRST_HANDOVER_UE_ID: i32 = 1000;
+/// The first UE id a handover-in admission allocates. The RLS hands detected UEs
+/// ids below `DETECTED_UE_ID_LIMIT`, so an admission's id never equals the id of
+/// a UE the cell detected itself (#355 review, round 3).
+const FIRST_HANDOVER_UE_ID: i32 = nextgsim_rls::DETECTED_UE_ID_LIMIT as i32;
 
 /// Criticality Diagnostics for a HANDOVER REQUEST missing its Security Context
 /// (TS 38.413 §9.2.3.4: mandatory, criticality reject; §10.3.5).
@@ -4910,8 +4912,9 @@ impl NgapTask {
     }
 
     /// The next handover-in UE id: monotonic from [`FIRST_HANDOVER_UE_ID`],
-    /// skipping any id a live context holds, so neither the context nor the
-    /// C-RNTI derived from it (`handover_c_rnti`) is shared (#355 review).
+    /// skipping any id a live context holds and any id whose C-RNTI
+    /// (`handover_c_rnti`) a live handover-in context already holds, so neither
+    /// the context nor the C-RNTI is shared (#355 review).
     fn allocate_handover_ue_id(&mut self) -> i32 {
         loop {
             let id = self.next_handover_ue_id;
@@ -4920,7 +4923,11 @@ impl NgapTask {
             } else {
                 id + 1
             };
-            if !self.ue_contexts.values().any(|c| c.ue_id == id) {
+            let c_rnti = handover_c_rnti(id);
+            if !self.ue_contexts.values().any(|c| {
+                c.ue_id == id
+                    || (c.ue_id >= FIRST_HANDOVER_UE_ID && handover_c_rnti(c.ue_id) == c_rnti)
+            }) {
                 return id;
             }
         }
@@ -8474,6 +8481,47 @@ mod tests {
         }
     }
 
+    /// #355 review, round 3: handover-in ids and the RLS's detected-UE ids are
+    /// disjoint. Before, admissions started at 1000 and a long-running cell's
+    /// 1000th detected UE was refused a context while that admission lived.
+    #[tokio::test]
+    async fn a_detected_ue_never_shares_an_id_with_a_handover_admission() {
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let pdu = handover_request(&[5], Some(test_security_context()));
+        let req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).unwrap();
+        task.handle_handover_request(1, 8, req).await;
+        let admitted: Vec<i32> = task
+            .ue_contexts
+            .keys()
+            .copied()
+            .filter(|id| *id != 1)
+            .collect();
+        assert_eq!(admitted.len(), 1);
+        assert!(admitted[0] >= nextgsim_rls::DETECTED_UE_ID_LIMIT as i32);
+        // Every id the RLS can hand a detected UE still gets its own context.
+        for id in [2, 1000, nextgsim_rls::DETECTED_UE_ID_LIMIT as i32 - 1] {
+            assert!(task.create_ue_context(id, 1).await.is_some(), "{id}");
+        }
+    }
+
+    /// #355 review, round 3: an admission's C-RNTI is unique among the live
+    /// handover-in contexts, even after the id counter has gone 0xFFEF past it.
+    #[tokio::test]
+    async fn a_handover_in_c_rnti_is_not_shared_with_a_live_admission() {
+        let (mut task, _rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let first = task.allocate_handover_ue_id();
+        assert!(task.create_ue_context(first, 1).await.is_some());
+        task.next_handover_ue_id = first + 0xFFEF;
+        assert_eq!(handover_c_rnti(first + 0xFFEF), handover_c_rnti(first));
+        let next = task.allocate_handover_ue_id();
+        assert_eq!(
+            next,
+            first + 0xFFF0,
+            "the id sharing a live C-RNTI is skipped"
+        );
+        assert_ne!(handover_c_rnti(next), handover_c_rnti(first));
+    }
+
     /// #324 (nextgcore #978 run): the GTP task learns of a handover-in UE BEFORE
     /// its sessions are created, as on the Initial UE Message path. Before, the
     /// target's GTP task had no UE context, every `SessionCreate` failed, and all
@@ -8609,11 +8657,12 @@ mod tests {
 
     /// The `ue_id` of the UE a handover-in created, found by the AMF id the request carried.
     ///
-    /// Not the pre-existing fixture UE: `handle_handover_request` allocates ids from 1000 up.
+    /// Not the pre-existing fixture UE: `handle_handover_request` allocates ids from
+    /// `FIRST_HANDOVER_UE_ID` up.
     fn handover_ue_id(task: &NgapTask) -> i32 {
         task.ue_contexts
             .values()
-            .find(|ctx| ctx.amf_ue_ngap_id == Some(7777) && ctx.ue_id >= 1000)
+            .find(|ctx| ctx.amf_ue_ngap_id == Some(7777) && ctx.ue_id >= FIRST_HANDOVER_UE_ID)
             .map(|ctx| ctx.ue_id)
             .expect("the handover-in must have created a UE context")
     }
@@ -8771,7 +8820,7 @@ mod tests {
         let ctx = task
             .ue_contexts
             .values()
-            .find(|c| c.ue_id >= 1000)
+            .find(|c| c.ue_id >= FIRST_HANDOVER_UE_ID)
             .expect("the handover UE context must exist");
         let sec = ctx
             .as_security

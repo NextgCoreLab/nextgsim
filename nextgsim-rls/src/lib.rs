@@ -84,7 +84,8 @@ pub use protocol::{
 // Re-export cell search types
 pub use cell_search::{
     CellInfo, CellSearchEvent, GnbCellTracker, GnbTrackerEvent, UeCellSearch, UeInfo,
-    DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_THRESHOLD_MS, MIN_ALLOWED_DBM,
+    DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_THRESHOLD_MS, DETECTED_UE_ID_LIMIT,
+    MIN_ALLOWED_DBM,
 };
 
 // Re-export transport types
