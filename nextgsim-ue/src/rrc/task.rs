@@ -476,6 +476,11 @@ pub struct RrcTask {
     /// and ciphering for SRB1"; #285 review). Only an RRCReestablishment is accepted
     /// then, and it is verified integrity-only with the re-derived key (§5.3.7.5).
     srb1_suspended_for_reestablishment: bool,
+    /// The NCC associated with the current KgNB (TS 33.501 §6.9.2.1.1): 0 for
+    /// the KgNB of the AS SecurityModeCommand, then the `nextHopChainingCount`
+    /// last received in a reconfigurationWithSync or an RRCReestablishment
+    /// (TS 38.331 §5.3.5.7, §5.3.7.5 "store the nextHopChainingCount value").
+    as_ncc: u8,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -742,6 +747,7 @@ impl RrcTask {
             inactive_as_security: None,
             srb1_pdcp: None,
             srb1_suspended_for_reestablishment: false,
+            as_ncc: 0,
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -804,8 +810,9 @@ impl RrcTask {
     }
 
     /// Returns the installed AS security context, if AS security has been
-    /// activated (test/observability hook, Wave-6 I5).
-    #[cfg(test)]
+    /// activated (test/observability hook, Wave-6 I5; the in-process cross-end
+    /// test in `tests/src/rrc_handshake.rs` checks a re-derived key with it).
+    #[doc(hidden)]
     pub fn as_security(&self) -> Option<&AsSecurityContext> {
         self.as_security.as_ref()
     }
@@ -855,6 +862,10 @@ impl RrcTask {
 
         let ctx =
             AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
+        // TS 33.501 §6.9.2.1.1: the KgNB of an initial AS security context "is then
+        // considered to be associated with a virtual NH parameter with NCC value
+        // equal to zero".
+        self.as_ncc = 0;
 
         // TS 38.331 §5.3.4.2: verify the SecurityModeCommand's integrity with the
         // FRESHLY DERIVED K_RRCint before replying. On failure the UE continues
@@ -4134,6 +4145,8 @@ impl RrcTask {
         let pci = (target_pci % 1008) as u16;
         let arfcn = self.task_base.config.dl_arfcn;
         let kgnb_star = derive_kgnb_star(&kgnb, pci, arfcn);
+        // TS 38.331 §5.3.5.7: "store the nextHopChainingCount value".
+        self.as_ncc = update.next_hop_chaining_count;
         info!(
             "Handover: re-derived KgNB* for PCI {pci}, ARFCN-DL {arfcn} (NCC {})",
             update.next_hop_chaining_count
@@ -5080,6 +5093,29 @@ impl RrcTask {
             warn!("RRCReestablishment from cell {cell_id}, whose PCI is unknown; discarded");
             return;
         };
+        // TS 33.501 §6.11: "The UE shall firstly synchronize the locally kept NH
+        // parameter as defined in Annex A.10 if the received NCC value is different
+        // from the current NCC value in the UE itself", and Annex A.11 then keys
+        // KgNB* from that NH. This UE keeps no NH chain yet (#325), so it cannot
+        // derive the key the network holds for a different NCC. It refuses, rather
+        // than verify with a key that cannot match: the RRCReestablishment's
+        // integrity check would fail anyway, and this says why (#348 review).
+        if reestablishment.next_hop_chaining_count != self.as_ncc {
+            warn!(
+                "RRCReestablishment signals NCC {} but this UE's KgNB has NCC {}: a \
+                 vertical KgNB* needs the NH chain (TS 33.501 §6.11, Annex A.10/A.11), \
+                 which is not implemented (#325); going to RRC_IDLE",
+                reestablishment.next_hop_chaining_count, self.as_ncc
+            );
+            self.srb1_suspended_for_reestablishment = false;
+            self.enter_idle_after_radio_link_failure().await;
+            return;
+        }
+        // ARFCN-DL of the selected cell (Annex A.11 P1). This simulator is
+        // single-carrier: RLS carries no carrier frequency, so every cell is on the
+        // UE's configured `dl_arfcn`, which must therefore equal each gNB's
+        // `dl_arfcn` (docs/configuration.md). A gNB on another value derives a
+        // different KgNB* and the re-establishment fails its integrity check.
         let arfcn = self.task_base.config.dl_arfcn;
         let kgnb_star = derive_kgnb_star(&current.kgnb, pci, arfcn);
         let rekeyed = AsSecurityContext::derive_from_kgnb(

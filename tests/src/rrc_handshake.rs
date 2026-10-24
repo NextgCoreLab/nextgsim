@@ -342,29 +342,28 @@ async fn the_smc_hop_reaches_the_ue_security_handler_and_answers_it() {
     );
 }
 
-/// #285 review (BLOCKER): AS security with NEA2/NIA2 through the REAL handlers of
-/// both ends, then an RRC re-establishment under it.
-///
-/// - The gNB's SecurityModeCommand goes through its own send path, which starts
-///   downlink protection (TS 33.501 §6.7.4). The UE's SecurityModeComplete is
-///   integrity protected at UL COUNT 0, and the next downlink PDU is ciphered and
-///   protected at DL COUNT 1.
-/// - Re-establishment: the RRCReestablishment is integrity protected, not ciphered,
-///   at DL COUNT 0 with K_RRCint from `KgNB*` (TS 38.331 §5.3.7.4-5, TS 33.501
-///   §6.11). The UE must verify it with the same re-derived key, and both ends then
-///   cipher again, the RRCReestablishmentComplete first.
-///
-/// Each end used to be tested on its own, with NEA0 on the UE side, where "ciphered"
-/// and "unciphered" are the same bytes. So the UE's full-context check of an
-/// integrity-only PDU, and the missing re-key, went unseen.
-#[tokio::test]
-async fn nea2_security_and_re_establishment_agree_end_to_end() {
+/// The KgNB both ends of the NEA2 cross-end tests hold.
+const KGNB: [u8; 32] = [0x42; 32];
+
+/// The real UE and gNB RRC tasks of the NEA2 cross-end tests, and their channels.
+struct Nea2Pair {
+    ue: UeRrcTask,
+    gnb: GnbRrcTask,
+    ue_nas_rx: mpsc::Receiver<UeTaskMessage<NasMessage>>,
+    ue_rls_rx: mpsc::Receiver<UeTaskMessage<UeRlsMessage>>,
+    gnb_ngap_rx: mpsc::Receiver<GnbTaskMessage<NgapMessage>>,
+    gnb_rls_rx: mpsc::Receiver<GnbTaskMessage<GnbRlsMessage>>,
+}
+
+/// AS security with NEA2/NIA2 through the real handlers of both ends, then an RLF
+/// and a re-establishment, up to the UE receiving the gNB's RRCReestablishment.
+/// The gNB's AS context holds NCC `gnb_ncc`.
+async fn nea2_up_to_the_reestablishment(gnb_ncc: u8) -> Nea2Pair {
     use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
     use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
     use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
     use nextgsim_ue::tasks::RlfCause;
 
-    const KGNB: [u8; 32] = [0x42; 32];
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, mut ue_rls_rx) = UeTaskBase::new(
         UeConfig {
             as_security_enabled: true,
@@ -420,7 +419,7 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
             ciphering_alg_id: 2,
             c_rnti: SIMULATED_C_RNTI,
             phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
-            next_hop_chaining_count: 0,
+            next_hop_chaining_count: gnb_ncc,
             kgnb: KGNB,
         },
     );
@@ -475,6 +474,45 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
     gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
     let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
     ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    Nea2Pair {
+        ue,
+        gnb,
+        ue_nas_rx,
+        ue_rls_rx,
+        gnb_ngap_rx,
+        gnb_rls_rx,
+    }
+}
+
+/// #285 review (BLOCKER): AS security with NEA2/NIA2 through the REAL handlers of
+/// both ends, then an RRC re-establishment under it.
+///
+/// - The gNB's SecurityModeCommand goes through its own send path, which starts
+///   downlink protection (TS 33.501 §6.7.4). The UE's SecurityModeComplete is
+///   integrity protected at UL COUNT 0, and the next downlink PDU is ciphered and
+///   protected at DL COUNT 1.
+/// - Re-establishment: the RRCReestablishment is integrity protected, not ciphered,
+///   at DL COUNT 0 with K_RRCint from `KgNB*` (TS 38.331 §5.3.7.4-5, TS 33.501
+///   §6.11). The UE must verify it with the same re-derived key, and both ends then
+///   cipher again, the RRCReestablishmentComplete first.
+///
+/// Each end used to be tested on its own, with NEA0 on the UE side, where "ciphered"
+/// and "unciphered" are the same bytes. So the UE's full-context check of an
+/// integrity-only PDU, and the missing re-key, went unseen.
+#[tokio::test]
+async fn nea2_security_and_re_establishment_agree_end_to_end() {
+    use nextgsim_crypto::kdf::{derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher};
+    use nextgsim_rrc::procedures::rrc_reestablishment::phys_cell_id_from_nci;
+
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        mut ue_nas_rx,
+        mut ue_rls_rx,
+        mut gnb_ngap_rx,
+        mut gnb_rls_rx,
+    } = nea2_up_to_the_reestablishment(0).await;
+    let accept = vec![0x7E, 0x02, 0x11, 0x22, 0x33, 0x44];
     let (ch, reest_complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
     assert_eq!(
         ch,
@@ -482,6 +520,22 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
         "the UE must accept the integrity-only RRCReestablishment and complete"
     );
     gnb.handle_uplink_rrc(UE_ID, ch, reest_complete).await;
+
+    // TS 33.501 Annex A.11, computed here independently of both ends: KgNB* from
+    // the KgNB, this cell's PCI and ARFCN-DL, then K_RRCint for NIA2 (A.8). Both
+    // ends dropping the KgNB* step would still agree with each other; they would
+    // not agree with this (#348 re-review).
+    let kgnb_star = derive_kgnb_star(
+        &KGNB,
+        phys_cell_id_from_nci(gnb_config().nci),
+        gnb_config().dl_arfcn,
+    );
+    assert_eq!(gnb_config().dl_arfcn, UeConfig::default().dl_arfcn);
+    assert_eq!(
+        ue.as_security().expect("the re-keyed context").k_rrc_int,
+        derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2),
+        "the UE's K_RRCint after re-establishment is the one from KgNB*"
+    );
 
     // After re-establishment both directions run on the re-derived keys: a
     // downlink NAS PDU at DL COUNT 1 reaches the UE NAS, and an uplink one at UL
@@ -511,6 +565,28 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
         delivered,
         Some(uplink),
         "uplink after re-establishment must verify with the re-derived keys"
+    );
+}
+
+/// #348 re-review, TS 33.501 §6.11: an RRCReestablishment whose NCC differs from
+/// the UE's needs the NH chain (Annex A.10/A.11), which this UE does not keep
+/// yet (#325). The UE refuses it and goes to RRC_IDLE, rather than complete on a
+/// key the network does not hold.
+#[tokio::test]
+async fn a_re_establishment_with_another_ncc_is_refused() {
+    let Nea2Pair {
+        ue, mut ue_rls_rx, ..
+    } = nea2_up_to_the_reestablishment(1).await;
+    let mut completed = false;
+    while let Ok(msg) = ue_rls_rx.try_recv() {
+        if let UeTaskMessage::Message(UeRlsMessage::RrcPduDelivery { channel, .. }) = msg {
+            completed |= channel == RrcChannel::UlDcch;
+        }
+    }
+    assert!(!completed, "no RRCReestablishmentComplete");
+    assert!(
+        ue.serving_cell_id().is_none() || ue.as_security().is_none(),
+        "the UE went to RRC_IDLE"
     );
 }
 

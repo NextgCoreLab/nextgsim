@@ -129,7 +129,7 @@ si_broadcast_period_ms: 80
 | `paging_default_cycle_frames` | u16 | 128 | Default paging cycle in radio frames (32, 64, 128 or 256), used when the AMF supplies no Paging DRX. Must match the UE's value |
 | `accept_raw_nas_on_dcch` | bool | false | Accept a raw NAS PDU on UL-DCCH from a UE that never sent RRCSetupComplete. `false` is strict TS 38.331 behaviour |
 | `as_security_enabled` | bool | false | Activate AS security (SRB1 PDCP integrity and ciphering, TS 33.501 §6.5). Must match the UE's value. Covers registration and RRC re-establishment (re-keyed with KgNB*); a handover target does not activate it yet (#325), so leave it off for handover scenarios |
-| `dl_arfcn` | u32 | 632448 | Downlink ARFCN of this cell, bound into the handover KgNB* derivation; both ends must hold the same value |
+| `dl_arfcn` | u32 | 632448 | Downlink ARFCN of this cell, bound into the KgNB* derivation of a handover and an RRC re-establishment; every gNB and UE must hold the same value (RLS carries no carrier frequency) |
 | `scell_phys_cell_id` | u16 | none | `physCellId` of a secondary cell to configure on each UE (event A6) |
 | `conditional_handover` | bool | false | Nominate the configured intra-frequency neighbours as conditional-handover candidates |
 | `cho_a3_offset_db` | f64 | 3.0 | CHO execution `a3-Offset` in dB |
@@ -257,7 +257,7 @@ tun_name: null
 | `racs_store_assigned_id` | bool | true | Keep the network-assigned UE radio capability ID (RACS) from a CONFIGURATION UPDATE COMMAND and present it in later Registration Requests |
 | `paging_default_cycle_frames` | u16 | 128 | Paging cycle for the UE's own paging occasion (TS 38.304 §7.1). Must match the gNB |
 | `as_security_enabled` | bool | false | AS security on SRB1. Must match the gNB. Not yet usable across a handover (#325) |
-| `dl_arfcn` | u32 | 632448 | Must match the gNB's (handover key derivation) |
+| `dl_arfcn` | u32 | 632448 | Must match every gNB's (handover and re-establishment key derivation) |
 | `require_broadcast_sib1` | bool | false | Require a decoded broadcast SIB1 before a cell is selectable |
 | `rlc_am_psis` | list of u8 | `[]` | PDU sessions whose DRB uses RLC AM. Must match the gNB |
 | `conditional_handover` | bool | false | Store CHO candidates from RRCReconfiguration and execute one when its condition holds |
