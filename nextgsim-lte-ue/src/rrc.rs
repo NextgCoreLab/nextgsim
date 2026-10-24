@@ -434,10 +434,44 @@ impl UeRrc {
             }
             RrcChannel::DlCcch => self.on_dl_ccch(cell, pdu, now),
             RrcChannel::DlDcch => self.on_dl_dcch(cell, lcid, pdu, now),
+            RrcChannel::Pcch => self.on_paging(cell, pdu, now),
             other => {
                 log::debug!("cell {cell:#x}: RRC PDU on {other:?} ignored");
                 vec![]
             }
+        }
+    }
+
+    /// A Paging message on PCCH (TS 36.331 §5.3.2.3, #351): in RRC_IDLE on the
+    /// camped cell, each PS record is forwarded to NAS, which says whether the
+    /// identity is the UE's and it wants a connection; the establishment then
+    /// follows with NAS's initial message (a SERVICE REQUEST, cause mt-Access).
+    fn on_paging(&mut self, cell: u64, pdu: &[u8], now: Instant) -> Vec<UeAction> {
+        if !matches!(self.state, State::Idle) || self.camped != Some(cell) {
+            return vec![];
+        }
+        let records = match msg::decode_pcch(pdu) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("cell {cell:#x}: undecodable PCCH message: {e}");
+                return vec![];
+            }
+        };
+        let mut wanted = false;
+        for r in records {
+            if r.cn_domain == msg::PagingCnDomain::Cs {
+                log::debug!("CS-domain paging record ignored: this UE has no CS fallback");
+                continue;
+            }
+            if self.nas.on_paging(&r.identity) {
+                log::info!("paged ({:?}) on cell {cell:#x}", r.identity);
+                wanted = true;
+            }
+        }
+        if wanted {
+            self.try_establish(now)
+        } else {
+            vec![]
         }
     }
 
