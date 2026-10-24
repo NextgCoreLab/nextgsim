@@ -58,6 +58,15 @@ pub enum GuardTimer {
         /// The AMF to retry towards.
         amf_id: i32,
     },
+    /// An NG Setup Request was sent and neither an NG Setup Response nor an NG
+    /// Setup Failure has arrived. TS 38.413 defines no timer and no rule for
+    /// this; the gNB re-sends an identical request, by analogy with §8.7.2.4
+    /// (RAN Configuration Update). See `NG_SETUP_RESPONSE_TIMEOUT` in the NGAP
+    /// task (#312).
+    NgSetupResponse {
+        /// The AMF the request went to.
+        amf_id: i32,
+    },
 }
 
 /// Pending guard timers, ordered only by when they are asked for.
@@ -113,6 +122,14 @@ impl GuardTimers {
             }
         });
         fired
+    }
+
+    /// When `timer` is due, if it is pending.
+    pub fn deadline(&self, timer: GuardTimer) -> Option<Instant> {
+        self.entries
+            .iter()
+            .find(|(_, pending)| *pending == timer)
+            .map(|(deadline, _)| *deadline)
     }
 
     /// Whether `timer` is pending.

@@ -88,6 +88,9 @@ impl Default for RlsTaskConfig {
     }
 }
 
+/// One round of gNB hostname resolutions, in `gnb_search_hosts` order (#311).
+type HostResolutions = Vec<(PeerAddr, std::io::Result<Vec<SocketAddr>>)>;
+
 /// RLS Task for managing radio link simulation on UE side
 pub struct RlsTask {
     task_base: UeTaskBase,
@@ -103,8 +106,18 @@ pub struct RlsTask {
     /// The last successful resolution of each `gnb_search_hosts` entry (#286).
     /// A failed lookup keeps the previous answer rather than emptying it.
     resolved_hosts: HashMap<PeerAddr, Vec<SocketAddr>>,
-    /// Sources already warned about by `handle_pdu_transmission`.
-    unknown_sources_warned: std::collections::HashSet<SocketAddr>,
+    /// Whether a re-resolution round is in flight; at most one (#311).
+    resolving: bool,
+    resolve_tx: mpsc::UnboundedSender<HostResolutions>,
+    resolve_rx: mpsc::UnboundedReceiver<HostResolutions>,
+    /// Test seam: hostname lookups never answer, as against an unreachable DNS.
+    #[cfg(test)]
+    resolve_hang: bool,
+    /// Test seam: how many re-resolution rounds were spawned (#342 review).
+    #[cfg(test)]
+    resolve_rounds: usize,
+    /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
+    unknown_sources: UnknownSourceWarner,
     sti: u64,
     /// RLC entities keyed by DRB identity.
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
@@ -227,6 +240,7 @@ impl RlsTask {
         cell_search.set_heartbeat_interval(config.heartbeat_interval);
         cell_search.set_heartbeat_threshold(config.heartbeat_threshold);
 
+        let (resolve_tx, resolve_rx) = mpsc::unbounded_channel();
         Self {
             task_base,
             cell_search,
@@ -237,7 +251,14 @@ impl RlsTask {
             socket: None,
             config,
             resolved_hosts: HashMap::new(),
-            unknown_sources_warned: std::collections::HashSet::new(),
+            resolving: false,
+            resolve_tx,
+            resolve_rx,
+            #[cfg(test)]
+            resolve_hang: false,
+            #[cfg(test)]
+            resolve_rounds: 0,
+            unknown_sources: UnknownSourceWarner::new(Instant::now()),
             sti,
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
@@ -316,10 +337,51 @@ impl RlsTask {
     /// space if any answer changed (issue #286). A gNB pod that restarts comes
     /// back at a new address; the cell at the old one stops answering and is
     /// lost as usual, and the new one is discovered by the next heartbeat.
-    async fn reresolve_search_hosts(&mut self) {
+    /// Start a round of resolving every `gnb_search_hosts` entry, off the task
+    /// loop (#311). The answers arrive through `resolve_rx` and are applied by
+    /// [`Self::apply_resolutions`].
+    ///
+    /// This loop also carries the user plane and the RLS heartbeats; a lookup
+    /// against an unreachable DNS server used to stall it for up to 2 s per
+    /// hostname every 5 s, which risks a spurious radio link failure. One round
+    /// at a time: a round still waiting on DNS is not stacked on.
+    fn start_reresolve(&mut self) {
+        if self.resolving || self.config.gnb_search_hosts.is_empty() {
+            return;
+        }
+        self.resolving = true;
+        let hosts = self.config.gnb_search_hosts.clone();
+        // An empty round if the task ends without reporting, so `resolving` is
+        // cleared whatever happens to it (#342 review).
+        let report =
+            nextgsim_common::outcome_guard::OutcomeGuard::new(self.resolve_tx.clone(), Vec::new());
+        #[cfg(test)]
+        let hang = self.resolve_hang;
+        #[cfg(test)]
+        {
+            self.resolve_rounds += 1;
+        }
+        tokio::spawn(async move {
+            #[cfg(test)]
+            if hang {
+                std::future::pending::<()>().await;
+            }
+            let mut out = Vec::with_capacity(hosts.len());
+            for host in hosts {
+                let result = host.resolve().await;
+                out.push((host, result));
+            }
+            report.send(out);
+        });
+    }
+
+    /// Apply one round of resolutions (#286): a changed answer replaces the
+    /// host's addresses in the search space; a failed lookup keeps the old one.
+    fn apply_resolutions(&mut self, results: HostResolutions) {
+        self.resolving = false;
         let mut changed = false;
-        for host in self.config.gnb_search_hosts.clone() {
-            match host.resolve().await {
+        for (host, result) in results {
+            match result {
                 Ok(addrs) => {
                     if self.resolved_hosts.get(&host) != Some(&addrs) {
                         info!("gNB {host} resolves to {addrs:?}");
@@ -334,6 +396,17 @@ impl RlsTask {
             let space = self.effective_search_space();
             self.cell_search.set_search_space(space);
         }
+    }
+
+    /// Resolve every hostname now and apply the answers, awaiting them.
+    #[cfg(test)]
+    async fn reresolve_search_hosts(&mut self) {
+        let mut out = Vec::new();
+        for host in self.config.gnb_search_hosts.clone() {
+            let result = host.resolve().await;
+            out.push((host, result));
+        }
+        self.apply_resolutions(out);
     }
 
     pub fn cell_count(&self) -> usize {
@@ -636,7 +709,7 @@ impl RlsTask {
             self.serving_cell = None;
             self.transport.clear_serving_endpoint();
             // The serving gNB may have restarted at a new address (#286).
-            self.reresolve_search_hosts().await;
+            self.start_reresolve();
             let _ = self
                 .task_base
                 .rrc_tx
@@ -834,14 +907,10 @@ impl RlsTask {
             None => {
                 // Expected while two gNB incarnations share an STI (a pod
                 // restart's overlap, #292): the one not adopted as a cell still
-                // broadcasts to this UE. Warned once per source, not per PDU.
-                if self.unknown_sources_warned.insert(source) {
-                    warn!(
-                        "PDU from unknown source {} (not a discovered cell); further PDUs \
-                         from it are dropped silently",
-                        source
-                    );
-                }
+                // broadcasts to this UE. Warned once per source, not per PDU, and
+                // with bounded memory: anything that can reach the RLS port can
+                // vary its source address (#314).
+                self.unknown_sources.on_pdu(source, Instant::now());
                 return;
             }
         };
@@ -1330,9 +1399,11 @@ impl Task for RlsTask {
             error!("Failed to initialize RLS socket: {}", e);
             return;
         }
-        // Hostnames are resolved before the first heartbeat; one that does not
-        // resolve yet is retried on `resolve_timer` (#286).
-        self.reresolve_search_hosts().await;
+        // Hostnames are resolved off the loop (#311): the first heartbeats go to
+        // the literal addresses, and a hostname joins the search space as soon as
+        // it answers. One that does not resolve yet is retried on
+        // `resolve_timer` (#286).
+        self.start_reresolve();
         info!(
             "RLS task started with {} gNB address(es) and {} gNB hostname(s) in search list",
             self.config.gnb_search_list.len(),
@@ -1371,7 +1442,8 @@ impl Task for RlsTask {
                     }
                 }
                 _ = heartbeat_timer.tick() => self.send_heartbeats().await,
-                _ = resolve_timer.tick(), if has_hosts => self.reresolve_search_hosts().await,
+                _ = resolve_timer.tick(), if has_hosts => self.start_reresolve(),
+                Some(results) = self.resolve_rx.recv() => self.apply_resolutions(results),
                 _ = lost_cell_timer.tick() => {
                     self.check_lost_cells().await;
                     self.send_pending_acks().await;
@@ -1387,6 +1459,83 @@ impl Task for RlsTask {
             self.cell_search.cell_count()
         );
     }
+}
+
+/// Most distinct unknown sources remembered for warn-once suppression.
+///
+/// The warn-once set used to grow by one entry per distinct source address and was
+/// never cleared, so a scanner or a peer sending from ephemeral ports could grow
+/// the UE's memory without bound (#314). Legitimate unknown sources are a handful:
+/// the non-adopted gNB incarnation during a restart overlap (#292).
+const UNKNOWN_SOURCE_WARN_CAP: usize = 64;
+
+/// How often a summary of suppressed unknown-source PDUs is logged, and how often
+/// the remembered set is forgotten once it has filled up.
+const UNKNOWN_SOURCE_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate-limited, memory-bounded "PDU from unknown source" warning.
+///
+/// The first PDU from each of up to [`UNKNOWN_SOURCE_WARN_CAP`] distinct sources
+/// is warned about individually, as before. Past the cap no new source is
+/// remembered: its PDUs are counted, and at most one summary line per
+/// [`UNKNOWN_SOURCE_SUMMARY_INTERVAL`] reports the count, after which the set is
+/// forgotten so per-source warnings resume. Memory is bounded by the cap whatever
+/// the sender does.
+#[derive(Debug)]
+struct UnknownSourceWarner {
+    warned: std::collections::HashSet<SocketAddr>,
+    /// PDUs dropped from sources not in `warned` because it was full.
+    suppressed_pdus: u64,
+    /// When the last summary was logged (or the warner was created).
+    last_summary: Instant,
+}
+
+impl UnknownSourceWarner {
+    fn new(now: Instant) -> Self {
+        Self {
+            warned: std::collections::HashSet::new(),
+            suppressed_pdus: 0,
+            last_summary: now,
+        }
+    }
+
+    /// Records a PDU from `source`, which is not a discovered cell, and logs as
+    /// the policy above says. Returns what was logged, for tests.
+    fn on_pdu(&mut self, source: SocketAddr, now: Instant) -> UnknownSourceLog {
+        if self.warned.contains(&source) {
+            return UnknownSourceLog::Silent;
+        }
+        if self.warned.len() < UNKNOWN_SOURCE_WARN_CAP {
+            self.warned.insert(source);
+            warn!(
+                "PDU from unknown source {} (not a discovered cell); further PDUs \
+                 from it are dropped silently",
+                source
+            );
+            return UnknownSourceLog::Warned;
+        }
+        self.suppressed_pdus = self.suppressed_pdus.saturating_add(1);
+        if now.saturating_duration_since(self.last_summary) < UNKNOWN_SOURCE_SUMMARY_INTERVAL {
+            return UnknownSourceLog::Silent;
+        }
+        warn!(
+            "Dropped {} PDU(s) from unknown sources beyond the first {} in the last {:?} \
+             (not discovered cells); latest from {}",
+            self.suppressed_pdus, UNKNOWN_SOURCE_WARN_CAP, UNKNOWN_SOURCE_SUMMARY_INTERVAL, source
+        );
+        self.suppressed_pdus = 0;
+        self.last_summary = now;
+        self.warned.clear();
+        UnknownSourceLog::Summary
+    }
+}
+
+/// What [`UnknownSourceWarner::on_pdu`] logged.
+#[derive(Debug, PartialEq, Eq)]
+enum UnknownSourceLog {
+    Silent,
+    Warned,
+    Summary,
 }
 
 #[cfg(test)]
@@ -1428,6 +1577,51 @@ mod tests {
         let task = RlsTask::from_ue_config(task_base);
         assert!(task.serving_cell.is_none());
         assert_eq!(task.config.gnb_search_list.len(), 1);
+    }
+
+    fn src(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], port))
+    }
+
+    /// #314: a sender varying its source port must not grow the warn-once set
+    /// past the cap, and once it is full the drops are summarised, at most once
+    /// per interval, after which the set is forgotten.
+    #[test]
+    fn the_unknown_source_warn_set_is_bounded() {
+        let t0 = Instant::now();
+        let mut w = UnknownSourceWarner::new(t0);
+        for port in 0..UNKNOWN_SOURCE_WARN_CAP as u16 {
+            assert_eq!(w.on_pdu(src(port), t0), UnknownSourceLog::Warned);
+        }
+        // A repeat of a remembered source stays silent, as before #314.
+        assert_eq!(w.on_pdu(src(0), t0), UnknownSourceLog::Silent);
+        // Ten thousand further distinct sources: none is remembered.
+        for port in 0..10_000u16 {
+            let p = UNKNOWN_SOURCE_WARN_CAP as u16 + port;
+            assert_eq!(w.on_pdu(src(p), t0), UnknownSourceLog::Silent);
+        }
+        assert_eq!(w.warned.len(), UNKNOWN_SOURCE_WARN_CAP);
+        assert_eq!(w.suppressed_pdus, 10_000);
+        // After the interval, one summary, and the set is forgotten.
+        let later = t0 + UNKNOWN_SOURCE_SUMMARY_INTERVAL;
+        assert_eq!(w.on_pdu(src(60_000), later), UnknownSourceLog::Summary);
+        assert!(w.warned.is_empty());
+        assert_eq!(w.suppressed_pdus, 0);
+        // Per-source warnings resume.
+        assert_eq!(w.on_pdu(src(60_001), later), UnknownSourceLog::Warned);
+    }
+
+    /// The overlap case #292 warns once per source and never summarises.
+    #[test]
+    fn a_few_unknown_sources_are_each_warned_once() {
+        let t0 = Instant::now();
+        let mut w = UnknownSourceWarner::new(t0);
+        assert_eq!(w.on_pdu(src(4997), t0), UnknownSourceLog::Warned);
+        let later = t0 + UNKNOWN_SOURCE_SUMMARY_INTERVAL * 10;
+        for _ in 0..100 {
+            assert_eq!(w.on_pdu(src(4997), later), UnknownSourceLog::Silent);
+        }
+        assert_eq!(w.warned.len(), 1);
     }
 
     fn lit(s: &str) -> PeerAddr {
@@ -1500,6 +1694,49 @@ mod tests {
                 "gnb.example.svc.cluster.local".into(),
                 DEFAULT_RLS_PORT
             )]
+        );
+    }
+
+    /// #311: with DNS unreachable, the RLS loop keeps running -- heartbeats keep
+    /// going to the literal gNB at their interval -- and a second round is not
+    /// stacked on the first. Before, the lookup ran inline in the loop.
+    #[tokio::test]
+    async fn a_hanging_resolver_does_not_stall_the_rls_loop() {
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, rls_rx) = UeTaskBase::new(test_config(), 16);
+        let rls_config = RlsTaskConfig {
+            gnb_search_list: vec![gnb.local_addr().unwrap()],
+            gnb_search_hosts: vec![PeerAddr::Host("gnb.test".into(), 4997)],
+            reresolve_interval: Duration::from_millis(50),
+            bind_address: Some("127.0.0.1:0".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut task = RlsTask::new(task_base, rls_config);
+        task.resolve_hang = true;
+        task.start_reresolve();
+        assert!(task.resolving);
+        task.start_reresolve(); // not stacked: still one round in flight
+        assert!(task.resolving);
+        assert_eq!(
+            task.resolve_rounds, 1,
+            "a second round is not spawned (#342 review)"
+        );
+        let runner = tokio::spawn(async move { task.run(rls_rx).await });
+
+        let mut buf = [0u8; 2048];
+        let mut heartbeats = 0;
+        // The loop heartbeats every HEARTBEAT_INTERVAL_MS (1 s), starting at once.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(2500);
+        while heartbeats < 3 {
+            match tokio::time::timeout_at(deadline, gnb.recv_from(&mut buf)).await {
+                Ok(Ok(_)) => heartbeats += 1,
+                _ => break,
+            }
+        }
+        runner.abort();
+        assert!(
+            heartbeats >= 3,
+            "heartbeats kept flowing while every lookup hung: {heartbeats}"
         );
     }
 
@@ -1731,6 +1968,54 @@ mod tests {
             panic!("not a PDU transmission");
         };
         assert_eq!(t.c_rnti, None, "a new serving cell clears it");
+    }
+
+    /// #337: a serving gNB that restarted at the SAME address (same NCI, so the
+    /// same STI) answers with a new incarnation. That ends the serving cell with a
+    /// radio link failure, as a real radio's missing grants would, and the
+    /// restarted gNB is a new cell at the same address. Before, the UE never
+    /// noticed and sent uplink to a gNB with no context for it, forever.
+    #[tokio::test]
+    async fn a_serving_gnb_restarted_at_the_same_address_is_a_radio_link_failure() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let a: SocketAddr = "10.0.0.1:4997".parse().unwrap();
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![a],
+                ..Default::default()
+            },
+        );
+        let before = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(1);
+        task.handle_heartbeat_ack(a, &before).await;
+        task.handle_assign_current_cell(0);
+        while rrc_rx.try_recv().is_ok() {}
+        task.handle_heartbeat_ack(a, &before).await;
+        assert_eq!(
+            task.serving_cell,
+            Some(0),
+            "same incarnation: nothing happens"
+        );
+
+        let after = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(2);
+        task.handle_heartbeat_ack(a, &after).await;
+        assert_eq!(
+            task.serving_cell, None,
+            "the old incarnation's cell is gone"
+        );
+        assert_eq!(
+            task.cell_addresses.get(&1),
+            Some(&a),
+            "a new cell, same address"
+        );
+        let mut rlf = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            rlf |= matches!(
+                msg,
+                TaskMessage::Message(RrcMessage::RadioLinkFailure { .. })
+            );
+        }
+        assert!(rlf, "losing the serving cell is a radio link failure");
     }
 
     #[test]

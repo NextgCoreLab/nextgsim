@@ -34,7 +34,7 @@ use nextgsim_rrc::procedures::rrc_reconfiguration::{
     encode_rrc_reconfiguration, RrcReconfigurationParams,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{
-    decode_rrc_reestablishment_request, RrcReestablishmentRequestData,
+    decode_rrc_reestablishment_request, phys_cell_id_from_nci, RrcReestablishmentRequestData,
 };
 use nextgsim_rrc::procedures::rrc_resume::{
     decode_rrc_resume_request, decode_rrc_resume_request1, RrcResumeCompleteData,
@@ -107,7 +107,7 @@ use super::system_info::{
 };
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
 use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager, SuspendedIdentity};
-use nextgsim_pdcp::srb_security::SrbSecurity;
+use nextgsim_pdcp::srb_security::{SrbSecurity, MAC_I_LEN as SRB_MAC_I_LEN};
 use nextgsim_rrc::procedures::system_information::Sib19Params;
 
 /// The NTN configuration this cell broadcasts, held at RRC level (issue #56).
@@ -1029,6 +1029,15 @@ impl RrcTask {
         // framing level" and nothing was protected in either direction.
         if self.task_base.config.as_security_enabled {
             if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                // Only a Complete whose MAC-I verified activates (§5.3.4.3, #285):
+                // an unprotected one proves nothing about the keys.
+                if !std::mem::take(&mut ctx.smc_complete_verified) {
+                    warn!(
+                        "Discarding SecurityModeComplete from UE[{ue_id}]: it carries no \
+                         valid MAC-I (TS 38.331 §5.3.4.3); AS security not activated"
+                    );
+                    return;
+                }
                 ctx.on_as_security_activated();
             }
         }
@@ -1073,6 +1082,13 @@ impl RrcTask {
                     return;
                 }
                 TidVerification::Match | TidVerification::NoOutstanding => {}
+            }
+        }
+        // The UE keeps its previous configuration (§5.3.4.4), so the downlink the
+        // SecurityModeCommand turned on goes back off (#285).
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            if !ctx.as_security_active() {
+                ctx.dl_protection_active = false;
             }
         }
         warn!(
@@ -1683,7 +1699,11 @@ impl RrcTask {
     // `dedicatedNAS-Message`, so the slice -- which would have mangled any
     // conformant peer's NAS -- is gone (issue #151).
 
-    async fn handle_nas_delivery(&mut self, ue_id: i32, nas_pdu: OctetString) {
+    /// Deliver a NAS PDU to the UE in a DLInformationTransfer.
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub async fn handle_nas_delivery(&mut self, ue_id: i32, nas_pdu: OctetString) {
         let ctx = match self.ue_manager.try_find_ue(ue_id) {
             Some(c) => c,
             None => {
@@ -1768,6 +1788,23 @@ impl RrcTask {
             .process_rrc_reestablishment_request(&mut self.ue_manager, &presented)
         {
             Ok(result) => {
+                // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established (COUNTs 0) and the
+                // RRCReestablishment is integrity protected, not ciphered (#285).
+                // The shortMAC-I was verified above with the OLD K_RRCint; the
+                // RRCReestablishment and everything after use the re-keyed SRB1.
+                let secured = self
+                    .ue_manager
+                    .try_find_ue(result.ue_id)
+                    .is_some_and(|c| c.as_security_active());
+                if secured {
+                    self.rekey_for_reestablishment(result.ue_id).await;
+                }
+                if let Some(ctx) = self.ue_manager.try_find_ue_mut(result.ue_id) {
+                    if ctx.as_security_active() {
+                        ctx.reestablish_srb1_pdcp();
+                        ctx.dl_next_integrity_only = true;
+                    }
+                }
                 self.send_rrc_message(result.ue_id, result.channel, result.rrc_reestablishment_pdu)
                     .await;
             }
@@ -1815,6 +1852,94 @@ impl RrcTask {
         }
     }
 
+    /// Deliver the SecurityModeCommand on SRB1 (TS 38.331 §5.3.4): integrity
+    /// protected and NOT ciphered (§5.3.4.2), so the UE can verify it with the
+    /// keys it is about to derive (issue #31).
+    ///
+    /// When it went out protected, the answer is a SecurityModeComplete integrity
+    /// protected at UL COUNT 0 or a SecurityModeFailure, and DOWNLINK protection
+    /// starts now: TS 33.501 §6.7.4, "RRC downlink ciphering (encryption) at the
+    /// gNB/ng-eNB shall start after sending the AS security mode command message"
+    /// (#285). The Registration Accept the AMF sends right behind the command must
+    /// already be protected.
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub async fn handle_security_mode_command(&mut self, ue_id: i32, pdu: OctetString) {
+        info!(
+            "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
+            ue_id,
+            pdu.len()
+        );
+        let original_len = pdu.len();
+        let pdu = self.protect_security_mode_command(ue_id, pdu);
+        if pdu.len() > original_len {
+            if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                ctx.smc_awaiting_answer = true;
+                ctx.smc_complete_verified = false;
+            }
+            // Sent first, unprotected by the DL path (the command carries its own
+            // MAC-I at DL COUNT 0); every later DL-DCCH PDU is protected.
+            self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+            if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                ctx.dl_protection_active = true;
+            }
+        } else {
+            self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+        }
+    }
+
+    /// Re-key a UE's AS security at RRC re-establishment (#285 review). TS 38.331
+    /// §5.3.7.5 has the UE "update the K_(gNB) key based on the current K_(gNB) key
+    /// or the NH, using the received nextHopChainingCount value". On the network
+    /// side, TS 33.501 §6.11: the gNB "shall use the K_(NG-RAN)* corresponding to the
+    /// selected cell as K_(gNB) and derive new RRC keys (new K_(RRCint) and new
+    /// K_(RRCenc)) based on the K_(gNB) and the AS algorithms used in source cell".
+    ///
+    /// This gNB holds no unused {NH, NCC}, so it signals the current NCC and the
+    /// derivation is horizontal: `KgNB*` from the current `KgNB`, this cell's PCI and
+    /// its ARFCN-DL (Annex A.11). The NGAP task's AS context is told, so a later
+    /// handover chains from the key the UE now holds.
+    async fn rekey_for_reestablishment(&mut self, ue_id: i32) {
+        use nextgsim_crypto::kdf::{
+            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+        };
+        let pci = phys_cell_id_from_nci(self.task_base.config.nci);
+        let arfcn = self.task_base.config.dl_arfcn;
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
+            return;
+        };
+        let Some(sec) = ctx.reestablishment_security.as_mut() else {
+            return;
+        };
+        let kgnb_star = derive_kgnb_star(&sec.kgnb, pci, arfcn);
+        sec.kgnb = kgnb_star;
+        sec.k_rrc_int = derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcInt,
+            sec.integrity_alg_id,
+        );
+        sec.k_rrc_enc = derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcEnc,
+            sec.ciphering_alg_id,
+        );
+        sec.phys_cell_id = pci;
+        info!(
+            "UE[{ue_id}]: re-establishment re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL \
+             {arfcn}, NCC {}, horizontal)",
+            sec.next_hop_chaining_count
+        );
+        let _ = self
+            .task_base
+            .ngap_tx
+            .send(NgapMessage::AsKeyRefreshed {
+                ue_id,
+                kgnb: kgnb_star,
+            })
+            .await;
+    }
+
     /// Records the AS security material a re-establishment is verified against
     /// (TS 38.331 §5.3.7.2), handed over by the NGAP task when it derives the AS
     /// keys at Initial Context Setup.
@@ -1822,7 +1947,10 @@ impl RrcTask {
     /// A UE with no context yet is skipped rather than given a fresh one: the
     /// material belongs to a connection the RRC task already knows about, and
     /// inventing a context around it would be a context nothing established.
-    fn handle_as_security_for_reestablishment(
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub fn handle_as_security_for_reestablishment(
         &mut self,
         ue_id: i32,
         security: ReestablishmentSecurity,
@@ -2249,9 +2377,9 @@ impl RrcTask {
         let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
             return Some(data);
         };
-        if !ctx.as_security_active() {
+        if !ctx.dl_protection_active {
             // Not yet activated: the SecurityModeCommand itself is handled by
-            // `protect_security_mode_command`, and everything before activation
+            // `protect_security_mode_command`, and everything before it
             // legitimately goes in the clear.
             return Some(data);
         }
@@ -2263,6 +2391,19 @@ impl RrcTask {
             return None;
         };
         let count = ctx.next_dl_pdcp_count();
+        if std::mem::take(&mut ctx.dl_next_integrity_only) {
+            // TS 38.331 §5.3.7.5: the RRCReestablishment is integrity protected
+            // and NOT ciphered; ciphering resumes after it (#285).
+            let mac = sec.compute_mac_i(
+                count,
+                SRB1_PDCP_BEARER,
+                PDCP_DIRECTION_DOWNLINK,
+                data.data(),
+            );
+            let mut out = data.data().to_vec();
+            out.extend_from_slice(&mac);
+            return Some(OctetString::from_slice(&out));
+        }
         Some(OctetString::from_slice(&sec.protect(
             count,
             SRB1_PDCP_BEARER,
@@ -2289,6 +2430,26 @@ impl RrcTask {
             return Some(data.clone());
         };
         if !ctx.as_security_active() {
+            if ctx.smc_awaiting_answer {
+                // TS 38.331 §5.3.4.3: the SecurityModeComplete is integrity
+                // protected (UL COUNT 0) and NOT ciphered. A PDU whose trailing
+                // MAC-I verifies is that Complete; anything else is passed on
+                // unprotected -- a SecurityModeFailure is sent in the clear -- and
+                // an unverified Complete is refused by its handler (#285).
+                ctx.smc_awaiting_answer = false;
+                let bytes = data.data();
+                if let (Some(sec), true) = (ctx.srb_security(), bytes.len() > SRB_MAC_I_LEN) {
+                    let (body, mac) = bytes.split_at(bytes.len() - SRB_MAC_I_LEN);
+                    let expected =
+                        sec.compute_mac_i(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, body);
+                    if nextgsim_pdcp::algorithms::ct_eq_mac(&expected, mac) {
+                        ctx.smc_complete_verified = true;
+                        // UL COUNT 0 is spent; the next protected UL PDU is COUNT 1.
+                        let _ = ctx.next_ul_pdcp_count();
+                        return Some(OctetString::from_slice(body));
+                    }
+                }
+            }
             return Some(data.clone());
         }
         let Some(sec) = ctx.srb_security() else {
@@ -2807,22 +2968,12 @@ impl Task for RrcTask {
                                 .await;
                             }
                             RrcMessage::SecurityModeCommand { ue_id, pdu } => {
-                                // TS 38.331 §5.3.4: deliver the SecurityModeCommand
-                                // on SRB1 (DL-DCCH), integrity protected and NOT
-                                // ciphered (§5.3.4.2) so the UE can verify it with
-                                // the keys it is about to derive (issue #31).
-                                info!(
-                                    "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
-                                    ue_id,
-                                    pdu.len()
-                                );
-                                let pdu = self.protect_security_mode_command(ue_id, pdu);
-                                self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+                                self.handle_security_mode_command(ue_id, pdu).await;
                             }
                             RrcMessage::AsSecurityForReestablishment {
                                 ue_id, k_rrc_int, k_rrc_enc, integrity_alg_id,
                                 ciphering_alg_id, c_rnti, phys_cell_id,
-                                next_hop_chaining_count,
+                                next_hop_chaining_count, kgnb,
                             } => {
                                 self.handle_as_security_for_reestablishment(
                                     ue_id,
@@ -2834,6 +2985,7 @@ impl Task for RrcTask {
                                         c_rnti,
                                         phys_cell_id,
                                         next_hop_chaining_count,
+                                        kgnb,
                                     },
                                 );
                             }
@@ -4058,6 +4210,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                 next_hop_chaining_count: ncc,
+                kgnb: [0x11; 32],
             },
         );
     }
@@ -4325,6 +4478,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: 1,
                 next_hop_chaining_count: 0,
+                kgnb: [0x11; 32],
             },
         );
 
@@ -4385,9 +4539,39 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                 next_hop_chaining_count: 0,
+                kgnb: [0x11; 32],
             },
         );
-        task.handle_security_mode_complete(ue_id, 0);
+        // As a SecurityModeCommand went out, then the UE's Complete integrity
+        // protected at UL COUNT 0 (TS 38.331 §5.3.4.3, #285).
+        task.ue_manager
+            .try_find_ue_mut(ue_id)
+            .expect("context")
+            .smc_awaiting_answer = true;
+        task.handle_ul_dcch_message(ue_id, &OctetString::from_slice(&protected_smc_complete(0)))
+            .await;
+        assert!(
+            task.ue_manager
+                .try_find_ue(ue_id)
+                .expect("context")
+                .as_security_active(),
+            "a verified SecurityModeComplete activates"
+        );
+    }
+
+    /// A SecurityModeComplete as the UE sends it: integrity protected at UL COUNT
+    /// 0, not ciphered (TS 38.331 §5.3.4.3, #285).
+    fn protected_smc_complete(tid: u8) -> Vec<u8> {
+        use nextgsim_rrc::procedures::security_mode::{
+            encode_security_mode_complete, SecurityModeCompleteParams,
+        };
+        let mut pdu = encode_security_mode_complete(&SecurityModeCompleteParams {
+            rrc_transaction_id: tid,
+        })
+        .expect("encode");
+        let mac = ue_side_security().compute_mac_i(0, 0, 0, &pdu);
+        pdu.extend_from_slice(&mac);
+        pdu
     }
 
     /// The UE's view of the same security state, built through the SHARED layer.
@@ -4437,6 +4621,7 @@ mod tests {
                     c_rnti: SIMULATED_C_RNTI,
                     phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                     next_hop_chaining_count: 0,
+                    kgnb: [0x11; 32],
                 },
             );
             while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
@@ -4534,7 +4719,7 @@ mod tests {
 
             // A well-formed uplink NAS PDU, protected then forged.
             let nas = vec![0x08u8, 0x00, 0x7E, 0x00, 0x41];
-            let mut protected = ue_side_security().protect(0, 0, 0, &nas);
+            let mut protected = ue_side_security().protect(1, 0, 0, &nas);
             let last = protected.len() - 1;
             protected[last] ^= 0xFF;
 
@@ -4568,8 +4753,8 @@ mod tests {
             activate_as_security(&mut task, 7).await;
             while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
 
-            // Valid first, consuming UL COUNT 0.
-            let good = ue_side_security().protect(0, 0, 0, &nas);
+            // Valid first, consuming UL COUNT 1 (the SecurityModeComplete took 0).
+            let good = ue_side_security().protect(1, 0, 0, &nas);
             let recovered = task
                 .unprotect_ul_dcch(7, &OctetString::from_slice(&good))
                 .expect("a valid PDU must be accepted");
@@ -4580,8 +4765,8 @@ mod tests {
                  make every dispatcher fail for the wrong reason"
             );
 
-            // Then a forged one at UL COUNT 1.
-            let mut bad = ue_side_security().protect(1, 0, 0, &nas);
+            // Then a forged one at UL COUNT 2.
+            let mut bad = ue_side_security().protect(2, 0, 0, &nas);
             let last = bad.len() - 1;
             bad[last] ^= 0xFF;
             assert!(
@@ -4590,6 +4775,156 @@ mod tests {
                 "a forged MAC-I must yield None -- the PDU is DISCARDED, not passed \
                  on for a dispatcher to fail on (TS 33.501 §6.5)"
             );
+        });
+    }
+
+    /// #285, TS 38.331 §5.3.4.3: AS security activates only on a SecurityModeComplete
+    /// whose MAC-I (UL COUNT 0) verifies. An unprotected Complete -- what the gNB
+    /// used to accept -- or one with a forged MAC-I does not activate, and the
+    /// gNB keeps sending in the clear.
+    #[test]
+    fn only_a_verified_security_mode_complete_activates_as_security() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            phys_cell_id_from_nci, SIMULATED_C_RNTI,
+        };
+        use nextgsim_rrc::procedures::security_mode::{
+            encode_security_mode_complete, SecurityModeCompleteParams,
+        };
+        for case in ["unprotected", "forged"] {
+            let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(as_security_config(), 16);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                task.handle_as_security_for_reestablishment(
+                    7,
+                    ReestablishmentSecurity {
+                        k_rrc_int: AS_K_INT,
+                        k_rrc_enc: AS_K_ENC,
+                        integrity_alg_id: 2,
+                        ciphering_alg_id: 2,
+                        c_rnti: SIMULATED_C_RNTI,
+                        phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
+                        next_hop_chaining_count: 0,
+                        kgnb: [0x11; 32],
+                    },
+                );
+                task.ue_manager
+                    .try_find_ue_mut(7)
+                    .unwrap()
+                    .smc_awaiting_answer = true;
+                let pdu = match case {
+                    "unprotected" => encode_security_mode_complete(&SecurityModeCompleteParams {
+                        rrc_transaction_id: 0,
+                    })
+                    .unwrap(),
+                    _ => {
+                        let mut p = protected_smc_complete(0);
+                        let last = p.len() - 1;
+                        p[last] ^= 0x01;
+                        p
+                    }
+                };
+                task.handle_ul_dcch_message(7, &OctetString::from_slice(&pdu))
+                    .await;
+                assert!(
+                    !task.ue_manager.try_find_ue(7).unwrap().as_security_active(),
+                    "{case} SecurityModeComplete must not activate"
+                );
+            });
+        }
+    }
+
+    /// #285, TS 33.501 §6.7.4: the gNB starts downlink protection right after
+    /// sending the SecurityModeCommand, before the Complete: the DL-DCCH PDU that
+    /// follows the command (here the DL NAS of the same Initial Context Setup) is
+    /// protected at DL COUNT 1, which is where the UE, having verified the command,
+    /// expects it. A SecurityModeFailure turns it back off.
+    #[test]
+    fn downlink_protection_starts_with_the_security_mode_command() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            phys_cell_id_from_nci, SIMULATED_C_RNTI,
+        };
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(as_security_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 7).await;
+            task.handle_as_security_for_reestablishment(
+                7,
+                ReestablishmentSecurity {
+                    k_rrc_int: AS_K_INT,
+                    k_rrc_enc: AS_K_ENC,
+                    integrity_alg_id: 2,
+                    ciphering_alg_id: 2,
+                    c_rnti: SIMULATED_C_RNTI,
+                    phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
+                    next_hop_chaining_count: 0,
+                    kgnb: [0x11; 32],
+                },
+            );
+            let ctx = task.ue_manager.try_find_ue_mut(7).unwrap();
+            ctx.smc_awaiting_answer = true;
+            ctx.dl_protection_active = true; // as the SMC arm sets it once sent
+            let plain = vec![0x28u8, 0x11, 0x22];
+            let sent = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            assert_eq!(
+                ue_side_security().unprotect(1, 0, 1, sent.data()).unwrap(),
+                plain,
+                "protected at DL COUNT 1 before the SecurityModeComplete"
+            );
+            task.handle_security_mode_failure(7, 0);
+            let after = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            assert_eq!(
+                after.data(),
+                &plain[..],
+                "back in the clear after a failure"
+            );
+        });
+    }
+
+    /// #285: a re-establishment restarts both SRB1 COUNTs at 0, and the
+    /// RRCReestablishment goes out integrity protected but NOT ciphered
+    /// (TS 38.331 §5.3.7.4, §5.3.7.5).
+    #[test]
+    fn a_reestablishment_restarts_srb1_and_sends_an_integrity_only_reestablishment() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(as_security_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            activate_as_security(&mut task, 7).await;
+            let ctx = task.ue_manager.try_find_ue_mut(7).unwrap();
+            ctx.reestablish_srb1_pdcp();
+            ctx.dl_next_integrity_only = true;
+            let plain = vec![0x55u8, 0x66, 0x77];
+            let sent = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            let (body, mac) = sent.data().split_at(sent.len() - SRB_MAC_I_LEN);
+            assert_eq!(body, &plain[..], "not ciphered");
+            assert_eq!(
+                mac,
+                &ue_side_security().compute_mac_i(0, 0, 1, &plain)[..],
+                "MAC-I at DL COUNT 0"
+            );
+            // The next one is ciphered again, at DL COUNT 1.
+            let next = task
+                .protect_dl_dcch(7, RrcChannel::DlDcch, OctetString::from_slice(&plain))
+                .expect("sent");
+            assert_eq!(
+                ue_side_security().unprotect(1, 0, 1, next.data()).unwrap(),
+                plain
+            );
+            // And the uplink restarted at COUNT 0 too.
+            let ul = ue_side_security().protect(0, 0, 0, &plain);
+            assert!(task
+                .unprotect_ul_dcch(7, &OctetString::from_slice(&ul))
+                .is_some());
+            while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
         });
     }
 
@@ -4614,7 +4949,7 @@ mod tests {
                 dedicated_nas_message: Some(vec![0x7E, 0x00, 0x41]),
             })
             .expect("encode ULInformationTransfer");
-            let protected = ue_side_security().protect(0, 0, 0, &nas);
+            let protected = ue_side_security().protect(1, 0, 0, &nas);
             task.handle_ul_dcch_message(7, &OctetString::from_slice(&protected))
                 .await;
         });

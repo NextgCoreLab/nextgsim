@@ -27,7 +27,7 @@ fn only_s1(acts: &[Action]) -> (u16, S1AP_PDU) {
         .iter()
         .filter_map(|a| match a {
             Action::S1 { stream, pdu } => Some((*stream, decode_s1ap_pdu(pdu).unwrap())),
-            Action::Rrc { .. } | Action::UserPlane { .. } => None,
+            Action::Rrc { .. } | Action::UserPlane { .. } | Action::Broadcast { .. } => None,
         })
         .collect();
     assert_eq!(s1.len(), 1, "{acts:?}");
@@ -465,4 +465,277 @@ fn reconfiguration_adds_srb2_and_nas_moves_onto_it() {
             nas: vec![0x07, 0x61]
         }
     );
+}
+
+fn rrc_with_inactivity(secs: u64) -> EnbRrc {
+    let mut c = cfg();
+    c.inactivity_timer_secs = Some(secs);
+    EnbRrc::new(&c, 2)
+}
+
+fn release_request_cause(acts: &[Action]) -> u8 {
+    let (_, pdu) = only_s1(acts);
+    let S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        value: InitiatingMessageValue::Id_UEContextReleaseRequest(r),
+        ..
+    }) = pdu
+    else {
+        panic!("not UE CONTEXT RELEASE REQUEST: {pdu:?}");
+    };
+    r.protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            UEContextReleaseRequestProtocolIEs_EntryValue::Id_Cause(Cause::RadioNetwork(
+                CauseRadioNetwork(c),
+            )) => Some(*c),
+            _ => None,
+        })
+        .expect("a Radio Network cause")
+}
+
+/// #350, TS 36.413 §8.3.2: a UE with an S1 connection that stays silent for the
+/// configured time gets one UE CONTEXT RELEASE REQUEST with cause
+/// user-inactivity. Not before the time, and not twice while the command is
+/// awaited; the command then releases RRC as for any other release.
+#[test]
+fn an_inactive_ue_is_released_with_cause_user_inactivity() {
+    let mut e = rrc_with_inactivity(10);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    let start = Instant::now();
+
+    assert!(e
+        .check_inactivity(start + Duration::from_secs(9))
+        .is_empty());
+    let acts = e.check_inactivity(start + Duration::from_secs(11));
+    assert_eq!(
+        release_request_cause(&acts),
+        CauseRadioNetwork::USER_INACTIVITY
+    );
+    assert!(
+        e.check_inactivity(start + Duration::from_secs(20))
+            .is_empty(),
+        "one request while the command is awaited"
+    );
+    assert_eq!(e.ue_count(), 1, "the context stays until the command");
+
+    let acts = e.on_s1(&release_command(9, enb));
+    assert!(acts.iter().any(|a| matches!(
+        a,
+        Action::Rrc {
+            channel: RrcChannel::DlDcch,
+            ..
+        }
+    )));
+    assert_eq!(e.ue_count(), 0);
+}
+
+/// #353 review: a request whose command never comes (lost, or the MME kept the
+/// UE) is re-armed. With no command one inactivity period after the request, it
+/// is sent again. Activity after the request means the UE stays connected, and a
+/// new period of silence asks again.
+#[test]
+fn a_lost_or_declined_inactivity_release_is_asked_again() {
+    let mut e = rrc_with_inactivity(10);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    let start = Instant::now();
+    assert!(!e
+        .check_inactivity(start + Duration::from_secs(11))
+        .is_empty());
+    // Lost: no command within another 10 s.
+    assert_eq!(
+        release_request_cause(&e.check_inactivity(start + Duration::from_secs(22))),
+        CauseRadioNetwork::USER_INACTIVITY,
+        "asked again when the command did not come"
+    );
+    // Declined: data flows after the request, then 10 s of silence.
+    e.on_user_plane_activity(5, start + Duration::from_secs(23));
+    assert!(e
+        .check_inactivity(start + Duration::from_secs(30))
+        .is_empty());
+    assert_eq!(
+        release_request_cause(&e.check_inactivity(start + Duration::from_secs(34))),
+        CauseRadioNetwork::USER_INACTIVITY,
+        "a new silence asks again"
+    );
+}
+
+/// #350: user data restarts the timer.
+#[test]
+fn user_plane_activity_restarts_the_inactivity_timer() {
+    let mut e = rrc_with_inactivity(10);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    let start = Instant::now();
+    e.on_user_plane_activity(5, start + Duration::from_secs(8));
+    assert!(e
+        .check_inactivity(start + Duration::from_secs(15))
+        .is_empty());
+    assert!(!e
+        .check_inactivity(start + Duration::from_secs(19))
+        .is_empty());
+}
+
+/// #350: off by default, and a UE with no S1 connection yet is not asked about.
+#[test]
+fn the_inactivity_release_is_off_by_default_and_needs_an_s1_connection() {
+    let mut e = rrc();
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    e.on_s1(&downlink_nas(9, enb, &[0x07, 0x52]));
+    assert!(e
+        .check_inactivity(Instant::now() + Duration::from_secs(86_400))
+        .is_empty());
+
+    let mut e = rrc_with_inactivity(1);
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(&mut e, 6, &mut ue_pdcp, &[0x07, 0x41]);
+    assert!(
+        e.check_inactivity(Instant::now() + Duration::from_secs(60))
+            .is_empty(),
+        "no MME UE S1AP ID yet"
+    );
+}
+
+/// An S1AP PAGING (TS 36.413 §9.1.6) for S-TMSI `(mmec, m_tmsi)` in TAC `tac`
+/// of PLMN 999/70.
+fn paging(mmec: u8, m_tmsi: u32, tac: u16, cs: bool) -> Vec<u8> {
+    paging_for(
+        UEPagingID::S_TMSI(S_TMSI {
+            mmec: MME_Code(vec![mmec]),
+            m_tmsi: M_TMSI(m_tmsi.to_be_bytes().to_vec()),
+            ie_extensions: None,
+        }),
+        tac,
+        cs,
+    )
+}
+
+/// An S1AP PAGING for UE Paging ID `id` in TAC `tac` of PLMN 999/70.
+fn paging_for(id: UEPagingID, tac: u16, cs: bool) -> Vec<u8> {
+    let ies = vec![
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_IDENTITY_INDEX_VALUE),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_UEIdentityIndexValue(UEIdentityIndexValue(
+                (0..10).rev().map(|i| (1u16 >> i) & 1 == 1).collect(),
+            )),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_PAGING_ID),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_UEPagingID(id),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_CN_DOMAIN),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_CNDomain(CNDomain(if cs {
+                CNDomain::CS
+            } else {
+                CNDomain::PS
+            })),
+        },
+        PagingProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_TAI_LIST),
+            criticality: Criticality(Criticality::IGNORE),
+            value: PagingProtocolIEs_EntryValue::Id_TAIList(TAIList(vec![TAIList_Entry {
+                id: ProtocolIE_ID(ID_TAI_ITEM),
+                criticality: Criticality(Criticality::IGNORE),
+                value: TAIList_EntryValue::Id_TAIItem(TAIItem {
+                    tai: TAI {
+                        plm_nidentity: TBCD_STRING(Plmn::new(999, 70, false).encode().to_vec()),
+                        tac: TAC(tac.to_be_bytes().to_vec()),
+                        ie_extensions: None,
+                    },
+                    ie_extensions: None,
+                }),
+            }])),
+        },
+    ];
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_PAGING),
+        criticality: Criticality(Criticality::IGNORE),
+        value: InitiatingMessageValue::Id_Paging(Paging {
+            protocol_i_es: PagingProtocolIEs(ies),
+        }),
+    }))
+    .unwrap()
+}
+
+/// #351, TS 36.413 §8.5.2 / TS 36.331 §5.3.2.2: an S1AP PAGING listing this
+/// cell's TAI is broadcast as an RRC Paging on PCCH carrying the S-TMSI and the
+/// CN domain; one for another TA is not this cell's to send.
+#[test]
+fn an_s1_paging_for_this_tai_is_broadcast_on_pcch() {
+    let mut e = rrc();
+    let acts = e.on_s1(&paging(1, 0x1234_5678, 1, false));
+    let [Action::Broadcast {
+        channel: RrcChannel::Pcch,
+        pdu,
+    }] = acts.as_slice()
+    else {
+        panic!("expected one PCCH broadcast: {acts:?}");
+    };
+    assert_eq!(
+        msg::decode_pcch(pdu).unwrap(),
+        vec![msg::PagingRecordInfo {
+            identity: msg::PagedUeIdentity::STmsi {
+                mmec: 1,
+                m_tmsi: 0x1234_5678
+            },
+            cn_domain: msg::PagingCnDomain::Ps,
+        }]
+    );
+    let acts = e.on_s1(&paging(1, 0x1234_5678, 1, true));
+    let [Action::Broadcast { pdu, .. }] = acts.as_slice() else {
+        panic!("{acts:?}");
+    };
+    assert_eq!(
+        msg::decode_pcch(pdu).unwrap()[0].cn_domain,
+        msg::PagingCnDomain::Cs
+    );
+    assert!(
+        e.on_s1(&paging(1, 0x1234_5678, 7, false)).is_empty(),
+        "TAC 7 is not this cell"
+    );
+}
+
+/// #351 review, TS 36.413 §9.2.3.11: the IMSI is TBCD, "bit 4 to 1 of octet n
+/// encoding digit 2n-1" and "bit 8 to 5 of octet n encoding digit 2n", with the
+/// 1111 filler "encoded as bit 8 to 5 of octet N" for an odd number of digits.
+/// Hand-encoded: IMSI 999700000000001 (15 digits) is 99 79 00 00 00 00 00 F1,
+/// and 99970000000012 (14 digits) is 99 79 00 00 00 00 21. A nibble swap would
+/// read the first as 9 9 7 9 ... and is caught.
+#[test]
+fn an_s1_imsi_paging_decodes_the_tbcd_digits_low_nibble_first() {
+    for (tbcd, digits) in [
+        (
+            vec![0x99, 0x79, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF1],
+            vec![9, 9, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ),
+        (
+            vec![0x99, 0x79, 0x00, 0x00, 0x00, 0x00, 0x21],
+            vec![9, 9, 9, 7, 0, 0, 0, 0, 0, 0, 0, 0, 1, 2],
+        ),
+    ] {
+        let mut e = rrc();
+        let acts = e.on_s1(&paging_for(UEPagingID::IMSI(IMSI(tbcd.clone())), 1, false));
+        let [Action::Broadcast { pdu, .. }] = acts.as_slice() else {
+            panic!("expected one PCCH broadcast for {tbcd:02X?}: {acts:?}");
+        };
+        assert_eq!(
+            msg::decode_pcch(pdu).unwrap()[0].identity,
+            msg::PagedUeIdentity::Imsi(digits),
+            "{tbcd:02X?}"
+        );
+    }
 }

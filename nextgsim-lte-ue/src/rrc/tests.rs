@@ -10,6 +10,8 @@ struct Seen {
     indications: Vec<RrcIndication>,
     downlink: Vec<Vec<u8>>,
     uplink_pending: usize,
+    /// Paging records RRC handed to NAS (#351 review).
+    paged: usize,
 }
 
 /// A NAS that requests a connection with a fixed message, echoes a fixed
@@ -21,7 +23,13 @@ struct Scripted {
     k_enb: Option<[u8; 32]>,
     /// The initial message NAS asks for once told uplink data is pending.
     on_pending: Option<Vec<u8>>,
+    /// The identity this NAS answers a paging for (#351), and the initial
+    /// message it then asks for.
+    paged: Option<(msg::PagedUeIdentity, Vec<u8>)>,
 }
+
+/// The DETACH REQUEST the scripted NAS produces (#365).
+const DETACH_REQUEST: [u8; 3] = [0x27, 0x45, 0x01];
 
 impl NasLayer for Scripted {
     fn initial_nas(&mut self) -> Option<InitialNas> {
@@ -48,6 +56,27 @@ impl NasLayer for Scripted {
             self.initial = Some(m);
         }
     }
+    fn detach(&mut self, _switch_off: bool, connected: bool) -> crate::nas::NasTimerOutcome {
+        if connected {
+            crate::nas::NasTimerOutcome {
+                uplink: vec![DETACH_REQUEST.to_vec()],
+                release: false,
+            }
+        } else {
+            self.initial = Some(DETACH_REQUEST.to_vec());
+            crate::nas::NasTimerOutcome::default()
+        }
+    }
+    fn on_paging(&mut self, identity: &msg::PagedUeIdentity) -> bool {
+        self.seen.lock().unwrap().paged += 1;
+        match &self.paged {
+            Some((ours, sr)) if ours == identity => {
+                self.initial = Some(sr.clone());
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn plmn() -> Plmn {
@@ -62,6 +91,7 @@ fn ue(initial: Option<&[u8]>) -> (UeRrc, Arc<Mutex<Seen>>) {
         reply: Some(vec![0x07, 0x53]),
         k_enb: Some(K_ENB),
         on_pending: None,
+        paged: None,
     };
     (
         UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A)),
@@ -500,6 +530,7 @@ fn an_idle_uplink_packet_makes_nas_request_a_connection() {
         reply: None,
         k_enb: Some(K_ENB),
         on_pending: Some(vec![0xC7, 0x02, 0xAB, 0xCD]),
+        paged: None,
     };
     let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
     assert!(acquire(&mut u, cell_info(), true, now).is_empty());
@@ -515,6 +546,146 @@ fn an_idle_uplink_packet_makes_nas_request_a_connection() {
             }]
         ),
         "RRCConnectionRequest for the pending data: {acts:?}"
+    );
+    assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
+}
+
+fn paging_pdu(mmec: u8, m_tmsi: u32, cs: bool) -> Vec<u8> {
+    msg::encode_paging(&[msg::PagingRecordInfo {
+        identity: msg::PagedUeIdentity::STmsi { mmec, m_tmsi },
+        cn_domain: if cs {
+            msg::PagingCnDomain::Cs
+        } else {
+            msg::PagingCnDomain::Ps
+        },
+    }])
+    .unwrap()
+}
+
+fn paged_ue(seen: &Arc<Mutex<Seen>>) -> UeRrc {
+    let nas = Scripted {
+        seen: Arc::clone(seen),
+        initial: None,
+        reply: None,
+        k_enb: Some(K_ENB),
+        on_pending: None,
+        paged: Some((
+            msg::PagedUeIdentity::STmsi {
+                mmec: 1,
+                m_tmsi: 0x1234_5678,
+            },
+            vec![0xC7, 0x02, 0xAB, 0xCD],
+        )),
+    };
+    UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A))
+}
+
+/// #351, TS 36.331 §5.3.2.3: in RRC_IDLE, a PS paging record with the UE's
+/// S-TMSI goes to NAS, and the connection NAS then wants is requested. A record
+/// for another S-TMSI, or for the CS domain, starts nothing.
+#[test]
+fn a_paging_for_the_ue_starts_a_connection_and_others_do_not() {
+    let now = Instant::now();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let mut u = paged_ue(&seen);
+    assert!(acquire(&mut u, cell_info(), true, now).is_empty());
+    assert!(u
+        .on_downlink(
+            CELL,
+            RrcChannel::Pcch,
+            0,
+            &paging_pdu(1, 0x9999_9999, false),
+            now
+        )
+        .is_empty());
+    assert!(u
+        .on_downlink(
+            CELL,
+            RrcChannel::Pcch,
+            0,
+            &paging_pdu(1, 0x1234_5678, true),
+            now
+        )
+        .is_empty());
+    assert_eq!(u.state(), UeRrcState::Camped { cell: CELL });
+
+    let acts = u.on_downlink(
+        CELL,
+        RrcChannel::Pcch,
+        0,
+        &paging_pdu(1, 0x1234_5678, false),
+        now,
+    );
+    assert!(
+        matches!(
+            acts.as_slice(),
+            [UeAction::Rrc {
+                channel: RrcChannel::UlCcch,
+                ..
+            }]
+        ),
+        "RRCConnectionRequest for the paging: {acts:?}"
+    );
+    assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
+    // Not in RRC_IDLE any more: a repeated paging is not acted on, and NAS is
+    // not told of it (TS 36.331 §5.3.2.3 is an RRC_IDLE procedure; #351 review).
+    let told = seen.lock().unwrap().paged;
+    assert!(u
+        .on_downlink(
+            CELL,
+            RrcChannel::Pcch,
+            0,
+            &paging_pdu(1, 0x1234_5678, false),
+            now
+        )
+        .is_empty());
+    assert_eq!(
+        seen.lock().unwrap().paged,
+        told,
+        "a paging outside RRC_IDLE must not reach NAS"
+    );
+}
+
+/// #365: connected, a detach goes out at once as a ULInformationTransfer.
+#[test]
+fn a_connected_detach_goes_out_as_ul_information_transfer() {
+    let now = Instant::now();
+    let (mut u, _seen) = ue(Some(&[0x07, 0x41]));
+    acquire(&mut u, cell_info(), true, now);
+    u.on_downlink(CELL, RrcChannel::DlCcch, 0, &setup(0), now);
+    assert!(matches!(u.state(), UeRrcState::Connected { .. }));
+    let acts = u.detach(false, now);
+    let [UeAction::Rrc { pdu, .. }] = acts.as_slice() else {
+        panic!("{acts:?}");
+    };
+    let mut enb_rx = LteSrbPdcp::new();
+    enb_rx.receive(&[0, 0, 0, 0, 0]).unwrap(); // the SetupComplete before it
+    let sdu = enb_rx.receive(pdu).unwrap().sdu;
+    assert_eq!(
+        msg::decode_ul_dcch(&sdu).unwrap(),
+        msg::UlDcch::InformationTransfer {
+            nas: DETACH_REQUEST.to_vec()
+        }
+    );
+}
+
+/// #365: in RRC_IDLE the UE establishes a connection whose initial NAS message
+/// is the DETACH REQUEST.
+#[test]
+fn an_idle_detach_requests_a_connection() {
+    let now = Instant::now();
+    let (mut u, _seen) = ue(None);
+    assert!(acquire(&mut u, cell_info(), true, now).is_empty());
+    let acts = u.detach(false, now);
+    assert!(
+        matches!(
+            acts.as_slice(),
+            [UeAction::Rrc {
+                channel: RrcChannel::UlCcch,
+                ..
+            }]
+        ),
+        "RRCConnectionRequest for the detach: {acts:?}"
     );
     assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
 }

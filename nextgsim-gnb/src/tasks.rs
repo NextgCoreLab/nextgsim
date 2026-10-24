@@ -340,6 +340,15 @@ pub struct HandoverInitiation {
 /// Messages for the NGAP task.
 #[derive(Debug)]
 pub enum NgapMessage {
+    /// The RRC plane re-keyed a UE at RRC re-establishment (TS 38.331 §5.3.7.5,
+    /// TS 33.501 §6.11, #285 review): the NGAP task's AS context now chains
+    /// from this `KgNB*`, so a later handover derives from the key the UE holds.
+    AsKeyRefreshed {
+        /// UE ID
+        ue_id: i32,
+        /// The new `KgNB`.
+        kgnb: [u8; 32],
+    },
     /// The UE answered a UE capability enquiry (from RRC). NGAP stores the
     /// capability and reports it to the AMF in a UE RADIO CAPABILITY INFO INDICATION
     /// (TS 38.413 §8.14.1).
@@ -592,6 +601,9 @@ pub enum RrcMessage {
         phys_cell_id: u16,
         /// `nextHopChainingCount` of the AS security context (0-7)
         next_hop_chaining_count: u8,
+        /// `KgNB` the keys above derive from: a re-establishment re-keys from it
+        /// (TS 38.331 §5.3.7.5, TS 33.501 §6.11, #285 review).
+        kgnb: [u8; 32],
     },
     /// RRC Reconfiguration delivery on DL-DCCH (from NGAP, on PDU Session
     /// Resource Setup — TS 38.331 §5.3.5.6) establishing a PDU session's DRB.

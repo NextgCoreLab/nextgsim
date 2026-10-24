@@ -286,15 +286,13 @@ pub struct GnbConfig {
     /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
     /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
     ///
-    /// **`false` by default**, which is a deliberate deviation from #31's own
-    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
-    /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
-    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
-    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
-    /// discards every uplink PDU that fails its integrity check. (The earlier
-    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
-    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
+    /// **`false` by default**, a deliberate deviation from #31's criterion 1
+    /// ("defaults to on") under the runtime-switch rule's carve-out: default-ON
+    /// *except where the behaviour drops traffic*. Since #285 both ends protect
+    /// SRB1 through registration, PDU session setup, RRC re-establishment and
+    /// resume; what still drops traffic is a HANDOVER with it on: the target gNB
+    /// does not activate SRB1 protection with the re-derived keys, so the UE (which
+    /// does) and the target disagree (#325).
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
@@ -2077,6 +2075,12 @@ pub struct UeConfig {
     /// without ever being compiled by the gate meant to cover it.
     #[serde(default)]
     pub conditional_handover: bool,
+    /// The UE is configured for high priority access in the selected PLMN
+    /// (access identity 1, 2 or 11..15 in a real USIM, TS 24.501 §4.5.2). Such a
+    /// UE is exempt from T3346 (§5.6.1.7 c) 4)) and from the non-allowed-area
+    /// bar (§5.3.5). Default `false`.
+    #[serde(default)]
+    pub high_priority_access: bool,
     /// Require a decoded broadcast SIB1 before a cell is selectable.
     ///
     /// `false` (the default) keeps the pre-#21 behaviour: on detecting a cell the
@@ -2148,15 +2152,13 @@ pub struct UeConfig {
     /// Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
     /// protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4, issue #31).
     ///
-    /// **`false` by default**, which is a deliberate deviation from #31's own
-    /// criterion 1 ("defaults to on"), for the reason the recorded runtime-switch
-    /// rule already carves out: default-ON *except where the behaviour drops
-    /// traffic*. Turning this on drops **all** UL-DCCH traffic after the
-    /// SecurityModeComplete today, because the UE has no SRB1 PDCP protection site
-    /// yet (nextgsim#285): it keeps sending plaintext, and the gNB, now active,
-    /// discards every uplink PDU that fails its integrity check. (The earlier
-    /// reason, `C5_TYPED_DCCH_DISPATCH` being `false`, no longer holds: it is
-    /// `true`, and the gNB unprotects UL-DCCH before dispatch.)
+    /// **`false` by default**, a deliberate deviation from #31's criterion 1
+    /// ("defaults to on") under the runtime-switch rule's carve-out: default-ON
+    /// *except where the behaviour drops traffic*. Since #285 both ends protect
+    /// SRB1 through registration, PDU session setup, RRC re-establishment and
+    /// resume; what still drops traffic is a HANDOVER with it on: the target gNB
+    /// does not activate SRB1 protection with the re-derived keys, so the UE (which
+    /// does) and the target disagree (#325).
     ///
     /// With it on, both ends protect and verify SRB1: the gNB integrity-protects
     /// the SecurityModeCommand (integrity only, not ciphered — TS 38.331
@@ -2345,6 +2347,7 @@ impl Default for UeConfig {
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             paging_default_cycle_frames: default_paging_cycle_frames(),
             lpp_arfcn_eutra: 0,
             rlc_am_psis: Vec::new(),
@@ -2898,6 +2901,7 @@ configured_nssai:
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::default(),
@@ -3191,6 +3195,7 @@ configured_nssai:
             eutra_neighbours: Vec::new(),
             eutra_b1_threshold_dbm: default_eutra_b1_threshold_dbm(),
             conditional_handover: false,
+            high_priority_access: false,
             rlc_am_psis: Vec::new(),
             state_file: None,
             pqc_config: PqcConfig::new(

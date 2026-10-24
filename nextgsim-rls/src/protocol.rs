@@ -187,17 +187,37 @@ pub struct RlsHeartbeatAck {
     pub sti: u64,
     /// Signal strength in dBm
     pub dbm: i32,
+    /// The answering gNB process's incarnation (#337): drawn once when the gNB
+    /// starts. A gNB that restarts at the same address keeps its STI (its NCI),
+    /// so this is what tells the UE the cell it hears is no longer the one it
+    /// had a connection with. Trailing and optional on the wire: an ack without
+    /// it decodes as before.
+    pub incarnation: Option<u64>,
 }
 
 impl RlsHeartbeatAck {
     /// Creates a new heartbeat acknowledgment
     pub fn new(sti: u64) -> Self {
-        Self { sti, dbm: 0 }
+        Self {
+            sti,
+            dbm: 0,
+            incarnation: None,
+        }
     }
 
     /// Creates a new heartbeat acknowledgment with signal strength
     pub fn with_dbm(sti: u64, dbm: i32) -> Self {
-        Self { sti, dbm }
+        Self {
+            sti,
+            dbm,
+            incarnation: None,
+        }
+    }
+
+    /// The same acknowledgment, carrying the gNB's incarnation (#337).
+    pub fn with_incarnation(mut self, incarnation: u64) -> Self {
+        self.incarnation = Some(incarnation);
+        self
     }
 }
 

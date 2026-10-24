@@ -434,10 +434,44 @@ impl UeRrc {
             }
             RrcChannel::DlCcch => self.on_dl_ccch(cell, pdu, now),
             RrcChannel::DlDcch => self.on_dl_dcch(cell, lcid, pdu, now),
+            RrcChannel::Pcch => self.on_paging(cell, pdu, now),
             other => {
                 log::debug!("cell {cell:#x}: RRC PDU on {other:?} ignored");
                 vec![]
             }
+        }
+    }
+
+    /// A Paging message on PCCH (TS 36.331 §5.3.2.3, #351): in RRC_IDLE on the
+    /// camped cell, each PS record is forwarded to NAS, which says whether the
+    /// identity is the UE's and it wants a connection; the establishment then
+    /// follows with NAS's initial message (a SERVICE REQUEST, cause mt-Access).
+    fn on_paging(&mut self, cell: u64, pdu: &[u8], now: Instant) -> Vec<UeAction> {
+        if !matches!(self.state, State::Idle) || self.camped != Some(cell) {
+            return vec![];
+        }
+        let records = match msg::decode_pcch(pdu) {
+            Ok(r) => r,
+            Err(e) => {
+                log::debug!("cell {cell:#x}: undecodable PCCH message: {e}");
+                return vec![];
+            }
+        };
+        let mut wanted = false;
+        for r in records {
+            if r.cn_domain == msg::PagingCnDomain::Cs {
+                log::debug!("CS-domain paging record ignored: this UE has no CS fallback");
+                continue;
+            }
+            if self.nas.on_paging(&r.identity) {
+                log::info!("paged ({:?}) on cell {cell:#x}", r.identity);
+                wanted = true;
+            }
+        }
+        if wanted {
+            self.try_establish(now)
+        } else {
+            vec![]
         }
     }
 
@@ -821,6 +855,40 @@ impl UeRrc {
                 }
             })
             .collect()
+    }
+
+    /// A UE-initiated detach (TS 24.301 §5.5.2.2, #365).
+    ///
+    /// Connected, the DETACH REQUEST goes out now in a ULInformationTransfer.
+    /// In RRC_IDLE, NAS holds it as its initial NAS message and the UE
+    /// establishes a connection for it, as it does for pending uplink data.
+    /// While a connection is being established nothing is sent: NAS already
+    /// handed RRC its initial message, and the detach is asked for again once
+    /// connected (the caller retries).
+    pub fn detach(&mut self, switch_off: bool, now: Instant) -> Vec<UeAction> {
+        match &self.state {
+            State::Connected { cell, .. } => {
+                let cell = *cell;
+                let out = self.nas.detach(switch_off, true);
+                let mut acts = self.send_ul_nas(cell, out.uplink);
+                if out.release {
+                    acts.extend(self.leave_connected("NAS requested a local release", now));
+                }
+                acts
+            }
+            State::Idle => {
+                let out = self.nas.detach(switch_off, false);
+                if out.uplink.is_empty() {
+                    self.try_establish(now)
+                } else {
+                    Vec::new()
+                }
+            }
+            State::Connecting { .. } => {
+                log::info!("detach asked for while an RRC connection is being set up; not now");
+                Vec::new()
+            }
+        }
     }
 
     /// An IP packet from the IP stack, for the default bearer's DRB (the

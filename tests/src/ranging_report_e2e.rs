@@ -81,6 +81,7 @@ fn serving_cell() -> ServingCellMeasurements {
         system_frame_number: None,
         rsrp_result: Some(60),
         rsrq_result: None,
+        ..Default::default()
     }
 }
 
