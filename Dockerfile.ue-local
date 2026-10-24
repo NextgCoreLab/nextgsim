@@ -7,7 +7,10 @@ RUN apt-get update && apt-get install -y \
     iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY binaries/nr-ue /usr/local/bin/
+# nr-cli too when the build provides it (the [i] glob matches nothing, rather
+# than failing, when binaries/nr-cli is absent); nr-ue-deregister needs it (#365).
+COPY binaries/nr-ue binaries/nr-cl[i] /usr/local/bin/
+COPY scripts/nr-ue-deregister.sh /usr/local/bin/nr-ue-deregister
 
 RUN mkdir -p /etc/nextgsim
 WORKDIR /etc/nextgsim

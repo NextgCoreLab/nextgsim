@@ -95,8 +95,7 @@ pub use energy_saving::{
 };
 pub use handover::{
     parse_measurement_report, GnbHandoverManager, HandoverCommand, HandoverConfig,
-    HandoverDecision, MeasurementReport, NeighborMeasurement, PathSwitchRequest, UeHandoverState,
-    XnHandoverAcknowledge, XnHandoverCause, XnHandoverRequest, XnPduSessionContext, XnUeContext,
+    HandoverDecision, MeasurementReport, NeighborMeasurement, UeHandoverState,
 };
 pub use meas::{a3_meas_config_params, A3_MEAS_ID};
 pub use ntn_gnb::{

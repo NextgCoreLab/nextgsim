@@ -271,13 +271,12 @@ semantic_comm_enabled: false    # Semantic Codec - semantic communication (Rel-2
 # Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
 # protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4).
 #
-# false by default, and that is deliberate rather than caution. Turning it on
-# drops ALL UL-DCCH traffic after the SecurityModeComplete today, because the UE
-# has no SRB1 PDCP protection site yet (nextgsim#285): it keeps sending plaintext,
-# and the gNB, now active, discards every PDU that fails its integrity check --
-# Registration Complete and the PDU Session Establishment Request included.
-# Leave it false on both ends until #285 lands; with it off the UE answers the
-# unprotected AS SecurityModeCommand with SecurityModeFailure, which is expected.
+# false by default. Since nextgsim#285 both ends protect SRB1 end to end
+# (registration, PDU sessions, RRC re-establishment, resume) when it is on. Kept
+# off because a HANDOVER with it on still loses SRB1: the target gNB does not yet
+# activate protection with the re-derived keys while the UE does (#325,
+# nextgsim). With it off the UE answers the unprotected AS SecurityModeCommand
+# with SecurityModeFailure, which is expected.
 #
 # THE gNB AND THE UE MUST BE SET THE SAME WAY. A gNB with it on and a UE with it
 # off would have the UE read a MAC-I as message content.

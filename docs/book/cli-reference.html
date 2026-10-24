@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
+            window.path_to_searchindex_js = "searchindex-bbb7f802.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -256,13 +256,21 @@ RUST_LOG=nextgsim_nas=trace nr-ue -c config/ue.yaml
 <pre><code class="language-bash">lte-enb --config &lt;FILE&gt;
 lte-ue  --config &lt;FILE&gt;
 </code></pre>
-<p>Each takes only <code>-c, --config &lt;FILE&gt;</code> (plus <code>-h</code> and <code>-V</code>). Their configuration,
+<p>Each takes <code>-c, --config &lt;FILE&gt;</code> (plus <code>-h</code> and <code>-V</code>); <code>lte-ue</code> also has the
+<code>detach</code> subcommand below. Their configuration,
 and the <code>NEXTGSIM_*</code> environment overrides they read, are in
 <a href="configuration.html#lte-enb-configuration-lte-enb">configuration.md</a>. Neither
 registers with <code>nr-cli</code>.</p>
 <p>The <code>lte-ue</code> container image also ships <code>lte-ue-ping-check &lt;target&gt; [count]</code>,
 which waits for the default bearer’s PDN address and asserts a 0%-loss ping
 (exit 0 pass, 1 no bearer, 2 loss).</p>
+<p><code>lte-ue detach [--switch-off] [--timeout SECS]</code> (in the image also as
+<code>lte-ue-detach</code>) asks the running UE to detach (TS 24.301 §5.5.2.2) through its
+control socket (<code>LTE_UE_CONTROL_SOCKET</code>, default <code>/run/nextgsim/lte-ue.sock</code>):
+an integrity-protected DETACH REQUEST, “EPS detach”, with the switch-off bit as
+asked. It exits 0 once the UE is EMM-DEREGISTERED (after DETACH ACCEPT, or at
+once for switch-off), 1 otherwise. The detached UE does not attach again, and
+its TUN interface goes down.</p>
 <hr>
 <h2 id="nr-cli"><a class="header" href="#nr-cli">nr-cli</a></h2>
 <p><code>nr-cli</code> connects to running <code>nr-gnb</code> / <code>nr-ue</code> instances on the same host.
@@ -293,9 +301,11 @@ they return <code>Unknown command</code>.</p>
 nr-cli ue0 -e status
 nr-cli gnb                # interactive
 </code></pre>
-<p>In the Docker images <code>nr-cli</code> is not installed; copy <code>binaries/nr-cli</code> into the
-container and run it there (nextgcore’s <code>docker/rust/ue-flow-check.sh</code> does
-exactly this).</p>
+<p>The <code>nr-ue</code> image includes <code>nr-cli</code> when <code>binaries/nr-cli</code> is present at build
+time; otherwise copy it into the container and run it there (nextgcore’s
+<code>docker/rust/ue-flow-check.sh</code> does exactly this). The image also ships
+<code>nr-ue-deregister [NODE] [normal|switch-off]</code>, which runs <code>deregister</code> and waits
+until the UE is RM-DEREGISTERED (exit 0), the 5G counterpart of <code>lte-ue-detach</code>.</p>
 <h3 id="ue-commands"><a class="header" href="#ue-commands">UE commands</a></h3>
 <div class="table-wrapper">
 <table>

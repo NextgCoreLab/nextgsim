@@ -215,9 +215,10 @@ impl UperWriter {
     /// and the additions after them.
     ///
     /// # Errors
-    /// [`UperError::Unsupported`] for more than 64 additions or an addition of 128
-    /// octets or more, neither of which the matching reader can handle -- refused
-    /// rather than encoded into bytes that would not decode.
+    /// [`UperError::Unsupported`] for more than 64 additions or an addition of 16K
+    /// octets or more (it would need fragmentation), neither of which the matching
+    /// reader can handle -- refused rather than encoded into bytes that would not
+    /// decode.
     pub fn write_extension_additions(&mut self, additions: &[Option<Vec<u8>>]) -> UperResult<()> {
         if additions.is_empty() || additions.len() > 64 {
             return Err(UperError::Unsupported(
@@ -232,12 +233,15 @@ impl UperWriter {
             self.write_bit(addition.is_some());
         }
         for addition in additions.iter().flatten() {
-            if addition.len() >= 0x80 {
-                return Err(UperError::Unsupported(
-                    "long-form or fragmented open-type length",
-                ));
+            // Open-type length determinant (X.691 11.9): one octet below 128, two
+            // (`10` then 14 bits) below 16K. Fragmentation is not produced.
+            if addition.len() < 0x80 {
+                self.write_bits(addition.len() as u64, 8);
+            } else if addition.len() < 0x4000 {
+                self.write_bits(0x8000 | addition.len() as u64, 16);
+            } else {
+                return Err(UperError::Unsupported("fragmented open-type length"));
             }
-            self.write_bits(addition.len() as u64, 8);
             for byte in addition {
                 self.write_bits(u64::from(*byte), 8);
             }
@@ -394,8 +398,8 @@ impl<'a> UperReader<'a> {
     /// newer peer's additions must not make the root fields unreadable.
     ///
     /// # Errors
-    /// [`UperError::Unsupported`] for a fragmented or long-form open type, which
-    /// this codec cannot skip correctly and must not pretend to.
+    /// [`UperError::Unsupported`] for a fragmented open type, which this codec
+    /// cannot skip correctly and must not pretend to.
     pub fn skip_extension_additions(&mut self) -> UperResult<()> {
         self.read_extension_additions().map(|_| ())
     }
@@ -408,8 +412,8 @@ impl<'a> UperReader<'a> {
     /// resumes.
     ///
     /// # Errors
-    /// [`UperError::Unsupported`] for a fragmented or long-form open type, which
-    /// this codec cannot read correctly and must not pretend to.
+    /// [`UperError::Unsupported`] for a fragmented open type, which this codec
+    /// cannot read correctly and must not pretend to.
     pub fn read_extension_additions(&mut self) -> UperResult<Vec<Option<Vec<u8>>>> {
         // Normally-small non-negative number (X.691 11.6): a leading 0 bit then 6
         // bits of (count - 1).
@@ -429,15 +433,16 @@ impl<'a> UperReader<'a> {
                 additions.push(None);
                 continue;
             }
-            // Open-type length determinant (X.691 11.9): the short form only, which
-            // covers additions below 128 octets.
-            let length = self.read_bits(8)?;
-            if length & 0x80 != 0 {
-                return Err(UperError::Unsupported(
-                    "long-form or fragmented open-type length",
-                ));
-            }
-            let octets = length as usize;
+            // Open-type length determinant (X.691 11.9): one octet below 128, two
+            // (`10` then 14 bits) below 16K. A fragmented one (`11`) is refused.
+            let first = self.read_bits(8)?;
+            let octets = if first & 0x80 == 0 {
+                first as usize
+            } else if first & 0x40 == 0 {
+                (((first & 0x3F) << 8) | self.read_bits(8)?) as usize
+            } else {
+                return Err(UperError::Unsupported("fragmented open-type length"));
+            };
             if self.remaining_bits() < octets * 8 {
                 return Err(UperError::OutOfBits {
                     needed: octets * 8,
@@ -656,21 +661,38 @@ mod tests {
     }
 
     #[test]
-    fn a_long_form_open_type_is_reported_rather_than_mis_skipped() {
+    fn a_fragmented_open_type_is_reported_rather_than_mis_skipped() {
         // Skipping the wrong number of octets would leave every later field
         // misaligned, which is worse than refusing.
         let mut w = UperWriter::new();
         w.write_bit(false);
         w.write_bits(0, 6);
         w.write_bit(true);
-        w.write_bits(0x80, 8); // long form
+        w.write_bits(0xC1, 8); // fragmented
         let bytes = w.into_bytes();
         let mut r = UperReader::new(&bytes);
         assert_eq!(
             r.skip_extension_additions(),
-            Err(UperError::Unsupported(
-                "long-form or fragmented open-type length"
-            ))
+            Err(UperError::Unsupported("fragmented open-type length"))
         );
+    }
+
+    /// #330: an addition of 128 octets or more uses the two-octet length form
+    /// (X.691 11.9), both ways.
+    #[test]
+    fn a_long_open_type_round_trips_with_a_two_octet_length() {
+        let long: Vec<u8> = (0..200u16).map(|i| i as u8).collect();
+        let mut w = UperWriter::new();
+        w.write_extension_additions(&[None, Some(long.clone())])
+            .expect("encodable");
+        w.write_bit(true);
+        let bytes = w.into_bytes();
+        // 7 bits of bit-map length, 2 presence bits, then 0x80|0x00C8.
+        let mut r = UperReader::new(&bytes);
+        assert_eq!(
+            r.read_extension_additions().expect("decodable"),
+            vec![None, Some(long)]
+        );
+        assert!(r.read_bit().expect("the marker survives"));
     }
 }

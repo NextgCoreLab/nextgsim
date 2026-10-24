@@ -35,7 +35,12 @@
 //!
 //! # What is not (and is said so where it would be reached)
 //!
-//! Tracking area update, UE-initiated detach and paging are not implemented. A network
+//! - **UE-initiated detach** (§5.5.2.2, #365): DETACH REQUEST ("EPS detach",
+//!   normal or switch off) under T3421 with four retransmissions; DETACH
+//!   ACCEPT, a lost connection or the fifth expiry leave the UE
+//!   EMM-DEREGISTERED with no further attach.
+//!
+//! Tracking area update is not implemented. A network
 //! message of a procedure this UE does not implement is answered with EMM
 //! STATUS #97 (§7.4), which is what the clause asks of a UE that does not
 //! implement a message type.
@@ -68,6 +73,15 @@ pub const T3417: Duration = Duration::from_secs(5);
 /// after a reject that ends the UE's registration (§10.2, Table 10.2.1); on
 /// expiry the UE releases it locally.
 pub const T3440: Duration = Duration::from_secs(10);
+/// T3421: UE-initiated detach supervision (§10.2, Table 10.2.1).
+pub const T3421: Duration = Duration::from_secs(15);
+/// DETACH REQUEST retransmissions on T3421 expiry: "On the first four expiries
+/// of the timer, the UE shall retransmit the DETACH REQUEST message"
+/// (§5.5.2.2.4 c).
+pub const MAX_DETACH_RETRANSMISSIONS: u8 = 4;
+/// Type of detach "IMSI detach" in the network-to-UE direction (§9.9.3.7: bits
+/// 3-1 = 011).
+const NETWORK_DETACH_TYPE_IMSI: u8 = 0b011;
 /// Attach attempt counter limit (§5.5.1.2.6: "equal to 5").
 pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 
@@ -118,6 +132,12 @@ pub enum EmmState {
     /// EMM-DEREGISTERED with no further attach: the USIM is invalid for EPS
     /// or the network refused this PLMN/TA (the EMM cause).
     NoService(u8),
+    /// EMM-DEREGISTERED-INITIATED: a UE-initiated DETACH REQUEST is sent (or
+    /// waits for a connection), T3421 running (§5.5.2.2.1, #365).
+    DeregisteredInitiated,
+    /// EMM-DEREGISTERED after a UE-initiated detach (§5.5.2.2.2): the EPS
+    /// bearer contexts are gone and no attach follows until asked for.
+    Detached,
 }
 
 /// The default EPS bearer context (§6.4.1.3).
@@ -196,6 +216,13 @@ pub struct EpsNasUe {
     /// The service request in progress answers a paging: the RRC establishment
     /// cause is mt-Access (Annex D, #351).
     service_request_for_paging: bool,
+    /// A UE-initiated detach waiting for a connection: the DETACH REQUEST is the
+    /// next [`EpsNasUe::initial_message`] (#365). Holds the switch-off bit.
+    detach_pending: Option<bool>,
+    /// The DETACH REQUEST in progress (unprotected) and how often it has been
+    /// retransmitted (§5.5.2.2.4 c), for T3421.
+    detach_request: Option<(Vec<u8>, u8)>,
+    t3421: Option<Instant>,
 }
 
 /// How the network paged the UE (TS 24.301 §5.6.2.2).
@@ -247,7 +274,123 @@ impl EpsNasUe {
             t3346: None,
             paging_response_pending: false,
             service_request_for_paging: false,
+            detach_pending: None,
+            detach_request: None,
+            t3421: None,
         }
+    }
+
+    /// UE-initiated detach for EPS services (TS 24.301 §5.5.2.2, #365).
+    ///
+    /// - Not registered: nothing to detach from. A UE between attach attempts
+    ///   stops attaching (EMM-DEREGISTERED, [`EmmState::Detached`]).
+    /// - Registered with a NAS signalling connection (`connected`): the DETACH
+    ///   REQUEST is returned now.
+    /// - Registered in EMM-IDLE: the DETACH REQUEST is the next
+    ///   [`Self::initial_message`], which the RRC sends when it establishes a
+    ///   connection for it.
+    ///
+    /// "If the detach is not due to switch off and the UE is in the state
+    /// EMM-REGISTERED or EMM-REGISTERED-INITIATED, timer T3421 shall be started
+    /// in the UE after the DETACH REQUEST message has been sent", and the UE
+    /// enters EMM-DEREGISTERED-INITIATED (§5.5.2.2.1). On a switch-off detach
+    /// the network sends no DETACH ACCEPT (§5.5.2.2.2), so the UE deactivates
+    /// its bearer contexts and is EMM-DEREGISTERED as soon as the request is out.
+    pub fn detach(&mut self, switch_off: bool, connected: bool, now: Instant) -> NasOutput {
+        match self.state {
+            EmmState::Registered | EmmState::ServiceRequestInitiated => {}
+            EmmState::RegisteredInitiated if connected => {
+                // §5.5.2.2.1: the DETACH REQUEST goes, with T3421, "in the state
+                // EMM-REGISTERED or EMM-REGISTERED-INITIATED". The attach is
+                // abandoned for it, so the MME is told rather than left with an
+                // attach in progress (#369 review).
+                log::info!("EMM: detach requested during attach; T3410 stopped, DETACH REQUEST");
+                self.t3410 = None;
+                self.attach_pti = None;
+                return self.send_detach_request(switch_off, now);
+            }
+            EmmState::RegisteredInitiated => {
+                // No connection to send it on: the attach ends locally.
+                log::info!(
+                    "EMM: detach requested during attach without a connection; attach aborted"
+                );
+                self.t3410 = None;
+                self.attach_pti = None;
+                self.enter_detached();
+                return NasOutput {
+                    uplink: vec![],
+                    release: true,
+                };
+            }
+            EmmState::Deregistered | EmmState::AttemptingToAttach => {
+                log::info!("EMM: detach requested while not attached; no further attach");
+                self.enter_detached();
+                return NasOutput::default();
+            }
+            EmmState::DeregisteredInitiated | EmmState::Detached | EmmState::NoService(_) => {
+                return NasOutput::default();
+            }
+        }
+        self.t3417 = None;
+        self.uplink_pending = false;
+        self.paging_response_pending = false;
+        if connected {
+            self.send_detach_request(switch_off, now)
+        } else {
+            log::info!("EMM: detach requested in EMM-IDLE; DETACH REQUEST on the next connection");
+            self.detach_pending = Some(switch_off);
+            self.state = EmmState::DeregisteredInitiated;
+            NasOutput::default()
+        }
+    }
+
+    /// Whether a UE-initiated detach is waiting for a connection (#365).
+    pub fn detach_pending(&self) -> bool {
+        self.detach_pending.is_some()
+    }
+
+    /// Build, protect and record the DETACH REQUEST (§5.5.2.2.1).
+    fn detach_request_pdu(&mut self, switch_off: bool) -> Vec<u8> {
+        // "If the UE has a valid GUTI, the UE shall populate the EPS mobile
+        // identity IE with the valid GUTI. If the UE does not have a valid GUTI,
+        // the UE shall populate the EPS mobile identity IE with its IMSI."
+        let identity = match self.guti {
+            Some(g) => EpsMobileIdentity::Guti(g),
+            None => EpsMobileIdentity::Imsi(self.cfg.imsi.clone()),
+        };
+        let ksi = self
+            .ctx
+            .as_ref()
+            .map_or(NasKsi::NO_KEY, EpsSecurityContext::ksi);
+        msg::encode_detach_request(switch_off, ksi, &identity)
+    }
+
+    fn send_detach_request(&mut self, switch_off: bool, now: Instant) -> NasOutput {
+        let plain = self.detach_request_pdu(switch_off);
+        let out = self.send_emm(plain.clone());
+        if switch_off {
+            log::info!("EMM: DETACH REQUEST (switch off); EPS bearer contexts deactivated");
+            self.enter_detached();
+        } else {
+            log::info!("EMM: DETACH REQUEST (EPS detach); T3421 started");
+            self.state = EmmState::DeregisteredInitiated;
+            self.detach_request = Some((plain, 0));
+            self.t3421 = Some(now + T3421);
+        }
+        out
+    }
+
+    /// EMM-DEREGISTERED after a UE-initiated detach: the EPS bearer contexts are
+    /// deactivated locally (§5.5.2.2.2) and no attach follows.
+    fn enter_detached(&mut self) {
+        self.bearer = None;
+        self.uplink_pending = false;
+        self.paging_response_pending = false;
+        self.detach_pending = None;
+        self.detach_request = None;
+        self.t3421 = None;
+        self.retry_at = None;
+        self.state = EmmState::Detached;
     }
 
     /// The UE was paged for the PS domain (TS 24.301 §5.6.2.2, #351). Returns
@@ -416,6 +559,15 @@ impl EpsNasUe {
     /// REQUEST when an attach is due and no retry timer is running, SERVICE
     /// REQUEST when registered with uplink data pending.
     pub fn initial_message(&mut self, now: Instant) -> Option<Vec<u8>> {
+        if let Some(switch_off) = self.detach_pending.take() {
+            // §4.4.4.2: integrity protected, not ciphered, as an initial NAS
+            // message (the secure exchange is not established yet).
+            return self
+                .send_detach_request(switch_off, now)
+                .uplink
+                .into_iter()
+                .next();
+        }
         if self.state == EmmState::Registered {
             return self.service_request(now);
         }
@@ -475,6 +627,7 @@ impl EpsNasUe {
             self.t3417,
             self.t3440,
             self.t3346,
+            self.t3421,
             self.retry_at,
             self.stored_auth.as_ref().map(|a| a.t3416),
         ]
@@ -524,6 +677,32 @@ impl EpsNasUe {
                 release: true,
             };
         }
+        if self.t3421.is_some_and(|t| now >= t) {
+            // §5.5.2.2.4 c): "On the first four expiries of the timer, the UE
+            // shall retransmit the DETACH REQUEST message and shall reset and
+            // restart timer T3421. On the fifth expiry of timer T3421, the
+            // detach procedure shall be aborted" and the UE enters
+            // EMM-DEREGISTERED.
+            if let Some((plain, sent)) = self.detach_request.take() {
+                if sent < MAX_DETACH_RETRANSMISSIONS {
+                    log::warn!(
+                        "EMM: T3421 expired; DETACH REQUEST retransmitted ({})",
+                        sent + 1
+                    );
+                    self.detach_request = Some((plain.clone(), sent + 1));
+                    self.t3421 = Some(now + T3421);
+                    return self.send_emm(plain);
+                }
+            }
+            log::warn!(
+                "EMM: T3421 expired a fifth time; detach aborted, EMM-DEREGISTERED (§5.5.2.2.4 c)"
+            );
+            self.enter_detached();
+            return NasOutput {
+                uplink: vec![],
+                release: true,
+            };
+        }
         if self.t3346.is_some_and(|t| now >= t) {
             self.t3346 = None;
         }
@@ -566,6 +745,14 @@ impl EpsNasUe {
             log::warn!("EMM: NAS signalling connection lost during attach (§5.5.1.2.6 a)");
             self.t3410 = None;
             self.attach_failed(now, None);
+        }
+        if self.state == EmmState::DeregisteredInitiated && self.detach_request.is_some() {
+            // §5.5.2.2.4 b): "Lower layer failure or release of the NAS
+            // signalling connection before reception of DETACH ACCEPT message":
+            // the detach is aborted and, for "EPS detach", the UE enters
+            // EMM-DEREGISTERED.
+            log::warn!("EMM: NAS signalling connection lost before DETACH ACCEPT; EMM-DEREGISTERED (§5.5.2.2.4 b)");
+            self.enter_detached();
         }
         if self.state == EmmState::ServiceRequestInitiated {
             // §5.6.1.6 a): lower layer failure or release before the user
@@ -729,6 +916,47 @@ impl EpsNasUe {
             DownlinkEmm::ServiceReject(r) => {
                 self.on_service_reject(r, now);
                 NasOutput::default()
+            }
+            DownlinkEmm::DetachAccept => {
+                if self.state == EmmState::DeregisteredInitiated && self.detach_request.is_some() {
+                    // §5.5.2.2.2: "The UE, when receiving the DETACH ACCEPT
+                    // message, shall stop timer T3421", deactivates its EPS
+                    // bearer contexts locally and enters EMM-DEREGISTERED.
+                    log::info!("EMM: DETACH ACCEPT; detached, EMM-DEREGISTERED (§5.5.2.2.2)");
+                    self.enter_detached();
+                } else {
+                    log::warn!("EMM: DETACH ACCEPT with no detach in progress; ignored");
+                }
+                NasOutput::default()
+            }
+            DownlinkEmm::DetachRequest {
+                detach_type: NETWORK_DETACH_TYPE_IMSI,
+                cause,
+            } if self.state == EmmState::DeregisteredInitiated && self.detach_request.is_some() => {
+                // §5.5.2.2.4 d): a network "IMSI detach" while this UE runs an
+                // "EPS detach": "the UE shall progress both procedures". The
+                // network's is answered; this UE's own detach goes on, T3421 with
+                // it (#369 review). This UE has no CS domain to detach from.
+                log::info!(
+                    "EMM: network IMSI DETACH REQUEST (cause {cause:?}) during this UE's detach; \
+                     DETACH ACCEPT, own detach continues (§5.5.2.2.4 d)"
+                );
+                self.send_emm(msg::encode_detach_accept())
+            }
+            DownlinkEmm::DetachRequest { detach_type, cause }
+                if self.state == EmmState::DeregisteredInitiated
+                    && self.detach_request.is_some() =>
+            {
+                // §5.5.2.2.4 d), a network detach colliding with this UE's
+                // "EPS detach": it is treated per §5.5.2.3.2, except that "the UE
+                // need not initiate the attach". The UE answers DETACH ACCEPT
+                // and is detached.
+                log::info!(
+                    "EMM: network DETACH REQUEST (type {detach_type}, cause {cause:?}) during \
+                     this UE's detach; DETACH ACCEPT, detached (§5.5.2.2.4 d)"
+                );
+                self.enter_detached();
+                self.send_emm(msg::encode_detach_accept())
             }
             DownlinkEmm::DetachRequest { detach_type, cause } => {
                 self.on_detach_request(detach_type, cause, now)
