@@ -54,3 +54,9 @@ security:
 
 # The eNB's S1-U address named in INITIAL CONTEXT SETUP RESPONSE; default s1ap_ip.
 # gtp_ip: 172.24.0.50
+
+# User-inactivity release (TS 36.413 §8.3.2, nextgsim #350): after this many
+# seconds with no user data and no signalling, the eNB sends UE CONTEXT RELEASE
+# REQUEST (cause user-inactivity) and the UE goes ECM-IDLE on the MME's release
+# command. Commented out: no inactivity release.
+# inactivity_timer_secs: 20
