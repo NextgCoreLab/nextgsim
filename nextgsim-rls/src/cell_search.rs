@@ -591,7 +591,10 @@ mod tests {
         let restarted = RlsHeartbeatAck::with_dbm(67890, -80).with_incarnation(2);
         let events = search.process_heartbeat_ack(67890, test_addr(4997), &restarted);
         assert_eq!(events.len(), 2, "{events:?}");
-        assert!(matches!(events[0], CellSearchEvent::CellLost { cell_id: 0 }));
+        assert!(matches!(
+            events[0],
+            CellSearchEvent::CellLost { cell_id: 0 }
+        ));
         assert!(matches!(
             events[1],
             CellSearchEvent::CellDiscovered {

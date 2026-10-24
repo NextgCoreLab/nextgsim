@@ -1903,12 +1903,23 @@ mod tests {
         task.handle_assign_current_cell(0);
         while rrc_rx.try_recv().is_ok() {}
         task.handle_heartbeat_ack(a, &before).await;
-        assert_eq!(task.serving_cell, Some(0), "same incarnation: nothing happens");
+        assert_eq!(
+            task.serving_cell,
+            Some(0),
+            "same incarnation: nothing happens"
+        );
 
         let after = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(2);
         task.handle_heartbeat_ack(a, &after).await;
-        assert_eq!(task.serving_cell, None, "the old incarnation's cell is gone");
-        assert_eq!(task.cell_addresses.get(&1), Some(&a), "a new cell, same address");
+        assert_eq!(
+            task.serving_cell, None,
+            "the old incarnation's cell is gone"
+        );
+        assert_eq!(
+            task.cell_addresses.get(&1),
+            Some(&a),
+            "a new cell, same address"
+        );
         let mut rlf = false;
         while let Ok(msg) = rrc_rx.try_recv() {
             rlf |= matches!(
