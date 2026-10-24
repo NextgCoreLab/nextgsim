@@ -1948,12 +1948,11 @@ impl RrcTask {
         let Some(rsrp_dbm) = self.measurement_manager.rsrp(cell_id) else {
             return;
         };
-        // The RLS cell id is the PCI throughout this simulator (see
-        // `MeasurementManager::update_measurement`), and physCellId is INTEGER(0..503)
-        // on the wire. A cell id outside that is reported once and then not sent,
-        // because truncating it would name a DIFFERENT cell in the report.
-        let Ok(phys_cell_id) = u16::try_from(cell_id) else {
-            warn!("Serving cell id {cell_id} is negative; not reported to NAS for positioning");
+        // The serving cell's real physCellId, `nci % 1008` from its SIB1 (#330).
+        // It used to be the local RLS cell index, which names no cell the network
+        // knows. Before SIB1 is read nothing is reported: no PCI is the honest
+        // answer.
+        let Some(phys_cell_id) = self.cell_selector.phys_cell_id_of(cell_id) else {
             return;
         };
         if self.reported_serving_measurement == Some((phys_cell_id, rsrp_dbm)) {

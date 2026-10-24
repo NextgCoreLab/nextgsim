@@ -1112,6 +1112,11 @@ impl UeApp {
                                 // Not measured anywhere in this UE; see
                                 // `nas::lpp`'s module documentation.
                                 rsrq_result: None,
+                                // NR E-CID (#330): the level itself, mapped per
+                                // TS 38.133 §10.1.6.1 at report time, and the NR
+                                // carrier this UE is configured for.
+                                rsrp_dbm: Some(rsrp_dbm),
+                                nr_arfcn: task_base.config.dl_arfcn,
                             });
                         }
                         NasMessage::SidelinkRangingReport { results } => {
