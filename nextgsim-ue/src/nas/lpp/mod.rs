@@ -264,11 +264,14 @@ impl LppEndpoint {
                     self.nr_supported.ss_rsrp,
                     self.nr_supported.ss_rsrq
                 );
-                // NR E-CID capabilities are always reported (#330): an NR UE's
-                // own positioning method, whether or not this request named it.
+                // TS 37.355 §5.1.1 step 2: "The capabilities shall correspond to
+                // any capability types specified in step 1", and §5.1.3 includes
+                // each requested method the UE supports. So E-UTRA and NR E-CID
+                // are reported when asked for; a request naming only methods this
+                // UE lacks gets a ProvideCapabilities with none (#377).
                 LppBody::ProvideCapabilities {
-                    ecid_supported: self.supported,
-                    nr_ecid_supported: Some(self.nr_supported),
+                    ecid_supported: ecid_requested.then_some(self.supported),
+                    nr_ecid_supported: nr_ecid_requested.then_some(self.nr_supported),
                 }
             }
             LppBody::RequestLocationInformation {
@@ -572,11 +575,11 @@ mod tests {
                 nr_ecid_requested: false,
             },
             LppBody::ProvideCapabilities {
-                ecid_supported: EcidMeasurementBits {
+                ecid_supported: Some(EcidMeasurementBits {
                     rsrp: true,
                     rsrq: false,
                     ue_rx_tx: true,
-                },
+                }),
                 nr_ecid_supported: None,
             },
             asked_for(true, true, true),
@@ -1068,7 +1071,11 @@ mod tests {
         );
         assert!(decoded.end_transaction, "the transaction is complete");
         match decoded.body {
-            Some(LppBody::ProvideCapabilities { ecid_supported, .. }) => {
+            Some(LppBody::ProvideCapabilities {
+                ecid_supported: Some(ecid_supported),
+                nr_ecid_supported,
+            }) => {
+                assert_eq!(nr_ecid_supported, None, "NR E-CID was not asked for");
                 assert!(ecid_supported.rsrp, "RSRP is measured, so it is claimed");
                 assert!(
                     !ecid_supported.rsrq,
@@ -1121,6 +1128,92 @@ mod tests {
         );
     }
 
+    /// The header of a `RequestCapabilities` up to its `-r9` body, as in
+    /// `a_common_ies_capability_request_is_accepted_and_a_location_one_is_refused`.
+    fn capability_request_header() -> UperWriter {
+        let mut w = UperWriter::new();
+        w.write_sequence_preamble(None, &[false, false, false, true]);
+        w.write_bit(false); // endTransaction
+        w.write_choice_index(0, 2).expect("c1");
+        w.write_choice_index(0, 16).expect("requestCapabilities");
+        w.write_choice_index(0, 2).expect("criticalExtensions c1");
+        w.write_choice_index(0, 4).expect("r9");
+        w
+    }
+
+    fn assert_answered(pdu: &[u8], nr_ecid_requested: bool) {
+        assert_eq!(
+            LppMessage::decode(pdu).expect("decodes").body,
+            Some(LppBody::RequestCapabilities {
+                ecid_requested: true,
+                nr_ecid_requested,
+            })
+        );
+        let mut endpoint = LppEndpoint::new();
+        let LppReaction::Reply(reply) = endpoint.handle_downlink(pdu, &measurements(), &[]) else {
+            panic!("§5.1.3: the request must be answered");
+        };
+        let decoded = LppMessage::decode(&reply).expect("the reply decodes");
+        assert!(matches!(
+            decoded.body,
+            Some(LppBody::ProvideCapabilities { .. })
+        ));
+    }
+
+    /// #377 review: the r13 group (sensor, TBS, WLAN, Bluetooth) and the Rel-19
+    /// group name methods this UE lacks; with or without the r16 group, the
+    /// request is still answered for E-CID (TS 37.355 §5.1.3).
+    #[test]
+    fn a_capability_request_with_r13_or_r19_groups_is_answered() {
+        // r13: sensor-RequestCapabilities-r13 present (an empty extensible
+        // SEQUENCE): presence bits 1000, extension bit 0. r16: NR E-CID present,
+        // then its empty extensible SEQUENCE. r19: one octet of presence bits.
+        let r13 = vec![0x80];
+        let r16 = vec![0x80];
+        let r19 = vec![0x80];
+        for (groups, nr_ecid) in [
+            (
+                vec![Some(r13.clone()), Some(r16.clone()), Some(r19.clone())],
+                true,
+            ),
+            (vec![Some(r13.clone()), None, None], false),
+            (vec![None, None, Some(r19.clone())], false),
+        ] {
+            let mut w = capability_request_header();
+            w.write_sequence_preamble(Some(true), &[false, false, false, true, false]);
+            w.write_sequence_preamble(Some(false), &[]); // ECID-RequestCapabilities
+            w.write_extension_additions(&groups).expect("groups");
+            assert_answered(&w.into_bytes(), nr_ecid);
+        }
+    }
+
+    /// #377 review: root-level requests for A-GNSS, OTDOA and an EPDU are read
+    /// past, and the request is answered for E-CID (TS 37.355 §5.1.3).
+    #[test]
+    fn a_capability_request_naming_a_gnss_otdoa_and_an_epdu_is_answered() {
+        let mut w = capability_request_header();
+        w.write_sequence_preamble(Some(false), &[false, true, true, true, true]);
+        // A-GNSS-RequestCapabilities: extension bit, three BOOLEANs.
+        w.write_sequence_preamble(Some(false), &[]);
+        w.write_bit(true);
+        w.write_bit(false);
+        w.write_bit(true);
+        w.write_sequence_preamble(Some(false), &[]); // OTDOA-RequestCapabilities
+        w.write_sequence_preamble(Some(false), &[]); // ECID-RequestCapabilities
+                                                     // EPDU-Sequence of one: id 7, name "abc", a 2-octet body.
+        w.write_constrained(1, 1, 16).expect("count");
+        w.write_sequence_preamble(Some(false), &[true]);
+        w.write_constrained(7, 1, 256).expect("ePDU-ID");
+        w.write_constrained(3, 1, 32).expect("name length");
+        for c in b"abc" {
+            w.write_bits(u64::from(*c), 7);
+        }
+        w.write_bit(false);
+        w.write_bits(2, 7); // body length
+        w.write_bits(0xBEEF, 16);
+        assert_answered(&w.into_bytes(), false);
+    }
+
     #[test]
     fn the_advertised_capabilities_are_the_ones_the_ue_then_reports() {
         // The two halves of the transaction must not disagree: a claimed measurement
@@ -1140,7 +1233,10 @@ mod tests {
             panic!("a capability request is answered");
         };
         let claimed = match LppMessage::decode(&capability_reply).expect("decodes").body {
-            Some(LppBody::ProvideCapabilities { ecid_supported, .. }) => ecid_supported,
+            Some(LppBody::ProvideCapabilities {
+                ecid_supported: Some(ecid_supported),
+                ..
+            }) => ecid_supported,
             other => panic!("expected ProvideCapabilities, got {other:?}"),
         };
 
@@ -1345,7 +1441,7 @@ mod tests {
         let mut endpoint = LppEndpoint::new();
         let pdu = request(
             LppBody::ProvideCapabilities {
-                ecid_supported: EcidMeasurementBits::default(),
+                ecid_supported: Some(EcidMeasurementBits::default()),
                 nr_ecid_supported: None,
             },
             9,
@@ -1398,29 +1494,70 @@ mod tests {
     #[test]
     fn a_request_for_another_positioning_method_is_refused_not_answered_with_ecid() {
         // Answering a method the server did not ask for looks like a successful fix
-        // and is not one.
-        //
-        // BOTH message types, because they fail differently and the revert harness
-        // caught it: a location request naming another method already has no E-CID
-        // body to read, so the absent-body guard refuses it even without the
-        // method check -- while a CAPABILITY request legally has no E-CID body
-        // (`ecid_requested: false`), so only the method check stands between an
-        // A-GNSS capability enquiry and an E-CID answer to it.
-        for c1_index in [
-            0, // requestCapabilities
-            4, // requestLocationInformation
-        ] {
-            for method_index in [1usize, 2, 4] {
-                let pdu = request_naming_method(c1_index, method_index);
-                let mut endpoint = LppEndpoint::new();
-                assert_eq!(
-                    endpoint.handle_downlink(&pdu, &measurements(), &[]),
-                    LppReaction::Nothing,
-                    "c1 alternative {c1_index} naming root member {method_index} must not \
-                     be answered with an E-CID report"
-                );
-                assert_eq!(endpoint.replies_sent(), 0);
+        // and is not one. A location request naming another method has no E-CID
+        // body to read, so it is refused.
+        for method_index in [1usize, 2, 4] {
+            let pdu = request_naming_method(4, method_index); // requestLocationInformation
+            let mut endpoint = LppEndpoint::new();
+            assert_eq!(
+                endpoint.handle_downlink(&pdu, &measurements(), &[]),
+                LppReaction::Nothing,
+                "a location request naming root member {method_index} must not be \
+                 answered with an E-CID report"
+            );
+            assert_eq!(endpoint.replies_sent(), 0);
+        }
+    }
+
+    /// #377, TS 37.355 §5.1.3: a capability request naming only methods this UE
+    /// lacks is still answered, and the answer claims none of them and no E-CID
+    /// either (§5.1.1: the capabilities "shall correspond to any capability types
+    /// specified"). Before #377 it went unanswered; before that, it was answered
+    /// with E-CID capabilities nobody asked for.
+    #[test]
+    fn a_capability_request_for_only_unsupported_methods_gets_an_empty_answer() {
+        for method in ["a-gnss", "otdoa", "epdu"] {
+            let mut w = capability_request_header();
+            w.write_sequence_preamble(
+                Some(false),
+                &[
+                    false,
+                    method == "a-gnss",
+                    method == "otdoa",
+                    false,
+                    method == "epdu",
+                ],
+            );
+            match method {
+                "a-gnss" => {
+                    w.write_sequence_preamble(Some(false), &[]);
+                    for _ in 0..3 {
+                        w.write_bit(true);
+                    }
+                }
+                "otdoa" => w.write_sequence_preamble(Some(false), &[]),
+                _ => {
+                    w.write_constrained(1, 1, 16).expect("count");
+                    w.write_sequence_preamble(Some(false), &[false]);
+                    w.write_constrained(1, 1, 256).expect("ePDU-ID");
+                    w.write_bit(false);
+                    w.write_bits(0, 7); // an empty body
+                }
             }
+            let pdu = w.into_bytes();
+            let mut endpoint = LppEndpoint::new();
+            let LppReaction::Reply(reply) = endpoint.handle_downlink(&pdu, &measurements(), &[])
+            else {
+                panic!("{method}: §5.1.3 answers every RequestCapabilities");
+            };
+            assert_eq!(
+                LppMessage::decode(&reply).expect("decodes").body,
+                Some(LppBody::ProvideCapabilities {
+                    ecid_supported: None,
+                    nr_ecid_supported: None,
+                }),
+                "{method}"
+            );
         }
     }
 
