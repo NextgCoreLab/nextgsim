@@ -467,6 +467,7 @@ impl RlsTask {
             pdu_id: 0,
             payload: drb_id as u32,
             pdu: Bytes::from(pdu),
+            c_rnti: None,
         };
         self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
             .await;
@@ -724,6 +725,7 @@ impl RlsTask {
             ue_id,
             rrc_channel: channel,
             data,
+            c_rnti: pdu.c_rnti,
         };
 
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
@@ -877,6 +879,7 @@ impl RlsTask {
             pdu_id,
             payload: rrc_channel as u32,
             pdu: Bytes::copy_from_slice(data.data()),
+            c_rnti: None,
         };
 
         let msg = RlsProtocolMessage::PduTransmission(pdu);
@@ -933,6 +936,7 @@ impl RlsTask {
             pdu_id,
             payload: rrc_channel as u32,
             pdu: Bytes::copy_from_slice(data.data()),
+            c_rnti: None,
         };
         let msg = RlsProtocolMessage::PduTransmission(pdu);
 
@@ -1015,6 +1019,7 @@ impl RlsTask {
                 // its own entity maps on, so the two ends have to name the same thing.
                 payload: drb_id as u32,
                 pdu: Bytes::from(rlc_pdu),
+                c_rnti: None,
             };
             let msg = RlsProtocolMessage::PduTransmission(transmission);
             self.send_rls_message(dest, &msg).await;
@@ -1239,7 +1244,7 @@ impl Task for RlsTask {
                                 }
                                 RlsMessage::UplinkRrc { ue_id, rrc_channel, data } => {
                                     // Internal uplink RRC (forwarded from receive handler)
-                                    let msg = RrcMessage::UplinkRrc { ue_id, rrc_channel, data };
+                                    let msg = RrcMessage::UplinkRrc { ue_id, rrc_channel, data, c_rnti: None };
                                     if let Err(e) = self.task_base.rrc_tx.send(msg).await {
                                         error!("Failed to forward uplink RRC: {}", e);
                                     }
@@ -1944,6 +1949,7 @@ mod tests {
                 pdu_id: 0,
                 payload: 1, // PSI 1
                 pdu: Bytes::from(pdu),
+                c_rnti: None,
             }))
         };
         let um = |si: nextgsim_rlc::SegmentationInfo, sn: u16, so: Option<u16>, data: Vec<u8>| {
@@ -2076,6 +2082,7 @@ mod tests {
             pdu_id: 0,
             payload: 5,
             pdu: Bytes::from(polled),
+            c_rnti: None,
         }));
         ue.send_to(&framed, gnb_addr).await.unwrap();
 
@@ -2148,6 +2155,7 @@ mod tests {
                 pdu_id: 0,
                 payload: 5, // PSI 5 — the AM bearer
                 pdu: Bytes::from(pdu),
+                c_rnti: None,
             }))
         };
 
@@ -2310,6 +2318,7 @@ mod tests {
             pdu_id: 0,
             payload: 1, // PSI 1
             pdu: Bytes::from(rlc),
+            c_rnti: None,
         }));
         ue.send_to(&framed, gnb_addr).await.expect("the lone PDU");
 
@@ -2355,6 +2364,7 @@ mod tests {
                 pdu_id: 0,
                 payload: psi,
                 pdu: Bytes::from(first_segment.clone()),
+                c_rnti: None,
             };
             task.handle_uplink_data(1, &pdu).await;
         }
@@ -2496,6 +2506,7 @@ mod tests {
             pdu_id: 0,
             payload: psi as u32,
             pdu: Bytes::from(pdu_bytes.clone()),
+            c_rnti: None,
         };
         task.handle_uplink_data(1, &pdu).await;
         assert_eq!(task.load_window_octets, uplink_len, "uplink counted");

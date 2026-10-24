@@ -316,6 +316,14 @@ const DEFAULT_NGAP_PORT: u16 = 38412;
 /// §9.2.4). The RAN-side allocator wraps back to 1 after it.
 const NRPPA_UE_MEASUREMENT_ID_MAX: u16 = 256;
 
+/// The C-RNTI a handover-in admission allocates for UE `ue_id`: the UE id reduced
+/// into RNTI-Value (0..65535), unique among the admissions this gNB holds at once.
+/// It goes to the UE in the reconfigurationWithSync and back to the RRC task in
+/// `ExpectHandoverArrival`, which binds the arrival on it (#355 review).
+fn handover_c_rnti(ue_id: i32) -> u16 {
+    (ue_id as u32 % 65536) as u16
+}
+
 impl NgapTask {
     /// Creates a new NGAP task
     pub fn new(task_base: GnbTaskBase) -> Self {
@@ -4495,6 +4503,26 @@ impl NgapTask {
             ho_req.pdu_sessions.len()
         );
 
+        // TS 38.413 §9.2.3.4: the Security Context IE is mandatory with criticality
+        // reject, and §10.3.5 has a request missing it rejected "using the message
+        // normally used to report unsuccessful outcome of the procedure". Without
+        // it there is no {NH, NCC} to derive KgNB* or to signal (#355 review).
+        let Some(security_context) = ho_req.security_context.clone() else {
+            warn!(
+                "Handover Request for amf_ue_ngap_id={} has no Security Context; \
+                 HANDOVER FAILURE (TS 38.413 §10.3.5)",
+                ho_req.amf_ue_ngap_id
+            );
+            self.send_handover_failure(
+                client_id,
+                stream,
+                ho_req.amf_ue_ngap_id,
+                NgSetupFailureCause::Protocol(ProtocolCause::AbstractSyntaxErrorReject),
+            )
+            .await;
+            return;
+        };
+
         // Allocate a new UE context for the incoming handover
         let Some(ran_ue_ngap_id) = self
             .create_ue_context(
@@ -4533,11 +4561,8 @@ impl NgapTask {
         // hand `install_drb_security` the source's keys, and every PDCP MAC on this
         // cell would fail with nothing to say why.
         // The NCC the AMF's {NH, NCC} carries, for the masterKeyUpdate below.
-        let ho_ncc = ho_req
-            .security_context
-            .as_ref()
-            .map(|c| c.next_hop_chaining_count);
-        self.adopt_handover_security_context(ue_id, ho_req.security_context);
+        let ho_ncc = security_context.next_hop_chaining_count;
+        self.adopt_handover_security_context(ue_id, Some(security_context));
 
         // TS 23.502 §4.9.1.3.2 step 9 (RACS): the target uses the UE radio capability
         // the Source to Target Transparent Container carries -- the RRC
@@ -4591,22 +4616,15 @@ impl NgapTask {
                  HANDOVER FAILURE (TS 38.413 §8.4.2.3)",
                 ho_req.amf_ue_ngap_id
             );
-            let failure = nextgsim_ngap::procedures::handover::build_handover_failure(
-                &nextgsim_ngap::procedures::handover::HandoverFailureParams {
-                    amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
-                    cause: NgSetupFailureCause::RadioNetwork(
-                        RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
-                    ),
-                },
+            self.send_handover_failure(
+                client_id,
+                stream,
+                ho_req.amf_ue_ngap_id,
+                NgSetupFailureCause::RadioNetwork(
+                    RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                ),
             )
-            .ok()
-            .and_then(|pdu| encode_ngap_pdu(&pdu).ok());
-            match failure {
-                Some(data) => {
-                    self.send_ngap_ue_associated(client_id, stream, data).await;
-                }
-                None => error!("Failed to encode HANDOVER FAILURE"),
-            }
+            .await;
             self.local_release_ue(ue_id).await;
             return;
         }
@@ -4623,19 +4641,15 @@ impl NgapTask {
             Some(c) => c,
             None => {
                 error!("UE[{ue_id}]: cannot build the handover command for the source; HANDOVER FAILURE");
-                if let Some(data) = nextgsim_ngap::procedures::handover::build_handover_failure(
-                    &nextgsim_ngap::procedures::handover::HandoverFailureParams {
-                        amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
-                        cause: NgSetupFailureCause::RadioNetwork(
-                            RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
-                        ),
-                    },
+                self.send_handover_failure(
+                    client_id,
+                    stream,
+                    ho_req.amf_ue_ngap_id,
+                    NgSetupFailureCause::RadioNetwork(
+                        RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                    ),
                 )
-                .ok()
-                .and_then(|pdu| encode_ngap_pdu(&pdu).ok())
-                {
-                    self.send_ngap_ue_associated(client_id, stream, data).await;
-                }
+                .await;
                 self.local_release_ue(ue_id).await;
                 return;
             }
@@ -4678,7 +4692,10 @@ impl NgapTask {
                 if let Err(e) = self
                     .task_base
                     .rrc_tx
-                    .send(RrcMessage::ExpectHandoverArrival { ue_id })
+                    .send(RrcMessage::ExpectHandoverArrival {
+                        ue_id,
+                        c_rnti: handover_c_rnti(ue_id),
+                    })
                     .await
                 {
                     error!("Could not arm the handover-arrival detection for UE[{ue_id}]: {e}");
@@ -4851,13 +4868,37 @@ impl NgapTask {
         }
     }
 
+    /// Sends HANDOVER FAILURE (TS 38.413 §8.4.2.3) for the AMF's `amf_ue_ngap_id`.
+    async fn send_handover_failure(
+        &mut self,
+        client_id: i32,
+        stream: u16,
+        amf_ue_ngap_id: u64,
+        cause: NgSetupFailureCause,
+    ) {
+        let failure = nextgsim_ngap::procedures::handover::build_handover_failure(
+            &nextgsim_ngap::procedures::handover::HandoverFailureParams {
+                amf_ue_ngap_id,
+                cause,
+            },
+        )
+        .ok()
+        .and_then(|pdu| encode_ngap_pdu(&pdu).ok());
+        match failure {
+            Some(data) => {
+                self.send_ngap_ue_associated(client_id, stream, data).await;
+            }
+            None => error!("Failed to encode HANDOVER FAILURE"),
+        }
+    }
+
     /// The Target-to-Source transparent container for a handover-in (#324): an
     /// RRC HandoverCommand wrapping the RRCReconfiguration with
     /// reconfigurationWithSync for this cell.
     ///
     /// The masterKeyUpdate carries the NCC of the AMF's {NH, NCC}, from which
     /// `adopt_handover_security_context` derived this side's KgNB*.
-    fn build_target_to_source_container(&self, ue_id: i32, ncc: Option<u8>) -> Option<Vec<u8>> {
+    fn build_target_to_source_container(&self, ue_id: i32, ncc: u8) -> Option<Vec<u8>> {
         use nextgsim_rrc::procedures::handover_preparation::encode_rrc_handover_command;
         use nextgsim_rrc::procedures::rrc_reconfiguration::{
             encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
@@ -4865,9 +4906,9 @@ impl NgapTask {
         let reconfiguration = encode_handover_command(&HandoverCommandParams {
             rrc_transaction_id: 0,
             target_phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
-            // The C-RNTI the UE uses on this cell: this simulator's UE index,
-            // reduced into RNTI-Value, as the intra-gNB command does.
-            new_ue_identity: (ue_id as u32 % 65536) as u16,
+            // The C-RNTI the UE uses on this cell; the arriving UE presents it
+            // and the RRC task binds the arrival on it (#355 review).
+            new_ue_identity: handover_c_rnti(ue_id),
             t304_ms: 1000,
             full_config: true,
             // keySetChangeIndicator is false: "the new K_(gNB) key is obtained
@@ -4876,7 +4917,7 @@ impl NgapTask {
             // advances its own NH chain to (TS 33.501 §6.9.2.3.3; TS 38.331 §5.3.5.7).
             master_key_update: Some(MasterKeyUpdateParams {
                 key_set_change_indicator: false,
-                next_hop_chaining_count: ncc.unwrap_or(0),
+                next_hop_chaining_count: ncc,
             }),
         })
         .map_err(|e| error!("UE[{ue_id}]: RRCReconfiguration for the handover command: {e}"))
@@ -8057,6 +8098,14 @@ mod tests {
         out
     }
 
+    /// The {NH, NCC} a HANDOVER REQUEST carries (the IE is mandatory).
+    fn test_security_context() -> HandoverSecurityContext {
+        HandoverSecurityContext {
+            next_hop_chaining_count: 1,
+            next_hop_nh: [0xA5; 32],
+        }
+    }
+
     /// A HANDOVER REQUEST asking this target to admit `psis`, with a security context.
     fn handover_request(psis: &[u8], security: Option<HandoverSecurityContext>) -> NGAP_PDU {
         use nextgsim_ngap::procedures::handover::{
@@ -8230,6 +8279,35 @@ mod tests {
         );
     }
 
+    /// #355 review, TS 38.413 §9.2.3.4 / §10.3.5: the Security Context IE is
+    /// mandatory with criticality reject. A HANDOVER REQUEST without it is
+    /// answered with HANDOVER FAILURE (abstract-syntax-error-reject) and admits
+    /// nothing. It used to proceed and signal NCC 0.
+    #[tokio::test]
+    async fn a_handover_request_without_a_security_context_is_rejected() {
+        use nextgsim_ngap::codec::generated::{UnsuccessfulOutcomeValue, NGAP_PDU};
+
+        let (mut task, mut rrc_rx, mut gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
+        while gtp_rx.try_recv().is_ok() {}
+        let before = task.ue_contexts.len();
+        let pdu = handover_request(&[5], None);
+        let ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let failure = drain_sctp(&mut sctp_rx).iter().any(|bytes| {
+            matches!(
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes),
+                Ok(NGAP_PDU::UnsuccessfulOutcome(o))
+                    if matches!(o.value, UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(_))
+            )
+        });
+        assert!(failure, "HANDOVER FAILURE");
+        assert_eq!(task.ue_contexts.len(), before, "no UE context admitted");
+        assert!(gtp_rx.try_recv().is_err(), "no session created");
+        assert!(armed_arrivals(&mut rrc_rx).is_empty(), "no arrival armed");
+    }
+
     /// #324 (nextgcore #978 run): the GTP task learns of a handover-in UE BEFORE
     /// its sessions are created, as on the Initial UE Message path. Before, the
     /// target's GTP task had no UE context, every `SessionCreate` failed, and all
@@ -8380,7 +8458,7 @@ mod tests {
     ) -> Vec<i32> {
         let mut out = Vec::new();
         while let Ok(msg) = rx.try_recv() {
-            if let TaskMessage::Message(RrcMessage::ExpectHandoverArrival { ue_id }) = msg {
+            if let TaskMessage::Message(RrcMessage::ExpectHandoverArrival { ue_id, .. }) = msg {
                 out.push(ue_id);
             }
         }
@@ -8398,7 +8476,7 @@ mod tests {
         use nextgsim_ngap::procedures::handover::parse_handover_request_acknowledge;
 
         let (mut task, mut rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
-        let pdu = handover_request(&[5], None);
+        let pdu = handover_request(&[5], Some(test_security_context()));
         let ho_req =
             nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
 
@@ -8445,7 +8523,7 @@ mod tests {
         // The SCTP task is gone: `sctp_tx.send` now fails, so the AMF is never told.
         drop(sctp_rx);
 
-        let pdu = handover_request(&[5], None);
+        let pdu = handover_request(&[5], Some(test_security_context()));
         let ho_req =
             nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
 
@@ -8481,7 +8559,7 @@ mod tests {
 
         let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
         let before = task.ue_contexts.len();
-        let pdu = handover_request(&[5], None);
+        let pdu = handover_request(&[5], Some(test_security_context()));
         let mut ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
             .expect("parse the request");
         ho_req.pdu_sessions[0].transfer = vec![0x00];

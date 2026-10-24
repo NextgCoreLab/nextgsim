@@ -530,6 +530,8 @@ pub enum RrcMessage {
         rrc_channel: RrcChannel,
         /// RRC PDU data
         data: OctetString,
+        /// The C-RNTI the UE presented with the PDU, if any (#355 review).
+        c_rnti: Option<u16>,
     },
     /// Downlink NAS delivery (from NGAP)
     NasDelivery {
@@ -620,6 +622,9 @@ pub enum RrcMessage {
     ExpectHandoverArrival {
         /// UE ID the admission allocated.
         ue_id: i32,
+        /// The C-RNTI the admission allocated (`newUE-Identity`), by which the
+        /// arriving UE is recognised (#355 review).
+        c_rnti: u16,
     },
     /// AN release request (from NGAP)
     AnRelease {

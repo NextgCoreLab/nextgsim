@@ -95,6 +95,9 @@ pub struct RlsTask {
     transport: RlsTransport,
     cell_addresses: HashMap<i32, SocketAddr>,
     serving_cell: Option<i32>,
+    /// The C-RNTI a handover assigned in the serving cell, stamped on uplink RRC
+    /// PDUs (`RlsMessage::SetCRnti`, #355 review).
+    serving_c_rnti: Option<u16>,
     socket: Option<Arc<UdpSocket>>,
     config: RlsTaskConfig,
     /// The last successful resolution of each `gnb_search_hosts` entry (#286).
@@ -230,6 +233,7 @@ impl RlsTask {
             transport: RlsTransport::new(sti),
             cell_addresses: HashMap::new(),
             serving_cell: None,
+            serving_c_rnti: None,
             socket: None,
             config,
             resolved_hosts: HashMap::new(),
@@ -1007,6 +1011,7 @@ impl RlsTask {
         if self.cell_search.get_cell(cell_id as u32).is_some() {
             info!("Assigning serving cell: cell_id={}", cell_id);
             self.serving_cell = Some(cell_id);
+            self.serving_c_rnti = None;
             self.transport.set_serving_endpoint(cell_id as u32);
         } else {
             warn!("Cannot assign unknown cell as serving: cell_id={}", cell_id);
@@ -1065,7 +1070,8 @@ impl RlsTask {
             Bytes::copy_from_slice(pdu.data()),
             require_ack,
         ) {
-            Ok(transmission) => {
+            Ok(mut transmission) => {
+                transmission.c_rnti = self.serving_c_rnti;
                 self.send_rls_message(dest, &RlsProtocolMessage::PduTransmission(transmission))
                     .await
             }
@@ -1220,6 +1226,10 @@ impl RlsTask {
     async fn handle_rls_message(&mut self, msg: RlsMessage) {
         match msg {
             RlsMessage::AssignCurrentCell { cell_id } => self.handle_assign_current_cell(cell_id),
+            RlsMessage::SetCRnti { c_rnti } => {
+                debug!("Serving cell C-RNTI {c_rnti:#06x}");
+                self.serving_c_rnti = Some(c_rnti);
+            }
             #[cfg(feature = "up-security")]
             RlsMessage::InstallDrbSecurity {
                 psi,
@@ -1669,6 +1679,58 @@ mod tests {
             }
         }
         assert!(rlf, "losing the serving cell is a radio link failure");
+    }
+
+    /// #355 review: after `SetCRnti`, uplink RRC PDUs to the serving cell carry
+    /// the C-RNTI on RLS, which is how a handover target recognises the arriving
+    /// UE. A new serving cell clears it.
+    #[tokio::test]
+    async fn uplink_rrc_carries_the_handover_c_rnti_until_the_cell_changes() {
+        let gnb = UdpSocket::bind("127.0.0.1:0").await.expect("gNB socket");
+        let gnb_addr = gnb.local_addr().unwrap();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![gnb_addr],
+                ..Default::default()
+            },
+        );
+        task.socket = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let ack = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60);
+        task.handle_heartbeat_ack(gnb_addr, &ack).await;
+        task.handle_rls_message(RlsMessage::AssignCurrentCell { cell_id: 0 })
+            .await;
+        task.handle_rls_message(RlsMessage::SetCRnti { c_rnti: 0x03E8 })
+            .await;
+
+        let mut buf = [0u8; 2048];
+        let pdu = || OctetString::from_slice(&[0x10, 0x00]);
+        task.handle_rrc_pdu_delivery(RrcChannel::UlDcch, 0, pdu())
+            .await;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv(&mut buf))
+            .await
+            .expect("an uplink datagram")
+            .unwrap();
+        let Ok(RlsProtocolMessage::PduTransmission(t)) = nextgsim_rls::codec::decode(&buf[..n])
+        else {
+            panic!("not a PDU transmission");
+        };
+        assert_eq!(t.c_rnti, Some(0x03E8));
+
+        task.handle_rls_message(RlsMessage::AssignCurrentCell { cell_id: 0 })
+            .await;
+        task.handle_rrc_pdu_delivery(RrcChannel::UlDcch, 0, pdu())
+            .await;
+        let n = tokio::time::timeout(std::time::Duration::from_secs(2), gnb.recv(&mut buf))
+            .await
+            .expect("an uplink datagram")
+            .unwrap();
+        let Ok(RlsProtocolMessage::PduTransmission(t)) = nextgsim_rls::codec::decode(&buf[..n])
+        else {
+            panic!("not a PDU transmission");
+        };
+        assert_eq!(t.c_rnti, None, "a new serving cell clears it");
     }
 
     #[test]

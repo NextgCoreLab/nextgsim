@@ -687,6 +687,7 @@ async fn send_uplink_rrc(
         ue_id: UE_ID,
         rrc_channel: channel,
         data,
+        c_rnti: None,
     })
     .await
     .expect("the gNB RRC task accepts uplink RRC");

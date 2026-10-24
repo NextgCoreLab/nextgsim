@@ -216,6 +216,14 @@ pub struct RlsPduTransmission {
     pub payload: u32,
     /// The actual PDU data
     pub pdu: Bytes,
+    /// The C-RNTI the UE holds in the cell, on an uplink RRC PDU (#355 review).
+    ///
+    /// The radio equivalent is the C-RNTI MAC CE (TS 38.321 §6.1.3.2), or the
+    /// dedicated preamble of a contention-free random access, by which a target
+    /// cell knows which handover admission an arriving UE is: RLS assigns its own
+    /// UE ids, so nothing else ties the UE to the C-RNTI the target allocated.
+    /// Encoded as an optional trailer that older decoders skip.
+    pub c_rnti: Option<u16>,
 }
 
 impl RlsPduTransmission {
@@ -227,6 +235,7 @@ impl RlsPduTransmission {
             pdu_id: 0,
             payload: 0,
             pdu: Bytes::new(),
+            c_rnti: None,
         }
     }
 
@@ -238,6 +247,7 @@ impl RlsPduTransmission {
             pdu_id,
             payload: rrc_channel,
             pdu,
+            c_rnti: None,
         }
     }
 
@@ -249,6 +259,7 @@ impl RlsPduTransmission {
             pdu_id,
             payload: 0,
             pdu,
+            c_rnti: None,
         }
     }
 }

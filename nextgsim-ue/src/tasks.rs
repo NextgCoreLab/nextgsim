@@ -707,10 +707,19 @@ pub enum RlfCause {
 /// Based on `NmUeRrcToRls`, `NmUeNasToRls`, `NmUeRlsToRls` from `src/ue/nts.hpp`.
 #[derive(Debug)]
 pub enum RlsMessage {
-    /// Assign current cell (from RRC)
+    /// Assign current cell (from RRC). Clears any C-RNTI set for the previous
+    /// cell (see [`Self::SetCRnti`]).
     AssignCurrentCell {
         /// Cell ID
         cell_id: i32,
+    },
+    /// The C-RNTI a handover's reconfigurationWithSync assigned in the serving
+    /// cell (`newUE-Identity`, from RRC; #355 review). RLS stamps it on every
+    /// uplink RRC PDU to the cell, as the C-RNTI MAC CE identifies the UE to a
+    /// handover target (TS 38.321 §6.1.3.2). Send it after `AssignCurrentCell`.
+    SetCRnti {
+        /// The C-RNTI.
+        c_rnti: u16,
     },
     /// Install (or remove) user-plane security on one DRB, from RRC
     /// (issue #32, TS 33.501 §6.6.1).
