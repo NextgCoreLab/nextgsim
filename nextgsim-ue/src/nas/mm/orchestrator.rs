@@ -1629,10 +1629,22 @@ impl MmOrchestrator {
         // the follow-on request pending, so the network brings their user plane
         // back with the Registration Accept (#313 review: after SERVICE REJECT
         // #28 the held uplink otherwise waited for another packet).
+        //
+        // Two of §5.5.1.3.2's limits apply (#313 re-review):
+        // - "For all cases except case b ... the UE may include the Uplink data
+        //   status IE": case b is the periodic update on T3512 expiry in
+        //   5GMM-IDLE, so a periodic update never carries it;
+        // - "If the UE is in a non-allowed area or is not in an allowed area ...
+        //   the UE shall not include the Uplink data status IE except for
+        //   emergency services or for high priority access": the update after
+        //   #28 (5GMM-REGISTERED.NON-ALLOWED-SERVICE) carries it only for a UE
+        //   configured for high priority access. Its held uplink waits for an
+        //   allowed area, or for a Service Request after the Accept.
+        let non_allowed = self.state.mm_substate() == MmSubState::RegisteredNonAllowedService
+            && !self.high_priority_access;
         let uplink_data_status = match reg_type {
             RegistrationType::MobilityRegistrationUpdating
-            | RegistrationType::PeriodicRegistrationUpdating
-                if self.state.is_idle() || self.up_reactivation_pending =>
+                if !non_allowed && (self.state.is_idle() || self.up_reactivation_pending) =>
             {
                 self.held_uplink_data_status.filter(|status| *status != 0)
             }
@@ -2034,7 +2046,27 @@ impl MmOrchestrator {
             outs.push(MmOutput::NetworkPduSessionStatus(status));
         }
         outs.push(MmOutput::RegistrationSucceeded);
+        // The Accept stopped T3346 (above). §5.6.1.5 #22 / §5.6.1.7 c): "The
+        // service request procedure is started, if still necessary, when timer
+        // T3346 expires or is stopped" -- uplink still held asks now (#313
+        // re-review).
+        outs.extend(
+            self.retry_held_uplink_service_request("T3346 stopped by the Registration Accept"),
+        );
         outs
+    }
+
+    /// PDU session `psi` was released (#313 re-review): it has no uplink data
+    /// pending any more, so its bit leaves the held Uplink data status
+    /// (§5.6.1.2 names only sessions with pending data).
+    pub fn on_pdu_session_released(&mut self, psi: u8) {
+        let bit = uplink_data_status_bit(psi);
+        if let Some(status) = self.held_uplink_data_status.as_mut() {
+            *status &= !bit;
+            if *status == 0 {
+                self.held_uplink_data_status = None;
+            }
+        }
     }
 
     /// Registration Reject handling with the full cause table of
@@ -2267,6 +2299,9 @@ impl MmOrchestrator {
     fn delete_registration_context(&mut self) {
         self.stored_guti = None;
         self.tai_list = None;
+        // De-registered: no session has uplink waiting for a service request.
+        self.held_uplink_data_status = None;
+        self.registration_uplink_data_status = None;
         self.sec.reset();
         // TS 24.501 Annex C.1: the stored copy goes with the in-memory one.
         // Leaving the file behind would mean a restart presents a 5G-GUTI and a
@@ -3060,6 +3095,11 @@ impl MmOrchestrator {
         if exempt {
             return None;
         }
+        // A configured high-priority UE passed the `exempt` check above, so it
+        // is not held here. §5.6.1.5 #28 withdraws that exemption when the
+        // network indicates "High priority access UEs are not exempt from
+        // service area restrictions"; that indication is not parsed yet, so
+        // such a UE is always treated as exempt.
         if self.state.mm_substate() == MmSubState::RegisteredNonAllowedService {
             return Some("5GMM-REGISTERED.NON-ALLOWED-SERVICE (restricted service area)");
         }
@@ -3301,6 +3341,7 @@ impl MmOrchestrator {
     }
 
     fn handle_deregistration_accept(&mut self) -> Vec<MmOutput> {
+        self.held_uplink_data_status = None;
         info!("Deregistration Accept received");
         self.timers.stop(TIMER_T3521, true);
         self.timers.stop(TIMER_T3512, true);
@@ -7052,13 +7093,71 @@ mod tests {
             full.registration_type.registration_type,
             RegistrationType::MobilityRegistrationUpdating
         );
-        // §5.5.1.3.2 (#313 review): it names the held uplink's session in the
-        // Uplink data status IE, with the follow-on request pending.
+        // §5.5.1.3.2 (#313 re-review): in a non-allowed area the UE "shall not
+        // include the Uplink data status IE except for emergency services or
+        // for high priority access".
+        assert_eq!(full.uplink_data_status, None);
+        assert_eq!(
+            full.registration_type.follow_on_request_pending,
+            FollowOnRequest::NoPending
+        );
+    }
+
+    /// #313 re-review: a UE configured for high priority access does name its
+    /// held uplink in the #28 update.
+    #[test]
+    fn a_high_priority_ue_names_held_uplink_in_the_update_after_28() {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        orch.high_priority_access = true;
+        reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
+        let outs = orch.on_nas_signalling_connection_released();
+        let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
         assert_eq!(full.uplink_data_status, uplink_data_status(&[1]));
         assert_eq!(
             full.registration_type.follow_on_request_pending,
             FollowOnRequest::Pending
         );
+    }
+
+    /// The UE held after another reject, now idle.
+    fn idle_with_held_uplink() -> MmOrchestrator {
+        let mut orch = connected_without_user_plane_with_sr_in_flight();
+        reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
+        orch.on_nas_signalling_connection_released();
+        assert_eq!(orch.held_uplink_data_status, uplink_data_status(&[1]));
+        orch
+    }
+
+    /// #313 re-review, §5.5.1.3.2: a mobility update names the held session; a
+    /// periodic one (case b, T3512 expiry in 5GMM-IDLE) never does.
+    #[test]
+    fn only_a_mobility_update_names_held_uplink() {
+        for (reg_type, named) in [
+            (RegistrationType::MobilityRegistrationUpdating, true),
+            (RegistrationType::PeriodicRegistrationUpdating, false),
+        ] {
+            let mut orch = idle_with_held_uplink();
+            let outs = orch.start_registration(reg_type);
+            let (_outer, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+            assert_eq!(
+                full.uplink_data_status.is_some(),
+                named,
+                "{reg_type:?}: {:?}",
+                full.uplink_data_status
+            );
+        }
+    }
+
+    /// #313 re-review: a released session leaves the held status, and losing
+    /// the registration clears it.
+    #[test]
+    fn held_uplink_is_cleared_by_release_and_deregistration() {
+        let mut orch = idle_with_held_uplink();
+        orch.on_pdu_session_released(1);
+        assert_eq!(orch.held_uplink_data_status, None);
+        let mut orch = idle_with_held_uplink();
+        orch.delete_registration_context();
+        assert_eq!(orch.held_uplink_data_status, None);
     }
 
     /// #313 review, §5.5.1.3.4: the Registration Accept to an update that named
@@ -7067,9 +7166,8 @@ mod tests {
     #[test]
     fn a_registration_accept_restores_the_user_plane_the_update_asked_for() {
         for (failed, restored) in [(None, true), (Some(0x0002), false)] {
-            let mut orch = connected_without_user_plane_with_sr_in_flight();
-            reject_service_request(&mut orch, MmCause::RestrictedServiceArea, None, 2);
-            orch.on_nas_signalling_connection_released();
+            let mut orch = idle_with_held_uplink();
+            orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
             assert_eq!(
                 orch.registration_uplink_data_status,
                 uplink_data_status(&[1])
