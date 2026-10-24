@@ -405,6 +405,12 @@ pub struct RrcTask {
     uac_barring: UacBarringConfig,
     /// RRC re-establishment procedure state
     reestablishment_proc: ReestablishmentProcedure,
+    /// A re-establishment's selected cell whose SIB1 has not been read yet
+    /// (#349 review). TS 38.331 §5.3.7.3 has the UE "ensure having valid and up
+    /// to date essential system information" before it sends the
+    /// RRCReestablishmentRequest, whose shortMAC-I covers the cell's identity
+    /// from SIB1. The request goes when the SIB1 arrives, while T311 runs.
+    reestablishment_awaiting_sib1: Option<i32>,
     /// The SFN the paging-occasion check reads, pinned by a harness (issue #171).
     ///
     /// A radio frame is 10 ms. A test that chooses an identity for a particular frame and
@@ -510,6 +516,11 @@ pub struct RrcTask {
     /// Cells whose system information came from a real BCCH broadcast, so the
     /// simulated fallback must not overwrite it with the UE's own assumptions.
     cells_with_broadcast_si: std::collections::HashSet<i32>,
+    /// Cells whose SIB1 this UE has read from their broadcast, as opposed to the
+    /// simulated SIB1 a cell is given on detection (`provide_simulated_system_info`,
+    /// whose cell identity is the local cell index). A re-establishment's
+    /// shortMAC-I needs the real one (#349 review).
+    cells_with_broadcast_sib1: std::collections::HashSet<i32>,
     /// Stored conditional reconfigurations (TS 38.331 §5.3.5.13), populated only
     /// when `UeConfig::conditional_handover` is set. Evaluated on every
     /// measurement tick; a triggered candidate executes through
@@ -736,6 +747,7 @@ impl RrcTask {
             ntn_timing: None,
             uac_barring: UacBarringConfig::default(),
             reestablishment_proc: ReestablishmentProcedure::new(),
+            reestablishment_awaiting_sib1: None,
             pinned_sfn: None,
             // Starts on the TS 38.331 §7.1.1 defaults and is replaced by the serving cell's
             // broadcast `ue-TimersAndConstants` when SIB1 arrives.
@@ -754,6 +766,7 @@ impl RrcTask {
             t300_deadline: None,
             t300_duration_ms: T300_DEFAULT_MS,
             cells_with_broadcast_si: std::collections::HashSet::new(),
+            cells_with_broadcast_sib1: std::collections::HashSet::new(),
             cond_reconfig: CondReconfigStore::new(),
             cho_transaction_id: 0,
             paging_s_tmsi: None,
@@ -1188,8 +1201,17 @@ impl RrcTask {
             // A re-establishment searching for a cell (T311) re-establishes on this
             // one; NAS is not involved unless that fails (TS 38.331 §5.3.7.3, #264).
             if self.reestablishment_proc.state() == ReestablishmentState::CellSearch {
-                self.send_reestablishment_request(selected_cell.cell_id)
-                    .await;
+                if self.cell_has_sib1(selected_cell.cell_id) {
+                    self.send_reestablishment_request(selected_cell.cell_id)
+                        .await;
+                } else {
+                    info!(
+                        "Re-establishment: cell {} selected, waiting for its SIB1 before the \
+                         request (TS 38.331 §5.3.7.3)",
+                        selected_cell.cell_id
+                    );
+                    self.reestablishment_awaiting_sib1 = Some(selected_cell.cell_id);
+                }
                 return;
             }
 
@@ -2187,7 +2209,39 @@ impl RrcTask {
                 .await;
         } else {
             self.handle_broadcast_sib1_message(cell_id, &msg);
+            // The SIB1 a re-establishment was waiting for (#349 review): the
+            // request goes now, if T311 is still running and the cell still the
+            // one selected.
+            if self.reestablishment_awaiting_sib1 == Some(cell_id) && self.cell_has_sib1(cell_id) {
+                self.reestablishment_awaiting_sib1 = None;
+                if self.reestablishment_proc.state() == ReestablishmentState::CellSearch
+                    && self.serving_cell_id == Some(cell_id)
+                {
+                    self.send_reestablishment_request(cell_id).await;
+                }
+            } else if self.reestablishment_proc.state() == ReestablishmentState::CellSearch
+                && self.serving_cell_id.is_none()
+            {
+                // T311 runs, and a cell's essential system information has just
+                // arrived: select now rather than at the next throttled cycle.
+                // T311 is as short as 1 s (the gNB broadcasts ms1000), less than
+                // the selection interval, so waiting for the cycle let it expire
+                // with a suitable cell in hand (seen on real binaries, #348).
+                self.last_cell_selection = None;
+                self.perform_cell_selection().await;
+            }
         }
+    }
+
+    /// Whether this UE has read `cell_id`'s SIB1 from its broadcast. A simulated
+    /// SIB1 does not count: its cell identity is the local cell index, which the
+    /// network does not hold.
+    fn cell_has_sib1(&self, cell_id: i32) -> bool {
+        self.cells_with_broadcast_sib1.contains(&cell_id)
+            && self
+                .cell_selector
+                .get_cell(cell_id)
+                .is_some_and(|cell| cell.sib1.has_sib1)
     }
 
     /// Handles a broadcast `SystemInformation` carrying SIB2/SIB3/SIB4
@@ -2454,6 +2508,7 @@ impl RrcTask {
         }
 
         self.cells_with_broadcast_si.insert(cell_id);
+        self.cells_with_broadcast_sib1.insert(cell_id);
         self.cell_selector.update_sib1(
             cell_id,
             Sib1Info {
@@ -4749,6 +4804,7 @@ impl RrcTask {
         // A suspension for a re-establishment does not outlive the connection it
         // was for: the next connection's SRB1 starts afresh (#348 run).
         self.srb1_suspended_for_reestablishment = false;
+        self.reestablishment_awaiting_sib1 = None;
         self.serving_cell_id = None;
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
@@ -4980,6 +5036,9 @@ impl RrcTask {
         // new IDs, so the selector forgets them too and camps on what comes back
         // (nextgsim #275).
         self.cell_selector.forget_cells();
+        // The cell ids are reassigned with the STI, so what was read from a cell
+        // under an old id says nothing about the cell under that id now.
+        self.cells_with_broadcast_sib1.clear();
         self.last_cell_selection = None;
     }
 
@@ -11037,6 +11096,92 @@ mod tests {
                 task.reestablishment_proc.t301_remaining().is_some(),
                 "T301 armed"
             );
+        });
+    }
+
+    /// #349 review, TS 38.331 §5.3.7.3: the UE first ensures "having valid and up
+    /// to date essential system information" of the selected cell. A cell selected
+    /// during T311 before its SIB1 has been read gets no RRCReestablishmentRequest
+    /// yet, because its shortMAC-I would cover cell identity 0. The request goes
+    /// when the SIB1 arrives, over that cell's identity.
+    #[test]
+    fn a_reestablishment_waits_for_the_selected_cells_sib1() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            while rls_rx.try_recv().is_ok() {}
+            let source_pci = task
+                .cell_selector
+                .get_cell(1)
+                .map(|c| phys_cell_id_from_nci(c.sib1.nci as u64))
+                .unwrap();
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+
+            // Cell 2 is heard and selected, but its SIB1 has not come yet.
+            task.handle_signal_changed(2, -60).await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            assert!(
+                next_uplink_rrc_opt(&mut rls_rx).is_none(),
+                "no request before the selected cell's SIB1"
+            );
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "T311 still runs"
+            );
+
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            let (channel, bytes) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch);
+            let req = decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+            let security = task.as_security.clone().unwrap();
+            assert_eq!(
+                req.ue_identity.short_mac_i,
+                compute_short_mac_i(&security, source_pci, 0x20).unwrap(),
+                "the shortMAC-I covers the identity the SIB1 broadcast"
+            );
+        });
+    }
+
+    /// #348 real-binary run: the broadcast T311 is 1 s, less than the cell
+    /// selection interval. A cell whose SIB1 arrives during T311 is selected at
+    /// once, not at the next throttled cycle, so the request goes before T311
+    /// expires.
+    #[test]
+    fn a_sib1_arriving_during_t311_selects_the_cell_at_once() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+            // A cycle with no cell: the selection throttle is now armed.
+            task.perform_cycle().await;
+            assert!(next_uplink_rrc_opt(&mut rls_rx).is_none());
+
+            task.handle_signal_changed(2, -60).await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            let (channel, bytes) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch, "no wait for the next cycle");
+            decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+            assert_eq!(task.serving_cell_id, Some(2));
         });
     }
 
