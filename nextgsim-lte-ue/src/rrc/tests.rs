@@ -28,6 +28,9 @@ struct Scripted {
     paged: Option<(msg::PagedUeIdentity, Vec<u8>)>,
 }
 
+/// The DETACH REQUEST the scripted NAS produces (#365).
+const DETACH_REQUEST: [u8; 3] = [0x27, 0x45, 0x01];
+
 impl NasLayer for Scripted {
     fn initial_nas(&mut self) -> Option<InitialNas> {
         self.seen.lock().unwrap().initial_asked += 1;
@@ -51,6 +54,17 @@ impl NasLayer for Scripted {
         self.seen.lock().unwrap().uplink_pending += 1;
         if let Some(m) = self.on_pending.take() {
             self.initial = Some(m);
+        }
+    }
+    fn detach(&mut self, _switch_off: bool, connected: bool) -> crate::nas::NasTimerOutcome {
+        if connected {
+            crate::nas::NasTimerOutcome {
+                uplink: vec![DETACH_REQUEST.to_vec()],
+                release: false,
+            }
+        } else {
+            self.initial = Some(DETACH_REQUEST.to_vec());
+            crate::nas::NasTimerOutcome::default()
         }
     }
     fn on_paging(&mut self, identity: &msg::PagedUeIdentity) -> bool {
@@ -630,4 +644,48 @@ fn a_paging_for_the_ue_starts_a_connection_and_others_do_not() {
         told,
         "a paging outside RRC_IDLE must not reach NAS"
     );
+}
+
+/// #365: connected, a detach goes out at once as a ULInformationTransfer.
+#[test]
+fn a_connected_detach_goes_out_as_ul_information_transfer() {
+    let now = Instant::now();
+    let (mut u, _seen) = ue(Some(&[0x07, 0x41]));
+    acquire(&mut u, cell_info(), true, now);
+    u.on_downlink(CELL, RrcChannel::DlCcch, 0, &setup(0), now);
+    assert!(matches!(u.state(), UeRrcState::Connected { .. }));
+    let acts = u.detach(false, now);
+    let [UeAction::Rrc { pdu, .. }] = acts.as_slice() else {
+        panic!("{acts:?}");
+    };
+    let mut enb_rx = LteSrbPdcp::new();
+    enb_rx.receive(&[0, 0, 0, 0, 0]).unwrap(); // the SetupComplete before it
+    let sdu = enb_rx.receive(pdu).unwrap().sdu;
+    assert_eq!(
+        msg::decode_ul_dcch(&sdu).unwrap(),
+        msg::UlDcch::InformationTransfer {
+            nas: DETACH_REQUEST.to_vec()
+        }
+    );
+}
+
+/// #365: in RRC_IDLE the UE establishes a connection whose initial NAS message
+/// is the DETACH REQUEST.
+#[test]
+fn an_idle_detach_requests_a_connection() {
+    let now = Instant::now();
+    let (mut u, _seen) = ue(None);
+    assert!(acquire(&mut u, cell_info(), true, now).is_empty());
+    let acts = u.detach(false, now);
+    assert!(
+        matches!(
+            acts.as_slice(),
+            [UeAction::Rrc {
+                channel: RrcChannel::UlCcch,
+                ..
+            }]
+        ),
+        "RRCConnectionRequest for the detach: {acts:?}"
+    );
+    assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
 }
