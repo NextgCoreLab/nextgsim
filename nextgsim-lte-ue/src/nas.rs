@@ -253,3 +253,100 @@ impl NasLayer for EpsNas {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! #351 review: the paging match and the response cause on the REAL
+    //! [`EpsNas`], driven through an attach against the eps-nas scripted MME.
+    use super::*;
+    use nextgsim_eps_nas::testing::{registered_idle, IMSI};
+
+    /// The GUTI the scripted MME's ATTACH ACCEPT assigns: MMEC 0x01,
+    /// M-TMSI 0xC0000001.
+    const OUR_S_TMSI: PagedUeIdentity = PagedUeIdentity::STmsi {
+        mmec: 0x01,
+        m_tmsi: 0xC000_0001,
+    };
+
+    fn registered() -> EpsNas {
+        let (ue, _mme, _now) = registered_idle();
+        let nas = EpsNas {
+            status: Arc::new(Mutex::new(EpsNasStatus {
+                state: ue.state(),
+                bearer: None,
+            })),
+            ue,
+        };
+        assert_eq!(nas.ue.s_tmsi(), Some((0x01, 0xC000_0001)));
+        nas
+    }
+
+    fn digits(imsi: &str) -> Vec<u8> {
+        imsi.bytes().map(|b| b - b'0').collect()
+    }
+
+    /// TS 36.331 §5.3.2.3 + TS 24.301 §5.6.2.2.1 and Annex D: this UE's S-TMSI
+    /// starts a connection whose initial NAS is a SERVICE REQUEST with cause
+    /// mt-Access.
+    #[test]
+    fn our_s_tmsi_is_answered_with_an_mt_access_service_request() {
+        let mut nas = registered();
+        assert!(nas.on_paging(&OUR_S_TMSI));
+        let initial = nas.initial_nas().expect("the paging response");
+        assert_eq!(initial.cause, EstablishmentCauseValue::MtAccess);
+        assert_eq!(
+            initial.nas[0], 0xC7,
+            "SERVICE REQUEST, security header type 12"
+        );
+        assert_eq!(initial.s_tmsi, Some((0x01, 0xC000_0001)));
+    }
+
+    /// Another UE's S-TMSI is not this UE's paging: no connection, nothing owed.
+    #[test]
+    fn another_s_tmsi_is_not_answered() {
+        for other in [
+            PagedUeIdentity::STmsi {
+                mmec: 0x01,
+                m_tmsi: 0xC000_0002,
+            },
+            PagedUeIdentity::STmsi {
+                mmec: 0x02,
+                m_tmsi: 0xC000_0001,
+            },
+        ] {
+            let mut nas = registered();
+            assert!(!nas.on_paging(&other), "{other:?}");
+            assert!(nas.initial_nas().is_none(), "{other:?}");
+            assert_eq!(nas.ue.state(), EmmState::Registered);
+        }
+    }
+
+    /// TS 24.301 §5.6.2.2.2: a paging with this UE's IMSI detaches locally and
+    /// attaches again (mo-Signalling, Annex D), the GUTI gone.
+    #[test]
+    fn our_imsi_detaches_and_reattaches() {
+        let mut nas = registered();
+        assert!(nas.on_paging(&PagedUeIdentity::Imsi(digits(IMSI))));
+        assert_eq!(nas.ue.s_tmsi(), None, "the GUTI is deleted");
+        let initial = nas.initial_nas().expect("ATTACH REQUEST");
+        assert_eq!(&initial.nas[..2], &[0x07, 0x41], "plain ATTACH REQUEST");
+        assert_eq!(initial.cause, EstablishmentCauseValue::MoSignalling);
+    }
+
+    /// Another UE's IMSI must not wipe this UE's registration.
+    #[test]
+    fn another_imsi_leaves_the_registration_alone() {
+        let mut other = digits(IMSI);
+        *other.last_mut().unwrap() = 2;
+        for paged in [other, digits("99970000000000")] {
+            let mut nas = registered();
+            assert!(
+                !nas.on_paging(&PagedUeIdentity::Imsi(paged.clone())),
+                "{paged:?}"
+            );
+            assert_eq!(nas.ue.s_tmsi(), Some((0x01, 0xC000_0001)), "GUTI kept");
+            assert_eq!(nas.ue.state(), EmmState::Registered);
+            assert!(nas.initial_nas().is_none());
+        }
+    }
+}

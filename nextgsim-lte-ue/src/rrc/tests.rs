@@ -10,6 +10,8 @@ struct Seen {
     indications: Vec<RrcIndication>,
     downlink: Vec<Vec<u8>>,
     uplink_pending: usize,
+    /// Paging records RRC handed to NAS (#351 review).
+    paged: usize,
 }
 
 /// A NAS that requests a connection with a fixed message, echoes a fixed
@@ -52,6 +54,7 @@ impl NasLayer for Scripted {
         }
     }
     fn on_paging(&mut self, identity: &msg::PagedUeIdentity) -> bool {
+        self.seen.lock().unwrap().paged += 1;
         match &self.paged {
             Some((ours, sr)) if ours == identity => {
                 self.initial = Some(sr.clone());
@@ -610,7 +613,9 @@ fn a_paging_for_the_ue_starts_a_connection_and_others_do_not() {
         "RRCConnectionRequest for the paging: {acts:?}"
     );
     assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
-    // Not in RRC_IDLE any more: a repeated paging is not acted on.
+    // Not in RRC_IDLE any more: a repeated paging is not acted on, and NAS is
+    // not told of it (TS 36.331 §5.3.2.3 is an RRC_IDLE procedure; #351 review).
+    let told = seen.lock().unwrap().paged;
     assert!(u
         .on_downlink(
             CELL,
@@ -620,4 +625,9 @@ fn a_paging_for_the_ue_starts_a_connection_and_others_do_not() {
             now
         )
         .is_empty());
+    assert_eq!(
+        seen.lock().unwrap().paged,
+        told,
+        "a paging outside RRC_IDLE must not reach NAS"
+    );
 }

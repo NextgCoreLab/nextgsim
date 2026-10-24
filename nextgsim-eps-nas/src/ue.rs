@@ -574,6 +574,12 @@ impl EpsNasUe {
             self.t3417 = None;
             self.state = EmmState::Registered;
         }
+        // A paging response that never went out (the establishment failed or
+        // the connection went before the SERVICE REQUEST) is not owed any
+        // more: the network pages again on T3413 (§5.6.2.2.1). Kept, it would
+        // label the next data-triggered SERVICE REQUEST mt-Access and let it
+        // past T3346 (#351 review).
+        self.paging_response_pending = false;
         // Table 10.2.1: T3440 stops when the connection is released.
         self.t3440 = None;
         // AKA results that no SMC took into use do not survive the connection,

@@ -193,9 +193,12 @@ struct UeContext {
     /// The last user data or signalling to or from the UE, for the
     /// user-inactivity release (#350).
     last_activity: Instant,
-    /// A UE CONTEXT RELEASE REQUEST (user-inactivity) went out and the MME's
-    /// command has not come yet: not sent again (#350).
-    inactivity_release_requested: bool,
+    /// When a UE CONTEXT RELEASE REQUEST (user-inactivity) went out (#350). It
+    /// is not sent again while the MME's command is awaited, but a request is
+    /// re-armed when activity follows it (the MME kept the UE connected) or when
+    /// no command came within one more inactivity period (the request or the
+    /// command was lost), so a UE is never left connected for good (#353 review).
+    inactivity_release_requested_at: Option<Instant>,
 }
 
 impl UeContext {
@@ -327,8 +330,10 @@ impl EnbRrc {
             .iter()
             .filter(|(_, c)| {
                 c.state == UeState::Connected
-                    && !c.inactivity_release_requested
                     && now.saturating_duration_since(c.last_activity) >= limit
+                    && c.inactivity_release_requested_at.is_none_or(|at| {
+                        c.last_activity > at || now.saturating_duration_since(at) >= limit
+                    })
             })
             .filter_map(|(ue, c)| c.mme_ue_s1ap_id.map(|mme| (*ue, mme, c.enb_ue_s1ap_id)))
             .collect();
@@ -340,7 +345,7 @@ impl EnbRrc {
             );
             self.push_release_request_with(&mut acts, mme, enb, CauseRadioNetwork::USER_INACTIVITY);
             if let Some(c) = self.ues.get_mut(&ue) {
-                c.inactivity_release_requested = true;
+                c.inactivity_release_requested_at = Some(now);
             }
         }
         acts
@@ -513,7 +518,7 @@ impl EnbRrc {
             ics: None,
             drbs: Vec::new(),
             last_activity: Instant::now(),
-            inactivity_release_requested: false,
+            inactivity_release_requested_at: None,
         };
         let transaction_id = ctx.next_tid();
         ctx.state = UeState::AwaitingSetupComplete { transaction_id };

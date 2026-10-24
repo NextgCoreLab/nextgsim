@@ -21,6 +21,8 @@ pub mod aka;
 pub mod ie;
 pub mod msg;
 pub mod security;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod ue;
 
 pub use ue::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith};
