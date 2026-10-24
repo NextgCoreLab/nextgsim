@@ -600,6 +600,15 @@ pub enum RrcMessage {
         /// Encoded DL-DCCH RRCReconfiguration PDU
         pdu: OctetString,
     },
+    /// Send an N2 handover's RRCReconfiguration with reconfigurationWithSync to
+    /// the UE (source gNB, TS 38.300 §9.2.3.2.1 step 8, #324): the target's
+    /// HandoverCommand, unwrapped from the HANDOVER COMMAND.
+    SendHandoverCommand {
+        /// UE ID
+        ue_id: i32,
+        /// The RRCReconfiguration (DL-DCCH message).
+        pdu: OctetString,
+    },
     /// A handover-in has been ADMITTED for this UE, so the next
     /// `RRCReconfigurationComplete` from it means "the UE has landed" and not "the UE
     /// applied a reconfiguration" (TS 38.413 §8.4.3, issue #156).
@@ -888,6 +897,15 @@ pub enum RlsMessage {
         ue_id: i32,
         /// The ceiling in octets, or `None` for unrestricted (the full cell budget)
         grant_octets: Option<usize>,
+    },
+    /// A UE heard as `from` has arrived on a handover-in that admitted it as `to`
+    /// (#324): from now on this RLS reports and addresses the UE as `to`, the id
+    /// the NGAP, GTP and RRC tasks hold its contexts under.
+    RebindUe {
+        /// The id the UE was detected with.
+        from: i32,
+        /// The id the handover admission allocated.
+        to: i32,
     },
     /// Downlink data PDU (from GTP)
     DownlinkData {

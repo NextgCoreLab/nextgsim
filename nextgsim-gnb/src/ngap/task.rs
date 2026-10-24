@@ -4419,15 +4419,36 @@ impl NgapTask {
                      pending: either it already timed out or this gNB never started one"
                 );
             }
-            // Forward the Target-to-Source Transparent Container to UE via RRC
-            // This contains the RRC Reconfiguration with mobility control info
-            let container = OctetString::from_slice(&ho_cmd.target_to_source_transparent_container);
-            let msg = RrcMessage::NasDelivery {
-                ue_id,
-                pdu: container,
-            };
-            if let Err(e) = self.task_base.rrc_tx.send(msg).await {
-                error!("Failed to forward handover command to RRC: {}", e);
+            // TS 38.300 §9.2.3.2.1 step 8: the source sends the UE the
+            // RRCReconfiguration inside the target's HandoverCommand, the
+            // Target-to-Source container's rRCContainer (TS 38.413 §9.3.1.21). It was
+            // forwarded whole as a NAS PDU, which the UE could not act on (#324).
+            let reconfiguration =
+                nextgsim_ngap::procedures::handover::decode_target_to_source_container(
+                    &ho_cmd.target_to_source_transparent_container,
+                )
+                .ok()
+                .and_then(|rrc| {
+                    nextgsim_rrc::procedures::handover_preparation::decode_rrc_handover_command(
+                        &rrc,
+                    )
+                    .ok()
+                    .flatten()
+                });
+            match reconfiguration {
+                Some(reconfiguration) => {
+                    let msg = RrcMessage::SendHandoverCommand {
+                        ue_id,
+                        pdu: OctetString::from_slice(&reconfiguration),
+                    };
+                    if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+                        error!("Failed to forward handover command to RRC: {}", e);
+                    }
+                }
+                None => warn!(
+                    "UE[{ue_id}]: HANDOVER COMMAND's Target-to-Source container carries no \
+                     RRC HandoverCommand; the UE stays"
+                ),
             }
 
             // Release PDU sessions that failed handover
@@ -4499,11 +4520,23 @@ impl NgapTask {
         // its AMF UE NGAP ID already known, so `create_ue_context`'s send above
         // published an incomplete pair.
         self.sync_ue_context_to_app(ue_id).await;
+        // The GTP task's UE context, before any session is admitted below: the
+        // Initial UE Message path creates it, and a handover-in never ran that path.
+        // Without it every `SessionCreate` for the admitted sessions failed ("UE
+        // context not found") and the UE arrived with no user plane: every uplink
+        // PDU was dropped (#324, seen with nextgcore #978).
+        self.send_gtp_ue_context_update(ue_id, Some(ho_req.amf_ue_ngap_id as i64))
+            .await;
 
         // TS 33.501 §6.9.2.3.1: derive this target's KgNB* BEFORE admitting any
         // session, because the admitted DRBs are keyed from it. Doing it after would
         // hand `install_drb_security` the source's keys, and every PDCP MAC on this
         // cell would fail with nothing to say why.
+        // The NCC the AMF's {NH, NCC} carries, for the masterKeyUpdate below.
+        let ho_ncc = ho_req
+            .security_context
+            .as_ref()
+            .map(|c| c.next_hop_chaining_count);
         self.adopt_handover_security_context(ue_id, ho_req.security_context);
 
         // TS 23.502 §4.9.1.3.2 step 9 (RACS): the target uses the UE radio capability
@@ -4546,14 +4579,67 @@ impl NgapTask {
                 Err(item) => failed_list.push(item),
             }
         }
-        if admitted_list.is_empty() && !ho_req.pdu_sessions.is_empty() {
+        if admitted_list.is_empty() {
+            // TS 38.413 §8.4.2.3: "If the target NG-RAN node does not admit any of
+            // the PDU session resources, ... it shall send the HANDOVER FAILURE
+            // message to the AMF with an appropriate cause value." An acknowledge
+            // was attempted here instead, and `PDUSessionResourceAdmittedList` is
+            // SIZE(1..), so it failed to encode and the AMF heard nothing until
+            // the source's TNGRELOCprep expired (#324, seen against amfd).
             warn!(
-                "Handover for amf_ue_ngap_id={}: no requested session could be admitted",
+                "Handover for amf_ue_ngap_id={}: no requested session could be admitted; \
+                 HANDOVER FAILURE (TS 38.413 §8.4.2.3)",
                 ho_req.amf_ue_ngap_id
             );
+            let failure = nextgsim_ngap::procedures::handover::build_handover_failure(
+                &nextgsim_ngap::procedures::handover::HandoverFailureParams {
+                    amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
+                    cause: NgSetupFailureCause::RadioNetwork(
+                        RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                    ),
+                },
+            )
+            .ok()
+            .and_then(|pdu| encode_ngap_pdu(&pdu).ok());
+            match failure {
+                Some(data) => {
+                    self.send_ngap_ue_associated(client_id, stream, data).await;
+                }
+                None => error!("Failed to encode HANDOVER FAILURE"),
+            }
+            self.local_release_ue(ue_id).await;
+            return;
         }
 
-        let target_to_source_container = ho_req.source_to_target_transparent_container.clone();
+        // TS 38.413 §9.3.1.21 / TS 38.300 §9.2.3.2.1: the Target-to-Source container
+        // carries the RRC HandoverCommand (TS 38.331 §11.2.2) whose
+        // handoverCommandMessage is the RRCReconfiguration with reconfigurationWithSync
+        // the source sends the UE: this cell's PCI, the UE's new C-RNTI and T304, and
+        // the key update for the KgNB* derived above. It used to echo the
+        // Source-to-Target container back -- a HandoverPreparationInformation -- so the
+        // UE was never told where to go (#324).
+        let target_to_source_container = match self.build_target_to_source_container(ue_id, ho_ncc)
+        {
+            Some(c) => c,
+            None => {
+                error!("UE[{ue_id}]: cannot build the handover command for the source; HANDOVER FAILURE");
+                if let Some(data) = nextgsim_ngap::procedures::handover::build_handover_failure(
+                    &nextgsim_ngap::procedures::handover::HandoverFailureParams {
+                        amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
+                        cause: NgSetupFailureCause::RadioNetwork(
+                            RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                        ),
+                    },
+                )
+                .ok()
+                .and_then(|pdu| encode_ngap_pdu(&pdu).ok())
+                {
+                    self.send_ngap_ue_associated(client_id, stream, data).await;
+                }
+                self.local_release_ue(ue_id).await;
+                return;
+            }
+        };
 
         match encode_handover_request_acknowledge(&HandoverRequestAcknowledgeParams {
             amf_ue_ngap_id: ho_req.amf_ue_ngap_id,
@@ -4737,6 +4823,70 @@ impl NgapTask {
             pdu_session_id: psi,
             handover_request_ack_transfer: transfer,
         })
+    }
+
+    /// `NgapMessage::InitiateHandover`: the production caller `initiate_handover`
+    /// never had (issue #39).
+    ///
+    /// One preparation per UE at a time (TS 38.413 §8.4.1.2: TNGRELOCprep guards
+    /// it). A UE keeps reporting the better neighbour every report interval until
+    /// it moves (#324), and each report used to send another HANDOVER REQUIRED.
+    async fn handle_initiate_handover(&mut self, request: HandoverInitiation) {
+        if self
+            .guard_timers
+            .is_pending(GuardTimer::HandoverPreparation {
+                ue_id: request.ue_id,
+            })
+        {
+            debug!(
+                "UE[{}]: handover preparation already in progress; not repeated",
+                request.ue_id
+            );
+            return;
+        }
+        if !self.initiate_handover(request).await {
+            // Reported rather than swallowed: a handover that did not start must
+            // not look like one that did.
+            warn!("Handover initiation did not send a HANDOVER REQUIRED");
+        }
+    }
+
+    /// The Target-to-Source transparent container for a handover-in (#324): an
+    /// RRC HandoverCommand wrapping the RRCReconfiguration with
+    /// reconfigurationWithSync for this cell.
+    ///
+    /// The masterKeyUpdate carries the NCC of the AMF's {NH, NCC}, from which
+    /// `adopt_handover_security_context` derived this side's KgNB*.
+    fn build_target_to_source_container(&self, ue_id: i32, ncc: Option<u8>) -> Option<Vec<u8>> {
+        use nextgsim_rrc::procedures::handover_preparation::encode_rrc_handover_command;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+        };
+        let reconfiguration = encode_handover_command(&HandoverCommandParams {
+            rrc_transaction_id: 0,
+            target_phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
+            // The C-RNTI the UE uses on this cell: this simulator's UE index,
+            // reduced into RNTI-Value, as the intra-gNB command does.
+            new_ue_identity: (ue_id as u32 % 65536) as u16,
+            t304_ms: 1000,
+            full_config: true,
+            // keySetChangeIndicator is false: "the new K_(gNB) key is obtained
+            // from the current K_(gNB) key or from the NH" (TS 38.331 §6.2.2), here
+            // the AMF's NH. nextHopChainingCount is that NH's NCC, which the UE
+            // advances its own NH chain to (TS 33.501 §6.9.2.3.3; TS 38.331 §5.3.5.7).
+            master_key_update: Some(MasterKeyUpdateParams {
+                key_set_change_indicator: false,
+                next_hop_chaining_count: ncc.unwrap_or(0),
+            }),
+        })
+        .map_err(|e| error!("UE[{ue_id}]: RRCReconfiguration for the handover command: {e}"))
+        .ok()?;
+        let command = encode_rrc_handover_command(&reconfiguration)
+            .map_err(|e| error!("UE[{ue_id}]: RRC HandoverCommand: {e}"))
+            .ok()?;
+        nextgsim_ngap::procedures::handover::encode_target_to_source_container(&command)
+            .map_err(|e| error!("UE[{ue_id}]: Target-to-Source container: {e}"))
+            .ok()
     }
 
     /// Adopt the AMF-supplied `{NH, NCC}` and derive this target's `KgNB*`
@@ -6183,30 +6333,8 @@ impl Task for NgapTask {
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
                     }
-                    NgapMessage::InitiateHandover(request)
-                        if self
-                            .guard_timers
-                            .is_pending(GuardTimer::HandoverPreparation {
-                                ue_id: request.ue_id,
-                            }) =>
-                    {
-                        // One preparation per UE at a time (TS 38.413 §8.4.1.2:
-                        // TNGRELOCprep guards it). A UE keeps reporting the better
-                        // neighbour every report interval until it moves (#324), and
-                        // each report used to send another HANDOVER REQUIRED.
-                        debug!(
-                            "UE[{}]: handover preparation already in progress; not repeated",
-                            request.ue_id
-                        );
-                    }
                     NgapMessage::InitiateHandover(request) => {
-                        // The production caller `initiate_handover` never had (issue #39).
-                        if !self.initiate_handover(*request).await {
-                            // Reported rather than swallowed: a handover that did not
-                            // start must not look like one that did, which is the
-                            // no-op-that-logs-success failure this issue is about.
-                            warn!("Handover initiation did not send a HANDOVER REQUIRED");
-                        }
+                        self.handle_initiate_handover(*request).await;
                     }
                     NgapMessage::HandoverAccessCompleted { ue_id } => {
                         // TS 38.413 §8.4.3: the target tells the AMF the UE has arrived,
@@ -8049,6 +8177,188 @@ mod tests {
         );
     }
 
+    /// #324, TS 38.413 §9.3.1.21 / TS 38.331 §11.2.2: the Target-to-Source container
+    /// is an RRC HandoverCommand whose RRCReconfiguration sends the UE to THIS cell,
+    /// with the AMF's NCC in the masterKeyUpdate and keySetChangeIndicator false.
+    /// Before, the container echoed the Source-to-Target one back.
+    #[tokio::test]
+    async fn the_target_to_source_container_is_a_handover_command_to_this_cell() {
+        use nextgsim_ngap::procedures::handover::{
+            decode_target_to_source_container, parse_handover_request_acknowledge,
+        };
+        use nextgsim_rrc::procedures::handover_preparation::decode_rrc_handover_command;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::decode_handover_command;
+
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
+        let pdu = handover_request(
+            &[5],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 2,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let ack = drain_sctp(&mut sctp_rx)
+            .iter()
+            .find_map(|bytes| {
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+                    .ok()
+                    .and_then(|pdu| parse_handover_request_acknowledge(&pdu).ok())
+            })
+            .expect("a Handover Request Acknowledge must be sent");
+        let rrc_container =
+            decode_target_to_source_container(&ack.target_to_source_transparent_container)
+                .expect("a TargetNGRANNode-ToSourceNGRANNode-TransparentContainer");
+        let reconfiguration = decode_rrc_handover_command(&rrc_container)
+            .expect("an RRC HandoverCommand")
+            .expect("its handoverCommandMessage");
+        let command = decode_handover_command(&reconfiguration)
+            .expect("an RRCReconfiguration with reconfigurationWithSync");
+        assert_eq!(
+            command.target_phys_cell_id,
+            phys_cell_id_from_nci(task.task_base.config.nci),
+            "the UE is sent to the target's own cell"
+        );
+        let update = command.master_key_update.expect("a masterKeyUpdate");
+        assert_eq!(update.next_hop_chaining_count, 2, "the AMF's NCC");
+        assert!(
+            !update.key_set_change_indicator,
+            "KgNB* comes from the NH, not a new K_AMF"
+        );
+    }
+
+    /// #324 (nextgcore #978 run): the GTP task learns of a handover-in UE BEFORE
+    /// its sessions are created, as on the Initial UE Message path. Before, the
+    /// target's GTP task had no UE context, every `SessionCreate` failed, and all
+    /// user-plane traffic after the handover was dropped.
+    #[tokio::test]
+    async fn a_handover_in_creates_the_gtp_ue_context_before_its_sessions() {
+        let (mut task, _rrc_rx, mut gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        while gtp_rx.try_recv().is_ok() {}
+        let pdu = handover_request(
+            &[5],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let ue_id = handover_ue_id(&task);
+        let mut order = Vec::new();
+        while let Ok(msg) = gtp_rx.try_recv() {
+            match msg {
+                TaskMessage::Message(GtpMessage::UeContextUpdate { ue_id: u, update }) => {
+                    assert_eq!(update.amf_ue_ngap_id, Some(7777));
+                    order.push(("context", u));
+                }
+                TaskMessage::Message(GtpMessage::SessionCreate { ue_id: u, .. }) => {
+                    order.push(("session", u));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(order, vec![("context", ue_id), ("session", ue_id)]);
+    }
+
+    /// #324, TS 38.413 §8.4.1.2: one HANDOVER REQUIRED per UE while TNGRELOCprep
+    /// runs. The UE reports the better neighbour every interval until it moves, and
+    /// each report used to start another preparation.
+    #[tokio::test]
+    async fn a_second_handover_trigger_during_preparation_sends_nothing() {
+        use nextgsim_ngap::procedures::handover::parse_handover_required;
+
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(3).await;
+        if let Some(ctx) = task.find_ue_context_mut(3) {
+            ctx.add_pdu_session(NgapPduSession {
+                psi: 5,
+                qfi: Some(9),
+                uplink_teid: 1,
+                downlink_teid: 2,
+                upf_address: "10.45.0.1".parse().unwrap(),
+                up_security_policy: UpSecurityPolicy::locally_configured_default(),
+                up_security: DrbSecurityDecision::default(),
+            });
+        }
+        let trigger = || HandoverInitiation {
+            ue_id: 3,
+            target_gnb_id: 0x2,
+            target_tac: 1,
+            target_cell_identity: 0x20,
+            ue_nr_capability: None,
+            time_in_source_cell_s: 1,
+        };
+        task.handle_initiate_handover(trigger()).await;
+        task.handle_initiate_handover(trigger()).await;
+        let required = drain_sctp(&mut sctp_rx)
+            .iter()
+            .filter(|bytes| {
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes)
+                    .ok()
+                    .is_some_and(|pdu| parse_handover_required(&pdu).is_ok())
+            })
+            .count();
+        assert_eq!(required, 1, "one preparation at a time");
+    }
+
+    /// #324, TS 38.300 §9.2.3.2.1 step 8: the source unwraps the HANDOVER COMMAND's
+    /// container and sends the RRCReconfiguration inside it to the UE. It used to
+    /// forward the whole container as a NAS PDU. A container with no RRC
+    /// HandoverCommand in it sends the UE nothing.
+    #[tokio::test]
+    async fn the_source_sends_the_ue_the_reconfiguration_inside_the_handover_command() {
+        use nextgsim_ngap::procedures::handover::encode_target_to_source_container;
+        use nextgsim_rrc::procedures::handover_preparation::encode_rrc_handover_command;
+
+        let reconfiguration = vec![0x08, 0x10, 0x20, 0x30];
+        let container = encode_target_to_source_container(
+            &encode_rrc_handover_command(&reconfiguration).expect("encode the command"),
+        )
+        .expect("encode the container");
+        for (container, expected) in [
+            (container, Some(reconfiguration.clone())),
+            (vec![0x01, 0x02], None),
+        ] {
+            let (mut task, mut rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(14).await;
+            let ran_ue_ngap_id = task
+                .find_ue_context(14)
+                .map(|c| c.ran_ue_ngap_id)
+                .expect("ue context") as u32;
+            task.handle_handover_command(
+                1,
+                0,
+                HandoverCommandData {
+                    amf_ue_ngap_id: 7777,
+                    ran_ue_ngap_id,
+                    handover_type: HandoverTypeValue::Intra5gs,
+                    target_to_source_transparent_container: container,
+                    pdu_session_resource_handover_list: None,
+                    pdu_session_resource_to_release_list: None,
+                },
+            )
+            .await;
+            let mut sent = None;
+            while let Ok(msg) = rrc_rx.try_recv() {
+                match msg {
+                    TaskMessage::Message(RrcMessage::SendHandoverCommand { ue_id, pdu }) => {
+                        assert_eq!(ue_id, 14);
+                        sent = Some(pdu.data().to_vec());
+                    }
+                    TaskMessage::Message(RrcMessage::NasDelivery { .. }) => {
+                        panic!("the container must not reach the UE as a NAS PDU")
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(sent, expected);
+        }
+    }
+
     // ------------------------------------------------------------------
     // #169: the handover-arrival arming, over the channel
     // ------------------------------------------------------------------
@@ -8156,6 +8466,40 @@ mod tests {
             armed_arrivals(&mut rrc_rx).is_empty(),
             "an acknowledge the AMF never received must not arm arrival detection: the \
              target would report a HANDOVER NOTIFY for a handover nobody asked it to admit"
+        );
+    }
+
+    /// #324, TS 38.413 §8.4.2.3: a target that admits none of the requested
+    /// sessions answers HANDOVER FAILURE and drops the UE context it created.
+    /// Here the only session's transfer is undecodable -- what amfd sent in the
+    /// two-gNB run, the source's Handover Required Transfer passed through. Before,
+    /// the target tried an acknowledge with an empty admitted list, which cannot
+    /// be encoded, so the AMF heard nothing until TNGRELOCprep ran out.
+    #[tokio::test]
+    async fn a_target_that_admits_no_session_answers_handover_failure() {
+        use nextgsim_ngap::codec::generated::{UnsuccessfulOutcomeValue, NGAP_PDU};
+
+        let (mut task, _rrc_rx, _gtp_rx, mut sctp_rx) = task_with_sctp(1).await;
+        let before = task.ue_contexts.len();
+        let pdu = handover_request(&[5], None);
+        let mut ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        ho_req.pdu_sessions[0].transfer = vec![0x00];
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let failure = drain_sctp(&mut sctp_rx).iter().any(|bytes| {
+            matches!(
+                nextgsim_ngap::codec::decode_ngap_pdu(bytes),
+                Ok(NGAP_PDU::UnsuccessfulOutcome(o))
+                    if matches!(o.value, UnsuccessfulOutcomeValue::Id_HandoverResourceAllocation(_))
+            )
+        });
+        assert!(failure, "a HANDOVER FAILURE must reach the AMF");
+        assert_eq!(
+            task.ue_contexts.len(),
+            before,
+            "the handover-in UE context is released again"
         );
     }
 

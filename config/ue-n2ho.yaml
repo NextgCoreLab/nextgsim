@@ -102,7 +102,7 @@ gnb_search_list:
 # Start 35 m from the first gNB (x 0) and 85 m from the second (x 120), then,
 # 20 s after start-up, walk to x 85 at 2.5 m/s (20 s). Levels are -1 dBm per
 # metre, so the second gNB's cell passes the first's by the A3 margin (3 dB
-# offset, 1 dB hysteresis) at about x 61, some 10 s into the walk.
+# offset plus 1 dB hysteresis) past x 62, some 11 s into the walk.
 sim_position: { x: 35, y: 0, z: 0 }
 sim_movement:
   target: { x: 85, y: 0, z: 0 }

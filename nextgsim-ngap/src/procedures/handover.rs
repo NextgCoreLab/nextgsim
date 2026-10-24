@@ -866,6 +866,25 @@ pub fn encode_source_to_target_container(
     Ok(encode_aper(&container)?)
 }
 
+/// Encode a `TargetNGRANNode-ToSourceNGRANNode-TransparentContainer`
+/// (TS 38.413 §9.3.1.21): its `rRCContainer` is the RRC HandoverCommand
+/// (TS 38.331 §11.2.2) the source delivers to the UE (#324).
+pub fn encode_target_to_source_container(rrc_container: &[u8]) -> Result<Vec<u8>, HandoverError> {
+    Ok(encode_aper(
+        &TargetNGRANNode_ToSourceNGRANNode_TransparentContainer {
+            rrc_container: RRCContainer(rrc_container.to_vec()),
+            ie_extensions: None,
+        },
+    )?)
+}
+
+/// Decode a `TargetNGRANNode-ToSourceNGRANNode-TransparentContainer` and return
+/// its `rRCContainer` (#324).
+pub fn decode_target_to_source_container(bytes: &[u8]) -> Result<Vec<u8>, HandoverError> {
+    let container: TargetNGRANNode_ToSourceNGRANNode_TransparentContainer = decode_aper(bytes)?;
+    Ok(container.rrc_container.0)
+}
+
 /// Decode a `SourceNGRANNode-ToTargetNGRANNode-TransparentContainer`.
 ///
 /// A non-NR target cell yields an error rather than a zeroed CGI: an NR target handed a

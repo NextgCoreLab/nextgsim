@@ -139,9 +139,54 @@ pub fn decode_handover_preparation_information(
     parse_handover_preparation_information(&msg)
 }
 
+/// Wrap an RRCReconfiguration (DL-DCCH message bytes) in the inter-node
+/// `HandoverCommand` (TS 38.331 §11.2.2) a target gNB returns in the
+/// Target-to-Source container (#324): `handoverCommandMessage` is the
+/// RRCReconfiguration the source sends to the UE.
+pub fn encode_rrc_handover_command(
+    rrc_reconfiguration: &[u8],
+) -> Result<Vec<u8>, HandoverPreparationError> {
+    Ok(encode_rrc(&HandoverCommand {
+        critical_extensions: HandoverCommandCriticalExtensions::C1(
+            HandoverCommandCriticalExtensions_c1::HandoverCommand(HandoverCommand_IEs {
+                handover_command_message: HandoverCommand_IEsHandoverCommandMessage(
+                    rrc_reconfiguration.to_vec(),
+                ),
+                non_critical_extension: None,
+            }),
+        ),
+    })?)
+}
+
+/// The `handoverCommandMessage` (the RRCReconfiguration bytes) of an inter-node
+/// `HandoverCommand` (#324). `None` for a critical-extension form this build
+/// does not read.
+pub fn decode_rrc_handover_command(
+    bytes: &[u8],
+) -> Result<Option<Vec<u8>>, HandoverPreparationError> {
+    let msg: HandoverCommand = decode_rrc(bytes)?;
+    Ok(match msg.critical_extensions {
+        HandoverCommandCriticalExtensions::C1(
+            HandoverCommandCriticalExtensions_c1::HandoverCommand(ies),
+        ) => Some(ies.handover_command_message.0),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #324: the inter-node HandoverCommand carries the RRCReconfiguration intact.
+    #[test]
+    fn the_rrc_handover_command_round_trips_its_reconfiguration() {
+        let reconfiguration = vec![0x08, 0x10, 0x20, 0x30];
+        let bytes = encode_rrc_handover_command(&reconfiguration).expect("encode");
+        assert_eq!(
+            decode_rrc_handover_command(&bytes).expect("decode"),
+            Some(reconfiguration)
+        );
+    }
 
     /// #39: the UE's real capability container survives the round trip, so a target
     /// learns what the UE supports.

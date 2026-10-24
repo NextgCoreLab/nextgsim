@@ -206,9 +206,11 @@ impl GnbHandoverManager {
         let mut best_candidate: Option<(u32, i32)> = None;
 
         for neighbor in &report.neighbors {
-            // Check A3 condition: neighbor > serving + offset - hysteresis
+            // A3 entering condition, TS 38.331 §5.5.4.4 Inequality A3-1:
+            // "Mn + Ofn + Ocn – Hys > Mp + Ofp + Ocp + Off", so the neighbour must
+            // beat serving + Off + Hys (no cell offsets are configured here).
             let threshold =
-                f64::from(report.serving_rsrp) + self.config.a3_offset - self.config.hysteresis;
+                f64::from(report.serving_rsrp) + self.config.a3_offset + self.config.hysteresis;
             if f64::from(neighbor.rsrp) > threshold
                 && best_candidate.is_none_or(|(_, rsrp)| neighbor.rsrp > rsrp)
             {
@@ -1334,9 +1336,10 @@ mod tests {
         }
     }
 
-    /// #324: the margin is the configured one, fractional values included. With
-    /// offset -3 dB and hysteresis 0.5 dB a neighbour 2 dB WORSE still qualifies
-    /// (-92 > -90 - 3 - 0.5); one 4 dB worse does not.
+    /// #324: the margin is the configured one, fractional values included, and the
+    /// hysteresis is ADDED (TS 38.331 §5.5.4.4 A3-1). With offset -3 dB and
+    /// hysteresis 0.5 dB a neighbour 2 dB worse qualifies (-92 > -90 - 3 + 0.5);
+    /// one 3 dB worse does not, though it would if the hysteresis were subtracted.
     #[test]
     fn the_a3_margin_is_the_configured_one() {
         let mut manager = GnbHandoverManager::new(1);
@@ -1355,7 +1358,7 @@ mod tests {
             HandoverDecision::IntraGnbHandover { target_cell_id: 7 }
         ));
         assert!(matches!(
-            manager.process_measurement_report(1, &report(-94)),
+            manager.process_measurement_report(1, &report(-93)),
             HandoverDecision::NoHandover
         ));
     }

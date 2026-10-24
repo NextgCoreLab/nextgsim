@@ -485,6 +485,7 @@ impl RrcTask {
                 self.handle_ul_ccch_message(ue_id, &data).await;
             }
             RrcChannel::UlDcch => {
+                let ue_id = self.bind_handover_arrival(ue_id).await;
                 self.handle_ul_dcch_message(ue_id, &data).await;
             }
             _ => warn!("Unexpected uplink channel: {:?}", channel),
@@ -1087,6 +1088,51 @@ impl RrcTask {
             ue_id
         );
         self.pending_handover_arrivals.insert(ue_id);
+    }
+
+    /// The source side of an N2 handover (#324): send the target's
+    /// RRCReconfiguration with reconfigurationWithSync to the UE on SRB1.
+    pub async fn handle_send_handover_command(&mut self, ue_id: i32, pdu: OctetString) {
+        info!(
+            "RRC: sending the N2 handover command to UE[{ue_id}] ({} bytes)",
+            pdu.len()
+        );
+        self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+        self.handover_manager.mark_executing(ue_id);
+    }
+
+    /// A UE-DCCH PDU from a UE this cell has no RRC context for, while a
+    /// handover-in is awaited, is that UE arriving (#324). The RLS assigns ids by
+    /// what it hears, and the NGAP admission allocated its own, so nothing ties
+    /// the two until the UE speaks on the cell. In a real cell the UE's dedicated
+    /// RACH and the C-RNTI do that; here the first such PDU binds the RLS id to
+    /// the oldest pending arrival, the RLS is told to use the admitted id from now
+    /// on, and the PDU is handled under it.
+    async fn bind_handover_arrival(&mut self, ue_id: i32) -> i32 {
+        if self.ue_manager.try_find_ue(ue_id).is_some()
+            || self.pending_handover_arrivals.contains(&ue_id)
+        {
+            return ue_id;
+        }
+        let Some(&admitted) = self.pending_handover_arrivals.iter().min() else {
+            return ue_id;
+        };
+        info!("UE[{ue_id}] speaks on this cell with no RRC context: the handover arrival UE[{admitted}]");
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::RebindUe {
+                from: ue_id,
+                to: admitted,
+            })
+            .await
+        {
+            error!("Failed to rebind UE[{ue_id}] as UE[{admitted}]: {e}");
+            return ue_id;
+        }
+        let ctx = self.ue_manager.find_or_create_ue(admitted);
+        ctx.on_setup_complete();
+        admitted
     }
 
     /// Whether a handover arrival is still expected for `ue_id`.
@@ -2788,6 +2834,9 @@ impl Task for RrcTask {
                             }
                             RrcMessage::ExpectHandoverArrival { ue_id } => {
                                 self.handle_expect_handover_arrival(ue_id);
+                            }
+                            RrcMessage::SendHandoverCommand { ue_id, pdu } => {
+                                self.handle_send_handover_command(ue_id, pdu).await;
                             }
                             RrcMessage::AnRelease { ue_id } => {
                                 self.handle_an_release(ue_id).await;
@@ -5042,6 +5091,56 @@ mod tests {
             !task.expects_handover_arrival(7),
             "and the expectation is spent"
         );
+    }
+
+    /// #324: an N2 handover arrival speaks first under the id the RLS gave it, which
+    /// is not the id the NGAP admission allocated. Its first UL-DCCH PDU, from a UE
+    /// this cell has no RRC context for, binds the two: the RLS is told to rebind,
+    /// and the arrival is reported under the admitted id. A UE with no admission
+    /// pending is not rebound.
+    #[test]
+    fn a_handover_arrival_under_another_rls_id_is_bound_to_the_admission() {
+        use crate::tasks::RlsMessage;
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_rrc_reconfiguration_complete, RrcReconfigurationCompleteParams,
+        };
+
+        for admitted in [Some(1000), None] {
+            let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+                GnbTaskBase::new(test_config(), 16);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                if let Some(admitted) = admitted {
+                    task.handle_expect_handover_arrival(admitted);
+                }
+                let complete =
+                    encode_rrc_reconfiguration_complete(&RrcReconfigurationCompleteParams {
+                        rrc_transaction_id: 1,
+                    })
+                    .expect("encode RRCReconfigurationComplete");
+                task.handle_uplink_rrc(9, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                    .await;
+            });
+
+            let mut rebound = None;
+            while let Ok(msg) = rls_rx.try_recv() {
+                if let TaskMessage::Message(RlsMessage::RebindUe { from, to }) = msg {
+                    rebound = Some((from, to));
+                }
+            }
+            let mut notified = None;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                if let TaskMessage::Message(NgapMessage::HandoverAccessCompleted { ue_id }) = msg {
+                    notified = Some(ue_id);
+                }
+            }
+            assert_eq!(rebound, admitted.map(|a| (9, a)), "admitted {admitted:?}");
+            assert_eq!(notified, admitted, "admitted {admitted:?}");
+            if let Some(admitted) = admitted {
+                assert!(task.ue_manager.try_find_ue(admitted).is_some());
+                assert!(task.ue_manager.try_find_ue(9).is_none());
+            }
+        }
     }
 
     /// The negative control: an ORDINARY RRCReconfigurationComplete, with no admission
