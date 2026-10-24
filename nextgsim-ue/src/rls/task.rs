@@ -110,6 +110,9 @@ pub struct RlsTask {
     /// Test seam: hostname lookups never answer, as against an unreachable DNS.
     #[cfg(test)]
     resolve_hang: bool,
+    /// Test seam: how many re-resolution rounds were spawned (#342 review).
+    #[cfg(test)]
+    resolve_rounds: usize,
     /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
     unknown_sources: UnknownSourceWarner,
     sti: u64,
@@ -249,6 +252,8 @@ impl RlsTask {
             resolve_rx,
             #[cfg(test)]
             resolve_hang: false,
+            #[cfg(test)]
+            resolve_rounds: 0,
             unknown_sources: UnknownSourceWarner::new(Instant::now()),
             sti,
             rlc_entities: HashMap::new(),
@@ -343,9 +348,16 @@ impl RlsTask {
         }
         self.resolving = true;
         let hosts = self.config.gnb_search_hosts.clone();
-        let tx = self.resolve_tx.clone();
+        // An empty round if the task ends without reporting, so `resolving` is
+        // cleared whatever happens to it (#342 review).
+        let report =
+            nextgsim_common::outcome_guard::OutcomeGuard::new(self.resolve_tx.clone(), Vec::new());
         #[cfg(test)]
         let hang = self.resolve_hang;
+        #[cfg(test)]
+        {
+            self.resolve_rounds += 1;
+        }
         tokio::spawn(async move {
             #[cfg(test)]
             if hang {
@@ -356,7 +368,7 @@ impl RlsTask {
                 let result = host.resolve().await;
                 out.push((host, result));
             }
-            let _ = tx.send(out);
+            report.send(out);
         });
     }
 
@@ -1685,6 +1697,10 @@ mod tests {
         assert!(task.resolving);
         task.start_reresolve(); // not stacked: still one round in flight
         assert!(task.resolving);
+        assert_eq!(
+            task.resolve_rounds, 1,
+            "a second round is not spawned (#342 review)"
+        );
         let runner = tokio::spawn(async move { task.run(rls_rx).await });
 
         let mut buf = [0u8; 2048];

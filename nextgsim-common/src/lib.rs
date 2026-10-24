@@ -25,6 +25,7 @@ pub mod logging;
 pub mod octet;
 pub mod octet_string;
 pub mod octet_view;
+pub mod outcome_guard;
 pub mod peer_addr;
 pub mod sim_tick;
 pub mod transport;
