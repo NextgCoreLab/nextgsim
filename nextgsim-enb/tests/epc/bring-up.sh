@@ -133,12 +133,17 @@ start() { # name, then the command
 
 start hssd "$BIN/nextgcore-hssd" -c hss.yaml --diameter-config "$DIR/hss.conf" \
     --db-uri mongodb://127.0.0.1:27118/nextgcore
-start upfd "$BIN/nextgcore-upfd" -c pgwu.yaml --pfcp-addr 127.0.0.7 --gtpu-addr 127.0.0.7 \
+# PFCP peer allowlists (nextgcore #968): upfd and sgwud refuse every PFCP
+# Association Setup from a peer not listed, and with no list they refuse all.
+# Given as environment variables, which a build before #968 ignores, so this
+# script works on both sides of it (#357).
+UPF_PFCP_ALLOWED_PEERS=127.0.0.4 \
+    start upfd "$BIN/nextgcore-upfd" -c pgwu.yaml --pfcp-addr 127.0.0.7 --gtpu-addr 127.0.0.7 \
     --no-dataplane
 SMF_PFCP_ADDR=127.0.0.4 UPF_PFCP_ADDR=127.0.0.7 NEXTGCORE_SBI_PROFILE=dev \
     start smfd "$BIN/nextgcore-smfd" -c pgwc.yaml
 PFCP_BIND_ADDR=127.0.0.6:8805 PFCP_NODE_IP=127.0.0.6 SGWU_GTPU_BIND=127.0.0.6:2152 \
-    SGWU_METRICS_PORT=19096 start sgwud "$BIN/nextgcore-sgwud" -c sgwu.yaml
+    SGWU_METRICS_PORT=19096 SGWU_PFCP_ALLOWED_PEERS=127.0.0.3 start sgwud "$BIN/nextgcore-sgwud" -c sgwu.yaml
 SGWC_S11_BIND=127.0.0.3:2123 SGWC_PFCP_BIND_ADDR=127.0.0.3:8805 SGWC_PFCP_NODE_IP=127.0.0.3 \
     SGWC_SGWU_ADDR=127.0.0.6:8805 SGWC_GTPU_ADVERTISE=127.0.0.6 SGWC_PGW_S5C=127.0.0.4 \
     SGWC_RESTART_COUNTER_FILE="$DIR/sgwc-restart-counter" \
