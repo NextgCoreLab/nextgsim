@@ -12,21 +12,23 @@
 //! - **`RequestCapabilities`** (§5.1.3) → `ProvideCapabilities` naming the E-CID
 //!   measurements this UE can actually report.
 //! - **`RequestLocationInformation`** (§5.3.3) → `ProvideLocationInformation`
-//!   carrying an E-CID measurement report.
+//!   carrying an E-CID measurement report, or an NR E-CID one for the Rel-16
+//!   `nr-ECID-RequestLocationInformation-r16` (#330), or both when both are asked.
+//!   `ProvideCapabilities` names the NR E-CID measurements too.
 //!
 //! Both echo the incoming `LPP-TransactionID` and set `endTransaction`, so the
 //! server can match the reply to its request and close the transaction.
 //!
 //! ## What it refuses rather than answers
 //!
-//! A request for A-GNSS, OTDOA, NR-DL-TDOA or Multi-RTT is **refused at the codec**
+//! A request for A-GNSS, OTDOA, NR-DL-TDOA, NR-DL-AoD or Multi-RTT is **refused at the codec**
 //! rather than answered with E-CID: answering a method the server did not ask for
 //! looks like a successful positioning fix and is not one. The refusal is logged
 //! with its reason.
 //!
 //! ## What this UE can honestly measure
 //!
-//! Exactly one of E-CID's three quantities: **RSRP**. The UE's measurement path
+//! Exactly one of E-CID's three quantities: **RSRP** (for NR E-CID, SS-RSRP). The UE's measurement path
 //! (`MeasurementManager::update_measurement`) is fed one dBm level per cell by RLS
 //! and populates nothing else — `CellMeasResult::rsrq` is declared and never
 //! written, and there is no downlink-receive-to-uplink-transmit timing anywhere in
@@ -40,8 +42,9 @@ mod uper;
 
 pub use message::{
     EcidMeasurementBits, EcidSignalMeasurementInformation, Initiator, LppBody, LppMessage,
-    LppTransactionId, MeasuredResultsElement, SidelinkRangingMethod, SidelinkRangingReport,
-    SidelinkRangingResult,
+    LppTransactionId, MeasuredResultsElement, NrEcidMeasurementBits,
+    NrEcidSignalMeasurementInformation, NrMeasuredResultsElement, SidelinkRangingMethod,
+    SidelinkRangingReport, SidelinkRangingResult,
 };
 pub use uper::{UperError, UperReader, UperResult, UperWriter};
 
@@ -58,9 +61,8 @@ use tracing::{debug, info, warn};
 pub struct ServingCellMeasurements {
     /// Physical cell identity of the serving cell.
     ///
-    /// The simulator's RLS cell id doubles as the PCI throughout this tree —
-    /// `MeasurementManager::update_measurement` stores `pci: cell_id as u32`, and
-    /// `rrc::conditional_handover::candidate_cell_id` relies on the same identity.
+    /// `nci % 1008` of the serving cell, from its SIB1 (#330), the convention the
+    /// gNB uses for its own PCI.
     pub phys_cell_id: u16,
     /// `arfcnEUTRA`, which TS 37.355 makes a **mandatory** member of
     /// `MeasuredResultsElement`.
@@ -76,6 +78,35 @@ pub struct ServingCellMeasurements {
     ///
     /// Always `None` today: nothing in the UE measures RSRQ (see the module doc).
     pub rsrq_result: Option<u8>,
+    /// The serving cell's level in dBm, from which the NR SS-RSRP report value
+    /// (TS 38.133 §10.1.6.1) is derived for NR E-CID (#330).
+    pub rsrp_dbm: Option<i32>,
+    /// The serving cell's SSB `ARFCN-ValueNR` for NR E-CID (#330): the UE's
+    /// `dl_arfcn`, which must match the gNB's.
+    pub nr_arfcn: u32,
+}
+
+/// SS-RSRP in dBm as the TS 38.133 §10.1.6.1 report value (0..127), for NR E-CID
+/// (#330): `RSRP_0` below -156 dBm, `RSRP_1` from -156 to -155, 1 dB steps, up to
+/// `RSRP_127` at -30 dBm and above. So the value is `dBm + 157`, saturated.
+pub fn nr_ss_rsrp_report_value(dbm: i32) -> u8 {
+    (dbm.saturating_add(157)).clamp(0, 127) as u8
+}
+
+/// SS-RSRQ in dB as the TS 38.133 §10.1.11.1 report value (0..127), for NR E-CID
+/// (#330): `RSRQ_0` below -43 dB, `RSRQ_1` from -43 to -42.5, 0.5 dB steps, up to
+/// `RSRQ_127` at 20 dB and above.
+///
+/// Unused today -- nothing measures RSRQ -- and kept so a future RSRQ source has
+/// the mapping written and tested.
+pub fn nr_ss_rsrq_report_value(db: f32) -> u8 {
+    if db < -43.0 {
+        return 0;
+    }
+    if db >= 20.0 {
+        return 127;
+    }
+    (1 + ((db + 43.0) * 2.0).floor() as i32).clamp(0, 127) as u8
 }
 
 /// RSRP in dBm as the TS 36.133 §9.1.4 `RSRP_LEV` report value (0..97).
@@ -142,6 +173,9 @@ pub struct LppEndpoint {
     /// The E-CID measurements this UE reports as supported. See the module doc for
     /// why RSRP is the only one.
     supported: EcidMeasurementBits,
+    /// The NR E-CID measurements this UE reports as supported (#330): SS-RSRP
+    /// only, for the same reason as `supported`.
+    nr_supported: NrEcidMeasurementBits,
     /// How many replies have been sent, so a caller can tell "answered" from
     /// "nothing arrived".
     replies_sent: u32,
@@ -164,6 +198,12 @@ impl LppEndpoint {
                 rsrq: false,
                 ue_rx_tx: false,
             },
+            nr_supported: NrEcidMeasurementBits {
+                ss_rsrp: true,
+                ss_rsrq: false,
+                csi_rsrp: false,
+                csi_rsrq: false,
+            },
             replies_sent: 0,
         }
     }
@@ -171,6 +211,11 @@ impl LppEndpoint {
     /// The E-CID measurements this UE advertises.
     pub fn supported(&self) -> EcidMeasurementBits {
         self.supported
+    }
+
+    /// The NR E-CID measurements this UE advertises (#330).
+    pub fn nr_supported(&self) -> NrEcidMeasurementBits {
+        self.nr_supported
     }
 
     /// How many LPP replies have been produced.
@@ -205,43 +250,95 @@ impl LppEndpoint {
         };
 
         let reply_body = match body {
-            LppBody::RequestCapabilities { ecid_requested } => {
+            LppBody::RequestCapabilities {
+                ecid_requested,
+                nr_ecid_requested,
+            } => {
                 info!(
-                    "LPP RequestCapabilities (E-CID asked for: {ecid_requested}); \
-                     answering with rsrp={} rsrq={} ueRxTx={}",
-                    self.supported.rsrp, self.supported.rsrq, self.supported.ue_rx_tx
+                    "LPP RequestCapabilities (E-CID asked for: {ecid_requested}, NR E-CID: \
+                     {nr_ecid_requested}); answering with rsrp={} rsrq={} ueRxTx={}, \
+                     NR ss-rsrp={} ss-rsrq={}",
+                    self.supported.rsrp,
+                    self.supported.rsrq,
+                    self.supported.ue_rx_tx,
+                    self.nr_supported.ss_rsrp,
+                    self.nr_supported.ss_rsrq
                 );
+                // NR E-CID capabilities are always reported (#330): an NR UE's
+                // own positioning method, whether or not this request named it.
                 LppBody::ProvideCapabilities {
                     ecid_supported: self.supported,
+                    nr_ecid_supported: Some(self.nr_supported),
                 }
             }
-            LppBody::RequestLocationInformation { requested } => {
+            LppBody::RequestLocationInformation {
+                requested,
+                nr_requested,
+            } => {
                 // Report only what was BOTH asked for and supported. A measurement
                 // the server did not request is not part of the answer, and one this
                 // UE cannot make would have to be invented.
-                let element = MeasuredResultsElement {
-                    phys_cell_id: measurements.phys_cell_id,
-                    arfcn: measurements.arfcn,
-                    system_frame_number: measurements.system_frame_number,
-                    rsrp_result: (requested.rsrp && self.supported.rsrp)
-                        .then_some(measurements.rsrp_result)
-                        .flatten(),
-                    rsrq_result: (requested.rsrq && self.supported.rsrq)
-                        .then_some(measurements.rsrq_result)
-                        .flatten(),
-                    // Never reported: see the module doc.
-                    ue_rx_tx_time_diff: None,
-                };
-                info!(
-                    "LPP RequestLocationInformation (rsrp={} rsrq={} ueRxTx={}); reporting PCI {} \
-                     rsrp={:?} rsrq={:?}",
-                    requested.rsrp,
-                    requested.rsrq,
-                    requested.ue_rx_tx,
-                    element.phys_cell_id,
-                    element.rsrp_result,
-                    element.rsrq_result
-                );
+                let ecid = requested.map(|requested| {
+                    let element = MeasuredResultsElement {
+                        phys_cell_id: measurements.phys_cell_id,
+                        arfcn: measurements.arfcn,
+                        system_frame_number: measurements.system_frame_number,
+                        rsrp_result: (requested.rsrp && self.supported.rsrp)
+                            .then_some(measurements.rsrp_result)
+                            .flatten(),
+                        rsrq_result: (requested.rsrq && self.supported.rsrq)
+                            .then_some(measurements.rsrq_result)
+                            .flatten(),
+                        // Never reported: see the module doc.
+                        ue_rx_tx_time_diff: None,
+                    };
+                    info!(
+                        "LPP RequestLocationInformation E-CID (rsrp={} rsrq={} ueRxTx={}); \
+                         reporting PCI {} rsrp={:?} rsrq={:?}",
+                        requested.rsrp,
+                        requested.rsrq,
+                        requested.ue_rx_tx,
+                        element.phys_cell_id,
+                        element.rsrp_result,
+                        element.rsrq_result
+                    );
+                    EcidSignalMeasurementInformation {
+                        // The serving cell appears as the PRIMARY cell and as the
+                        // single list element, because `MeasuredResultsList` is
+                        // SIZE(1..32) and cannot be empty -- so a UE with no
+                        // neighbour measurements still has to put something there,
+                        // and its own serving cell is the only honest candidate.
+                        primary_cell: Some(element.clone()),
+                        measured_results: vec![element],
+                    }
+                });
+                // NR E-CID (TS 37.355 Rel-16, #330): the serving NR cell as the
+                // primary cell; no neighbour list (it is optional here).
+                let nr = nr_requested.map(|nr| {
+                    let element = NrMeasuredResultsElement {
+                        phys_cell_id: measurements.phys_cell_id,
+                        ssb_arfcn: measurements.nr_arfcn,
+                        system_frame_number: measurements.system_frame_number,
+                        ss_rsrp: (nr.ss_rsrp && self.nr_supported.ss_rsrp)
+                            .then_some(measurements.rsrp_dbm.map(nr_ss_rsrp_report_value))
+                            .flatten(),
+                        // Not measured (see the module doc), so never reported.
+                        ss_rsrq: None,
+                    };
+                    info!(
+                        "LPP RequestLocationInformation NR E-CID (ss-rsrp={} ss-rsrq={}); \
+                         reporting PCI {} ssb-ARFCN {} ss-rsrp={:?}",
+                        nr.ss_rsrp,
+                        nr.ss_rsrq,
+                        element.phys_cell_id,
+                        element.ssb_arfcn,
+                        element.ss_rsrp
+                    );
+                    NrEcidSignalMeasurementInformation {
+                        primary_cell: element,
+                        measured_results: Vec::new(),
+                    }
+                });
                 // The sidelink ranging report rides along when this UE holds one
                 // (TS 23.586 §5.3.3, issue #137). `MeasuredResultsList` is
                 // SIZE(1..32), and so is the ranging list, so an EMPTY set of results
@@ -270,15 +367,8 @@ impl LppEndpoint {
                     None => None,
                 };
                 LppBody::ProvideLocationInformation {
-                    measurements: EcidSignalMeasurementInformation {
-                        // The serving cell appears as the PRIMARY cell and as the
-                        // single list element, because `MeasuredResultsList` is
-                        // SIZE(1..32) and cannot be empty -- so a UE with no
-                        // neighbour measurements still has to put something there,
-                        // and its own serving cell is the only honest candidate.
-                        primary_cell: Some(element.clone()),
-                        measured_results: vec![element],
-                    },
+                    measurements: ecid,
+                    nr_measurements: nr,
                     sidelink,
                 }
             }
@@ -351,6 +441,8 @@ mod tests {
             // "requested but unsupported" tests below cannot pass merely because
             // there was nothing to report.
             rsrq_result: Some(20),
+            rsrp_dbm: Some(-87),
+            nr_arfcn: 632_448,
         }
     }
 
@@ -370,11 +462,12 @@ mod tests {
 
     fn asked_for(rsrp: bool, rsrq: bool, ue_rx_tx: bool) -> LppBody {
         LppBody::RequestLocationInformation {
-            requested: EcidMeasurementBits {
+            requested: Some(EcidMeasurementBits {
                 rsrp,
                 rsrq,
                 ue_rx_tx,
-            },
+            }),
+            nr_requested: None,
         }
     }
 
@@ -472,9 +565,11 @@ mod tests {
         let bodies = [
             LppBody::RequestCapabilities {
                 ecid_requested: true,
+                nr_ecid_requested: false,
             },
             LppBody::RequestCapabilities {
                 ecid_requested: false,
+                nr_ecid_requested: false,
             },
             LppBody::ProvideCapabilities {
                 ecid_supported: EcidMeasurementBits {
@@ -482,10 +577,11 @@ mod tests {
                     rsrq: false,
                     ue_rx_tx: true,
                 },
+                nr_ecid_supported: None,
             },
             asked_for(true, true, true),
             LppBody::ProvideLocationInformation {
-                measurements: EcidSignalMeasurementInformation {
+                measurements: Some(EcidSignalMeasurementInformation {
                     primary_cell: None,
                     measured_results: vec![MeasuredResultsElement {
                         phys_cell_id: 503,
@@ -495,7 +591,8 @@ mod tests {
                         rsrq_result: Some(34),
                         ue_rx_tx_time_diff: Some(4095),
                     }],
-                },
+                }),
+                nr_measurements: None,
                 sidelink: None,
             },
         ];
@@ -529,10 +626,11 @@ mod tests {
         };
         for count in [1usize, 32] {
             let body = LppBody::ProvideLocationInformation {
-                measurements: EcidSignalMeasurementInformation {
+                measurements: Some(EcidSignalMeasurementInformation {
                     primary_cell: None,
                     measured_results: vec![element.clone(); count],
-                },
+                }),
+                nr_measurements: None,
                 sidelink: None,
             };
             let message = LppMessage {
@@ -552,10 +650,11 @@ mod tests {
                 transaction_id: None,
                 end_transaction: true,
                 body: Some(LppBody::ProvideLocationInformation {
-                    measurements: EcidSignalMeasurementInformation {
+                    measurements: Some(EcidSignalMeasurementInformation {
                         primary_cell: None,
                         measured_results: vec![element.clone(); count],
-                    },
+                    }),
+                    nr_measurements: None,
                     sidelink: None,
                 }),
             };
@@ -565,6 +664,228 @@ mod tests {
                 "{count} element(s) is outside SIZE(1..32)"
             );
         }
+    }
+
+    // ---- NR E-CID (#330) ----
+
+    /// nextgcore lmfd's NR E-CID request (nextgcore #715), as its golden vectors
+    /// give it: `requestedMeasurements-r16` ssrsrpReq and ssrsrqReq in the Rel-16
+    /// group of `RequestLocationInformation-r9-IEs`, transactions 0 and 255.
+    const LMFD_NR_ECID_REQUEST_T0: [u8; 8] = [0x90, 0x00, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0];
+    const LMFD_NR_ECID_REQUEST_T255: [u8; 8] = [0x91, 0xFE, 0x20, 0x80, 0x12, 0x02, 0x81, 0xC0];
+
+    fn nr_asked_for(ss_rsrp: bool, ss_rsrq: bool) -> LppBody {
+        LppBody::RequestLocationInformation {
+            requested: None,
+            nr_requested: Some(NrEcidMeasurementBits {
+                ss_rsrp,
+                ss_rsrq,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn the_lmfd_nr_ecid_request_decodes_and_encodes_byte_for_byte() {
+        for (bytes, transaction) in [
+            (LMFD_NR_ECID_REQUEST_T0, 0),
+            (LMFD_NR_ECID_REQUEST_T255, 255),
+        ] {
+            let message = LppMessage::decode(&bytes).expect("decodes");
+            assert_eq!(message.body, Some(nr_asked_for(true, true)));
+            assert_eq!(
+                message.transaction_id.map(|t| t.transaction_number),
+                Some(transaction)
+            );
+            assert_eq!(
+                request(nr_asked_for(true, true), transaction),
+                bytes.to_vec()
+            );
+        }
+    }
+
+    /// nextgcore #715 also added ueRxTxReq to the E-UTRA E-CID request:
+    /// `90 00 20 08 B8`.
+    #[test]
+    fn the_lmfd_eutra_ecid_request_with_ue_rx_tx_decodes() {
+        let message = LppMessage::decode(&[0x90, 0x00, 0x20, 0x08, 0xB8]).expect("decodes");
+        assert_eq!(message.body, Some(asked_for(true, true, true)));
+    }
+
+    /// The answer to an NR E-CID request: the serving NR cell as the primary
+    /// cell, its SSB ARFCN, SS-RSRP per TS 38.133 §10.1.6.1 (-87 dBm -> 70), no
+    /// SS-RSRQ (not measured) and no E-UTRA report.
+    #[test]
+    fn an_nr_ecid_request_is_answered_with_the_serving_nr_cell() {
+        let mut endpoint = LppEndpoint::new();
+        let reply = match endpoint.handle_downlink(&LMFD_NR_ECID_REQUEST_T0, &measurements(), &[]) {
+            LppReaction::Reply(bytes) => LppMessage::decode(&bytes).expect("the reply decodes"),
+            LppReaction::Nothing => panic!("an NR E-CID request must be answered"),
+        };
+        assert!(reply.end_transaction);
+        assert_eq!(reply.transaction_id.map(|t| t.transaction_number), Some(0));
+        match reply.body {
+            Some(LppBody::ProvideLocationInformation {
+                measurements: None,
+                nr_measurements: Some(nr),
+                sidelink: None,
+            }) => {
+                assert_eq!(
+                    nr.primary_cell,
+                    NrMeasuredResultsElement {
+                        phys_cell_id: 321,
+                        ssb_arfcn: 632_448,
+                        system_frame_number: Some(42),
+                        ss_rsrp: Some(70),
+                        ss_rsrq: None,
+                    }
+                );
+                assert!(nr.measured_results.is_empty());
+            }
+            other => panic!("expected an NR E-CID report only, got {other:?}"),
+        }
+    }
+
+    /// The NR E-CID report, derived by hand from X.691 rather than from this
+    /// encoder: transaction 0, PCI 16, SSB ARFCN 632448, SS-RSRP 70, nothing else.
+    ///
+    /// | bits | field |
+    /// |------|-------|
+    /// | `1001 0 0 0 00000000 1` | LPP-Message presence, transactionID, endTransaction |
+    /// | `0 0101 0 00` | c1, provideLocationInformation (5 of 16), criticalExtensions c1, r9 |
+    /// | `1 00000` | r9-IEs: extension additions present, no root member |
+    /// | `0 000010 010 00001000` | three groups, only Rel-16, open type of 8 octets |
+    /// | `1000` | the group: nr-ECID present, the other three NR methods absent |
+    /// | `0 10` | NR-ECID-ProvideLocationInformation-r16: signal measurements, no error |
+    /// | `0 0` | NR-ECID-SignalMeasurementInformation-r16: no neighbour list |
+    /// | `0 001000` | the element: only resultsSSB-Cell-r16 |
+    /// | `0000010000 0` | PCI 16 (10 bits), ssb-ARFCN-r16 |
+    /// | 22 bits | 632448 |
+    /// | `10 1000110` | MeasQuantityResults-r16: nr-RSRP-r16 70 |
+    /// | `000000` | open-type padding |
+    #[test]
+    fn the_nr_ecid_report_matches_x691() {
+        let message = LppMessage {
+            transaction_id: Some(LppTransactionId {
+                initiator: Initiator::LocationServer,
+                transaction_number: 0,
+            }),
+            end_transaction: true,
+            body: Some(LppBody::ProvideLocationInformation {
+                measurements: None,
+                nr_measurements: Some(NrEcidSignalMeasurementInformation {
+                    primary_cell: NrMeasuredResultsElement {
+                        phys_cell_id: 16,
+                        ssb_arfcn: 632_448,
+                        system_frame_number: None,
+                        ss_rsrp: Some(70),
+                        ss_rsrq: None,
+                    },
+                    measured_results: Vec::new(),
+                }),
+                sidelink: None,
+            }),
+        };
+        assert_eq!(
+            message.encode().expect("encodes"),
+            vec![
+                0x90, 0x01, 0x28, 0x80, 0x12, 0x08, 0x84, 0x08, 0x04, 0x04, 0xD3, 0x40, 0x51, 0x80
+            ]
+        );
+    }
+
+    /// ProvideCapabilities names NR E-CID SS-RSRP (and not SS-RSRQ or CSI), and
+    /// an LMF RequestCapabilities for NR E-CID decodes.
+    #[test]
+    fn capabilities_include_nr_ecid() {
+        let mut endpoint = LppEndpoint::new();
+        let ask = request(
+            LppBody::RequestCapabilities {
+                ecid_requested: false,
+                nr_ecid_requested: true,
+            },
+            3,
+        );
+        assert_eq!(
+            LppMessage::decode(&ask).expect("decodes").body,
+            Some(LppBody::RequestCapabilities {
+                ecid_requested: false,
+                nr_ecid_requested: true,
+            })
+        );
+        let reply = match endpoint.handle_downlink(&ask, &measurements(), &[]) {
+            LppReaction::Reply(bytes) => LppMessage::decode(&bytes).expect("decodes"),
+            LppReaction::Nothing => panic!("answered"),
+        };
+        match reply.body {
+            Some(LppBody::ProvideCapabilities {
+                nr_ecid_supported: Some(nr),
+                ..
+            }) => {
+                assert!(nr.ss_rsrp);
+                assert!(!nr.ss_rsrq && !nr.csi_rsrp && !nr.csi_rsrq);
+            }
+            other => panic!("expected NR E-CID capabilities, got {other:?}"),
+        }
+    }
+
+    /// Both methods asked at once are both answered.
+    #[test]
+    fn a_request_for_both_methods_gets_both_reports() {
+        let both = LppBody::RequestLocationInformation {
+            requested: Some(EcidMeasurementBits {
+                rsrp: true,
+                ..Default::default()
+            }),
+            nr_requested: Some(NrEcidMeasurementBits {
+                ss_rsrp: true,
+                ..Default::default()
+            }),
+        };
+        let mut endpoint = LppEndpoint::new();
+        match endpoint.handle_downlink(&request(both, 1), &measurements(), &[]) {
+            LppReaction::Reply(bytes) => match LppMessage::decode(&bytes).expect("decodes").body {
+                Some(LppBody::ProvideLocationInformation {
+                    measurements: Some(_),
+                    nr_measurements: Some(_),
+                    ..
+                }) => {}
+                other => panic!("expected both reports, got {other:?}"),
+            },
+            LppReaction::Nothing => panic!("answered"),
+        }
+    }
+
+    /// TS 38.133 §10.1.6.1 / §10.1.11.1 boundaries.
+    #[test]
+    fn nr_ss_levels_map_to_the_ts_38_133_report_values() {
+        assert_eq!(nr_ss_rsrp_report_value(-157), 0);
+        assert_eq!(nr_ss_rsrp_report_value(-156), 1);
+        assert_eq!(nr_ss_rsrp_report_value(-31), 126);
+        assert_eq!(nr_ss_rsrp_report_value(-30), 127);
+        assert_eq!(nr_ss_rsrp_report_value(i32::MAX), 127);
+        assert_eq!(nr_ss_rsrp_report_value(i32::MIN), 0);
+        assert_eq!(nr_ss_rsrq_report_value(-43.5), 0);
+        assert_eq!(nr_ss_rsrq_report_value(-43.0), 1);
+        assert_eq!(nr_ss_rsrq_report_value(-42.5), 2);
+        assert_eq!(nr_ss_rsrq_report_value(19.5), 126);
+        assert_eq!(nr_ss_rsrq_report_value(20.0), 127);
+    }
+
+    /// Another NR method in the Rel-16 group (here Multi-RTT) is refused, not
+    /// answered as NR E-CID.
+    #[test]
+    fn another_nr_method_is_refused() {
+        // The NR E-CID request with its group's presence bits flipped from 1000 to
+        // 0100: octet 6 goes from 0x81 (1000 0001) to 0x41.
+        let mut bytes = LMFD_NR_ECID_REQUEST_T0;
+        bytes[6] = 0x41;
+        assert_eq!(
+            LppMessage::decode(&bytes),
+            Err(UperError::Unsupported(
+                "LPP NR positioning other than NR E-CID"
+            ))
+        );
     }
 
     // ---- byte agreement with the peer ----
@@ -664,7 +985,8 @@ mod tests {
         // request -- which is the point of the derivation above.
         let element = match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
-                measurements: report,
+                measurements: Some(report),
+                nr_measurements: None,
                 sidelink: None,
             }) => report.primary_cell.expect("primary"),
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
@@ -694,7 +1016,8 @@ mod tests {
         assert_eq!(
             LppMessage::decode(&accepted).expect("decodes").body,
             Some(LppBody::RequestCapabilities {
-                ecid_requested: true
+                ecid_requested: true,
+                nr_ecid_requested: false,
             })
         );
 
@@ -724,6 +1047,7 @@ mod tests {
         let pdu = request(
             LppBody::RequestCapabilities {
                 ecid_requested: true,
+                nr_ecid_requested: false,
             },
             7,
         );
@@ -744,7 +1068,7 @@ mod tests {
         );
         assert!(decoded.end_transaction, "the transaction is complete");
         match decoded.body {
-            Some(LppBody::ProvideCapabilities { ecid_supported }) => {
+            Some(LppBody::ProvideCapabilities { ecid_supported, .. }) => {
                 assert!(ecid_supported.rsrp, "RSRP is measured, so it is claimed");
                 assert!(
                     !ecid_supported.rsrq,
@@ -769,6 +1093,7 @@ mod tests {
             &request(
                 LppBody::RequestCapabilities {
                     ecid_requested: true,
+                    nr_ecid_requested: false,
                 },
                 1,
             ),
@@ -778,7 +1103,7 @@ mod tests {
             panic!("a capability request is answered");
         };
         let claimed = match LppMessage::decode(&capability_reply).expect("decodes").body {
-            Some(LppBody::ProvideCapabilities { ecid_supported }) => ecid_supported,
+            Some(LppBody::ProvideCapabilities { ecid_supported, .. }) => ecid_supported,
             other => panic!("expected ProvideCapabilities, got {other:?}"),
         };
 
@@ -792,7 +1117,8 @@ mod tests {
         };
         let element = match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
-                measurements: r, ..
+                measurements: Some(r),
+                ..
             }) => r.primary_cell.expect("primary"),
             other => panic!("expected ProvideLocationInformation, got {other:?}"),
         };
@@ -819,7 +1145,7 @@ mod tests {
         assert!(decoded.end_transaction);
         match decoded.body {
             Some(LppBody::ProvideLocationInformation {
-                measurements: report,
+                measurements: Some(report),
                 ..
             }) => {
                 let element = report
@@ -858,7 +1184,7 @@ mod tests {
             };
             match LppMessage::decode(&reply).expect("decodes").body {
                 Some(LppBody::ProvideLocationInformation {
-                    measurements: report,
+                    measurements: Some(report),
                     ..
                 }) => {
                     let element = report.primary_cell.expect("primary");
@@ -886,7 +1212,7 @@ mod tests {
         };
         match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
-                measurements: report,
+                measurements: Some(report),
                 ..
             }) => {
                 let element = report.primary_cell.expect("primary");
@@ -920,7 +1246,7 @@ mod tests {
         };
         match LppMessage::decode(&reply).expect("decodes").body {
             Some(LppBody::ProvideLocationInformation {
-                measurements: report,
+                measurements: Some(report),
                 ..
             }) => {
                 let element = report.primary_cell.expect("primary");
@@ -983,6 +1309,7 @@ mod tests {
         let pdu = request(
             LppBody::ProvideCapabilities {
                 ecid_supported: EcidMeasurementBits::default(),
+                nr_ecid_supported: None,
             },
             9,
         );
@@ -1121,6 +1448,7 @@ mod tests {
             for body in [
                 LppBody::RequestCapabilities {
                     ecid_requested: true,
+                    nr_ecid_requested: false,
                 },
                 asked_for(true, false, false),
             ] {

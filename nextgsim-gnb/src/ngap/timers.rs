@@ -124,6 +124,14 @@ impl GuardTimers {
         fired
     }
 
+    /// When `timer` is due, if it is pending.
+    pub fn deadline(&self, timer: GuardTimer) -> Option<Instant> {
+        self.entries
+            .iter()
+            .find(|(_, pending)| *pending == timer)
+            .map(|(deadline, _)| *deadline)
+    }
+
     /// Whether `timer` is pending.
     pub fn is_pending(&self, timer: GuardTimer) -> bool {
         self.entries.iter().any(|(_, pending)| *pending == timer)

@@ -204,6 +204,11 @@ impl std::fmt::Debug for AsSecurityContext {
 /// same value and a mismatch fails the MAC with no other symptom (issue #31).
 pub const SMC_PDCP_COUNT: u32 = 0;
 
+/// The UL PDCP COUNT the SecurityModeComplete is integrity-protected with: zero,
+/// it is the first protected uplink PDU on SRB1 (TS 38.331 §5.3.4.3, #285). The
+/// gNB's `RrcUeContext::ul_pdcp_count` starts there for the same reason.
+pub const SMC_COMPLETE_PDCP_COUNT: u32 = 0;
+
 /// BEARER identity for SRB1 fed to the PDCP security algorithms: the radio
 /// bearer identity minus one (TS 33.501 §6.5 referencing TS 33.401 §7); SRB1
 /// (SRB-Identity 1) → 0.

@@ -35,6 +35,7 @@ use nextgsim_gnb::tasks::{
 use nextgsim_gnb::RlsTask as GnbRlsTask;
 use nextgsim_gnb::Task as GnbTask;
 use nextgsim_pdcp::{Pdcp, PdcpConfig, PdcpSnSize};
+use nextgsim_rls::RrcChannel;
 use nextgsim_ue::rls::{RlsTask as UeRlsTask, RlsTaskConfig};
 use nextgsim_ue::{
     NasMessage, RlsMessage as UeRlsMessage, Task as UeTask, TaskMessage as UeTaskMessage,
@@ -148,6 +149,15 @@ async fn complete_discovery(h: &mut Harness) -> i32 {
     gnb_saw_ue
 }
 
+/// Empties every channel the RLS tasks report into, so no task can block on a
+/// full 64-deep report channel during a long run.
+fn drain_all(h: &mut Harness) {
+    while h.ue_nas_rx.try_recv().is_ok() {}
+    while h.gnb_gtp_rx.try_recv().is_ok() {}
+    while h.ue_rrc_rx.try_recv().is_ok() {}
+    while h.gnb_rrc_rx.try_recv().is_ok() {}
+}
+
 /// Collects `count` downlink SDUs the UE handed up to NAS.
 async fn collect_at_ue(
     rx: &mut mpsc::Receiver<UeTaskMessage<NasMessage>>,
@@ -167,6 +177,56 @@ async fn collect_at_ue(
     })
     .await
     .unwrap_or_else(|_| panic!("expected {count} SDU(s) at the UE, got {}", out.len()));
+    out
+}
+
+/// Collects `count` downlink SDUs at the UE that satisfy `keep`, ignoring others.
+async fn collect_at_ue_where(
+    rx: &mut mpsc::Receiver<UeTaskMessage<NasMessage>>,
+    count: usize,
+    keep: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(count);
+    tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        while out.len() < count {
+            match rx.recv().await {
+                Some(UeTaskMessage::Message(NasMessage::UplinkDataDelivery { data, .. })) => {
+                    if keep(data.data()) {
+                        out.push(data.data().to_vec());
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("UE NAS channel closed after {} SDU(s)", out.len()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {count} SDU(s) at the UE, got {}", out.len()));
+    out
+}
+
+/// Collects `count` uplink SDUs at the gNB that satisfy `keep`, ignoring others.
+async fn collect_at_gnb_where(
+    rx: &mut mpsc::Receiver<GnbTaskMessage<GtpMessage>>,
+    count: usize,
+    keep: impl Fn(&[u8]) -> bool,
+) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(count);
+    tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        while out.len() < count {
+            match rx.recv().await {
+                Some(GnbTaskMessage::Message(GtpMessage::DataPduDelivery { pdu, .. })) => {
+                    if keep(pdu.data()) {
+                        out.push(pdu.data().to_vec());
+                    }
+                }
+                Some(_) => continue,
+                None => panic!("gNB GTP channel closed after {} SDU(s)", out.len()),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("expected {count} SDU(s) at the gNB, got {}", out.len()));
     out
 }
 
@@ -304,4 +364,174 @@ async fn a_long_downlink_burst_stays_in_order() {
 
     let delivered = collect_at_ue(&mut h.ue_nas_rx, burst.len()).await;
     assert_eq!(delivered, burst, "40 SDUs must arrive in order and intact");
+}
+
+/// #315: a new RRC connection starts every DRB at COUNT 0 on BOTH ends.
+///
+/// More than half the 12-bit SN space (2048) is sent first, so the UE's entity
+/// is far from COUNT 0. Then the gNB side starts fresh -- what a restarted gNB,
+/// or the same gNB after an RRC release and re-setup, does -- and the UE
+/// releases its DRB entities as its RRC does on the new RRCSetup. The traffic
+/// that follows must arrive. Before #315 no entity was ever released or
+/// re-established: the UE kept RX_DELIV at 2100, read the new COUNT 0..9 as
+/// older than that, and discarded every PDU.
+// Multi-threaded, so the two RLS tasks keep answering each other's heartbeats
+// while this test pushes 4200 SDUs: on a single-threaded runtime they only run
+// when the test yields, and on a loaded host a missed heartbeat window loses the
+// cell (UE) or the UE (gNB), after which nothing is delivered at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
+    let mut h = start_harness().await;
+    let ue_id = complete_discovery(&mut h).await;
+
+    const FIRST: usize = 2100;
+    for i in 0..FIRST {
+        h.gnb_rls_tx
+            .send(GnbRlsMessage::DownlinkData {
+                ue_id,
+                psi: PSI,
+                drb_id: DRB_ID,
+                pdu: OctetString::from_slice(&(i as u32).to_be_bytes()),
+            })
+            .await
+            .expect("gNB RLS task alive");
+        // Paced so loopback UDP does not drop under a full-speed burst.
+        if i % 50 == 49 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        h.ue_rls_tx
+            .send(UeRlsMessage::DataPduDelivery {
+                psi: PSI,
+                pdu: OctetString::from_slice(&(i as u32).to_be_bytes()),
+            })
+            .await
+            .expect("UE RLS task alive");
+        // Drain as we go, so no 64-deep channel fills.
+        drain_all(&mut h);
+    }
+    // Barrier on the first phase: a marker each way, sent after all of it. Each
+    // RX entity delivers in COUNT order, so once both markers are up nothing
+    // from the first phase is still held (a lost PDU before a marker holds it
+    // only until t-Reordering expires).
+    const MARKER: [u8; 5] = [0x55; 5];
+    h.gnb_rls_tx
+        .send(GnbRlsMessage::DownlinkData {
+            ue_id,
+            psi: PSI,
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&MARKER),
+        })
+        .await
+        .expect("gNB RLS task alive");
+    h.ue_rls_tx
+        .send(UeRlsMessage::DataPduDelivery {
+            psi: PSI,
+            pdu: OctetString::from_slice(&MARKER),
+        })
+        .await
+        .expect("UE RLS task alive");
+    collect_at_ue_where(&mut h.ue_nas_rx, 1, |sdu| sdu == MARKER).await;
+    collect_at_gnb_where(&mut h.gnb_gtp_rx, 1, |sdu| sdu == MARKER).await;
+    drain_all(&mut h);
+
+    // The new connection: the gNB's entities go (a restart, or AN release then
+    // RRCSetup), and the UE's go on its RRCSetup.
+    h.gnb_rls_tx
+        .send(GnbRlsMessage::ReleaseUeDrbs { ue_id })
+        .await
+        .expect("gNB RLS task alive");
+    // Barrier on the gNB release: the gNB task reads its channel in order, so
+    // once this RRC PDU (sent after the release) reaches the UE, the gNB's DRB
+    // entities are the new ones, its uplink RX entity included. It goes on an
+    // SRB, so no DRB COUNT moves.
+    const GNB_PROBE: [u8; 3] = [0x66; 3];
+    h.gnb_rls_tx
+        .send(GnbRlsMessage::DownlinkRrc {
+            ue_id,
+            rrc_channel: RrcChannel::DlDcch,
+            pdu_id: 0,
+            data: OctetString::from_slice(&GNB_PROBE),
+        })
+        .await
+        .expect("gNB RLS task alive");
+    tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        loop {
+            match h.ue_rrc_rx.recv().await {
+                Some(UeTaskMessage::Message(nextgsim_ue::RrcMessage::DownlinkRrcDelivery {
+                    pdu,
+                    ..
+                })) if pdu.data() == GNB_PROBE => break,
+                Some(_) => continue,
+                None => panic!("UE RRC channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("the gNB's RRC probe must reach the UE");
+    drain_all(&mut h);
+    h.ue_rls_tx
+        .send(UeRlsMessage::ReleaseDrbs)
+        .await
+        .expect("UE RLS task alive");
+    // Barrier: the UE task processes its channel in order, so once this probe
+    // (sent after the release) reaches the gNB, the UE's entities are the new
+    // ones. Without it the downlink below could reach the UE's OLD RX entity
+    // (at COUNT 2100), which reads SN 0 as COUNT 4096 and holds it -- the order
+    // a real UE never sees, since its RRCSetup precedes any DRB data.
+    const PROBE: [u8; 8] = [0x77; 8];
+    h.ue_rls_tx
+        .send(UeRlsMessage::DataPduDelivery {
+            psi: PSI,
+            pdu: OctetString::from_slice(&PROBE),
+        })
+        .await
+        .expect("UE RLS task alive");
+    collect_at_gnb_where(&mut h.gnb_gtp_rx, 1, |sdu| sdu == PROBE).await;
+
+    let after: Vec<Vec<u8>> = (0..10u8).map(|i| vec![0xE0 + i; 24]).collect();
+    let sent_at = std::time::Instant::now();
+    for payload in &after {
+        h.gnb_rls_tx
+            .send(GnbRlsMessage::DownlinkData {
+                ue_id,
+                psi: PSI,
+                drb_id: DRB_ID,
+                pdu: OctetString::from_slice(payload),
+            })
+            .await
+            .expect("gNB RLS task alive");
+    }
+    // The new connection's SDUs are 24 octets: the first phase's are 4, the
+    // markers 5 and the uplink probe 8.
+    let delivered: Vec<Vec<u8>> =
+        collect_at_ue_where(&mut h.ue_nas_rx, after.len(), |sdu| sdu.len() == 24).await;
+    // Delivered at once, by a fresh RX entity. The UE's OLD entity (RX_DELIV at
+    // 2100) reads SN 0..9 as COUNT 4096.. and holds them until t-Reordering
+    // (1000 ms, PdcpConfig::default) expires, so without the release they still
+    // arrive, in order, a second late. The bound is what tells the two apart
+    // (#364 review).
+    let waited = sent_at.elapsed();
+    assert!(
+        waited < Duration::from_millis(500),
+        "the new connection's SDUs waited {waited:?}: they went through t-Reordering, \
+         so the UE kept its old RX entity"
+    );
+    assert_eq!(
+        delivered, after,
+        "traffic on the new connection arrives in order"
+    );
+
+    // And the uplink: the UE's TX entity had reached COUNT 2100 too. The probe
+    // was COUNT 0 of the new entity; these follow it.
+    for payload in &after {
+        h.ue_rls_tx
+            .send(UeRlsMessage::DataPduDelivery {
+                psi: PSI,
+                pdu: OctetString::from_slice(payload),
+            })
+            .await
+            .expect("UE RLS task alive");
+    }
+    let at_gnb = collect_at_gnb_where(&mut h.gnb_gtp_rx, after.len(), |sdu| sdu.len() == 24).await;
+    assert_eq!(at_gnb, after, "and so does the uplink");
 }

@@ -3,8 +3,8 @@
 > Generated: 2026-02-07 | Scope: nextgsim-gnb, nextgsim-ue, nextgsim-cli, nextgsim-common, nextgsim-crypto
 >
 > **Status before 0.2.0: this is a dated snapshot and many of its gap rows are
-> closed.** Checked against `main`: inter-gNB (Xn) handover is implemented and
-> re-keys (#150); the gNB sends UE Context Release Request (#245); RRC Setup,
+> closed.** Checked against `main`: inter-gNB handover is implemented over N2 (no
+> Xn-C between gNBs, #341) and re-keys (#150); the gNB sends UE Context Release Request (#245); RRC Setup,
 > Release, Resume, Reestablishment, the handover command and the measurement
 > report are real UPER (#107, #146); the six gNB 6G tasks and the UE 6G tasks
 > run when built with their features and enabled in config; `nextgsim-crypto`

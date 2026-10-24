@@ -230,6 +230,26 @@ pub fn encode_detach_accept() -> Vec<u8> {
     vec![PD_EMM, emm_type::DETACH_ACCEPT]
 }
 
+/// DETACH REQUEST, UE to network (§8.2.11.1, #365): "EPS detach" (Type of
+/// detach 001, §9.9.3.7), with the switch-off bit (bit 4) as asked. The detach
+/// type is the first half-octet IE, so it takes bits 4 to 1 of octet 3, and
+/// the NAS key set identifier takes bits 8 to 5. Then the EPS mobile identity
+/// (LV, §9.9.3.12).
+pub fn encode_detach_request(
+    switch_off: bool,
+    ksi: NasKsi,
+    identity: &EpsMobileIdentity,
+) -> Vec<u8> {
+    let detach_type = 0x01 | if switch_off { 0x08 } else { 0x00 };
+    let mut out = vec![
+        PD_EMM,
+        emm_type::DETACH_REQUEST,
+        (ksi.nibble() << 4) | detach_type,
+    ];
+    put_lv(&mut out, &identity.encode());
+    out
+}
+
 /// SECURITY MODE REJECT (§8.2.22).
 pub fn encode_security_mode_reject(cause: u8) -> Vec<u8> {
     vec![PD_EMM, emm_type::SECURITY_MODE_REJECT, cause]
@@ -407,6 +427,9 @@ pub enum DownlinkEmm {
     AttachReject(AttachReject),
     /// SERVICE REJECT.
     ServiceReject(ServiceReject),
+    /// DETACH ACCEPT, network to UE (§8.2.10.2): the answer to a UE-initiated
+    /// detach (#365).
+    DetachAccept,
     /// DETACH REQUEST, network to UE (§8.2.11.2).
     DetachRequest {
         /// Detach type (§9.9.3.7): 1 re-attach required, 2 re-attach not
@@ -511,6 +534,7 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
             }
             DownlinkEmm::ServiceReject(rej)
         }
+        emm_type::DETACH_ACCEPT => DownlinkEmm::DetachAccept,
         emm_type::DETACH_REQUEST => {
             // Octet 3: spare half octet, then the detach type (§9.9.3.7).
             let detach_type = r.u8()? & 0x07;

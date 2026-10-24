@@ -181,6 +181,21 @@ impl RlsTask {
         }
     }
 
+    /// Drop every DRB entity (RLC and, with `drb-pdcp`, PDCP) of `ue_id` and its
+    /// DRB-to-session record (#315). The next DRB for this UE is created fresh,
+    /// at COUNT 0, as TS 38.323 §5.1.1 establishes it.
+    fn release_ue_drbs(&mut self, ue_id: i32) {
+        let before = self.rlc_entities.len();
+        self.rlc_entities.retain(|(u, _), _| *u != ue_id);
+        #[cfg(feature = "drb-pdcp")]
+        self.pdcp_entities.retain(|(u, _), _| *u != ue_id);
+        self.drb_to_psi.retain(|(u, _), _| *u != ue_id);
+        let released = before - self.rlc_entities.len();
+        if released > 0 {
+            debug!("UE[{ue_id}]: released the L2 entities of {released} DRB(s)");
+        }
+    }
+
     /// The PDCP entity for one UE's DRB, created on first use (issue #33).
     ///
     /// Keyed on `drb_id`, not the PSI: TS 38.323 §5.2 gives every DRB its own entity,
@@ -1157,6 +1172,9 @@ impl Task for RlsTask {
                                     // traffic does -- which is the normal order.
                                     self.drb_to_psi.insert((ue_id, drb_id), psi);
                                     self.install_drb_security(ue_id, drb_id, security.map(|b| *b));
+                                }
+                                RlsMessage::ReleaseUeDrbs { ue_id } => {
+                                    self.release_ue_drbs(ue_id);
                                 }
                                 RlsMessage::SetUeGrantCeiling { ue_id, grant_octets } => {
                                     self.set_ue_grant_ceiling(ue_id, grant_octets);

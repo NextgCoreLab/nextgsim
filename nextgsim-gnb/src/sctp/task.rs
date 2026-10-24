@@ -15,6 +15,7 @@
 //! The SCTP task receives `SctpMessage` from other tasks and routes NGAP PDUs
 //! to the NGAP task via `NgapMessage`.
 
+use nextgsim_common::outcome_guard::OutcomeGuard;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -67,6 +68,10 @@ struct Resolver {
     /// unreachable DNS server.
     #[cfg(test)]
     hang: bool,
+    /// Test seam: the next `panics` hostname lookups panic, as a connect task
+    /// that dies mid-attempt (#367 review).
+    #[cfg(test)]
+    panics: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Resolver {
@@ -75,6 +80,14 @@ impl Resolver {
         if let PeerAddr::Host(..) = remote {
             if self.hang {
                 std::future::pending::<()>().await;
+            }
+            use std::sync::atomic::Ordering;
+            if self
+                .panics
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                panic!("test seam: the resolver panics");
             }
             if let Some(over) = &self.override_addrs {
                 let addrs = over.lock().unwrap().clone();
@@ -206,14 +219,16 @@ impl SctpTask {
         }
         self.reresolving = true;
         let resolver = self.resolver.clone();
-        let tx = self.reresolve_tx.clone();
+        // An empty round if the task ends without reporting, so `reresolving`
+        // is cleared whatever happens to it (#342 review).
+        let report = OutcomeGuard::new(self.reresolve_tx.clone(), Vec::new());
         tokio::spawn(async move {
             let mut out = Vec::with_capacity(named.len());
             for (client_id, remote) in named {
                 let result = resolver.resolve(&remote).await;
                 out.push((client_id, remote, result));
             }
-            let _ = tx.send(out);
+            report.send(out);
         });
     }
 
@@ -299,6 +314,17 @@ impl SctpTask {
         // A request for a target replaces it: an attempt still in flight for the
         // previous one is now stale and its outcome is discarded.
         self.connecting.remove(&client_id);
+        // So is a live association to the previous target. It was replaced by the
+        // new one without a close, leaving the old association up at the AMF
+        // (#342 review). Its loss is reported to NGAP, and the SHUTDOWN runs off
+        // the loop.
+        if let Some(mut old) = self.connections.remove(&client_id) {
+            info!("AMF {client_id}: closing the association the new request replaces");
+            self.route_association_down(client_id).await;
+            tokio::spawn(async move {
+                let _ = old.close().await;
+            });
+        }
         self.connect_target(client_id).await;
     }
 
@@ -383,7 +409,16 @@ impl SctpTask {
         let attempt = self.next_attempt;
         self.connecting.insert(client_id, attempt);
         let resolver = self.resolver.clone();
-        let tx = self.connect_tx.clone();
+        // A failed attempt if the task ends without reporting, so the target
+        // leaves `connecting` and is retried (#342 review).
+        let report = OutcomeGuard::new(
+            self.connect_tx.clone(),
+            ConnectOutcome {
+                client_id,
+                attempt,
+                result: Err("the connection attempt ended without an outcome".to_string()),
+            },
+        );
         let connect_timeout = self.connect_timeout;
         let remote = target.remote;
         tokio::spawn(async move {
@@ -416,7 +451,7 @@ impl SctpTask {
                     "{remote}: no association within {connect_timeout:?}"
                 )),
             };
-            let _ = tx.send(ConnectOutcome {
+            report.send(ConnectOutcome {
                 client_id,
                 attempt,
                 result,
@@ -437,7 +472,11 @@ impl SctpTask {
             // The target was closed or replaced while this attempt ran.
             if let Ok((mut connection, _)) = result {
                 debug!("AMF {client_id}: discarding the association of a superseded attempt");
-                let _ = connection.close().await;
+                // Closed off the loop: the SHUTDOWN waits on the peer, and nothing
+                // peer-dependent is awaited in the task loop (#311, #342 review).
+                tokio::spawn(async move {
+                    let _ = connection.close().await;
+                });
             }
             return;
         }
@@ -937,6 +976,97 @@ mod tests {
                 NgapMessage::SctpAssociationUp { client_id: 0, .. }
             ),
             "the gNB must reconnect to the AMF's new address"
+        );
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        let _ = runner.await;
+    }
+
+    /// #342 review: a connection request for a client that is already associated
+    /// replaces the association. The old one is reported down to NGAP and closed,
+    /// and only then does the new one come up. It used to be overwritten in the map
+    /// with no close, leaving the old association up at the AMF.
+    #[tokio::test]
+    async fn a_new_connection_request_closes_the_association_it_replaces() {
+        let (a, _a_task) = amf_stand_in("127.0.0.1:0".parse().unwrap()).await;
+        let (b, _b_task) = amf_stand_in("127.0.0.2:0".parse().unwrap()).await;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let task = SctpTask::new(task_base);
+        let (tx, rx) = mpsc::channel(16);
+        let runner = tokio::spawn(async move {
+            let mut task = task;
+            task.run(rx).await
+        });
+        for amf in [a, b] {
+            tx.send(TaskMessage::Message(SctpMessage::ConnectionRequest {
+                client_id: 0,
+                local_address: "127.0.0.1".into(),
+                local_port: 0,
+                remote_address: amf.ip().to_string(),
+                remote_port: amf.port(),
+                ppid: nextgsim_sctp::NGAP_PPID,
+            }))
+            .await
+            .unwrap();
+            if amf == b {
+                assert!(
+                    matches!(
+                        next_association_event(&mut ngap_rx).await,
+                        NgapMessage::SctpAssociationDown { client_id: 0 }
+                    ),
+                    "the replaced association is reported down first"
+                );
+            }
+            assert!(matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationUp { client_id: 0, .. }
+            ));
+        }
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        let _ = runner.await;
+    }
+
+    /// #367 review: the connect task's OutcomeGuard, end to end. A connect task
+    /// that panics still reports a failed attempt, so the target leaves
+    /// `connecting`, NGAP hears the association is down, and the target is retried
+    /// and comes up. With a plain sender the panic left `connecting` set and the
+    /// target was never retried.
+    #[tokio::test]
+    async fn a_connect_task_that_panics_is_still_retried() {
+        let (amf, _amf_task) = amf_stand_in("127.0.0.1:0".parse().unwrap()).await;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = SctpTask::new(task_base);
+        task.reconnect_delay = Duration::from_millis(100);
+        task.resolver.override_addrs = Some(std::sync::Arc::new(std::sync::Mutex::new(vec![amf])));
+        task.resolver
+            .panics
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = mpsc::channel(16);
+        let runner = tokio::spawn(async move { task.run(rx).await });
+        tx.send(TaskMessage::Message(SctpMessage::ConnectionRequest {
+            client_id: 4,
+            local_address: "127.0.0.1".into(),
+            local_port: 0,
+            remote_address: "amf.test".into(),
+            remote_port: amf.port(),
+            ppid: nextgsim_sctp::NGAP_PPID,
+        }))
+        .await
+        .unwrap();
+        assert!(
+            matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationDown { client_id: 4 }
+            ),
+            "the panicked attempt is reported as a failure"
+        );
+        assert!(
+            matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationUp { client_id: 4, .. }
+            ),
+            "and the target is retried"
         );
         tx.send(TaskMessage::Shutdown).await.unwrap();
         let _ = runner.await;

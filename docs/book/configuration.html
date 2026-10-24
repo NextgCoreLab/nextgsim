@@ -35,7 +35,7 @@
             const path_to_root = "";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-efe6c60a.js";
+            window.path_to_searchindex_js = "searchindex-bbb7f802.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-09918d46.js"></script>
@@ -465,7 +465,7 @@ tun_name: null
 <tr><td><code>paging_default_cycle_frames</code></td><td>u16</td><td>128</td><td>Paging cycle for the UE’s own paging occasion (TS 38.304 §7.1). Must match the gNB</td></tr>
 <tr><td><code>as_security_enabled</code></td><td>bool</td><td>false</td><td>AS security on SRB1. Must match the gNB</td></tr>
 <tr><td><code>dl_arfcn</code></td><td>u32</td><td>632448</td><td>Must match the gNB’s (handover key derivation)</td></tr>
-<tr><td><code>require_broadcast_sib1</code></td><td>bool</td><td>false</td><td>Require a decoded broadcast SIB1 before a cell is selectable</td></tr>
+<tr><td><code>require_broadcast_sib1</code></td><td>bool</td><td>false</td><td>Require a decoded broadcast SIB1 before a cell is selectable. With <code>false</code> a detected cell is selectable at once on a simulated SIB1, but an RRC re-establishment still waits for the selected cell’s broadcast SIB1 (its shortMAC-I covers the broadcast cell identity, TS 38.331 §5.3.7.3-4): against a gNB that never broadcasts SIB1 the request is not sent, T311 expires and the UE recovers through RRC_IDLE and a new RRCSetup</td></tr>
 <tr><td><code>rlc_am_psis</code></td><td>list of u8</td><td><code>[]</code></td><td>PDU sessions whose DRB uses RLC AM. Must match the gNB</td></tr>
 <tr><td><code>conditional_handover</code></td><td>bool</td><td>false</td><td>Store CHO candidates from RRCReconfiguration and execute one when its condition holds</td></tr>
 <tr><td><code>eutra_neighbours</code></td><td>list</td><td><code>[]</code></td><td>E-UTRA neighbour cells the UE measures for events B1/B2</td></tr>

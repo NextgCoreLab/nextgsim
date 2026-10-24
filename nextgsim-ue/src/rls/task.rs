@@ -110,6 +110,9 @@ pub struct RlsTask {
     /// Test seam: hostname lookups never answer, as against an unreachable DNS.
     #[cfg(test)]
     resolve_hang: bool,
+    /// Test seam: how many re-resolution rounds were spawned (#342 review).
+    #[cfg(test)]
+    resolve_rounds: usize,
     /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
     unknown_sources: UnknownSourceWarner,
     sti: u64,
@@ -249,6 +252,8 @@ impl RlsTask {
             resolve_rx,
             #[cfg(test)]
             resolve_hang: false,
+            #[cfg(test)]
+            resolve_rounds: 0,
             unknown_sources: UnknownSourceWarner::new(Instant::now()),
             sti,
             rlc_entities: HashMap::new(),
@@ -343,9 +348,16 @@ impl RlsTask {
         }
         self.resolving = true;
         let hosts = self.config.gnb_search_hosts.clone();
-        let tx = self.resolve_tx.clone();
+        // An empty round if the task ends without reporting, so `resolving` is
+        // cleared whatever happens to it (#342 review).
+        let report =
+            nextgsim_common::outcome_guard::OutcomeGuard::new(self.resolve_tx.clone(), Vec::new());
         #[cfg(test)]
         let hang = self.resolve_hang;
+        #[cfg(test)]
+        {
+            self.resolve_rounds += 1;
+        }
         tokio::spawn(async move {
             #[cfg(test)]
             if hang {
@@ -356,7 +368,7 @@ impl RlsTask {
                 let result = host.resolve().await;
                 out.push((host, result));
             }
-            let _ = tx.send(out);
+            report.send(out);
         });
     }
 
@@ -513,6 +525,41 @@ impl RlsTask {
     /// AM decision can only be made from the PSI; and a received SDU has to be handed
     /// to NAS under its session, so [`Self::drb_to_psi`] is recorded here — the one
     /// place every bearer passes through.
+    /// Drop every DRB's L2 entities and DRB-to-session records (#315): no DRB
+    /// outlives its RRC connection (TS 38.331 §5.3.11).
+    fn release_drbs(&mut self) {
+        let n = self.rlc_entities.len();
+        self.rlc_entities.clear();
+        #[cfg(feature = "drb-pdcp")]
+        self.pdcp_entities.clear();
+        self.drb_to_psi.clear();
+        #[cfg(feature = "sdap-dataplane")]
+        self.sdap_uplink.clear();
+        if n > 0 {
+            debug!("Released the L2 entities of {n} DRB(s)");
+        }
+    }
+
+    /// Re-establish every DRB (#315) after a handover: RLC entities are dropped
+    /// (re-created on next use, which is RLC re-establishment for UM, TS 38.322
+    /// §5.1.2), PDCP entities re-established in place so their keys stay
+    /// (TS 38.323 §5.1.2), and the SDUs the PDCP reception buffers held are
+    /// delivered.
+    async fn reestablish_drbs(&mut self) {
+        self.rlc_entities.clear();
+        #[cfg(feature = "drb-pdcp")]
+        {
+            let mut delivered = Vec::new();
+            for (drb_id, pdcp) in &mut self.pdcp_entities {
+                for sdu in pdcp.reestablish() {
+                    delivered.push((*drb_id, sdu));
+                }
+            }
+            self.deliver_held_sdus(delivered).await;
+        }
+        debug!("DRB L2 entities re-established (reconfiguration with sync)");
+    }
+
     fn rlc_entity_for(&mut self, drb_id: i32, psi: i32) -> &mut RlcEntity {
         let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
             RlcMode::AcknowledgedMode
@@ -542,6 +589,13 @@ impl RlsTask {
                 delivered.push((*drb_id, sdu));
             }
         }
+        self.deliver_held_sdus(delivered).await;
+    }
+
+    /// Deliver downlink SDUs a PDCP entity held (t-Reordering expiry, or a
+    /// re-establishment, #315) to NAS under their session, stripping SDAP.
+    #[cfg(feature = "drb-pdcp")]
+    async fn deliver_held_sdus(&mut self, delivered: Vec<(i32, Vec<u8>)>) {
         for (drb_id, sdu) in delivered {
             debug!(
                 "PDCP t-Reordering released an SDU: drb_id={drb_id}, len={}",
@@ -1311,6 +1365,8 @@ impl RlsTask {
                 pdu,
             } => self.handle_rrc_pdu_delivery(channel, pdu_id, pdu).await,
             RlsMessage::ResetSti => self.handle_reset_sti(),
+            RlsMessage::ReleaseDrbs => self.release_drbs(),
+            RlsMessage::ReestablishDrbs => self.reestablish_drbs().await,
             RlsMessage::DataPduDelivery { psi, pdu } => {
                 self.handle_data_pdu_delivery(psi, pdu).await
             }
@@ -1685,6 +1741,10 @@ mod tests {
         assert!(task.resolving);
         task.start_reresolve(); // not stacked: still one round in flight
         assert!(task.resolving);
+        assert_eq!(
+            task.resolve_rounds, 1,
+            "a second round is not spawned (#342 review)"
+        );
         let runner = tokio::spawn(async move { task.run(rls_rx).await });
 
         let mut buf = [0u8; 2048];
@@ -1878,6 +1938,54 @@ mod tests {
             ) {
                 rlf = true;
             }
+        }
+        assert!(rlf, "losing the serving cell is a radio link failure");
+    }
+
+    /// #337: a serving gNB that restarted at the SAME address (same NCI, so the
+    /// same STI) answers with a new incarnation. That ends the serving cell with a
+    /// radio link failure, as a real radio's missing grants would, and the
+    /// restarted gNB is a new cell at the same address. Before, the UE never
+    /// noticed and sent uplink to a gNB with no context for it, forever.
+    #[tokio::test]
+    async fn a_serving_gnb_restarted_at_the_same_address_is_a_radio_link_failure() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let a: SocketAddr = "10.0.0.1:4997".parse().unwrap();
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![a],
+                ..Default::default()
+            },
+        );
+        let before = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(1);
+        task.handle_heartbeat_ack(a, &before).await;
+        task.handle_assign_current_cell(0);
+        while rrc_rx.try_recv().is_ok() {}
+        task.handle_heartbeat_ack(a, &before).await;
+        assert_eq!(
+            task.serving_cell,
+            Some(0),
+            "same incarnation: nothing happens"
+        );
+
+        let after = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(2);
+        task.handle_heartbeat_ack(a, &after).await;
+        assert_eq!(
+            task.serving_cell, None,
+            "the old incarnation's cell is gone"
+        );
+        assert_eq!(
+            task.cell_addresses.get(&1),
+            Some(&a),
+            "a new cell, same address"
+        );
+        let mut rlf = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            rlf |= matches!(
+                msg,
+                TaskMessage::Message(RrcMessage::RadioLinkFailure { .. })
+            );
         }
         assert!(rlf, "losing the serving cell is a radio link failure");
     }

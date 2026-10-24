@@ -9,6 +9,10 @@ description = "5G UE (User Equipment) simulator binary"
 
 [features]
 default = []
+# Test-only accessors (the AS security context and its keys) for other crates'
+# tests, such as the in-process cross-end test in nextgsim-integration-tests.
+# Not part of the production API (#348 review).
+testing = []
 # In-process topic pub/sub bus for cross-cutting 6G observations (issue #16).
 # Off by default; forwards to nextgsim-common's own feature.
 event-bus = ["nextgsim-common/event-bus"]

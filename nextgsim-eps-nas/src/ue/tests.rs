@@ -696,3 +696,179 @@ fn an_imsi_paging_detaches_locally_and_reattaches() {
     let req = ue.initial_message(now).expect("re-attach");
     assert_eq!(&req[..3], &[0x07, 0x41, 0x71], "plain, no KSI, EPS attach");
 }
+
+// ---- #365: UE-initiated detach (TS 24.301 §5.5.2.2) ----
+
+/// The plain DETACH REQUEST inside a protected uplink PDU.
+fn detach_request_body(mme: &mut Mme, pdu: &[u8]) -> Vec<u8> {
+    let plain = mme.unprotect(pdu);
+    assert_eq!(&plain[..2], &[0x07, 0x45], "DETACH REQUEST");
+    plain
+}
+
+/// §5.5.2.2.1 / §8.2.11.1, connected: an integrity-protected DETACH REQUEST
+/// with "EPS detach" and the GUTI (detach type in bits 4-1 of octet 3, the KSI
+/// in bits 8-5), EMM-DEREGISTERED-INITIATED under T3421. The DETACH ACCEPT then
+/// stops T3421, deactivates the default bearer and leaves the UE
+/// EMM-DEREGISTERED with no attach to follow (§5.5.2.2.2).
+#[test]
+fn a_connected_detach_is_accepted_and_the_ue_is_deregistered() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.detach(false, true, now);
+    let plain = detach_request_body(&mut mme, &out.uplink[0]);
+    assert_eq!(plain[2] & 0x0F, 0x01, "EPS detach, not switch off");
+    assert_eq!(plain[2] >> 4, 1, "the KSI of the current context");
+    assert_eq!(plain[3], 11, "EPS mobile identity LV: a GUTI");
+    assert_eq!(plain[4] & 0x07, 6, "type of identity GUTI");
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    assert_eq!(ue.next_deadline(), Some(now + T3421));
+
+    let accept = mme.protect(&[0x07, 0x46], 2);
+    let out = ue.on_downlink(&accept, now);
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Detached);
+    assert!(ue.default_bearer().is_none(), "bearer contexts deactivated");
+    assert_eq!(ue.next_deadline(), None, "T3421 stopped");
+    assert_eq!(ue.initial_message(now), None, "no attach follows a detach");
+}
+
+/// In EMM-IDLE the DETACH REQUEST waits for a connection: it is the next
+/// initial NAS message, integrity protected and not ciphered (§4.4.4.2).
+#[test]
+fn an_idle_detach_goes_out_as_the_initial_message() {
+    let (mut ue, mut mme, now) = registered_idle();
+    let out = ue.detach(false, false, now);
+    assert!(out.uplink.is_empty(), "nothing to send it on yet");
+    assert!(ue.detach_pending());
+    let pdu = ue.initial_message(now).expect("the DETACH REQUEST");
+    assert_eq!(pdu[0] >> 4, 1, "integrity protected, not ciphered");
+    detach_request_body(&mut mme, &pdu);
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    assert!(!ue.detach_pending());
+}
+
+/// §5.5.2.2.4 c): four retransmissions on T3421, then the procedure is aborted
+/// and the UE is EMM-DEREGISTERED.
+#[test]
+fn t3421_retransmits_four_times_then_gives_up() {
+    let (mut ue, mut mme, _) = attach();
+    let mut now = Instant::now();
+    let first = ue.detach(false, true, now);
+    let first = detach_request_body(&mut mme, &first.uplink[0]);
+    // §5.5.2.2.4 c): "On the first four expiries of the timer, the UE shall
+    // retransmit the DETACH REQUEST message". The literal, not the constant, so
+    // a changed constant fails here (#369 review).
+    assert_eq!(MAX_DETACH_RETRANSMISSIONS, 4);
+    for n in 1..=4 {
+        now += T3421;
+        let out = ue.on_timer(now);
+        assert_eq!(out.uplink.len(), 1, "retransmission {n}");
+        assert_eq!(detach_request_body(&mut mme, &out.uplink[0]), first);
+        assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    }
+    now += T3421;
+    let out = ue.on_timer(now);
+    assert!(out.uplink.is_empty());
+    assert!(out.release);
+    assert_eq!(ue.state(), EmmState::Detached);
+}
+
+/// A switch-off detach gets no DETACH ACCEPT (§5.5.2.2.2): the UE is
+/// EMM-DEREGISTERED as soon as the request is out, with no T3421.
+#[test]
+fn a_switch_off_detach_needs_no_accept() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.detach(true, true, now);
+    let plain = detach_request_body(&mut mme, &out.uplink[0]);
+    assert_eq!(plain[2] & 0x0F, 0x09, "switch off, EPS detach");
+    assert_eq!(ue.state(), EmmState::Detached);
+    assert_eq!(ue.next_deadline(), None);
+}
+
+/// §5.5.2.2.4 b): the connection lost before DETACH ACCEPT aborts the detach;
+/// for "EPS detach" the UE enters EMM-DEREGISTERED.
+#[test]
+fn a_lost_connection_before_the_accept_still_detaches() {
+    let (mut ue, _mme, _) = attach();
+    let now = Instant::now();
+    ue.detach(false, true, now);
+    ue.on_released(now);
+    assert_eq!(ue.state(), EmmState::Detached);
+    assert_eq!(ue.next_deadline(), None);
+}
+
+/// §5.5.2.2.4 d): a network DETACH REQUEST (not switch off) during this UE's
+/// detach is answered with DETACH ACCEPT, and "the UE need not initiate the
+/// attach".
+#[test]
+fn a_colliding_network_detach_is_accepted_without_reattach() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.detach(false, true, now);
+    detach_request_body(&mut mme, &out.uplink[0]);
+    // DETACH REQUEST, network to UE: re-attach required.
+    let req = mme.protect(&[0x07, 0x45, 0x01], 2);
+    let out = ue.on_downlink(&req, now);
+    let accept = mme.unprotect(&out.uplink[0]);
+    assert_eq!(&accept[..2], &[0x07, 0x46], "DETACH ACCEPT");
+    assert_eq!(ue.state(), EmmState::Detached);
+    assert_eq!(ue.initial_message(now), None, "no re-attach");
+}
+
+/// Not attached: nothing to detach from, and no attach follows.
+#[test]
+fn a_detach_while_not_attached_stops_attaching() {
+    let mut ue = EpsNasUe::new(cfg());
+    let out = ue.detach(false, false, Instant::now());
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Detached);
+    assert_eq!(ue.initial_message(Instant::now()), None);
+}
+
+/// #369 review, §5.5.2.2.4 d): a network "IMSI detach" during this UE's "EPS
+/// detach" is answered, and the UE's own detach goes on: still
+/// EMM-DEREGISTERED-INITIATED, T3421 running, completed by its DETACH ACCEPT.
+#[test]
+fn a_network_imsi_detach_during_the_ues_detach_progresses_both() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    let out = ue.detach(false, true, now);
+    detach_request_body(&mut mme, &out.uplink[0]);
+    let req = mme.protect(&[0x07, 0x45, 0x03], 2);
+    let out = ue.on_downlink(&req, now);
+    let accept = mme.unprotect(&out.uplink[0]);
+    assert_eq!(
+        &accept[..2],
+        &[0x07, 0x46],
+        "DETACH ACCEPT for the IMSI detach"
+    );
+    assert_eq!(
+        ue.state(),
+        EmmState::DeregisteredInitiated,
+        "own detach continues"
+    );
+    assert_eq!(ue.next_deadline(), Some(now + T3421));
+    let out = ue.on_downlink(&mme.protect(&[0x07, 0x46], 2), now);
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.state(), EmmState::Detached);
+}
+
+/// #369 review, §5.5.2.2.1: a detach during an attach sends the DETACH REQUEST,
+/// with T3421, on the attach's connection.
+#[test]
+fn a_detach_during_an_attach_sends_the_request() {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    ue.initial_message(now).expect("ATTACH REQUEST");
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+    let out = ue.detach(false, true, now);
+    assert_eq!(
+        &out.uplink[0][..2],
+        &[0x07, 0x45],
+        "plain DETACH REQUEST: no context yet"
+    );
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    assert_eq!(ue.next_deadline(), Some(now + T3421), "T3421, not T3410");
+}

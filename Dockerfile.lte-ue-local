@@ -8,7 +8,8 @@
 #   --cap-add NET_ADMIN --device /dev/net/tun
 # Without them the UE still attaches; only the TUN (and the ping) fails.
 # lte-ue-ping-check (scripts/lte-ue-ping-check.sh) asserts a 0%-loss ping
-# through the PDN once the bearer is up.
+# through the PDN once the bearer is up; lte-ue-detach (scripts/lte-ue-detach.sh)
+# makes the running UE detach and waits for it (#365).
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y \
@@ -19,6 +20,7 @@ RUN apt-get update && apt-get install -y \
 
 COPY binaries/lte-ue /usr/local/bin/
 COPY scripts/lte-ue-ping-check.sh /usr/local/bin/lte-ue-ping-check
+COPY scripts/lte-ue-detach.sh /usr/local/bin/lte-ue-detach
 COPY config/lte-ue.yaml /etc/nextgsim/lte-ue.yaml
 
 WORKDIR /etc/nextgsim

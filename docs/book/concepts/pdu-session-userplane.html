@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "navy";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-efe6c60a.js";
+            window.path_to_searchindex_js = "../searchindex-bbb7f802.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-09918d46.js"></script>
@@ -481,11 +481,13 @@ socket and the <code>TunnelManager</code>.</p>
 <em>downlink tunnel</em> is <code>(gNB's own TEID → gNB address)</code> — where the UPF sends
 downlink. The gNB advertises its own TEID/address in the setup response transfer
 (using <code>gtp_advertise_ip</code> if configured, else <code>gtp_ip</code>).</p>
-<p><strong>Auto-create fallback and loopback.</strong> If a data PDU arrives for a session that
-was never signalled, <code>handle_uplink_data</code> (<code>gtp/task.rs</code>) creates one on the
-fly: <code>auto_create_upf_session</code> derives a TEID by bit-packing <code>ue_id</code>/<code>psi</code> and
-forwards to the config <code>upf_addr</code>, while <code>auto_create_loopback_session</code> is used
-when <code>upf_addr</code> is unset. <code>loopback_mode</code> is enabled whenever the gNB config has
+<p><strong>No session, no tunnel; loopback.</strong> If a data PDU arrives for a session that
+was never signalled, <code>handle_uplink_data</code> (<code>gtp/task.rs</code>) drops it when a UPF is
+configured (<code>upf_addr</code> set): the uplink TEID belongs to the UPF and only NGAP
+(PDU Session Resource Setup, Initial Context Setup, Handover Request) can supply
+it, so the gNB never invents one (#293). The drops are counted and logged at a
+bounded rate. When <code>upf_addr</code> is unset, <code>auto_create_loopback_session</code> creates a
+local echo session instead. <code>loopback_mode</code> is enabled whenever the gNB config has
 no <code>upf_addr</code> (<code>GtpTask::new</code>); in that mode <code>handle_loopback_data</code> echoes ICMP
 Echo Requests straight back to the UE (swapping src/dst and recomputing the IP
 and ICMP checksums), letting the data plane be exercised without any core. The

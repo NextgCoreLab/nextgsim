@@ -33,6 +33,8 @@ pub struct CellInfo {
     pub last_seen: Instant,
     /// Signal strength in dBm
     pub dbm: i32,
+    /// The gNB incarnation the cell answered with (#337), when it sends one.
+    pub incarnation: Option<u64>,
 }
 
 impl CellInfo {
@@ -44,6 +46,7 @@ impl CellInfo {
             address,
             last_seen: Instant::now(),
             dbm,
+            incarnation: None,
         }
     }
 
@@ -200,6 +203,24 @@ impl UeCellSearch {
         // resolvable, e.g. a rolling update's overlap) the old cell is kept and
         // the stranger's ack ignored, so two live gNBs sharing an STI cannot
         // make the cell flap between them.
+        // The same STI from the same address with ANOTHER incarnation is a gNB
+        // that restarted in place (#337): same NCI, same IP, no RRC, NGAP or GTP
+        // context for this UE. On a real radio the UE would get no grants and
+        // declare a radio link failure; here the old cell is reported lost, which
+        // the UE turns into one, and the new incarnation is discovered below. An
+        // ack without an incarnation (an older gNB) never triggers this.
+        if let Some(old) = self
+            .cells
+            .get(&sti)
+            .filter(|c| c.address == address)
+            .filter(|c| matches!((c.incarnation, ack.incarnation), (Some(a), Some(b)) if a != b))
+            .map(|c| c.cell_id)
+        {
+            self.cells.remove(&sti);
+            self.cell_id_to_sti.remove(&old);
+            events.push(CellSearchEvent::CellLost { cell_id: old });
+        }
+
         if let Some(old_addr) = self
             .cells
             .get(&sti)
@@ -221,6 +242,9 @@ impl UeCellSearch {
             // Existing cell - check for signal change
             let old_dbm = cell.dbm;
             cell.update(address, ack.dbm);
+            if cell.incarnation.is_none() {
+                cell.incarnation = ack.incarnation;
+            }
 
             if old_dbm != ack.dbm {
                 events.push(CellSearchEvent::SignalChanged {
@@ -234,7 +258,8 @@ impl UeCellSearch {
             let cell_id = self.next_cell_id;
             self.next_cell_id += 1;
 
-            let cell = CellInfo::new(cell_id, sti, address, ack.dbm);
+            let mut cell = CellInfo::new(cell_id, sti, address, ack.dbm);
+            cell.incarnation = ack.incarnation;
             self.cells.insert(sti, cell);
             self.cell_id_to_sti.insert(cell_id, sti);
 
@@ -319,6 +344,19 @@ pub struct GnbCellTracker {
     next_ue_id: u32,
     /// Heartbeat threshold duration
     heartbeat_threshold: Duration,
+    /// This gNB process's incarnation, carried in every HeartbeatAck (#337).
+    incarnation: u64,
+}
+
+/// A value that differs between two starts of a process on the same host:
+/// wall-clock nanoseconds mixed with the PID (#337). Not a secret, only a
+/// "this is a new start" marker, so no RNG dependency is needed.
+fn new_incarnation() -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    nanos ^ (u64::from(std::process::id()) << 32)
 }
 
 /// Information about a tracked UE
@@ -400,7 +438,13 @@ impl GnbCellTracker {
             ue_id_to_sti: HashMap::new(),
             next_ue_id: 0,
             heartbeat_threshold: Duration::from_millis(DEFAULT_HEARTBEAT_THRESHOLD_MS),
+            incarnation: new_incarnation(),
         }
+    }
+
+    /// This tracker's incarnation (#337).
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 
     /// Sets the heartbeat threshold duration
@@ -453,7 +497,7 @@ impl GnbCellTracker {
             events.push(GnbTrackerEvent::UeDetected { ue_id, sti });
         }
 
-        let ack = RlsHeartbeatAck::with_dbm(self.sti, dbm);
+        let ack = RlsHeartbeatAck::with_dbm(self.sti, dbm).with_incarnation(self.incarnation);
         (Some(ack), events)
     }
 
@@ -528,6 +572,60 @@ mod tests {
             }
         ));
         assert_eq!(search.cell_count(), 1);
+    }
+
+    /// #337: the same STI from the same address with another incarnation is a
+    /// gNB that restarted in place: the old cell is lost (the UE's RLF) and the
+    /// new one discovered. The same incarnation, or none at all (an older gNB),
+    /// changes nothing.
+    #[test]
+    fn a_gnb_restarted_in_place_is_a_lost_cell_and_a_new_one() {
+        let mut search = UeCellSearch::new(12345, vec![test_addr(4997)]);
+        let first = RlsHeartbeatAck::with_dbm(67890, -80).with_incarnation(1);
+        search.process_heartbeat_ack(67890, test_addr(4997), &first);
+        assert!(search
+            .process_heartbeat_ack(67890, test_addr(4997), &first)
+            .is_empty());
+        let unmarked = RlsHeartbeatAck::with_dbm(67890, -80);
+        assert!(
+            search
+                .process_heartbeat_ack(67890, test_addr(4997), &unmarked)
+                .is_empty(),
+            "an ack without an incarnation is not a restart"
+        );
+
+        let restarted = RlsHeartbeatAck::with_dbm(67890, -80).with_incarnation(2);
+        let events = search.process_heartbeat_ack(67890, test_addr(4997), &restarted);
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(matches!(
+            events[0],
+            CellSearchEvent::CellLost { cell_id: 0 }
+        ));
+        assert!(matches!(
+            events[1],
+            CellSearchEvent::CellDiscovered {
+                cell_id: 1,
+                sti: 67890,
+                ..
+            }
+        ));
+        assert_eq!(search.get_cell(1).unwrap().incarnation, Some(2));
+    }
+
+    /// The gNB side: every ack carries the tracker's incarnation, and two
+    /// trackers (two starts) differ.
+    #[test]
+    fn every_heartbeat_ack_carries_the_trackers_incarnation() {
+        let mut tracker = GnbCellTracker::new(1, SimCoord::new(0, 0, 0));
+        let (ack, _) = tracker.process_heartbeat(
+            9,
+            test_addr(4997),
+            &RlsHeartbeat::with_position(9, SimCoord::new(50, 0, 0)),
+        );
+        assert_eq!(ack.unwrap().incarnation, Some(tracker.incarnation()));
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let other = GnbCellTracker::new(1, SimCoord::new(0, 0, 0));
+        assert_ne!(other.incarnation(), tracker.incarnation());
     }
 
     /// #292: a cell whose STI answers from a new address (a gNB pod restarted

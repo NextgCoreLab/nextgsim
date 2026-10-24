@@ -340,6 +340,15 @@ pub struct HandoverInitiation {
 /// Messages for the NGAP task.
 #[derive(Debug)]
 pub enum NgapMessage {
+    /// The RRC plane re-keyed a UE at RRC re-establishment (TS 38.331 §5.3.7.5,
+    /// TS 33.501 §6.11, #285 review): the NGAP task's AS context now chains
+    /// from this `KgNB*`, so a later handover derives from the key the UE holds.
+    AsKeyRefreshed {
+        /// UE ID
+        ue_id: i32,
+        /// The new `KgNB`.
+        kgnb: [u8; 32],
+    },
     /// The UE answered a UE capability enquiry (from RRC). NGAP stores the
     /// capability and reports it to the AMF in a UE RADIO CAPABILITY INFO INDICATION
     /// (TS 38.413 §8.14.1).
@@ -590,6 +599,9 @@ pub enum RrcMessage {
         phys_cell_id: u16,
         /// `nextHopChainingCount` of the AS security context (0-7)
         next_hop_chaining_count: u8,
+        /// `KgNB` the keys above derive from: a re-establishment re-keys from it
+        /// (TS 38.331 §5.3.7.5, TS 33.501 §6.11, #285 review).
+        kgnb: [u8; 32],
     },
     /// RRC Reconfiguration delivery on DL-DCCH (from NGAP, on PDU Session
     /// Resource Setup — TS 38.331 §5.3.5.6) establishing a PDU session's DRB.
@@ -800,6 +812,15 @@ pub struct PduSessionResource {
 /// Messages for the RLS task.
 #[derive(Debug)]
 pub enum RlsMessage {
+    /// Release every DRB's L2 entities (PDCP, RLC) of one UE (from RRC, #315).
+    ///
+    /// Sent when the UE's RRC connection is released and when a new one is set
+    /// up for the same UE id, so a DRB of the next connection starts from COUNT 0
+    /// on both ends (TS 38.323 §5.1.1, TS 38.331 §5.3.11).
+    ReleaseUeDrbs {
+        /// UE ID
+        ue_id: i32,
+    },
     /// Signal detected from UE
     SignalDetected {
         /// UE ID

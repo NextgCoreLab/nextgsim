@@ -352,6 +352,12 @@ pub enum NasMessage {
     ActiveCellChanged {
         /// Previous TAI
         previous_tai: Tai,
+        /// TAI of the cell the UE is now camped on, from its SIB1 (PLMN + TAC).
+        ///
+        /// NAS needs it to tell whether the serving cell's TA is in its TAI
+        /// list, which decides the 5GMM substate after a failed registration
+        /// update (TS 24.501 §5.5.1.3.7, #277).
+        serving_tai: Tai,
         /// PLMNs currently available on the radio (broadcast by the cells the
         /// UE can detect), reported by the RRC CellSelector for TS 23.122
         /// §4.4.3 automatic PLMN selection. Empty if none are known yet.
@@ -497,6 +503,15 @@ pub enum RrcMessage {
     SetSelectedPlmn {
         /// The chosen PLMN.
         plmn: crate::rrc::cell_selection::Plmn,
+    },
+    /// NAS's "5GS forbidden tracking areas" lists changed (TS 24.501 §5.3.13,
+    /// nextgsim #322). Replaces both lists in the cell selector; a cell in one
+    /// of them is not suitable (TS 38.304 §4.5).
+    SetForbiddenTais {
+        /// "5GS forbidden tracking areas for roaming".
+        roaming: Vec<crate::rrc::cell_selection::Tai>,
+        /// "5GS forbidden tracking areas for regional provision of service".
+        regional_service: Vec<crate::rrc::cell_selection::Tai>,
     },
     /// Local release connection (from NAS)
     LocalReleaseConnection {
@@ -819,6 +834,14 @@ pub enum RlsMessage {
     },
     /// Reset STI (from RRC)
     ResetSti,
+    /// Release every DRB's L2 entities (from RRC, #315): the RRC connection was
+    /// released or lost, or a new one is being set up, and neither leaves a DRB
+    /// behind (TS 38.331 §5.3.11, §5.3.3.4). The next DRB starts at COUNT 0.
+    ReleaseDrbs,
+    /// Re-establish every DRB's PDCP and RLC entity (from RRC, #315): a
+    /// reconfiguration with sync (handover) moved the UE to a target whose
+    /// entities start fresh (TS 38.323 §5.1.2, TS 38.322 §5.1.2).
+    ReestablishDrbs,
     /// Data PDU delivery (from NAS)
     DataPduDelivery {
         /// PDU session ID
