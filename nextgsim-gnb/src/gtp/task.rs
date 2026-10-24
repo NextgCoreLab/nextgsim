@@ -62,6 +62,10 @@ struct SdapSessionState {
     enforcer: QosFlowEnforcer,
 }
 
+/// After the first, an uplink PDU dropped for want of a PDU session is logged once
+/// per this many drops (#293).
+const UPLINK_WITHOUT_SESSION_LOG_EVERY: u64 = 1000;
+
 /// GTP Task
 ///
 /// Handles GTP-U tunnel management and user plane data forwarding.
@@ -78,6 +82,8 @@ pub struct GtpTask {
     recv_buffer_size: usize,
     /// Enable loopback mode (for testing without UPF)
     loopback_mode: bool,
+    /// Uplink PDUs dropped because their PDU session has no N3 tunnel (#293).
+    uplink_without_session_drops: u64,
     /// This node's GTP-U restart counter, advertised in every Echo Response
     /// Recovery IE (TS 29.281 §8.2, TS 23.007).
     restart_counter: RestartCounter,
@@ -154,6 +160,7 @@ impl GtpTask {
             tunnel_manager: TunnelManager::new(),
             recv_buffer_size: 65535,
             loopback_mode,
+            uplink_without_session_drops: 0,
             restart_counter,
             path_supervisor,
             #[cfg(feature = "sdap-dataplane")]
@@ -384,13 +391,20 @@ impl GtpTask {
             return;
         }
 
-        // Auto-create session if needed
         if !self.tunnel_manager.has_session(ue_id as u32, psi as u8) {
             if self.loopback_mode {
+                // Loopback mode (no `upf_addr`): there is no core and no UPF, so the
+                // session is a local echo and nothing leaves this node.
                 self.auto_create_loopback_session(ue_id, psi);
             } else {
-                // Auto-create session to UPF
-                self.auto_create_upf_session(ue_id, psi);
+                // No N3 tunnel without NGAP: a session's uplink TEID is the UPF's,
+                // allocated by the SMF and signalled in PDU Session Resource Setup
+                // (or Initial Context Setup / Handover Request), TS 38.413 §8.2.1,
+                // TS 23.502 §4.3.2.2.1. Inventing one sent traffic the UPF cannot
+                // attribute, and hid a missing user-plane activation behind a
+                // tunnel that looked up (#293). The packet is dropped.
+                self.drop_uplink_without_session(ue_id, psi);
+                return;
             }
         }
 
@@ -474,82 +488,32 @@ impl GtpTask {
             }
         }
 
-        // See `auto_create_upf_session`: one invented flow matching the `with_qfi(1)`
-        // this session stamps on its uplink container.
+        // One invented flow matching the `with_qfi(1)` this session stamps on its
+        // uplink container: nothing told loopback mode a QoS flow, so a dynamic 5QI.
         #[cfg(feature = "sdap-dataplane")]
         self.install_sdap_session(ue_id, psi as u8, &[(1, None)]);
     }
 
-    /// Auto-create a PDU session to UPF for user plane forwarding
-    fn auto_create_upf_session(&mut self, ue_id: i32, psi: i32) {
-        // Get UPF address from config
-        let upf_port = self.task_base.config.upf_port;
-        let upf_addr = match self.task_base.config.upf_addr.as_deref() {
-            Some(addr) => match addr.parse::<std::net::IpAddr>() {
-                Ok(ip) => ip,
-                // A hostname (#286). Resolved here, on this fallback path only;
-                // the PDU-session path uses the address the AMF signalled.
-                Err(_) => {
-                    use std::net::ToSocketAddrs;
-                    match (addr, upf_port).to_socket_addrs().map(|mut a| a.next()) {
-                        Ok(Some(sa)) => sa.ip(),
-                        _ => {
-                            error!("Cannot create UPF session: upf_addr {addr} does not resolve");
-                            return;
-                        }
-                    }
-                }
-            },
-            None => {
-                error!("Cannot create UPF session: upf_addr not configured");
-                return;
-            }
-        };
-
-        // Ensure UE context exists
-        self.ue_contexts.entry(ue_id).or_insert_with(|| {
-            info!("Auto-creating UE context for UPF session: ue_id={}", ue_id);
-            GtpUeContext::new(ue_id)
-        });
-
-        // Create session with TEIDs
-        // Use a simple TEID allocation: 0x0001UUPP where UU=ue_id (lower 8 bits), PP=psi
-        let teid_base = 0x00010000u32;
-        let teid = teid_base | ((ue_id as u32 & 0xFF) << 8) | (psi as u32 & 0xFF);
-        // Use the same TEID for both uplink and downlink
-        // This allows the UPF to echo back with the same TEID it receives
-        let uplink_teid = teid;
-        let downlink_teid = teid;
-
-        let upf_socket_addr = SocketAddr::new(upf_addr, upf_port);
-        let gtp_ip = self.task_base.config.gtp_ip;
-        let local_addr = SocketAddr::new(gtp_ip, GTP_U_PORT);
-
-        let session = PduSession::new(
-            ue_id as u32,
-            psi as u8,
-            GtpTunnel::new(uplink_teid, upf_socket_addr), // Send uplink to UPF
-            GtpTunnel::new(downlink_teid, local_addr),    // Receive downlink from UPF
-        )
-        .with_qfi(1);
-
-        match self.tunnel_manager.create_session(session) {
-            Ok(()) => {
-                info!(
-                    "UPF PDU session created: ue_id={}, psi={}, teid={:#x}, upf={}",
-                    ue_id, psi, teid, upf_socket_addr
-                );
-            }
-            Err(e) => {
-                error!("Failed to create UPF session: {}", e);
-            }
+    /// Count, and log at a bounded rate, an uplink PDU dropped because its PDU
+    /// session has no N3 tunnel (#293).
+    ///
+    /// The first drop is a warning: in a working network it means the UE sends on a
+    /// DRB the gNB never set up a session for, typically after a gNB restart or an
+    /// AMF loss that took the session's resources (TS 24.501 §5.6.1: the UE must
+    /// Service Request them back). Later drops are logged once every
+    /// `UPLINK_WITHOUT_SESSION_LOG_EVERY` PDUs, so a UE sending at line rate
+    /// cannot flood the log.
+    fn drop_uplink_without_session(&mut self, ue_id: i32, psi: i32) {
+        self.uplink_without_session_drops = self.uplink_without_session_drops.saturating_add(1);
+        let n = self.uplink_without_session_drops;
+        if n == 1 || n % UPLINK_WITHOUT_SESSION_LOG_EVERY == 0 {
+            warn!(
+                "Uplink dropped: UE[{ue_id}] PSI {psi} has no PDU session resources \
+                 (no PDU Session Resource Setup); {n} such PDU(s) dropped so far"
+            );
+        } else {
+            debug!("Uplink dropped: UE[{ue_id}] PSI {psi} has no PDU session resources");
         }
-
-        // Matches the `with_qfi(1)` above: this path invents the session because
-        // traffic arrived without one, so the only flow it can claim is the one it
-        // stamps on the uplink container. A dynamic 5QI, because nothing told it one.
-        #[cfg(feature = "sdap-dataplane")]
-        self.install_sdap_session(ue_id, psi as u8, &[(1, None)]);
     }
 
     /// Handle loopback data - echo packet back to UE
@@ -1329,6 +1293,77 @@ mod tests {
 
         assert!(task.ue_contexts.contains_key(&1));
         assert_eq!(task.ue_contexts[&1].amf_ue_ngap_id, Some(12345));
+    }
+
+    /// #293: with a UPF configured (not loopback), uplink for a PDU session the
+    /// gNB never got NGAP resources for is DROPPED -- no session is invented and no
+    /// G-PDU leaves toward the UPF. Before, `auto_create_upf_session` created one
+    /// with a TEID made up from `ue_id`/`psi` and tunnelled the packet.
+    #[tokio::test]
+    async fn uplink_without_a_signalled_session_is_dropped_not_tunnelled() {
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.upf_addr = Some("127.0.0.1".to_string());
+        config.upf_port = upf.local_addr().unwrap().port();
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::new(task_base);
+        assert!(!task.loopback_mode);
+        task.udp_socket = Some(Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        // A minimal IPv4 header: version 4, IHL 5.
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+
+        for _ in 0..3 {
+            task.handle_uplink_data(0, 1, ip.clone()).await;
+        }
+
+        assert_eq!(
+            task.tunnel_manager.session_count(),
+            0,
+            "no invented session"
+        );
+        assert!(task.ue_contexts.is_empty(), "no invented UE context");
+        assert_eq!(
+            task.uplink_without_session_drops, 3,
+            "each PDU counted as dropped"
+        );
+        let mut buf = [0u8; 64];
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            upf.recv_from(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "nothing reached the UPF");
+
+        // The same packet IS tunnelled once a session exists (what NGAP's PDU Session
+        // Resource Setup installs, here pointed at the stand-in UPF's port), so the
+        // drop above is the missing session and not a broken uplink path.
+        let session = PduSession::new(
+            0,
+            1,
+            GtpTunnel::new(0xABCD, upf.local_addr().unwrap()),
+            GtpTunnel::new(
+                0x2000,
+                SocketAddr::new(IpAddr::from([127, 0, 0, 1]), GTP_U_PORT),
+            ),
+        )
+        .with_qfi(1);
+        task.tunnel_manager.create_session(session).unwrap();
+        task.handle_uplink_data(0, 1, ip).await;
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), upf.recv_from(&mut buf))
+                .await
+                .expect("the signalled session's uplink reaches the UPF")
+                .unwrap();
+        assert!(n > 8);
+        assert_eq!(
+            &buf[4..8],
+            &0xABCDu32.to_be_bytes(),
+            "the signalled UPF TEID"
+        );
+        assert_eq!(task.uplink_without_session_drops, 3);
     }
 
     #[test]

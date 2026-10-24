@@ -1830,6 +1830,40 @@ impl UeTaskBase {
         (base, app_rx, nas_rx, rrc_rx, rls_rx)
     }
 
+    /// Builds a `UeTaskBase` from handles the caller already owns, with no 6G
+    /// task handles and the given Rel-18 handles.
+    ///
+    /// Code outside this crate cannot write a `UeTaskBase { .. }` literal that
+    /// compiles under every feature set: the `sixg` field exists only when one of
+    /// the 6G features is on, and a dependent crate cannot see this crate's
+    /// features to `#[cfg]` it (#319). This constructor is the feature-independent
+    /// way to wire a task base around test or harness channels.
+    pub fn from_handles(
+        config: Arc<UeConfig>,
+        app_tx: TaskHandle<AppMessage>,
+        nas_tx: TaskHandle<NasMessage>,
+        rrc_tx: TaskHandle<RrcMessage>,
+        rls_tx: TaskHandle<RlsMessage>,
+        rel18: Option<UeRel18Handles>,
+    ) -> Self {
+        Self {
+            config,
+            app_tx,
+            nas_tx,
+            rrc_tx,
+            rls_tx,
+            #[cfg(any(
+                feature = "nextgsim-she",
+                feature = "nextgsim-nwdaf",
+                feature = "nextgsim-isac",
+                feature = "nextgsim-fl",
+                feature = "nextgsim-semantic",
+            ))]
+            sixg: None,
+            rel18,
+        }
+    }
+
     /// Initialize 6G task handles and return their receivers.
     ///
     /// Call this after `new()` to enable 6G tasks (SHE Client, NWDAF Reporter,

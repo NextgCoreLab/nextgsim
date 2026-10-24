@@ -1108,6 +1108,14 @@ impl RrcTask {
                 error!("Failed to notify RLS of cell change: {}", e);
             }
 
+            // A re-establishment searching for a cell (T311) re-establishes on this
+            // one; NAS is not involved unless that fails (TS 38.331 §5.3.7.3, #264).
+            if self.reestablishment_proc.state() == ReestablishmentState::CellSearch {
+                self.send_reestablishment_request(selected_cell.cell_id)
+                    .await;
+                return;
+            }
+
             // If cell changed, notify NAS
             if old_cell != Some(selected_cell.cell_id) {
                 if let Err(e) = self
@@ -4637,8 +4645,12 @@ impl RrcTask {
         }
     }
 
-    /// Handle radio link failure
-    async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
+    /// Handle radio link failure (TS 38.331 §5.3.10.3).
+    ///
+    /// Public because it is a real message-handler entry point
+    /// (`RrcMessage::RadioLinkFailure`) also driven directly by the in-process
+    /// gNB<->UE harness (`tests/src/rrc_handshake.rs`, #264).
+    pub async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
         warn!("Radio link failure: {:?}", cause);
 
         // Map RLF cause to re-establishment trigger
@@ -4660,85 +4672,41 @@ impl RrcTask {
         };
         if let Some(security) = security {
             let c_rnti = security.c_rnti;
-
-            // Target cell identity: the cell we re-establish on (the serving
-            // cell in this simulation, looked up from its SIB1 NCI)
-            let target_cell_identity = self
+            // physCellId is the SOURCE PCell's: the cell in which the trigger
+            // occurred (TS 38.331 §5.3.7.4), derived from its broadcast NCI the way
+            // the network derives it (`phys_cell_id_from_nci`).
+            let source_pci = self
                 .serving_cell_id
                 .and_then(|id| self.cell_selector.get_cell(id))
-                .map(|cell| cell.sib1.nci as u64)
+                .map(|cell| phys_cell_id_from_nci(cell.sib1.nci as u64))
                 .unwrap_or(0);
-            // The PCI is derived from that same NCI rather than from the UE's own
-            // cell index, which is a local counter the network cannot hold. See
-            // `phys_cell_id_from_nci`: with a real broadcast SIB1 both ends derive
-            // the same number, and without one the gNB answers with an RRCSetup,
-            // which is §5.3.3.1's behaviour for an unresolvable identity.
-            let pci = phys_cell_id_from_nci(target_cell_identity);
-
-            // ShortMAC-I derived from the AS security context (TS 38.331 §5.3.7.4)
-            let short_mac_i = match compute_short_mac_i(&security, pci, target_cell_identity) {
-                Ok(mac) => mac,
-                Err(e) => {
-                    error!("ShortMAC-I derivation failed: {} — going to idle", e);
-                    self.enter_idle_after_radio_link_failure().await;
-                    return;
-                }
-            };
 
             match self.reestablishment_proc.initiate(
                 trigger,
                 c_rnti,
-                pci,
-                short_mac_i,
+                source_pci,
+                // The shortMAC-I covers the cell the UE re-establishes ON, which is
+                // not known until cell selection picks one; computed then.
+                0,
                 &mut self.state_machine,
             ) {
                 Ok(params) => {
+                    // TS 38.331 §5.3.7.3: T311 runs while the UE performs cell
+                    // selection (TS 38.304); the request goes to the cell it
+                    // selects (§5.3.7.4), not to the cell that just failed -- which
+                    // after a radio link failure the UE usually cannot reach at all
+                    // (#264). The failed cell's camp is cleared so selection
+                    // re-evaluates it like any other, and NAS is not told anything
+                    // yet: the connection may still be recovered.
                     info!(
-                        "RLF: sending RRCReestablishmentRequest (cause={}, c_rnti={:#06x}, pci={})",
+                        "RLF: re-establishment initiated (cause={}, c_rnti={:#06x}, source \
+                         pci={}); T311 running, selecting a cell",
                         params.trigger, params.c_rnti, params.pci
                     );
-                    // Immediately mark cell as found (re-use serving cell if still visible)
-                    let _ = self.reestablishment_proc.on_cell_found();
-
-                    // A real UPER UL-CCCH RRCReestablishmentRequest (TS 38.331
-                    // §6.2.2). The bespoke framing this replaced put 0x05 in the
-                    // first byte, which the gNB's dispatcher read as an
-                    // RRCSetupRequest -- and which actually DECODES as one, so
-                    // the network answered a re-establishment with an RRCSetup
-                    // built on a fabricated context and never saw the shortMAC-I
-                    // at all (issue #37).
-                    let cause = match params.trigger {
-                        ReestablishmentTrigger::ReconfigurationFailure => {
-                            ReestablishmentCauseValue::ReconfigurationFailure
-                        }
-                        ReestablishmentTrigger::HandoverFailure => {
-                            ReestablishmentCauseValue::HandoverFailure
-                        }
-                        _ => ReestablishmentCauseValue::OtherFailure,
-                    };
-                    match encode_rrc_reestablishment_request(&RrcReestablishmentRequestParams {
-                        ue_identity: ReestablishmentUeIdentity {
-                            c_rnti: params.c_rnti,
-                            phys_cell_id: params.pci,
-                            short_mac_i: params.short_mac_i,
-                        },
-                        reestablishment_cause: cause,
-                    }) {
-                        Ok(bytes) => {
-                            self.send_uplink_rrc(
-                                RrcChannel::UlCcch,
-                                OctetString::from_slice(&bytes),
-                            )
-                            .await;
-                        }
-                        Err(e) => {
-                            error!(
-                                "RRCReestablishmentRequest encoding failed: {} -- going to idle",
-                                e
-                            );
-                            self.enter_idle_after_radio_link_failure().await;
-                        }
-                    }
+                    self.serving_cell_id = None;
+                    self.measurement_manager.set_serving_cell(None);
+                    self.cell_selector.clear_camp();
+                    self.last_cell_selection = None;
                 }
                 Err(e) => {
                     warn!(
@@ -4752,6 +4720,72 @@ impl RrcTask {
             // Already idle, re-establishment in progress, or AS security never
             // activated (TS 38.331 §5.3.7.2: go to RRC_IDLE) — just notify NAS
             self.enter_idle_after_radio_link_failure().await;
+        }
+    }
+
+    /// Cell selection picked `cell_id` while a re-establishment searches (T311):
+    /// send the RRCReestablishmentRequest on it and start T301 (TS 38.331
+    /// §5.3.7.3, §5.3.7.4, #264).
+    ///
+    /// `VarShortMAC-Input` is the SOURCE PCI and C-RNTI (stored when the procedure
+    /// started) and the identity of the cell selected here.
+    async fn send_reestablishment_request(&mut self, cell_id: i32) {
+        let Some(security) = self.as_security.clone() else {
+            warn!("Re-establishment lost its AS security context; going to idle");
+            self.reestablishment_proc.on_rrc_setup_fallback();
+            self.enter_idle_after_radio_link_failure().await;
+            return;
+        };
+        let target_cell_identity = self
+            .cell_selector
+            .get_cell(cell_id)
+            .map(|cell| cell.sib1.nci as u64)
+            .unwrap_or(0);
+        let (c_rnti, source_pci) = self.reestablishment_proc.ue_identity();
+        let short_mac_i = match compute_short_mac_i(&security, source_pci, target_cell_identity) {
+            Ok(mac) => mac,
+            Err(e) => {
+                error!("ShortMAC-I derivation failed: {} — going to idle", e);
+                self.reestablishment_proc.on_rrc_setup_fallback();
+                self.enter_idle_after_radio_link_failure().await;
+                return;
+            }
+        };
+        let cause = match self.reestablishment_proc.trigger() {
+            Some(ReestablishmentTrigger::ReconfigurationFailure) => {
+                ReestablishmentCauseValue::ReconfigurationFailure
+            }
+            Some(ReestablishmentTrigger::HandoverFailure) => {
+                ReestablishmentCauseValue::HandoverFailure
+            }
+            _ => ReestablishmentCauseValue::OtherFailure,
+        };
+        // A real UPER UL-CCCH RRCReestablishmentRequest (TS 38.331 §6.2.2).
+        match encode_rrc_reestablishment_request(&RrcReestablishmentRequestParams {
+            ue_identity: ReestablishmentUeIdentity {
+                c_rnti,
+                phys_cell_id: source_pci,
+                short_mac_i,
+            },
+            reestablishment_cause: cause,
+        }) {
+            Ok(bytes) => {
+                let _ = self.reestablishment_proc.on_cell_found();
+                info!(
+                    "Re-establishment: cell {cell_id} selected; sending RRCReestablishmentRequest \
+                     (c_rnti={c_rnti:#06x}, source pci={source_pci}), T301 started"
+                );
+                self.send_uplink_rrc(RrcChannel::UlCcch, OctetString::from_slice(&bytes))
+                    .await;
+            }
+            Err(e) => {
+                error!(
+                    "RRCReestablishmentRequest encoding failed: {} -- going to idle",
+                    e
+                );
+                self.reestablishment_proc.on_rrc_setup_fallback();
+                self.enter_idle_after_radio_link_failure().await;
+            }
         }
     }
 
@@ -5393,6 +5427,21 @@ mod tests {
                 }
                 Ok(_) => continue,
                 Err(e) => panic!("expected an uplink RRC PDU, got none: {e}"),
+            }
+        }
+    }
+
+    /// The next uplink RRC PDU, if any (non-panicking `next_uplink_rrc`).
+    fn next_uplink_rrc_opt(
+        rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> Option<(RrcChannel, OctetString)> {
+        loop {
+            match rx.try_recv() {
+                Ok(TaskMessage::Message(RlsMessage::RrcPduDelivery { channel, pdu, .. })) => {
+                    return Some((channel, pdu))
+                }
+                Ok(_) => continue,
+                Err(_) => return None,
             }
         }
     }
@@ -9807,6 +9856,18 @@ mod tests {
     fn sib1_with_all_timers(
         timers: nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams,
     ) -> Vec<u8> {
+        sib1_for_cell(timers, 1)
+    }
+
+    /// A SIB1 for a cell with NR Cell Identity `nci` and the broadcast guard timers.
+    fn sib1_with_nci(nci: u64) -> Vec<u8> {
+        sib1_for_cell(broadcast_guard_timers(), nci)
+    }
+
+    fn sib1_for_cell(
+        timers: nextgsim_rrc::procedures::system_information::UeTimersAndConstantsParams,
+        nci: u64,
+    ) -> Vec<u8> {
         use nextgsim_rrc::procedures::system_information::{
             encode_sib1, CellSelectionInfo, PlmnIdentityInfo, Sib1Params,
         };
@@ -9829,7 +9890,7 @@ mod tests {
                     mnc: vec![((hplmn.mnc / 10) % 10) as u8, (hplmn.mnc % 10) as u8],
                 }],
                 tracking_area_code: Some(1),
-                cell_identity: 1,
+                cell_identity: nci,
             }],
             ims_emergency_support: false,
             ecall_over_ims_support: false,
@@ -10023,6 +10084,9 @@ mod tests {
             // T301 is armed.
             task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
                 .await;
+            // Cell selection under T311 finds the cell again (#264).
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
             let remaining = task
                 .reestablishment_proc
                 .t301_remaining()
@@ -10401,6 +10465,15 @@ mod tests {
                 "§5.3.10.3 declares RLF and §5.3.7.2 re-establishes on a keyed UE; before \
                  #168 this failure could not happen at all"
             );
+            // §5.3.7.3: the request goes out once cell selection (under T311) has found a
+            // suitable cell -- here the same cell, recovered (#264).
+            assert!(
+                next_uplink_rrc_opt(&mut rls_rx).is_none(),
+                "no request before a cell is selected"
+            );
+            task.handle_signal_changed(1, -60).await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
             // And it reached the WIRE: an RRCReestablishmentRequest on UL-CCCH. Asserted
             // because the procedure state alone would be satisfied by an initiate() whose
             // request never left.
@@ -10413,6 +10486,70 @@ mod tests {
             assert!(
                 !task.rlf_detector.t310_is_running(),
                 "and the detector is reset, or the next poll declares the same failure again"
+            );
+        });
+    }
+
+    /// #264, TS 38.331 §5.3.7.3/§5.3.7.4: after a radio link failure the
+    /// RRCReestablishmentRequest goes to the cell selected during T311 -- a
+    /// DIFFERENT cell here -- with the SOURCE cell's PCI and C-RNTI, and a
+    /// shortMAC-I over the SELECTED cell's identity. Before, it went at once to the
+    /// cell that had just failed, which the UE usually cannot reach.
+    #[test]
+    fn a_reestablishment_goes_to_the_cell_selected_after_the_failure() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            while rls_rx.try_recv().is_ok() {}
+            let source_pci = task
+                .cell_selector
+                .get_cell(1)
+                .map(|c| phys_cell_id_from_nci(c.sib1.nci as u64))
+                .unwrap();
+
+            // The serving cell is lost: RLS reports the RLF first, then the cell as gone
+            // (the order `on_cell_lost` uses). A neighbour (cell 2, own SIB1) is heard.
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+            assert!(task.reestablishment_proc.is_in_progress());
+            assert!(
+                next_uplink_rrc_opt(&mut rls_rx).is_none(),
+                "nothing sent yet"
+            );
+            assert!(
+                !nas_rx
+                    .try_recv()
+                    .is_ok_and(|m| matches!(m, TaskMessage::Message(NasMessage::RadioLinkFailure))),
+                "NAS is not told: the connection may still be recovered"
+            );
+            task.handle_signal_changed(2, -60).await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+
+            let (channel, bytes) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch);
+            let req = decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+            assert_eq!(req.ue_identity.phys_cell_id, source_pci, "the SOURCE PCI");
+            let security = task.as_security.clone().unwrap();
+            let expected = compute_short_mac_i(&security, source_pci, 0x20).unwrap();
+            assert_eq!(
+                req.ue_identity.short_mac_i, expected,
+                "the shortMAC-I covers the SELECTED cell's identity"
+            );
+            assert_eq!(task.serving_cell_id, Some(2));
+            assert!(
+                task.reestablishment_proc.t301_remaining().is_some(),
+                "T301 armed"
             );
         });
     }
