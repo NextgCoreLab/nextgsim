@@ -46,7 +46,7 @@
 <tr><td>RRC connection (SRB1/SRB2/DRB)</td><td>RRCSetup, SecurityModeCommand, Reconfiguration w/ DRB, UECapability, typed UL/DL-DCCH UPER</td><td>TS 38.331 §5.3/§5.6/§6.2</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>AS security</td><td>KgNB-derived RRC/UP keys (FC=0x69), NEA/NIA selection, NIA0-never-fallback</td><td>TS 33.501 §6.7/A.8</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>RRC reestablishment/resume</td><td>ReestablishmentRequest/Complete, ResumeRequest/Complete handlers in live RRC task</td><td>TS 38.331 §5.3.7/§5.3.13</td><td><span class="fm-status fm-partial">partial</span></td></tr>
-<tr><td>N2 handover + Xn handover</td><td>HandoverRequired/Request/Ack, PathSwitchRequest wired via NGAP; Xn structs+DAPS local-only</td><td>TS 38.300/38.413 §8.4</td><td><span class="fm-status fm-partial">partial</span></td></tr>
+<tr><td>N2 handover</td><td>HandoverRequired/Request/Ack/Command/Notify via NGAP, measurement-triggered; PathSwitchRequest by CLI only; no Xn-C between gNBs; DAPS local-only</td><td>TS 38.300/38.413 §8.4</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>GTP-U / N3 user plane</td><td>UDP GTP-U tunnels, TEID mgmt, DL/UL forwarding to RLS; E2E-validated 0% loss</td><td>TS 29.281</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>LTE eNB + LTE UE (lte-enb, lte-ue)</td><td>S1 Setup and S1AP UE signalling, E-UTRA RRC over RLS, EPS NAS attach with EPS AKA, AS security, SRB2/DRBs on PDCP and RLC UM, S1-U GTP-U; attaches to nextgcore EPC with a 0%-loss ping in CI</td><td>TS 36.413 / 36.331 / 24.301</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
 <tr><td>Kernel-SCTP NGAP transport</td><td>Real kernel SCTP (Linux, feature kernel-sctp) or userspace/multi-homed backends</td><td>RFC 4960 / TS 38.412</td><td><span class="fm-status fm-implemented">implemented</span></td></tr>
@@ -55,7 +55,7 @@
 <tr><td>MBS multicast (Rel-17)</td><td>MBS session activation/deactivation, TMGI, multicast tunnel context in NGAP task</td><td>TS 38.413/23.247</td><td><span class="fm-status fm-partial">partial</span></td></tr>
 <tr><td>6G AI-native tasks (Rel-20)</td><td>ISAC sensing, SHE, NKEF, NWDAF, agent/FL, Rel-18 energy saving — config-gated spawned tasks</td><td>non-normative (no Stage-3)</td><td><span class="fm-status fm-prototype">prototype</span></td></tr>
 </table></div>
-<p class="fm-notes">Inter-gNB (Xn) handover runs and re-keys (KgNB*); conditional handover is config-gated. DAPS types exist but are not task-wired.</p>
+<p class="fm-notes">Inter-gNB handover runs over N2 and re-keys (KgNB*); there is no Xn-C interface between gNBs; conditional handover is config-gated. DAPS types exist but are not task-wired.</p>
 <h3 class="group-heading">UE (nr-ue)</h3>
 <div class="fm-wrap"><table class="fm-table">
 <tr><th>Service / Area</th><th>Key Procedures</th><th>Spec</th><th>Status</th></tr>
