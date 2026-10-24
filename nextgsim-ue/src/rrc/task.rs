@@ -32,7 +32,8 @@ use crate::rrc::reestablishment::{
 use crate::rrc::resume::{ResumeCause, ResumeIdentity, ResumeProcedure};
 use crate::rrc::security::{
     as_security_enabled, compute_short_mac_i, AsSecurityContext, AsSecurityError,
-    CipheringAlgorithm, IntegrityAlgorithm, DIRECTION_DOWNLINK, SMC_PDCP_COUNT, SRB1_BEARER,
+    CipheringAlgorithm, IntegrityAlgorithm, DIRECTION_DOWNLINK, DIRECTION_UPLINK,
+    SMC_COMPLETE_PDCP_COUNT, SMC_PDCP_COUNT, SRB1_BEARER,
 };
 use crate::rrc::state::{RrcState, RrcStateMachine};
 #[cfg(feature = "nextgsim-she")]
@@ -348,6 +349,29 @@ pub struct Srb1Config {
     pub cell_group_config: Option<CellGroupConfig>,
 }
 
+/// The PDCP COUNTs of a protected SRB1 (#285).
+///
+/// Reset to `{0, 0}` wherever TS 38.331 (re-)establishes PDCP for SRB1: RRC
+/// re-establishment (§5.3.7.4), RRC resume (§5.3.13.3), and a reconfiguration
+/// with sync (handover, §5.3.5.8.3). At AS security activation the
+/// SecurityModeCommand has taken DL COUNT 0 and the SecurityModeComplete takes
+/// UL COUNT 0, so protection starts at `{1, 1}`. The gNB keeps the same pair
+/// (`RrcUeContext::dl_pdcp_count` / `ul_pdcp_count`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Srb1Pdcp {
+    /// COUNT of the next UL-DCCH PDU this UE sends.
+    tx_count: u32,
+    /// COUNT of the next DL-DCCH PDU this UE expects.
+    rx_count: u32,
+}
+
+impl Srb1Pdcp {
+    const RE_ESTABLISHED: Self = Self {
+        tx_count: 0,
+        rx_count: 0,
+    };
+}
+
 /// RRC Task for managing cell selection and RRC connections
 pub struct RrcTask {
     task_base: UeTaskBase,
@@ -440,6 +464,23 @@ pub struct RrcTask {
     /// no SecurityModeComplete ever confirmed. Hence a second field with one
     /// reader.
     inactive_as_security: Option<AsSecurityContext>,
+    /// SRB1 PDCP protection state (TS 38.323 §5.8/§5.9, #285): `Some` while every
+    /// UL-DCCH PDU is ciphered and integrity protected and every DL-DCCH PDU is
+    /// verified and deciphered with [`Self::as_security`]'s keys. The COUNTs are
+    /// implicit -- SRB1 here carries no PDCP SN -- so both ends count the same
+    /// PDUs in the same order, from the same reset points (see `Srb1Pdcp`).
+    srb1_pdcp: Option<Srb1Pdcp>,
+    /// SRB1 integrity protection and ciphering are suspended between an
+    /// RRCReestablishmentRequest and the RRCReestablishment that answers it
+    /// (TS 38.331 §5.3.7.4 "configure lower layers to suspend integrity protection
+    /// and ciphering for SRB1"; #285 review). Only an RRCReestablishment is accepted
+    /// then, and it is verified integrity-only with the re-derived key (§5.3.7.5).
+    srb1_suspended_for_reestablishment: bool,
+    /// The NCC associated with the current KgNB (TS 33.501 §6.9.2.1.1): 0 for
+    /// the KgNB of the AS SecurityModeCommand, then the `nextHopChainingCount`
+    /// last received in a reconfigurationWithSync or an RRCReestablishment
+    /// (TS 38.331 §5.3.5.7, §5.3.7.5 "store the nextHopChainingCount value").
+    as_ncc: u8,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -704,6 +745,9 @@ impl RrcTask {
             suspended_in_cell_identity: None,
             as_security: None,
             inactive_as_security: None,
+            srb1_pdcp: None,
+            srb1_suspended_for_reestablishment: false,
+            as_ncc: 0,
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -766,8 +810,9 @@ impl RrcTask {
     }
 
     /// Returns the installed AS security context, if AS security has been
-    /// activated (test/observability hook, Wave-6 I5).
-    #[cfg(test)]
+    /// activated (test/observability hook, Wave-6 I5; the in-process cross-end
+    /// test in `tests/src/rrc_handshake.rs` checks a re-derived key with it).
+    #[doc(hidden)]
     pub fn as_security(&self) -> Option<&AsSecurityContext> {
         self.as_security.as_ref()
     }
@@ -817,6 +862,10 @@ impl RrcTask {
 
         let ctx =
             AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
+        // TS 33.501 §6.9.2.1.1: the KgNB of an initial AS security context "is then
+        // considered to be associated with a virtual NH parameter with NCC value
+        // equal to zero".
+        self.as_ncc = 0;
 
         // TS 38.331 §5.3.4.2: verify the SecurityModeCommand's integrity with the
         // FRESHLY DERIVED K_RRCint before replying. On failure the UE continues
@@ -851,6 +900,14 @@ impl RrcTask {
         );
         self.set_as_security_context(ctx);
         self.send_security_mode_complete(tid).await;
+        // From here SRB1 is protected both ways (§5.3.4.3). The command took DL
+        // COUNT 0 and the Complete UL COUNT 0.
+        if as_security_enabled(&self.task_base.config) {
+            self.srb1_pdcp = Some(Srb1Pdcp {
+                tx_count: 1,
+                rx_count: 1,
+            });
+        }
     }
 
     /// Records the **UE Inactive AS Context** keys from an SMC the UE is refusing
@@ -996,8 +1053,28 @@ impl RrcTask {
         match encode_security_mode_complete(&SecurityModeCompleteParams {
             rrc_transaction_id: tid,
         }) {
-            Ok(bytes) => {
-                info!("Sending AS SecurityModeComplete (tid={tid})");
+            Ok(mut bytes) => {
+                // TS 38.331 §5.3.4.3: integrity protection applies immediately,
+                // "including the SecurityModeComplete message", while ciphering
+                // starts after it, "except for the SecurityModeComplete message
+                // which is sent unciphered". So: MAC-I at UL COUNT 0, no cipher.
+                // Sent before `srb1_pdcp` is set, so the generic uplink path does
+                // not protect it a second time (#285).
+                let wire_protection = as_security_enabled(&self.task_base.config);
+                if let (true, Some(ctx)) = (wire_protection, self.as_security.as_ref()) {
+                    let integrity_only = AsSecurityContext {
+                        ciphering_algorithm: CipheringAlgorithm::Nea0,
+                        ..ctx.clone()
+                    };
+                    let mac = integrity_only.compute_rrc_mac_i(
+                        SMC_COMPLETE_PDCP_COUNT,
+                        SRB1_BEARER,
+                        DIRECTION_UPLINK,
+                        &bytes,
+                    );
+                    bytes.extend_from_slice(&mac);
+                }
+                info!("Sending AS SecurityModeComplete (tid={tid}), integrity protected");
                 self.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&bytes))
                     .await;
             }
@@ -2640,7 +2717,22 @@ impl RrcTask {
             );
         }
 
-        let bytes = pdu.data();
+        // §5.3.7.4/§5.3.7.5 (#285 review): with SRB1 suspended for a
+        // re-establishment, the only DL-DCCH PDU acted on is the RRCReestablishment,
+        // integrity protected and not ciphered, and only once its MAC-I verifies
+        // with the key it re-derives.
+        if self.srb1_suspended_for_reestablishment {
+            self.handle_suspended_srb1_pdu(cell_id, pdu.data()).await;
+            return;
+        }
+
+        // SRB1 PDCP (#285): once AS security is active every DL-DCCH PDU is
+        // verified and deciphered first, because everything below reads its
+        // leading bytes and a ciphered PDU has none worth reading.
+        let Some(plain) = self.unprotect_dl_dcch(pdu.data()) else {
+            return;
+        };
+        let bytes = plain.as_slice();
         if bytes.is_empty() {
             return;
         }
@@ -2931,6 +3023,13 @@ impl RrcTask {
         // Set up default measurements for handover
         self.setup_default_measurements();
         self.measurement_manager.set_serving_cell(Some(cell_id));
+
+        // A new connection: SRB1 is unprotected until this connection's own
+        // SecurityModeCommand (§5.3.3.4, #285).
+        self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
 
         // Send RRC Setup Complete with initial NAS
         self.send_rrc_setup_complete().await;
@@ -3445,6 +3544,10 @@ impl RrcTask {
             ctx.full_i_rnti(),
             params.resume_mac_i
         );
+        // §5.3.13.3: "re-establish PDCP entities for SRB1" -- the RRCResume is the
+        // first DL PDU of the re-established SRB1, ciphered and integrity protected
+        // when AS security was active (#285).
+        self.reestablish_srb1_pdcp();
         // UL-CCCH1, which is what carries `RRCResumeRequest1` (TS 38.331 §6.2.1).
         self.send_uplink_rrc(RrcChannel::UlCcch1, pdu).await;
     }
@@ -3512,6 +3615,11 @@ impl RrcTask {
         // Secondary cells are part of that configuration (§5.3.5.5.9), so they
         // go the same way: A6 has no reference in RRC_IDLE.
         self.release_all_scells();
+        // SRB1 goes with the connection; a resume re-establishes it (#285).
+        self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
 
         info!("RRC connection released");
 
@@ -4046,6 +4154,8 @@ impl RrcTask {
         let pci = (target_pci % 1008) as u16;
         let arfcn = self.task_base.config.dl_arfcn;
         let kgnb_star = derive_kgnb_star(&kgnb, pci, arfcn);
+        // TS 38.331 §5.3.5.7: "store the nextHopChainingCount value".
+        self.as_ncc = update.next_hop_chaining_count;
         info!(
             "Handover: re-derived KgNB* for PCI {pci}, ARFCN-DL {arfcn} (NCC {})",
             update.next_hop_chaining_count
@@ -4188,6 +4298,11 @@ impl RrcTask {
             // cell group configuration, so the source cell's secondary cells
             // are gone. The target names its own in a later reconfiguration.
             self.release_all_scells();
+
+            // §5.3.5.8.3 / §5.3.5.6.3: the reconfiguration with sync re-establishes
+            // PDCP for SRB1 under the refreshed keys (#285); the
+            // RRCReconfigurationComplete is its first UL PDU.
+            self.reestablish_srb1_pdcp();
 
             // Notify RLS of new serving cell
             if let Err(e) = self
@@ -4631,6 +4746,10 @@ impl RrcTask {
     /// NAS is told the connection is gone, so it enters CM-IDLE.
     async fn enter_idle_after_radio_link_failure(&mut self) {
         let _ = self.state_machine.on_rrc_release();
+        self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
         self.serving_cell_id = None;
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
@@ -4775,6 +4894,12 @@ impl RrcTask {
                     "Re-establishment: cell {cell_id} selected; sending RRCReestablishmentRequest \
                      (c_rnti={c_rnti:#06x}, source pci={source_pci}), T301 started"
                 );
+                // §5.3.7.4: "re-establish PDCP for SRB1", then "configure lower
+                // layers to suspend integrity protection and ciphering for SRB1".
+                // The RRCReestablishment answering this is the first DL PDU of the
+                // re-established SRB1, verified integrity-only with the re-derived
+                // key (#285).
+                self.suspend_srb1_for_reestablishment();
                 self.send_uplink_rrc(RrcChannel::UlCcch, OctetString::from_slice(&bytes))
                     .await;
             }
@@ -4865,6 +4990,183 @@ impl RrcTask {
         self.send_uplink_rrc_with_id(channel, pdu_id, pdu).await;
     }
 
+    /// PDCP-protect an UL-DCCH PDU when SRB1 protection is on (TS 38.323
+    /// §5.8/§5.9, #285): ciphered and integrity protected at the next UL COUNT.
+    /// Returns `None` only when the PDU must be dropped (an unusable security
+    /// state); sending it in the clear to a gNB that verifies would be discarded
+    /// anyway, and would be a security regression besides.
+    fn protect_ul_dcch(&mut self, channel: RrcChannel, pdu: OctetString) -> Option<OctetString> {
+        if channel != RrcChannel::UlDcch {
+            return Some(pdu);
+        }
+        let Some(counts) = self.srb1_pdcp.as_mut() else {
+            return Some(pdu);
+        };
+        let Some(ctx) = self.as_security.as_ref() else {
+            error!("Dropping an UL-DCCH PDU: SRB1 protection is on but no AS security context");
+            return None;
+        };
+        match ctx.protect_srb(counts.tx_count, SRB1_BEARER, DIRECTION_UPLINK, pdu.data()) {
+            Ok(protected) => {
+                counts.tx_count = counts.tx_count.wrapping_add(1);
+                Some(OctetString::from_slice(&protected))
+            }
+            Err(e) => {
+                error!("Dropping an UL-DCCH PDU: SRB1 protection failed ({e})");
+                None
+            }
+        }
+    }
+
+    /// Verify and decipher a DL-DCCH PDU when SRB1 protection is on (#285).
+    /// `None` means discard: a PDU that fails integrity is never acted on
+    /// (TS 33.501 §6.5), and the expected COUNT does not advance for it.
+    fn unprotect_dl_dcch(&mut self, pdu: &[u8]) -> Option<Vec<u8>> {
+        let Some(counts) = self.srb1_pdcp.as_mut() else {
+            return Some(pdu.to_vec());
+        };
+        let Some(ctx) = self.as_security.as_ref() else {
+            warn!("Discarding a DL-DCCH PDU: SRB1 protection is on but no AS security context");
+            return None;
+        };
+        match ctx.unprotect_srb(counts.rx_count, SRB1_BEARER, DIRECTION_DOWNLINK, pdu) {
+            Ok(plain) => {
+                counts.rx_count = counts.rx_count.wrapping_add(1);
+                Some(plain)
+            }
+            Err(e) => {
+                warn!(
+                    "Discarding a DL-DCCH PDU: SRB1 integrity check failed at COUNT {} ({e}) \
+                     -- TS 33.501 §6.5",
+                    counts.rx_count
+                );
+                None
+            }
+        }
+    }
+
+    /// PDCP for SRB1 is (re-)established (§5.3.7.4, §5.3.13.3, §5.3.5.8.3):
+    /// both COUNTs restart at 0, and protection stays on when AS security is
+    /// active (#285).
+    fn reestablish_srb1_pdcp(&mut self) {
+        if as_security_enabled(&self.task_base.config) && self.as_security.is_some() {
+            self.srb1_pdcp = Some(Srb1Pdcp::RE_ESTABLISHED);
+        } else {
+            self.srb1_pdcp = None;
+        }
+    }
+
+    /// §5.3.7.4 on sending an RRCReestablishmentRequest: SRB1's PDCP is
+    /// re-established and its integrity protection and ciphering are suspended
+    /// (#285 review). Without AS security there is nothing to suspend.
+    fn suspend_srb1_for_reestablishment(&mut self) {
+        self.reestablish_srb1_pdcp();
+        if self.srb1_pdcp.is_some() {
+            self.srb1_pdcp = None;
+            self.srb1_suspended_for_reestablishment = true;
+        }
+    }
+
+    /// A DL-DCCH PDU while SRB1 is suspended for a re-establishment (§5.3.7.5,
+    /// #285 review). It must be an RRCReestablishment followed by its MAC-I:
+    /// - `KgNB*` is derived from the current `KgNB`, the cell's PCI and the
+    ///   ARFCN-DL ("update the K_(gNB) key based on the current K_(gNB) key or the
+    ///   NH, using the received nextHopChainingCount value"), and K_RRCint/K_RRCenc
+    ///   from it with the previously configured algorithms;
+    /// - the MAC-I is verified integrity-only at DL COUNT 0 with the new K_RRCint;
+    ///   a failure goes to RRC_IDLE ("RRC connection failure");
+    /// - integrity protection and ciphering resume "immediately": the
+    ///   RRCReestablishmentComplete is the first protected UL PDU (COUNT 0), and
+    ///   the next DL PDU is COUNT 1.
+    ///
+    /// Anything else is discarded: nothing else is expected, and nothing unverified
+    /// is acted on.
+    async fn handle_suspended_srb1_pdu(&mut self, cell_id: i32, pdu: &[u8]) {
+        use nextgsim_crypto::kdf::derive_kgnb_star;
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+
+        if pdu.len() <= MAC_I_LEN {
+            warn!("Discarding a DL-DCCH PDU while SRB1 is suspended: too short for a MAC-I");
+            return;
+        }
+        let (body, mac) = pdu.split_at(pdu.len() - MAC_I_LEN);
+        let Ok(reestablishment) = decode_rrc_reestablishment(body) else {
+            warn!(
+                "Discarding a DL-DCCH PDU while SRB1 is suspended for re-establishment: \
+                 not an RRCReestablishment (TS 38.331 §5.3.7.4)"
+            );
+            return;
+        };
+        let Some(current) = self.as_security.clone() else {
+            warn!("RRCReestablishment under suspended SRB1 but no AS security context");
+            return;
+        };
+        let Some(pci) = self.cell_selector.phys_cell_id_of(cell_id) else {
+            warn!("RRCReestablishment from cell {cell_id}, whose PCI is unknown; discarded");
+            return;
+        };
+        // TS 33.501 §6.11: "The UE shall firstly synchronize the locally kept NH
+        // parameter as defined in Annex A.10 if the received NCC value is different
+        // from the current NCC value in the UE itself", and Annex A.11 then keys
+        // KgNB* from that NH. This UE keeps no NH chain yet (#325), so it cannot
+        // derive the key the network holds for a different NCC. It refuses, rather
+        // than verify with a key that cannot match: the RRCReestablishment's
+        // integrity check would fail anyway, and this says why (#348 review).
+        if reestablishment.next_hop_chaining_count != self.as_ncc {
+            warn!(
+                "RRCReestablishment signals NCC {} but this UE's KgNB has NCC {}: a \
+                 vertical KgNB* needs the NH chain (TS 33.501 §6.11, Annex A.10/A.11), \
+                 which is not implemented (#325); going to RRC_IDLE",
+                reestablishment.next_hop_chaining_count, self.as_ncc
+            );
+            self.srb1_suspended_for_reestablishment = false;
+            self.enter_idle_after_radio_link_failure().await;
+            return;
+        }
+        // ARFCN-DL of the selected cell (Annex A.11 P1). This simulator is
+        // single-carrier: RLS carries no carrier frequency, so every cell is on the
+        // UE's configured `dl_arfcn`, which must therefore equal each gNB's
+        // `dl_arfcn` (docs/configuration.md). A gNB on another value derives a
+        // different KgNB* and the re-establishment fails its integrity check.
+        let arfcn = self.task_base.config.dl_arfcn;
+        let kgnb_star = derive_kgnb_star(&current.kgnb, pci, arfcn);
+        let rekeyed = AsSecurityContext::derive_from_kgnb(
+            &kgnb_star,
+            current.ciphering_algorithm,
+            current.integrity_algorithm,
+            current.c_rnti,
+        );
+        // Integrity only: the RRCReestablishment is not ciphered (§5.3.7.4 NOTE).
+        let integrity_only = AsSecurityContext {
+            ciphering_algorithm: CipheringAlgorithm::Nea0,
+            ..rekeyed.clone()
+        };
+        let expected = integrity_only.compute_rrc_mac_i(0, SRB1_BEARER, DIRECTION_DOWNLINK, body);
+        if !nextgsim_pdcp::algorithms::ct_eq_mac(&expected, mac) {
+            warn!(
+                "RRCReestablishment failed its integrity check with the re-derived K_RRCint \
+                 (PCI {pci}, ARFCN-DL {arfcn}); going to RRC_IDLE, 'RRC connection failure' \
+                 (TS 38.331 §5.3.7.5)"
+            );
+            self.srb1_suspended_for_reestablishment = false;
+            self.enter_idle_after_radio_link_failure().await;
+            return;
+        }
+        info!(
+            "RRCReestablishment verified with KgNB* (PCI {pci}, ARFCN-DL {arfcn}, NCC {}); \
+             SRB1 integrity protection and ciphering resumed",
+            reestablishment.next_hop_chaining_count
+        );
+        self.as_security = Some(rekeyed);
+        self.srb1_suspended_for_reestablishment = false;
+        self.srb1_pdcp = Some(Srb1Pdcp {
+            tx_count: 0,
+            rx_count: 1,
+        });
+        self.handle_rrc_reestablishment(cell_id, &reestablishment)
+            .await;
+    }
+
     /// Route AI/ML inference request to SHE Client task
     #[cfg(feature = "nextgsim-she")]
     async fn route_6g_inference(&self, model_id: String, input_data: Vec<f32>) {
@@ -4943,7 +5245,15 @@ impl RrcTask {
     }
 
     /// Send uplink RRC message with specific PDU ID
-    async fn send_uplink_rrc_with_id(&self, channel: RrcChannel, pdu_id: u32, pdu: OctetString) {
+    async fn send_uplink_rrc_with_id(
+        &mut self,
+        channel: RrcChannel,
+        pdu_id: u32,
+        pdu: OctetString,
+    ) {
+        let Some(pdu) = self.protect_ul_dcch(channel, pdu) else {
+            return;
+        };
         let msg = RlsMessage::RrcPduDelivery {
             channel,
             pdu_id,
@@ -7850,6 +8160,167 @@ mod tests {
                     .expect("SecurityModeComplete")
                     .rrc_transaction_id,
                 2
+            );
+        });
+    }
+
+    // ---- #285: SRB1 PDCP protection after AS security activation ----
+
+    fn as_security_on_config() -> nextgsim_common::config::UeConfig {
+        nextgsim_common::config::UeConfig {
+            as_security_enabled: true,
+            ..test_config()
+        }
+    }
+
+    /// The gNB's SRB1 security for TEST_KGNB with the algorithms of
+    /// `gnb_smc_bytes` (NEA0, NIA2), built through the shared layer the gNB uses.
+    fn gnb_srb_security() -> nextgsim_pdcp::srb_security::SrbSecurity {
+        let k_rrc_int = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcInt, 2);
+        let k_rrc_enc = derive_rrc_up_key(&TEST_KGNB, AlgorithmTypeDistinguisher::RrcEnc, 0);
+        nextgsim_pdcp::srb_security::SrbSecurity::new(k_rrc_enc, k_rrc_int, 0, 2).unwrap()
+    }
+
+    /// #285, TS 38.331 §5.3.4.3: the SecurityModeComplete is integrity protected
+    /// at UL COUNT 0 and NOT ciphered -- its body is the plain UPER message and
+    /// the trailing MAC-I verifies with the gNB's key.
+    #[test]
+    fn the_security_mode_complete_is_integrity_protected_at_ul_count_0() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(as_security_on_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            deliver_gnb_smc(&mut task, 1).await;
+            let (ch, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(ch, RrcChannel::UlDcch);
+            let bytes = pdu.data();
+            let (body, mac) = bytes.split_at(bytes.len() - MAC_I_LEN);
+            assert_eq!(
+                decode_security_mode_complete(body)
+                    .unwrap()
+                    .rrc_transaction_id,
+                1,
+                "the body is the unciphered SecurityModeComplete"
+            );
+            let expected = gnb_srb_security().compute_mac_i(0, SRB1_BEARER, DIRECTION_UPLINK, body);
+            assert_eq!(mac, &expected[..], "MAC-I at UL COUNT 0");
+            assert_eq!(
+                task.srb1_pdcp,
+                Some(Srb1Pdcp {
+                    tx_count: 1,
+                    rx_count: 1
+                })
+            );
+        });
+    }
+
+    /// #285: after activation every UL-DCCH PDU is protected at the next UL COUNT
+    /// and every DL-DCCH PDU is verified at the next DL COUNT. A forged DL PDU is
+    /// discarded without advancing the COUNT, so the next genuine one is still
+    /// accepted. Before #285 the UE had no SRB1 PDCP site at all: it sent plaintext
+    /// the gNB discarded and never deciphered what the gNB protected.
+    #[test]
+    fn after_activation_srb1_is_protected_both_ways() {
+        use nextgsim_rrc::procedures::information_transfer::{
+            encode_dl_information_transfer, DlInformationTransferParams,
+        };
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(as_security_on_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            task.serving_cell_id = Some(1);
+            deliver_gnb_smc(&mut task, 0).await;
+            let _ = next_uplink_rrc(&mut rls_rx); // the Complete
+            let gnb = gnb_srb_security();
+
+            // Uplink: protected at UL COUNT 1, then 2.
+            for count in 1..=2u32 {
+                let plain = OctetString::from_slice(&[0x10 + count as u8, 0xAA, 0xBB]);
+                task.send_uplink_rrc(RrcChannel::UlDcch, plain.clone())
+                    .await;
+                let (_ch, sent) = next_uplink_rrc(&mut rls_rx);
+                assert_ne!(sent.data(), plain.data());
+                let opened = gnb
+                    .unprotect(count, SRB1_BEARER, DIRECTION_UPLINK, sent.data())
+                    .expect("the gNB verifies it at the matching COUNT");
+                assert_eq!(opened, plain.data());
+            }
+
+            // Downlink: a DLInformationTransfer the gNB protected at DL COUNT 1.
+            let nas = vec![0x7E, 0x00, 0x5A];
+            let dl = encode_dl_information_transfer(&DlInformationTransferParams {
+                rrc_transaction_id: 0,
+                dedicated_nas_message: Some(nas.clone()),
+            })
+            .expect("encode");
+            let mut forged = gnb.protect(1, SRB1_BEARER, DIRECTION_DOWNLINK, &dl);
+            let last = forged.len() - 1;
+            forged[last] ^= 0x01;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&forged))
+                .await;
+            assert_eq!(
+                task.srb1_pdcp.unwrap().rx_count,
+                1,
+                "a forgery does not advance"
+            );
+            let genuine = gnb.protect(1, SRB1_BEARER, DIRECTION_DOWNLINK, &dl);
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, OctetString::from_slice(&genuine))
+                .await;
+            assert_eq!(task.srb1_pdcp.unwrap().rx_count, 2);
+            let mut got = None;
+            while let Ok(m) = nas_rx.try_recv() {
+                if let TaskMessage::Message(NasMessage::NasDelivery { pdu }) = m {
+                    got = Some(pdu.data().to_vec());
+                }
+            }
+            assert_eq!(
+                got.as_deref(),
+                Some(&nas[..]),
+                "the deciphered NAS reaches NAS once"
+            );
+        });
+    }
+
+    /// #285: a re-establishment restarts both SRB1 COUNTs at 0 (§5.3.7.4), and a
+    /// new RRCSetup drops protection until its own SecurityModeCommand.
+    #[test]
+    fn srb1_counts_restart_where_pdcp_is_reestablished() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(as_security_on_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            deliver_gnb_smc(&mut task, 0).await;
+            let _ = next_uplink_rrc(&mut rls_rx);
+            task.send_uplink_rrc(RrcChannel::UlDcch, OctetString::from_slice(&[1, 2]))
+                .await;
+            assert_eq!(task.srb1_pdcp.unwrap().tx_count, 2);
+            task.reestablish_srb1_pdcp();
+            assert_eq!(task.srb1_pdcp, Some(Srb1Pdcp::RE_ESTABLISHED));
+        });
+    }
+
+    /// #348 real-binary run: a re-establishment that fails (T301, T311) leaves the
+    /// UE in RRC_IDLE, and the SRB1 suspension goes with the connection. Kept, it
+    /// discarded every DL-DCCH PDU of the UE's next connection (its
+    /// SecurityModeCommand first), so the UE never recovered.
+    #[test]
+    fn a_failed_re_establishment_does_not_leave_srb1_suspended() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(as_security_on_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            deliver_gnb_smc(&mut task, 0).await;
+            let _ = next_uplink_rrc(&mut rls_rx);
+            task.suspend_srb1_for_reestablishment();
+            assert!(task.srb1_suspended_for_reestablishment);
+            task.enter_idle_after_radio_link_failure().await;
+            assert!(
+                !task.srb1_suspended_for_reestablishment,
+                "the next connection's SRB1 is not suspended"
             );
         });
     }

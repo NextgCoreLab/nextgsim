@@ -1210,6 +1210,7 @@ impl NgapTask {
             c_rnti: SIMULATED_C_RNTI,
             phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
             next_hop_chaining_count: 0,
+            kgnb,
         };
         if let Err(e) = self.task_base.rrc_tx.send(reestablishment_security).await {
             error!(
@@ -6290,6 +6291,23 @@ impl Task for NgapTask {
                     }
                     NgapMessage::RadioLinkFailure { ue_id } => {
                         self.handle_radio_link_failure(ue_id).await;
+                    }
+                    NgapMessage::AsKeyRefreshed { ue_id, kgnb } => {
+                        // #285 review: the RRC plane re-keyed at re-establishment
+                        // (TS 38.331 §5.3.7.5). The algorithms stay; the key changes.
+                        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id)
+                        {
+                            if let Some(old) = ctx.as_security.as_ref() {
+                                ctx.as_security = Some(AsSecurityContext::from_kgnb(
+                                    kgnb,
+                                    old.ciphering_alg_id,
+                                    old.integrity_alg_id,
+                                ));
+                                info!(
+                                    "UE[{ue_id}]: AS context re-keyed after RRC re-establishment"
+                                );
+                            }
+                        }
                     }
                     NgapMessage::InitiateHandover(request) => {
                         // The production caller `initiate_handover` never had (issue #39).
