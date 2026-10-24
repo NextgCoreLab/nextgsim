@@ -21,6 +21,7 @@ pub(crate) fn cfg() -> EnbConfig {
         radio: Default::default(),
         security: Default::default(),
         gtp_ip: None,
+        inactivity_timer_secs: None,
     }
 }
 

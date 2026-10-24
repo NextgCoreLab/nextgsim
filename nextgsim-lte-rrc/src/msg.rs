@@ -1500,3 +1500,122 @@ pub fn encode_rrc_connection_reconfiguration_complete(
 
 #[cfg(test)]
 mod tests;
+
+// ---------------------------------------------------------------------------
+// Paging (TS 36.331 §5.3.2, nextgsim #351)
+// ---------------------------------------------------------------------------
+
+/// The `ue-Identity` of a `PagingRecord` (§6.2.2 PagingUE-Identity), the two
+/// root alternatives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PagedUeIdentity {
+    /// `s-TMSI`: MMEC (8 bits) and M-TMSI (32 bits).
+    STmsi {
+        /// MME Code.
+        mmec: u8,
+        /// M-TMSI.
+        m_tmsi: u32,
+    },
+    /// `imsi`: 6..21 IMSI digits, each 0..9.
+    Imsi(Vec<u8>),
+}
+
+/// The core-network domain of a `PagingRecord` (`cn-Domain`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagingCnDomain {
+    /// `ps`.
+    Ps,
+    /// `cs`.
+    Cs,
+}
+
+/// One `PagingRecord`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagingRecordInfo {
+    /// Who is paged.
+    pub identity: PagedUeIdentity,
+    /// For which domain.
+    pub cn_domain: PagingCnDomain,
+}
+
+/// `maxPageRec` (§6.4): records per Paging message.
+pub const MAX_PAGE_REC: usize = 16;
+
+/// Encode a `PCCH-Message` carrying Paging with `records` (§5.3.2.2), 1..=16 of
+/// them, and nothing else (no systemInfoModification or ETWS indication).
+pub fn encode_paging(records: &[PagingRecordInfo]) -> Result<Vec<u8>, RrcMsgError> {
+    if records.is_empty() || records.len() > MAX_PAGE_REC {
+        return Err(RrcMsgError::Invalid(format!(
+            "{} paging records is outside 1..={MAX_PAGE_REC}",
+            records.len()
+        )));
+    }
+    let mut list = Vec::with_capacity(records.len());
+    for r in records {
+        let ue_identity = match &r.identity {
+            PagedUeIdentity::STmsi { mmec, m_tmsi } => PagingUE_Identity::S_TMSI(S_TMSI {
+                mmec: MMEC(bits_of(u64::from(*mmec), 8)),
+                m_tmsi: S_TMSIM_TMSI(bits_of(u64::from(*m_tmsi), 32)),
+            }),
+            PagedUeIdentity::Imsi(digits) => {
+                if !(6..=21).contains(&digits.len()) || digits.iter().any(|d| *d > 9) {
+                    return Err(RrcMsgError::Invalid("IMSI is not 6..21 digits 0..9".into()));
+                }
+                PagingUE_Identity::Imsi(IMSI(digits.iter().map(|d| IMSI_Digit(*d)).collect()))
+            }
+        };
+        list.push(PagingRecord {
+            ue_identity,
+            cn_domain: PagingRecordCn_Domain(match r.cn_domain {
+                PagingCnDomain::Ps => PagingRecordCn_Domain::PS,
+                PagingCnDomain::Cs => PagingRecordCn_Domain::CS,
+            }),
+        });
+    }
+    enc(&PCCH_Message {
+        message: PCCH_MessageType::C1(PCCH_MessageType_c1::Paging(Paging {
+            paging_record_list: Some(PagingRecordList(list)),
+            system_info_modification: None,
+            etws_indication: None,
+            non_critical_extension: None,
+        })),
+    })
+}
+
+/// Decode a `PCCH-Message` and return its paging records (empty when the
+/// Paging carries none, e.g. a system-information change only). Records with an
+/// identity outside the two root alternatives (a 5G-S-TMSI or full I-RNTI) are
+/// not for an EPS UE in RRC_IDLE and are skipped.
+pub fn decode_pcch(bytes: &[u8]) -> Result<Vec<PagingRecordInfo>, RrcMsgError> {
+    let msg: PCCH_Message = dec(bytes)?;
+    let PCCH_MessageType::C1(PCCH_MessageType_c1::Paging(paging)) = msg.message else {
+        return Ok(Vec::new());
+    };
+    Ok(paging
+        .paging_record_list
+        .map(|l| l.0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            let identity = match r.ue_identity {
+                PagingUE_Identity::S_TMSI(s) => PagedUeIdentity::STmsi {
+                    mmec: value_of(&s.mmec.0) as u8,
+                    m_tmsi: value_of(&s.m_tmsi.0) as u32,
+                },
+                PagingUE_Identity::Imsi(i) => {
+                    PagedUeIdentity::Imsi(i.0.iter().map(|d| d.0).collect())
+                }
+                _ => return None,
+            };
+            let cn_domain = if r.cn_domain.0 == PagingRecordCn_Domain::CS {
+                PagingCnDomain::Cs
+            } else {
+                PagingCnDomain::Ps
+            };
+            Some(PagingRecordInfo {
+                identity,
+                cn_domain,
+            })
+        })
+        .collect())
+}

@@ -368,6 +368,12 @@ impl ReestablishmentProcedure {
     }
 
     /// Returns the current procedure state.
+    /// The C-RNTI and source PCI the procedure was initiated with: the
+    /// `ue-Identity` of the request (TS 38.331 §5.3.7.4).
+    pub fn ue_identity(&self) -> (u16, u16) {
+        (self.ue_c_rnti, self.ue_pci)
+    }
+
     pub fn state(&self) -> ReestablishmentState {
         self.state
     }

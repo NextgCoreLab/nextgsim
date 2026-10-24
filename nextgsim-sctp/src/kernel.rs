@@ -286,8 +286,8 @@ pub struct KernelSctpAssociation {
     fd: RawFd,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
-    /// Set once `connect` returns; the kernel completes the 4-way handshake
-    /// synchronously for a blocking connect, so this is true after `connect`.
+    /// Set once `connect` returns, which it does only after the 4-way handshake
+    /// completed, so this is true after `connect`.
     established: bool,
     /// Maximum receive buffer size from config (per-recv allocation cap).
     max_recv: usize,
@@ -305,8 +305,9 @@ impl KernelSctpAssociation {
     /// 1. Create a `SOCK_STREAM` SCTP socket (IP proto 132).
     /// 2. Set `SCTP_INITMSG` (stream counts) and `SCTP_RECVRCVINFO` (so recv
     ///    can read the PPID).
-    /// 3. Bind to `local`, connect to `remote` (blocking 4-way handshake).
-    /// 4. Switch to non-blocking and register with the tokio reactor.
+    /// 3. Switch to non-blocking, register with the tokio reactor, bind to
+    ///    `local` and connect to `remote`, awaiting the 4-way handshake for at
+    ///    most `config.connect_timeout` without blocking a worker thread (#311).
     ///
     /// `expected_ppid` is the application protocol this association carries —
     /// [`NGAP_PPID`] for a gNB, [`crate::S1AP_PPID`] for an eNB. A received
@@ -397,18 +398,63 @@ impl KernelSctpAssociation {
             )));
         }
 
-        // 3. Bind + connect. We do this while the socket is still blocking so
-        //    the kernel performs the full 4-way handshake synchronously and we
-        //    get a clear error if the AMF is unreachable.
+        // 3. Bind, then connect WITHOUT blocking (#311). A blocking connect held
+        //    the tokio worker thread that called it for the whole kernel INIT
+        //    retransmission sequence (tens of seconds toward a black-holed peer),
+        //    starving every other task on that worker. The socket goes
+        //    non-blocking first; the 4-way handshake completes when it turns
+        //    writable, and SO_ERROR says how it ended (connect(2), EINPROGRESS).
         let bind_addr = SockAddr::from(local);
         socket
             .bind(&bind_addr)
             .map_err(|e| SctpError::ConnectionFailed(format!("bind({local}): {e}")))?;
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| SctpError::ConnectionFailed(format!("set_nonblocking: {e}")))?;
+
+        let async_fd = AsyncFd::new(fd)
+            .map_err(|e| SctpError::ConnectionFailed(format!("AsyncFd::new: {e}")))?;
 
         let remote_sa = SockAddr::from(remote);
-        socket
-            .connect(&remote_sa)
-            .map_err(|e| SctpError::ConnectionFailed(format!("connect({remote}): {e}")))?;
+        match socket.connect(&remote_sa) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+                let handshake = async {
+                    loop {
+                        let mut guard = async_fd.writable().await.map_err(|e| {
+                            SctpError::ConnectionFailed(format!("connect({remote}): {e}"))
+                        })?;
+                        match socket.take_error() {
+                            Ok(None) => {}
+                            Ok(Some(e)) | Err(e) => {
+                                return Err(SctpError::ConnectionFailed(format!(
+                                    "connect({remote}): {e}"
+                                )))
+                            }
+                        }
+                        // Writable with no error: established once the peer
+                        // address is set; otherwise a spurious wake-up.
+                        if socket.peer_addr().is_ok() {
+                            return Ok(());
+                        }
+                        guard.clear_ready();
+                    }
+                };
+                tokio::time::timeout(config.connect_timeout, handshake)
+                    .await
+                    .map_err(|_| {
+                        SctpError::ConnectionFailed(format!(
+                            "connect({remote}): no association within {:?}",
+                            config.connect_timeout
+                        ))
+                    })??;
+            }
+            Err(e) => {
+                return Err(SctpError::ConnectionFailed(format!(
+                    "connect({remote}): {e}"
+                )))
+            }
+        }
 
         // Read back the OS-assigned local address (port).
         let local_addr = socket
@@ -416,14 +462,6 @@ impl KernelSctpAssociation {
             .ok()
             .and_then(|sa| sa.as_socket())
             .unwrap_or(local);
-
-        // 4. Non-blocking + register with the tokio reactor.
-        socket
-            .set_nonblocking(true)
-            .map_err(|e| SctpError::ConnectionFailed(format!("set_nonblocking: {e}")))?;
-
-        let async_fd = AsyncFd::new(fd)
-            .map_err(|e| SctpError::ConnectionFailed(format!("AsyncFd::new: {e}")))?;
 
         info!(
             "Kernel SCTP association established: {} -> {}",
@@ -779,6 +817,65 @@ mod tests {
         assert!(check.observe(60, 0));
         assert!(!check.observe(S1AP_PPID, 0));
         assert_eq!(check.unexpected, 1);
+    }
+
+    /// #311: a kernel connect toward a peer that never answers neither blocks the
+    /// runtime thread nor runs past `connect_timeout`. Run on the single-threaded
+    /// test runtime, where a blocking `connect(2)` would freeze the ticker below
+    /// for the whole kernel INIT retransmission sequence. 192.0.2.1 is TEST-NET-1
+    /// (RFC 5737): nothing answers there. Skips, saying so, on a host without
+    /// kernel SCTP or where the address fails at once (no route).
+    #[tokio::test]
+    async fn a_kernel_connect_to_a_silent_peer_does_not_block_the_runtime() {
+        if socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::from(libc::IPPROTO_SCTP)),
+        )
+        .is_err()
+        {
+            eprintln!("skipping: no kernel SCTP on this host");
+            return;
+        }
+        let ticks = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let t = ticks.clone();
+        let ticker = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                t.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        });
+        let config = SctpConfig {
+            connect_timeout: std::time::Duration::from_secs(1),
+            ..SctpConfig::default()
+        };
+        let started = std::time::Instant::now();
+        let result = super::KernelSctpAssociation::connect(
+            "0.0.0.0:0".parse().unwrap(),
+            "192.0.2.1:38412".parse().unwrap(),
+            &config,
+            NGAP_PPID,
+        )
+        .await;
+        let elapsed = started.elapsed();
+        ticker.abort();
+        assert!(result.is_err(), "nothing answers at 192.0.2.1");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "connect_timeout bounds the attempt: {elapsed:?}"
+        );
+        if elapsed < std::time::Duration::from_millis(900) {
+            eprintln!(
+                "skipping the runtime check: the connect failed at once ({:?})",
+                result.err()
+            );
+            return;
+        }
+        let n = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            n >= 40,
+            "the runtime kept running during the connect: {n} ticks"
+        );
     }
 
     /// Real kernel SCTP over loopback: a listener sends one S1AP (18) and one
