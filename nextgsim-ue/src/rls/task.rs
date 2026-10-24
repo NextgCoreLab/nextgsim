@@ -528,6 +528,41 @@ impl RlsTask {
     /// AM decision can only be made from the PSI; and a received SDU has to be handed
     /// to NAS under its session, so [`Self::drb_to_psi`] is recorded here — the one
     /// place every bearer passes through.
+    /// Drop every DRB's L2 entities and DRB-to-session records (#315): no DRB
+    /// outlives its RRC connection (TS 38.331 §5.3.11).
+    fn release_drbs(&mut self) {
+        let n = self.rlc_entities.len();
+        self.rlc_entities.clear();
+        #[cfg(feature = "drb-pdcp")]
+        self.pdcp_entities.clear();
+        self.drb_to_psi.clear();
+        #[cfg(feature = "sdap-dataplane")]
+        self.sdap_uplink.clear();
+        if n > 0 {
+            debug!("Released the L2 entities of {n} DRB(s)");
+        }
+    }
+
+    /// Re-establish every DRB (#315) after a handover: RLC entities are dropped
+    /// (re-created on next use, which is RLC re-establishment for UM, TS 38.322
+    /// §5.1.2), PDCP entities re-established in place so their keys stay
+    /// (TS 38.323 §5.1.2), and the SDUs the PDCP reception buffers held are
+    /// delivered.
+    async fn reestablish_drbs(&mut self) {
+        self.rlc_entities.clear();
+        #[cfg(feature = "drb-pdcp")]
+        {
+            let mut delivered = Vec::new();
+            for (drb_id, pdcp) in &mut self.pdcp_entities {
+                for sdu in pdcp.reestablish() {
+                    delivered.push((*drb_id, sdu));
+                }
+            }
+            self.deliver_held_sdus(delivered).await;
+        }
+        debug!("DRB L2 entities re-established (reconfiguration with sync)");
+    }
+
     fn rlc_entity_for(&mut self, drb_id: i32, psi: i32) -> &mut RlcEntity {
         let mode = if self.task_base.config.rlc_am_psis.contains(&(psi as u8)) {
             RlcMode::AcknowledgedMode
@@ -557,6 +592,13 @@ impl RlsTask {
                 delivered.push((*drb_id, sdu));
             }
         }
+        self.deliver_held_sdus(delivered).await;
+    }
+
+    /// Deliver downlink SDUs a PDCP entity held (t-Reordering expiry, or a
+    /// re-establishment, #315) to NAS under their session, stripping SDAP.
+    #[cfg(feature = "drb-pdcp")]
+    async fn deliver_held_sdus(&mut self, delivered: Vec<(i32, Vec<u8>)>) {
         for (drb_id, sdu) in delivered {
             debug!(
                 "PDCP t-Reordering released an SDU: drb_id={drb_id}, len={}",
@@ -1343,6 +1385,8 @@ impl RlsTask {
                 pdu,
             } => self.handle_rrc_pdu_delivery(channel, pdu_id, pdu).await,
             RlsMessage::ResetSti => self.handle_reset_sti(),
+            RlsMessage::ReleaseDrbs => self.release_drbs(),
+            RlsMessage::ReestablishDrbs => self.reestablish_drbs().await,
             RlsMessage::DataPduDelivery { psi, pdu } => {
                 self.handle_data_pdu_delivery(psi, pdu).await
             }

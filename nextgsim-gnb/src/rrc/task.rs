@@ -580,6 +580,7 @@ impl RrcTask {
                 is_stmsi,
                 establishment_cause,
             ) {
+                self.release_ue_drbs(result.ue_id).await;
                 self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu)
                     .await;
             }
@@ -617,6 +618,7 @@ impl RrcTask {
                     is_stmsi,
                     establishment_cause,
                 ) {
+                    self.release_ue_drbs(result.ue_id).await;
                     self.send_rrc_message(result.ue_id, result.channel, result.rrc_setup_pdu)
                         .await;
                 }
@@ -2131,6 +2133,20 @@ impl RrcTask {
         }
     }
 
+    /// Tell RLS to release `ue_id`'s DRB L2 entities (#315): a new RRC connection
+    /// and a released one both leave no DRB behind (TS 38.331 §5.3.3.4,
+    /// §5.3.11), so the next DRB starts at COUNT 0 on both ends.
+    async fn release_ue_drbs(&self, ue_id: i32) {
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::ReleaseUeDrbs { ue_id })
+            .await
+        {
+            warn!("Failed to release UE[{ue_id}]'s DRB entities on RLS: {e}");
+        }
+    }
+
     async fn handle_an_release(&mut self, ue_id: i32) {
         // A released handover-in admission (cancelled, failed, or released before
         // the UE arrived) is no longer awaited, so nothing can be bound to it
@@ -2147,6 +2163,7 @@ impl RrcTask {
                 .await;
         }
         self.ue_manager.delete_ue(ue_id);
+        self.release_ue_drbs(ue_id).await;
     }
 
     /// Handles `RrcMessage::Paging`: builds the TS 38.331 §5.3.2.2 `Paging`

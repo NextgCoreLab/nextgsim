@@ -11516,6 +11516,13 @@ mod tests {
                             value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_ue_ngap_id)),
                         },
                         Entry {
+                            id: ProtocolIE_ID(89),
+                            criticality: Criticality(0),
+                            value: V::Id_RoutingID(nextgsim_ngap::codec::generated::RoutingID(
+                                b"lmf-1".to_vec(),
+                            )),
+                        },
+                        Entry {
                             id: ProtocolIE_ID(46),
                             criticality: Criticality(0),
                             value: V::Id_NRPPa_PDU(NRPPa_PDU(payload)),
@@ -11647,15 +11654,22 @@ mod tests {
 
         let mut amf_id = None;
         let mut ran_id = None;
+        let mut routing_id = None;
         let mut payload = None;
         for ie in &ul.protocol_i_es.0 {
             match &ie.value {
                 V::Id_AMF_UE_NGAP_ID(id) => amf_id = Some(id.0),
                 V::Id_RAN_UE_NGAP_ID(id) => ran_id = Some(id.0),
+                V::Id_RoutingID(r) => routing_id = Some(r.0.clone()),
                 V::Id_NRPPa_PDU(p) => payload = Some(p.0.clone()),
-                _ => {}
             }
         }
+        // #374: TS 38.413 §9.2.9.2, mandatory with criticality reject.
+        assert_eq!(
+            routing_id.as_deref(),
+            Some(&b"lmf-1"[..]),
+            "the Routing ID is echoed"
+        );
         assert_eq!(amf_id, Some(777), "the answer must name the requested UE");
         assert_eq!(ran_id, Some(ran as u32));
 
@@ -11854,6 +11868,13 @@ mod tests {
                             id: ProtocolIE_ID(85),
                             criticality: Criticality(0),
                             value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran as u32)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(89),
+                            criticality: Criticality(0),
+                            value: V::Id_RoutingID(nextgsim_ngap::codec::generated::RoutingID(
+                                b"lmf-1".to_vec(),
+                            )),
                         },
                         Entry {
                             id: ProtocolIE_ID(46),
@@ -12122,6 +12143,13 @@ mod tests {
                             id: ProtocolIE_ID(85),
                             criticality: Criticality(0),
                             value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran as u32)),
+                        },
+                        Entry {
+                            id: ProtocolIE_ID(89),
+                            criticality: Criticality(0),
+                            value: V::Id_RoutingID(nextgsim_ngap::codec::generated::RoutingID(
+                                b"lmf-1".to_vec(),
+                            )),
                         },
                         Entry {
                             id: ProtocolIE_ID(46),

@@ -826,6 +826,15 @@ pub struct PduSessionResource {
 /// Messages for the RLS task.
 #[derive(Debug)]
 pub enum RlsMessage {
+    /// Release every DRB's L2 entities (PDCP, RLC) of one UE (from RRC, #315).
+    ///
+    /// Sent when the UE's RRC connection is released and when a new one is set
+    /// up for the same UE id, so a DRB of the next connection starts from COUNT 0
+    /// on both ends (TS 38.323 §5.1.1, TS 38.331 §5.3.11).
+    ReleaseUeDrbs {
+        /// UE ID
+        ue_id: i32,
+    },
     /// Signal detected from UE
     SignalDetected {
         /// UE ID
