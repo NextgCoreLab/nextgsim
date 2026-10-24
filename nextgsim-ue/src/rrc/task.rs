@@ -5115,7 +5115,8 @@ impl RrcTask {
             tx_count: 0,
             rx_count: 1,
         });
-        self.handle_rrc_reestablishment(cell_id, &reestablishment).await;
+        self.handle_rrc_reestablishment(cell_id, &reestablishment)
+            .await;
     }
 
     /// Route AI/ML inference request to SHE Client task

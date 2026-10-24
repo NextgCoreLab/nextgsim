@@ -6187,14 +6187,17 @@ impl Task for NgapTask {
                     NgapMessage::AsKeyRefreshed { ue_id, kgnb } => {
                         // #285 review: the RRC plane re-keyed at re-establishment
                         // (TS 38.331 §5.3.7.5). The algorithms stay; the key changes.
-                        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+                        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id)
+                        {
                             if let Some(old) = ctx.as_security.as_ref() {
                                 ctx.as_security = Some(AsSecurityContext::from_kgnb(
                                     kgnb,
                                     old.ciphering_alg_id,
                                     old.integrity_alg_id,
                                 ));
-                                info!("UE[{ue_id}]: AS context re-keyed after RRC re-establishment");
+                                info!(
+                                    "UE[{ue_id}]: AS context re-keyed after RRC re-establishment"
+                                );
                             }
                         }
                     }

@@ -400,11 +400,13 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
     ue.handle_uplink_nas_delivery(1, OctetString::from_slice(&registration_nas()))
         .await;
     let (_, setup_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
-    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlCcch, setup_req).await;
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlCcch, setup_req)
+        .await;
     let (_, ch, rrc_setup) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
     ue.handle_downlink_rrc(CELL_ID, ch, rrc_setup).await;
     let (_, setup_complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
-    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, setup_complete).await;
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, setup_complete)
+        .await;
     assert!(try_take_initial_nas(&mut gnb_ngap_rx).is_some());
 
     // Both ends hold the same KgNB, as the NAS layer and the NGAP task give it.
@@ -442,10 +444,13 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
     // ciphering (encryption) at the gNB/ng-eNB shall start after sending the AS
     // security mode command message").
     let accept = vec![0x7E, 0x02, 0x11, 0x22, 0x33, 0x44];
-    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept)).await;
+    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept))
+        .await;
     let (_, ch, dl) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
     assert!(
-        !dl.data().windows(accept.len()).any(|w| w == accept.as_slice()),
+        !dl.data()
+            .windows(accept.len())
+            .any(|w| w == accept.as_slice()),
         "the DLInformationTransfer after the SMC must be ciphered"
     );
 
@@ -457,10 +462,12 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
         ue_received_nas_delivery(&mut ue_nas_rx),
         "the UE must verify and decipher the first protected downlink PDU"
     );
-    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, smc_complete).await;
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, smc_complete)
+        .await;
 
     // Radio link failure, then re-establishment on the same cell.
-    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost).await;
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+        .await;
     // T311: cell selection finds the same cell, and the request goes to it.
     ue.perform_cycle().await;
     let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
@@ -480,7 +487,8 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
     // downlink NAS PDU at DL COUNT 1 reaches the UE NAS, and an uplink one at UL
     // COUNT 1 reaches the NGAP task.
     while ue_nas_rx.try_recv().is_ok() {}
-    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept)).await;
+    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept))
+        .await;
     let (_, ch, dl) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
     ue.handle_downlink_rrc(CELL_ID, ch, dl).await;
     assert!(

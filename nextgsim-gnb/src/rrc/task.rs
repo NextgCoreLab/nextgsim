@@ -1803,7 +1803,9 @@ impl RrcTask {
     /// its ARFCN-DL (Annex A.11). The NGAP task's AS context is told, so a later
     /// handover chains from the key the UE now holds.
     async fn rekey_for_reestablishment(&mut self, ue_id: i32) {
-        use nextgsim_crypto::kdf::{derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        use nextgsim_crypto::kdf::{
+            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+        };
         let pci = phys_cell_id_from_nci(self.task_base.config.nci);
         let arfcn = self.task_base.config.dl_arfcn;
         let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
@@ -1814,10 +1816,16 @@ impl RrcTask {
         };
         let kgnb_star = derive_kgnb_star(&sec.kgnb, pci, arfcn);
         sec.kgnb = kgnb_star;
-        sec.k_rrc_int =
-            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, sec.integrity_alg_id);
-        sec.k_rrc_enc =
-            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcEnc, sec.ciphering_alg_id);
+        sec.k_rrc_int = derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcInt,
+            sec.integrity_alg_id,
+        );
+        sec.k_rrc_enc = derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcEnc,
+            sec.ciphering_alg_id,
+        );
         sec.phys_cell_id = pci;
         info!(
             "UE[{ue_id}]: re-establishment re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL \
