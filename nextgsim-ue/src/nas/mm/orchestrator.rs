@@ -7910,6 +7910,7 @@ mod tests {
             system_frame_number: Some(100),
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
 
         let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
@@ -7923,7 +7924,10 @@ mod tests {
         assert_eq!(reply.transaction_id.map(|t| t.transaction_number), Some(0));
         assert!(reply.end_transaction);
         match reply.body {
-            Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
+            Some(LppBody::ProvideLocationInformation {
+                measurements: Some(measurements),
+                ..
+            }) => {
                 let element = measurements.primary_cell.expect("primary");
                 assert_eq!(element.phys_cell_id, 7, "the cell RRC reported");
                 assert_eq!(element.arfcn, 1850);
@@ -7953,6 +7957,7 @@ mod tests {
             system_frame_number: None,
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
         let measured = SidelinkRangingResult {
             peer_layer2_id: 0x00A5_A5A5,
@@ -7976,8 +7981,9 @@ mod tests {
             .body
         {
             Some(LppBody::ProvideLocationInformation {
-                measurements,
+                measurements: Some(measurements),
                 sidelink,
+                ..
             }) => {
                 assert_eq!(
                     sidelink,
@@ -8008,6 +8014,7 @@ mod tests {
             system_frame_number: None,
             rsrp_result: Some(60),
             rsrq_result: None,
+            ..Default::default()
         });
         assert!(
             orch.sidelink_ranging_results().is_empty(),
@@ -8045,6 +8052,7 @@ mod tests {
                 system_frame_number: None,
                 rsrp_result: Some(rsrp),
                 rsrq_result: None,
+                ..Default::default()
             });
             let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
                 panic!("answered");
@@ -8054,7 +8062,10 @@ mod tests {
                 .expect("decodes")
                 .body
             {
-                Some(LppBody::ProvideLocationInformation { measurements, .. }) => {
+                Some(LppBody::ProvideLocationInformation {
+                    measurements: Some(measurements),
+                    ..
+                }) => {
                     let element = measurements.primary_cell.expect("primary");
                     reported.push((element.phys_cell_id, element.rsrp_result));
                 }
