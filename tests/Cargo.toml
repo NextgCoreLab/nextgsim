@@ -51,7 +51,7 @@ nextgsim-pdcp = { path = "../nextgsim-pdcp" }
 nextgsim-rlc = { path = "../nextgsim-rlc" }
 nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
-nextgsim-ue = { path = "../nextgsim-ue", features = ["testing"] }
+nextgsim-ue = { path = "../nextgsim-ue" }
 
 # 6G AI-native network function crates
 nextgsim-ai = { path = "../nextgsim-ai" }
@@ -186,3 +186,9 @@ path = "src/gnb_cli_reachability.rs"
 [[test]]
 name = "rrc_inactive_resume"
 path = "src/rrc_inactive_resume.rs"
+
+# `testing` (as_security(), for rrc_handshake, #348) only in test builds: as a
+# normal dependency it would also reach the production nr-ue of a
+# `cargo build --workspace`.
+[dev-dependencies]
+nextgsim-ue = { path = "../nextgsim-ue", features = ["testing"] }
