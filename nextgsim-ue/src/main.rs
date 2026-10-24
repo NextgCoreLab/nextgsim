@@ -1738,6 +1738,8 @@ async fn process_sm_outputs(
             }
             SmOutput::SessionReleased { psi } => {
                 info!("PDU session {psi} released");
+                // Its held uplink bit goes too (#313 re-review).
+                orch.on_pdu_session_released(psi);
                 let _ = tun_tx
                     .send(TunMessage::DestroyInterface {
                         psi: i32::from(psi),
