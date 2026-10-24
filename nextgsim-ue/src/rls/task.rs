@@ -1898,6 +1898,54 @@ mod tests {
         assert!(rlf, "losing the serving cell is a radio link failure");
     }
 
+    /// #337: a serving gNB that restarted at the SAME address (same NCI, so the
+    /// same STI) answers with a new incarnation. That ends the serving cell with a
+    /// radio link failure, as a real radio's missing grants would, and the
+    /// restarted gNB is a new cell at the same address. Before, the UE never
+    /// noticed and sent uplink to a gNB with no context for it, forever.
+    #[tokio::test]
+    async fn a_serving_gnb_restarted_at_the_same_address_is_a_radio_link_failure() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let a: SocketAddr = "10.0.0.1:4997".parse().unwrap();
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![a],
+                ..Default::default()
+            },
+        );
+        let before = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(1);
+        task.handle_heartbeat_ack(a, &before).await;
+        task.handle_assign_current_cell(0);
+        while rrc_rx.try_recv().is_ok() {}
+        task.handle_heartbeat_ack(a, &before).await;
+        assert_eq!(
+            task.serving_cell,
+            Some(0),
+            "same incarnation: nothing happens"
+        );
+
+        let after = nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60).with_incarnation(2);
+        task.handle_heartbeat_ack(a, &after).await;
+        assert_eq!(
+            task.serving_cell, None,
+            "the old incarnation's cell is gone"
+        );
+        assert_eq!(
+            task.cell_addresses.get(&1),
+            Some(&a),
+            "a new cell, same address"
+        );
+        let mut rlf = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            rlf |= matches!(
+                msg,
+                TaskMessage::Message(RrcMessage::RadioLinkFailure { .. })
+            );
+        }
+        assert!(rlf, "losing the serving cell is a radio link failure");
+    }
+
     #[test]
     fn test_reset_sti() {
         let config = test_config();

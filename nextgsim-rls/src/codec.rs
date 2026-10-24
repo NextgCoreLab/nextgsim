@@ -90,6 +90,9 @@ pub fn encode_into(msg: &RlsMessage, buf: &mut BytesMut) {
         }
         RlsMessage::HeartbeatAck(m) => {
             buf.put_i32(m.dbm);
+            if let Some(incarnation) = m.incarnation {
+                buf.put_u64(incarnation);
+            }
         }
         RlsMessage::PduTransmission(m) => {
             buf.put_u8(m.pdu_type as u8);
@@ -187,10 +190,15 @@ fn decode_heartbeat_ack(sti: u64, mut buf: &[u8]) -> Result<RlsMessage> {
     }
 
     let dbm = buf.get_i32();
+    let ack = RlsHeartbeatAck::with_dbm(sti, dbm);
+    // The incarnation (#337) is a trailing optional u64: an older gNB sends none.
+    let ack = if buf.len() >= 8 {
+        ack.with_incarnation(buf.get_u64())
+    } else {
+        ack
+    };
 
-    Ok(RlsMessage::HeartbeatAck(RlsHeartbeatAck::with_dbm(
-        sti, dbm,
-    )))
+    Ok(RlsMessage::HeartbeatAck(ack))
 }
 
 fn decode_pdu_transmission(sti: u64, mut buf: &[u8]) -> Result<RlsMessage> {
@@ -284,6 +292,23 @@ mod tests {
         let decoded = decode(&encoded).unwrap();
 
         assert_eq!(msg, decoded);
+    }
+
+    /// #337: the incarnation rides after the dbm as a u64, and an ack without
+    /// one (an older gNB) still decodes, as `None`.
+    #[test]
+    fn a_heartbeat_ack_carries_its_incarnation_and_an_old_one_still_decodes() {
+        let msg = RlsMessage::HeartbeatAck(
+            RlsHeartbeatAck::with_dbm(0xFEDCBA9876543210, -85).with_incarnation(0x0102_0304),
+        );
+        let encoded = encode(&msg);
+        assert_eq!(decode(&encoded).unwrap(), msg);
+        let old = encode(&RlsMessage::HeartbeatAck(RlsHeartbeatAck::with_dbm(7, -60)));
+        assert_eq!(encoded.len(), old.len() + 8, "trailing, 8 octets");
+        match decode(&old).unwrap() {
+            RlsMessage::HeartbeatAck(ack) => assert_eq!(ack.incarnation, None),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
