@@ -470,6 +470,12 @@ pub struct RrcTask {
     /// implicit -- SRB1 here carries no PDCP SN -- so both ends count the same
     /// PDUs in the same order, from the same reset points (see `Srb1Pdcp`).
     srb1_pdcp: Option<Srb1Pdcp>,
+    /// SRB1 integrity protection and ciphering are suspended between an
+    /// RRCReestablishmentRequest and the RRCReestablishment that answers it
+    /// (TS 38.331 §5.3.7.4 "configure lower layers to suspend integrity protection
+    /// and ciphering for SRB1"; #285 review). Only an RRCReestablishment is accepted
+    /// then, and it is verified integrity-only with the re-derived key (§5.3.7.5).
+    srb1_suspended_for_reestablishment: bool,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -735,6 +741,7 @@ impl RrcTask {
             as_security: None,
             inactive_as_security: None,
             srb1_pdcp: None,
+            srb1_suspended_for_reestablishment: false,
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -2686,6 +2693,15 @@ impl RrcTask {
                  the RRCSetup (peer sent no srb-ToAddModList?)",
                 cell_id
             );
+        }
+
+        // §5.3.7.4/§5.3.7.5 (#285 review): with SRB1 suspended for a
+        // re-establishment, the only DL-DCCH PDU acted on is the RRCReestablishment,
+        // integrity protected and not ciphered, and only once its MAC-I verifies
+        // with the key it re-derives.
+        if self.srb1_suspended_for_reestablishment {
+            self.handle_suspended_srb1_pdu(cell_id, pdu.data()).await;
+            return;
         }
 
         // SRB1 PDCP (#285): once AS security is active every DL-DCCH PDU is
@@ -4715,8 +4731,11 @@ impl RrcTask {
         }
     }
 
-    /// Handle radio link failure
-    async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
+    /// Handle radio link failure.
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
         warn!("Radio link failure: {:?}", cause);
 
         // Map RLF cause to re-establishment trigger
@@ -4803,10 +4822,13 @@ impl RrcTask {
                         reestablishment_cause: cause,
                     }) {
                         Ok(bytes) => {
-                            // §5.3.7.4: "re-establish PDCP for SRB1". The
+                            // §5.3.7.4: "re-establish PDCP for SRB1", then
+                            // "configure lower layers to suspend integrity
+                            // protection and ciphering for SRB1". The
                             // RRCReestablishment answering this is the first DL
-                            // PDU of the re-established SRB1 (#285).
-                            self.reestablish_srb1_pdcp();
+                            // PDU of the re-established SRB1, and is verified
+                            // integrity-only with the re-derived key (#285).
+                            self.suspend_srb1_for_reestablishment();
                             self.send_uplink_rrc(
                                 RrcChannel::UlCcch,
                                 OctetString::from_slice(&bytes),
@@ -4977,6 +4999,93 @@ impl RrcTask {
         } else {
             self.srb1_pdcp = None;
         }
+    }
+
+    /// §5.3.7.4 on sending an RRCReestablishmentRequest: SRB1's PDCP is
+    /// re-established and its integrity protection and ciphering are suspended
+    /// (#285 review). Without AS security there is nothing to suspend.
+    fn suspend_srb1_for_reestablishment(&mut self) {
+        self.reestablish_srb1_pdcp();
+        if self.srb1_pdcp.is_some() {
+            self.srb1_pdcp = None;
+            self.srb1_suspended_for_reestablishment = true;
+        }
+    }
+
+    /// A DL-DCCH PDU while SRB1 is suspended for a re-establishment (§5.3.7.5,
+    /// #285 review). It must be an RRCReestablishment followed by its MAC-I:
+    /// - `KgNB*` is derived from the current `KgNB`, the cell's PCI and the
+    ///   ARFCN-DL ("update the K_(gNB) key based on the current K_(gNB) key or the
+    ///   NH, using the received nextHopChainingCount value"), and K_RRCint/K_RRCenc
+    ///   from it with the previously configured algorithms;
+    /// - the MAC-I is verified integrity-only at DL COUNT 0 with the new K_RRCint;
+    ///   a failure goes to RRC_IDLE ("RRC connection failure");
+    /// - integrity protection and ciphering resume "immediately": the
+    ///   RRCReestablishmentComplete is the first protected UL PDU (COUNT 0), and
+    ///   the next DL PDU is COUNT 1.
+    ///
+    /// Anything else is discarded: nothing else is expected, and nothing unverified
+    /// is acted on.
+    async fn handle_suspended_srb1_pdu(&mut self, cell_id: i32, pdu: &[u8]) {
+        use nextgsim_crypto::kdf::derive_kgnb_star;
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+
+        if pdu.len() <= MAC_I_LEN {
+            warn!("Discarding a DL-DCCH PDU while SRB1 is suspended: too short for a MAC-I");
+            return;
+        }
+        let (body, mac) = pdu.split_at(pdu.len() - MAC_I_LEN);
+        let Ok(reestablishment) = decode_rrc_reestablishment(body) else {
+            warn!(
+                "Discarding a DL-DCCH PDU while SRB1 is suspended for re-establishment: \
+                 not an RRCReestablishment (TS 38.331 §5.3.7.4)"
+            );
+            return;
+        };
+        let Some(current) = self.as_security.clone() else {
+            warn!("RRCReestablishment under suspended SRB1 but no AS security context");
+            return;
+        };
+        let Some(pci) = self.cell_selector.phys_cell_id_of(cell_id) else {
+            warn!("RRCReestablishment from cell {cell_id}, whose PCI is unknown; discarded");
+            return;
+        };
+        let arfcn = self.task_base.config.dl_arfcn;
+        let kgnb_star = derive_kgnb_star(&current.kgnb, pci, arfcn);
+        let rekeyed = AsSecurityContext::derive_from_kgnb(
+            &kgnb_star,
+            current.ciphering_algorithm,
+            current.integrity_algorithm,
+            current.c_rnti,
+        );
+        // Integrity only: the RRCReestablishment is not ciphered (§5.3.7.4 NOTE).
+        let integrity_only = AsSecurityContext {
+            ciphering_algorithm: CipheringAlgorithm::Nea0,
+            ..rekeyed.clone()
+        };
+        let expected = integrity_only.compute_rrc_mac_i(0, SRB1_BEARER, DIRECTION_DOWNLINK, body);
+        if !nextgsim_pdcp::algorithms::ct_eq_mac(&expected, mac) {
+            warn!(
+                "RRCReestablishment failed its integrity check with the re-derived K_RRCint \
+                 (PCI {pci}, ARFCN-DL {arfcn}); going to RRC_IDLE, 'RRC connection failure' \
+                 (TS 38.331 §5.3.7.5)"
+            );
+            self.srb1_suspended_for_reestablishment = false;
+            self.enter_idle_after_radio_link_failure().await;
+            return;
+        }
+        info!(
+            "RRCReestablishment verified with KgNB* (PCI {pci}, ARFCN-DL {arfcn}, NCC {}); \
+             SRB1 integrity protection and ciphering resumed",
+            reestablishment.next_hop_chaining_count
+        );
+        self.as_security = Some(rekeyed);
+        self.srb1_suspended_for_reestablishment = false;
+        self.srb1_pdcp = Some(Srb1Pdcp {
+            tx_count: 0,
+            rx_count: 1,
+        });
+        self.handle_rrc_reestablishment(cell_id, &reestablishment).await;
     }
 
     /// Route AI/ML inference request to SHE Client task

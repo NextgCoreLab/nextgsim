@@ -34,7 +34,7 @@ use nextgsim_rrc::procedures::rrc_reconfiguration::{
     encode_rrc_reconfiguration, RrcReconfigurationParams,
 };
 use nextgsim_rrc::procedures::rrc_reestablishment::{
-    decode_rrc_reestablishment_request, RrcReestablishmentRequestData,
+    decode_rrc_reestablishment_request, phys_cell_id_from_nci, RrcReestablishmentRequestData,
 };
 use nextgsim_rrc::procedures::rrc_resume::{
     decode_rrc_resume_request, decode_rrc_resume_request1, RrcResumeCompleteData,
@@ -1601,7 +1601,11 @@ impl RrcTask {
     // `dedicatedNAS-Message`, so the slice -- which would have mangled any
     // conformant peer's NAS -- is gone (issue #151).
 
-    async fn handle_nas_delivery(&mut self, ue_id: i32, nas_pdu: OctetString) {
+    /// Deliver a NAS PDU to the UE in a DLInformationTransfer.
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub async fn handle_nas_delivery(&mut self, ue_id: i32, nas_pdu: OctetString) {
         let ctx = match self.ue_manager.try_find_ue(ue_id) {
             Some(c) => c,
             None => {
@@ -1688,6 +1692,15 @@ impl RrcTask {
             Ok(result) => {
                 // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established (COUNTs 0) and the
                 // RRCReestablishment is integrity protected, not ciphered (#285).
+                // The shortMAC-I was verified above with the OLD K_RRCint; the
+                // RRCReestablishment and everything after use the re-keyed SRB1.
+                let secured = self
+                    .ue_manager
+                    .try_find_ue(result.ue_id)
+                    .is_some_and(|c| c.as_security_active());
+                if secured {
+                    self.rekey_for_reestablishment(result.ue_id).await;
+                }
                 if let Some(ctx) = self.ue_manager.try_find_ue_mut(result.ue_id) {
                     if ctx.as_security_active() {
                         ctx.reestablish_srb1_pdcp();
@@ -1741,6 +1754,86 @@ impl RrcTask {
         }
     }
 
+    /// Deliver the SecurityModeCommand on SRB1 (TS 38.331 §5.3.4): integrity
+    /// protected and NOT ciphered (§5.3.4.2), so the UE can verify it with the
+    /// keys it is about to derive (issue #31).
+    ///
+    /// When it went out protected, the answer is a SecurityModeComplete integrity
+    /// protected at UL COUNT 0 or a SecurityModeFailure, and DOWNLINK protection
+    /// starts now: TS 33.501 §6.7.4, "RRC downlink ciphering (encryption) at the
+    /// gNB/ng-eNB shall start after sending the AS security mode command message"
+    /// (#285). The Registration Accept the AMF sends right behind the command must
+    /// already be protected.
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub async fn handle_security_mode_command(&mut self, ue_id: i32, pdu: OctetString) {
+        info!(
+            "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
+            ue_id,
+            pdu.len()
+        );
+        let original_len = pdu.len();
+        let pdu = self.protect_security_mode_command(ue_id, pdu);
+        if pdu.len() > original_len {
+            if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                ctx.smc_awaiting_answer = true;
+                ctx.smc_complete_verified = false;
+            }
+            // Sent first, unprotected by the DL path (the command carries its own
+            // MAC-I at DL COUNT 0); every later DL-DCCH PDU is protected.
+            self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+            if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                ctx.dl_protection_active = true;
+            }
+        } else {
+            self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
+        }
+    }
+
+    /// Re-key a UE's AS security at RRC re-establishment (#285 review). TS 38.331
+    /// §5.3.7.5 has the UE "update the K_(gNB) key based on the current K_(gNB) key
+    /// or the NH, using the received nextHopChainingCount value". On the network
+    /// side, TS 33.501 §6.11: the gNB "shall use the K_(NG-RAN)* corresponding to the
+    /// selected cell as K_(gNB) and derive new RRC keys (new K_(RRCint) and new
+    /// K_(RRCenc)) based on the K_(gNB) and the AS algorithms used in source cell".
+    ///
+    /// This gNB holds no unused {NH, NCC}, so it signals the current NCC and the
+    /// derivation is horizontal: `KgNB*` from the current `KgNB`, this cell's PCI and
+    /// its ARFCN-DL (Annex A.11). The NGAP task's AS context is told, so a later
+    /// handover chains from the key the UE now holds.
+    async fn rekey_for_reestablishment(&mut self, ue_id: i32) {
+        use nextgsim_crypto::kdf::{derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher};
+        let pci = phys_cell_id_from_nci(self.task_base.config.nci);
+        let arfcn = self.task_base.config.dl_arfcn;
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
+            return;
+        };
+        let Some(sec) = ctx.reestablishment_security.as_mut() else {
+            return;
+        };
+        let kgnb_star = derive_kgnb_star(&sec.kgnb, pci, arfcn);
+        sec.kgnb = kgnb_star;
+        sec.k_rrc_int =
+            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, sec.integrity_alg_id);
+        sec.k_rrc_enc =
+            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcEnc, sec.ciphering_alg_id);
+        sec.phys_cell_id = pci;
+        info!(
+            "UE[{ue_id}]: re-establishment re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL \
+             {arfcn}, NCC {}, horizontal)",
+            sec.next_hop_chaining_count
+        );
+        let _ = self
+            .task_base
+            .ngap_tx
+            .send(NgapMessage::AsKeyRefreshed {
+                ue_id,
+                kgnb: kgnb_star,
+            })
+            .await;
+    }
+
     /// Records the AS security material a re-establishment is verified against
     /// (TS 38.331 §5.3.7.2), handed over by the NGAP task when it derives the AS
     /// keys at Initial Context Setup.
@@ -1748,7 +1841,10 @@ impl RrcTask {
     /// A UE with no context yet is skipped rather than given a fresh one: the
     /// material belongs to a connection the RRC task already knows about, and
     /// inventing a context around it would be a context nothing established.
-    fn handle_as_security_for_reestablishment(
+    ///
+    /// Public because it is a real message-handler entry point the in-process
+    /// cross-end test drives (`tests/src/rrc_handshake.rs`).
+    pub fn handle_as_security_for_reestablishment(
         &mut self,
         ue_id: i32,
         security: ReestablishmentSecurity,
@@ -2693,41 +2789,12 @@ impl Task for RrcTask {
                                 .await;
                             }
                             RrcMessage::SecurityModeCommand { ue_id, pdu } => {
-                                // TS 38.331 §5.3.4: deliver the SecurityModeCommand
-                                // on SRB1 (DL-DCCH), integrity protected and NOT
-                                // ciphered (§5.3.4.2) so the UE can verify it with
-                                // the keys it is about to derive (issue #31).
-                                info!(
-                                    "Sending RRC SecurityModeCommand to UE {} ({} bytes)",
-                                    ue_id,
-                                    pdu.len()
-                                );
-                                let original_len = pdu.len();
-                                let pdu = self.protect_security_mode_command(ue_id, pdu);
-                                // Protected (a MAC-I was appended): the answer is a
-                                // SecurityModeComplete integrity protected at UL
-                                // COUNT 0, or a SecurityModeFailure (#285).
-                                if pdu.len() > original_len {
-                                    if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
-                                        ctx.smc_awaiting_answer = true;
-                                        ctx.smc_complete_verified = false;
-                                    }
-                                    // Sent first, unprotected by the DL path (the
-                                    // command carries its own MAC-I at DL COUNT 0);
-                                    // every later DL-DCCH PDU is protected
-                                    // (TS 33.501 §6.7.4, #285).
-                                    self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
-                                    if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
-                                        ctx.dl_protection_active = true;
-                                    }
-                                } else {
-                                    self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
-                                }
+                                self.handle_security_mode_command(ue_id, pdu).await;
                             }
                             RrcMessage::AsSecurityForReestablishment {
                                 ue_id, k_rrc_int, k_rrc_enc, integrity_alg_id,
                                 ciphering_alg_id, c_rnti, phys_cell_id,
-                                next_hop_chaining_count,
+                                next_hop_chaining_count, kgnb,
                             } => {
                                 self.handle_as_security_for_reestablishment(
                                     ue_id,
@@ -2739,6 +2806,7 @@ impl Task for RrcTask {
                                         c_rnti,
                                         phys_cell_id,
                                         next_hop_chaining_count,
+                                        kgnb,
                                     },
                                 );
                             }
@@ -3960,6 +4028,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                 next_hop_chaining_count: ncc,
+                kgnb: [0x11; 32],
             },
         );
     }
@@ -4227,6 +4296,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: 1,
                 next_hop_chaining_count: 0,
+                kgnb: [0x11; 32],
             },
         );
 
@@ -4287,6 +4357,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                 next_hop_chaining_count: 0,
+                kgnb: [0x11; 32],
             },
         );
         // As a SecurityModeCommand went out, then the UE's Complete integrity
@@ -4368,6 +4439,7 @@ mod tests {
                     c_rnti: SIMULATED_C_RNTI,
                     phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                     next_hop_chaining_count: 0,
+                    kgnb: [0x11; 32],
                 },
             );
             while try_take_downlink_rrc(&mut rls_rx, 7).is_some() {}
@@ -4552,6 +4624,7 @@ mod tests {
                         c_rnti: SIMULATED_C_RNTI,
                         phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                         next_hop_chaining_count: 0,
+                        kgnb: [0x11; 32],
                     },
                 );
                 task.ue_manager
@@ -4605,6 +4678,7 @@ mod tests {
                     c_rnti: SIMULATED_C_RNTI,
                     phys_cell_id: phys_cell_id_from_nci(task.task_base.config.nci),
                     next_hop_chaining_count: 0,
+                    kgnb: [0x11; 32],
                 },
             );
             let ctx = task.ue_manager.try_find_ue_mut(7).unwrap();

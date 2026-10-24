@@ -341,3 +341,165 @@ async fn the_smc_hop_reaches_the_ue_security_handler_and_answers_it() {
         "a SecurityModeFailure is an RRC-local outcome and must not reach NGAP"
     );
 }
+
+/// #285 review (BLOCKER): AS security with NEA2/NIA2 through the REAL handlers of
+/// both ends, then an RRC re-establishment under it.
+///
+/// - The gNB's SecurityModeCommand goes through its own send path, which starts
+///   downlink protection (TS 33.501 §6.7.4). The UE's SecurityModeComplete is
+///   integrity protected at UL COUNT 0, and the next downlink PDU is ciphered and
+///   protected at DL COUNT 1.
+/// - Re-establishment: the RRCReestablishment is integrity protected, not ciphered,
+///   at DL COUNT 0 with K_RRCint from `KgNB*` (TS 38.331 §5.3.7.4-5, TS 33.501
+///   §6.11). The UE must verify it with the same re-derived key, and both ends then
+///   cipher again, the RRCReestablishmentComplete first.
+///
+/// Each end used to be tested on its own, with NEA0 on the UE side, where "ciphered"
+/// and "unciphered" are the same bytes. So the UE's full-context check of an
+/// integrity-only PDU, and the missing re-key, went unseen.
+#[tokio::test]
+async fn nea2_security_and_re_establishment_agree_end_to_end() {
+    use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
+    use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
+    use nextgsim_ue::tasks::RlfCause;
+
+    const KGNB: [u8; 32] = [0x42; 32];
+    let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, mut ue_rls_rx) = UeTaskBase::new(
+        UeConfig {
+            as_security_enabled: true,
+            ..UeConfig::default()
+        },
+        32,
+    );
+    let mut ue = UeRrcTask::new(ue_base);
+    let (gnb_base, _a, mut gnb_ngap_rx, _r, _g, mut gnb_rls_rx, _s) = GnbTaskBase::new(
+        GnbConfig {
+            as_security_enabled: true,
+            ..gnb_config()
+        },
+        32,
+    );
+    let mut gnb = GnbRrcTask::new(gnb_base);
+
+    // Camp with SIB1, so both ends derive the PCI from the broadcast NCI.
+    gnb.handle_radio_power_on();
+    gnb.broadcast_system_information(true).await;
+    ue.handle_signal_changed(CELL_ID, -60).await;
+    while let Ok(msg) = gnb_rls_rx.try_recv() {
+        if let GnbTaskMessage::Message(GnbRlsMessage::BroadcastRrc {
+            rrc_channel, data, ..
+        }) = msg
+        {
+            ue.handle_downlink_rrc(CELL_ID, rrc_channel, data).await;
+        }
+    }
+    ue.perform_cycle().await;
+
+    // Connection establishment.
+    ue.handle_uplink_nas_delivery(1, OctetString::from_slice(&registration_nas()))
+        .await;
+    let (_, setup_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlCcch, setup_req).await;
+    let (_, ch, rrc_setup) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, rrc_setup).await;
+    let (_, setup_complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, setup_complete).await;
+    assert!(try_take_initial_nas(&mut gnb_ngap_rx).is_some());
+
+    // Both ends hold the same KgNB, as the NAS layer and the NGAP task give it.
+    ue.set_pending_kgnb(KGNB);
+    gnb.handle_as_security_for_reestablishment(
+        UE_ID,
+        ReestablishmentSecurity {
+            k_rrc_int: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcInt, 2),
+            k_rrc_enc: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcEnc, 2),
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
+            next_hop_chaining_count: 0,
+            kgnb: KGNB,
+        },
+    );
+
+    // SecurityModeCommand NEA2/NIA2 through the gNB's send path.
+    let smc = encode_security_mode_command(&SecurityModeCommandParams {
+        rrc_transaction_id: 0,
+        security_algorithms: SecurityAlgorithms {
+            ciphering_algorithm: CipheringAlgorithmType::Nea2,
+            integrity_algorithm: Some(IntegrityAlgorithmType::Nia2),
+        },
+    })
+    .expect("encode SecurityModeCommand");
+    gnb.handle_security_mode_command(UE_ID, OctetString::from_slice(&smc))
+        .await;
+    let (_, smc_ch, protected_smc) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+
+    // A downlink NAS PDU right behind the command, before the UE has answered --
+    // the Registration Accept the AMF sends after the SMC. It must already be
+    // ciphered and protected, at DL COUNT 1 (TS 33.501 §6.7.4: "RRC downlink
+    // ciphering (encryption) at the gNB/ng-eNB shall start after sending the AS
+    // security mode command message").
+    let accept = vec![0x7E, 0x02, 0x11, 0x22, 0x33, 0x44];
+    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept)).await;
+    let (_, ch, dl) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    assert!(
+        !dl.data().windows(accept.len()).any(|w| w == accept.as_slice()),
+        "the DLInformationTransfer after the SMC must be ciphered"
+    );
+
+    ue.handle_downlink_rrc(CELL_ID, smc_ch, protected_smc).await;
+    let (_, smc_complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    while ue_nas_rx.try_recv().is_ok() {}
+    ue.handle_downlink_rrc(CELL_ID, ch, dl).await;
+    assert!(
+        ue_received_nas_delivery(&mut ue_nas_rx),
+        "the UE must verify and decipher the first protected downlink PDU"
+    );
+    gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, smc_complete).await;
+
+    // Radio link failure, then re-establishment on the same cell.
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost).await;
+    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlCcch);
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
+    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    let (ch, reest_complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(
+        ch,
+        RrcChannel::UlDcch,
+        "the UE must accept the integrity-only RRCReestablishment and complete"
+    );
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_complete).await;
+
+    // After re-establishment both directions run on the re-derived keys: a
+    // downlink NAS PDU at DL COUNT 1 reaches the UE NAS, and an uplink one at UL
+    // COUNT 1 reaches the NGAP task.
+    while ue_nas_rx.try_recv().is_ok() {}
+    gnb.handle_nas_delivery(UE_ID, OctetString::from_slice(&accept)).await;
+    let (_, ch, dl) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, dl).await;
+    assert!(
+        ue_received_nas_delivery(&mut ue_nas_rx),
+        "downlink after re-establishment must verify with the re-derived keys"
+    );
+    let uplink = vec![0x7E, 0x00, 0x67, 0x01];
+    while gnb_ngap_rx.try_recv().is_ok() {}
+    ue.handle_uplink_nas_delivery(2, OctetString::from_slice(&uplink))
+        .await;
+    let (ch, ul) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, ch, ul).await;
+    let mut delivered = None;
+    while let Ok(msg) = gnb_ngap_rx.try_recv() {
+        if let GnbTaskMessage::Message(NgapMessage::UplinkNasDelivery { pdu, .. }) = msg {
+            delivered = Some(pdu.data().to_vec());
+        }
+    }
+    assert_eq!(
+        delivered,
+        Some(uplink),
+        "uplink after re-establishment must verify with the re-derived keys"
+    );
+}

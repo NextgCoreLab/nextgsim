@@ -1328,6 +1328,7 @@ mod tests {
             c_rnti: 0x4601,
             phys_cell_id: 7,
             next_hop_chaining_count: 3,
+            kgnb: [0x11; 32],
         }
     }
 
@@ -1879,6 +1880,7 @@ mod tests {
                 c_rnti: SIMULATED_C_RNTI,
                 phys_cell_id: TEST_PCI,
                 next_hop_chaining_count: ncc,
+                kgnb: [0x11; 32],
             });
     }
 

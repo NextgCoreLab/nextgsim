@@ -93,6 +93,9 @@ pub struct ReestablishmentSecurity {
     /// Request Acknowledge. That path is not wired (issue #39), so this stays 0
     /// in a live run — which is the spec's own initial value, not a placeholder.
     pub next_hop_chaining_count: u8,
+    /// `KgNB` the RRC keys derive from (#285 review): a re-establishment re-keys
+    /// from it (TS 38.331 §5.3.7.5).
+    pub kgnb: [u8; 32],
 }
 
 impl std::fmt::Debug for ReestablishmentSecurity {
