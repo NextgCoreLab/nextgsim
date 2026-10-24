@@ -110,8 +110,8 @@ pub struct RlsTask {
     /// Test seam: hostname lookups never answer, as against an unreachable DNS.
     #[cfg(test)]
     resolve_hang: bool,
-    /// Sources already warned about by `handle_pdu_transmission`.
-    unknown_sources_warned: std::collections::HashSet<SocketAddr>,
+    /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
+    unknown_sources: UnknownSourceWarner,
     sti: u64,
     /// RLC entities keyed by DRB identity.
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
@@ -249,7 +249,7 @@ impl RlsTask {
             resolve_rx,
             #[cfg(test)]
             resolve_hang: false,
-            unknown_sources_warned: std::collections::HashSet::new(),
+            unknown_sources: UnknownSourceWarner::new(Instant::now()),
             sti,
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
@@ -881,14 +881,10 @@ impl RlsTask {
             None => {
                 // Expected while two gNB incarnations share an STI (a pod
                 // restart's overlap, #292): the one not adopted as a cell still
-                // broadcasts to this UE. Warned once per source, not per PDU.
-                if self.unknown_sources_warned.insert(source) {
-                    warn!(
-                        "PDU from unknown source {} (not a discovered cell); further PDUs \
-                         from it are dropped silently",
-                        source
-                    );
-                }
+                // broadcasts to this UE. Warned once per source, not per PDU, and
+                // with bounded memory: anything that can reach the RLS port can
+                // vary its source address (#314).
+                self.unknown_sources.on_pdu(source, Instant::now());
                 return;
             }
         };
@@ -1433,6 +1429,83 @@ impl Task for RlsTask {
     }
 }
 
+/// Most distinct unknown sources remembered for warn-once suppression.
+///
+/// The warn-once set used to grow by one entry per distinct source address and was
+/// never cleared, so a scanner or a peer sending from ephemeral ports could grow
+/// the UE's memory without bound (#314). Legitimate unknown sources are a handful:
+/// the non-adopted gNB incarnation during a restart overlap (#292).
+const UNKNOWN_SOURCE_WARN_CAP: usize = 64;
+
+/// How often a summary of suppressed unknown-source PDUs is logged, and how often
+/// the remembered set is forgotten once it has filled up.
+const UNKNOWN_SOURCE_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate-limited, memory-bounded "PDU from unknown source" warning.
+///
+/// The first PDU from each of up to [`UNKNOWN_SOURCE_WARN_CAP`] distinct sources
+/// is warned about individually, as before. Past the cap no new source is
+/// remembered: its PDUs are counted, and at most one summary line per
+/// [`UNKNOWN_SOURCE_SUMMARY_INTERVAL`] reports the count, after which the set is
+/// forgotten so per-source warnings resume. Memory is bounded by the cap whatever
+/// the sender does.
+#[derive(Debug)]
+struct UnknownSourceWarner {
+    warned: std::collections::HashSet<SocketAddr>,
+    /// PDUs dropped from sources not in `warned` because it was full.
+    suppressed_pdus: u64,
+    /// When the last summary was logged (or the warner was created).
+    last_summary: Instant,
+}
+
+impl UnknownSourceWarner {
+    fn new(now: Instant) -> Self {
+        Self {
+            warned: std::collections::HashSet::new(),
+            suppressed_pdus: 0,
+            last_summary: now,
+        }
+    }
+
+    /// Records a PDU from `source`, which is not a discovered cell, and logs as
+    /// the policy above says. Returns what was logged, for tests.
+    fn on_pdu(&mut self, source: SocketAddr, now: Instant) -> UnknownSourceLog {
+        if self.warned.contains(&source) {
+            return UnknownSourceLog::Silent;
+        }
+        if self.warned.len() < UNKNOWN_SOURCE_WARN_CAP {
+            self.warned.insert(source);
+            warn!(
+                "PDU from unknown source {} (not a discovered cell); further PDUs \
+                 from it are dropped silently",
+                source
+            );
+            return UnknownSourceLog::Warned;
+        }
+        self.suppressed_pdus = self.suppressed_pdus.saturating_add(1);
+        if now.saturating_duration_since(self.last_summary) < UNKNOWN_SOURCE_SUMMARY_INTERVAL {
+            return UnknownSourceLog::Silent;
+        }
+        warn!(
+            "Dropped {} PDU(s) from unknown sources beyond the first {} in the last {:?} \
+             (not discovered cells); latest from {}",
+            self.suppressed_pdus, UNKNOWN_SOURCE_WARN_CAP, UNKNOWN_SOURCE_SUMMARY_INTERVAL, source
+        );
+        self.suppressed_pdus = 0;
+        self.last_summary = now;
+        self.warned.clear();
+        UnknownSourceLog::Summary
+    }
+}
+
+/// What [`UnknownSourceWarner::on_pdu`] logged.
+#[derive(Debug, PartialEq, Eq)]
+enum UnknownSourceLog {
+    Silent,
+    Warned,
+    Summary,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1472,6 +1545,51 @@ mod tests {
         let task = RlsTask::from_ue_config(task_base);
         assert!(task.serving_cell.is_none());
         assert_eq!(task.config.gnb_search_list.len(), 1);
+    }
+
+    fn src(port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], port))
+    }
+
+    /// #314: a sender varying its source port must not grow the warn-once set
+    /// past the cap, and once it is full the drops are summarised, at most once
+    /// per interval, after which the set is forgotten.
+    #[test]
+    fn the_unknown_source_warn_set_is_bounded() {
+        let t0 = Instant::now();
+        let mut w = UnknownSourceWarner::new(t0);
+        for port in 0..UNKNOWN_SOURCE_WARN_CAP as u16 {
+            assert_eq!(w.on_pdu(src(port), t0), UnknownSourceLog::Warned);
+        }
+        // A repeat of a remembered source stays silent, as before #314.
+        assert_eq!(w.on_pdu(src(0), t0), UnknownSourceLog::Silent);
+        // Ten thousand further distinct sources: none is remembered.
+        for port in 0..10_000u16 {
+            let p = UNKNOWN_SOURCE_WARN_CAP as u16 + port;
+            assert_eq!(w.on_pdu(src(p), t0), UnknownSourceLog::Silent);
+        }
+        assert_eq!(w.warned.len(), UNKNOWN_SOURCE_WARN_CAP);
+        assert_eq!(w.suppressed_pdus, 10_000);
+        // After the interval, one summary, and the set is forgotten.
+        let later = t0 + UNKNOWN_SOURCE_SUMMARY_INTERVAL;
+        assert_eq!(w.on_pdu(src(60_000), later), UnknownSourceLog::Summary);
+        assert!(w.warned.is_empty());
+        assert_eq!(w.suppressed_pdus, 0);
+        // Per-source warnings resume.
+        assert_eq!(w.on_pdu(src(60_001), later), UnknownSourceLog::Warned);
+    }
+
+    /// The overlap case #292 warns once per source and never summarises.
+    #[test]
+    fn a_few_unknown_sources_are_each_warned_once() {
+        let t0 = Instant::now();
+        let mut w = UnknownSourceWarner::new(t0);
+        assert_eq!(w.on_pdu(src(4997), t0), UnknownSourceLog::Warned);
+        let later = t0 + UNKNOWN_SOURCE_SUMMARY_INTERVAL * 10;
+        for _ in 0..100 {
+            assert_eq!(w.on_pdu(src(4997), later), UnknownSourceLog::Silent);
+        }
+        assert_eq!(w.warned.len(), 1);
     }
 
     fn lit(s: &str) -> PeerAddr {

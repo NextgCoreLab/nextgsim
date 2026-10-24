@@ -33,8 +33,9 @@ pub mod types;
 pub use bit_buffer::{BitBuffer, BitBufferReader};
 pub use bit_string::BitString;
 pub use cli_server::{
-    lookup_node_port, CliCommand, CliMessage, CliMessageType, CliResponse, CliServer,
-    ProcTableEntry, CMD_SERVER_IP, PROC_TABLE_DIR, VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
+    lookup_node_port, proc_entry_is_live, process_start_time, CliCommand, CliMessage,
+    CliMessageType, CliResponse, CliServer, ProcTableEntry, CMD_SERVER_IP, PROC_TABLE_DIR,
+    VERSION_MAJOR, VERSION_MINOR, VERSION_PATCH,
 };
 pub use config::{
     AmbientIotConfig, AmbientIotDeviceType, AmfConfig, GnbConfig, MintConfig, OpType,
