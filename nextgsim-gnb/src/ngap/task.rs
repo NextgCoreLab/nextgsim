@@ -905,6 +905,29 @@ impl NgapTask {
                     .get(&amf_id)
                     .is_some_and(|c| c.state == AmfState::WaitingNgSetup);
                 if !in_flight {
+                    // A LATE Failure, for a request whose response timer already
+                    // fired and whose retry is now pending: its cause is moot, but
+                    // its Time to Wait still binds the next request. TS 38.413
+                    // §8.7.1.3: the gNB "shall wait at least for the indicated time
+                    // before reinitiating the NG Setup procedure towards the same
+                    // AMF". The pending retry, as short as the first backoff, is
+                    // pushed out to at least that wait (#328 review).
+                    let retry = GuardTimer::NgSetupRetry { amf_id };
+                    if let (Some(time_to_wait), Some(due)) =
+                        (failure.time_to_wait, self.guard_timers.deadline(retry))
+                    {
+                        let now = Instant::now();
+                        let wait = time_to_wait.as_duration();
+                        if due < now + wait {
+                            info!(
+                                "Late NG Setup Failure from AMF {amf_id} asks for a {wait:?} \
+                                 wait ({time_to_wait:?}); the pending NG Setup retry is \
+                                 deferred to honour it"
+                            );
+                            self.guard_timers.start(now, wait, retry);
+                        }
+                        return true;
+                    }
                     warn!("NG Setup Failure from AMF {amf_id} with no NG Setup in flight: ignored");
                     return true;
                 }
@@ -9467,6 +9490,49 @@ mod tests {
         task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
             .await;
         assert_eq!(count_ng_setup_requests(&mut sctp_rx), 0);
+    }
+
+    /// #328 review, TS 38.413 §8.7.1.3: a Failure that arrives after the response
+    /// timer has fired, while the retry is pending, still has its Time to Wait
+    /// honoured: "shall wait at least for the indicated time before reinitiating
+    /// the NG Setup procedure towards the same AMF". The pending retry is deferred
+    /// to the wait. Without a Time to Wait the late Failure changes nothing.
+    #[tokio::test]
+    async fn a_late_ng_setup_failure_still_defers_the_retry_to_its_time_to_wait() {
+        for (time_to_wait, deferred) in [(Some(TimeToWaitValue::V60s), true), (None, false)] {
+            let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
+            let base = Instant::now();
+            task.process_expired_guard_timers(base + NG_SETUP_RESPONSE_TIMEOUT)
+                .await;
+            assert!(task
+                .guard_timers
+                .is_pending(GuardTimer::NgSetupRetry { amf_id: 1 }));
+            assert_eq!(
+                task.find_amf_context(1).map(|c| c.state),
+                Some(AmfState::Connected),
+                "precondition: no NG Setup in flight"
+            );
+
+            assert!(task.handle_ng_setup_failure(1, &ng_setup_failure_bytes(time_to_wait)));
+            task.process_expired_guard_timers(
+                base + NG_SETUP_RESPONSE_TIMEOUT + NG_SETUP_BACKOFF_BASE,
+            )
+            .await;
+            assert_eq!(
+                count_ng_setup_requests(&mut sctp_rx),
+                usize::from(!deferred),
+                "{time_to_wait:?}: the backoff retry goes only without a Time to Wait"
+            );
+            if deferred {
+                task.process_expired_guard_timers(Instant::now() + Duration::from_secs(60))
+                    .await;
+                assert_eq!(
+                    count_ng_setup_requests(&mut sctp_rx),
+                    1,
+                    "the retry goes once the AMF's wait has passed"
+                );
+            }
+        }
     }
 
     /// A task whose AMF 1 association just came up, so its first NG Setup Request
