@@ -3024,6 +3024,9 @@ impl RrcTask {
         // A new connection: SRB1 is unprotected until this connection's own
         // SecurityModeCommand (§5.3.3.4, #285).
         self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
 
         // Send RRC Setup Complete with initial NAS
         self.send_rrc_setup_complete().await;
@@ -3611,6 +3614,9 @@ impl RrcTask {
         self.release_all_scells();
         // SRB1 goes with the connection; a resume re-establishes it (#285).
         self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
 
         info!("RRC connection released");
 
@@ -4738,6 +4744,9 @@ impl RrcTask {
     async fn enter_idle_after_radio_link_failure(&mut self) {
         let _ = self.state_machine.on_rrc_release();
         self.srb1_pdcp = None;
+        // A suspension for a re-establishment does not outlive the connection it
+        // was for: the next connection's SRB1 starts afresh (#348 run).
+        self.srb1_suspended_for_reestablishment = false;
         self.serving_cell_id = None;
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
@@ -8271,6 +8280,29 @@ mod tests {
             assert_eq!(task.srb1_pdcp.unwrap().tx_count, 2);
             task.reestablish_srb1_pdcp();
             assert_eq!(task.srb1_pdcp, Some(Srb1Pdcp::RE_ESTABLISHED));
+        });
+    }
+
+    /// #348 real-binary run: a re-establishment that fails (T301, T311) leaves the
+    /// UE in RRC_IDLE, and the SRB1 suspension goes with the connection. Kept, it
+    /// discarded every DL-DCCH PDU of the UE's next connection (its
+    /// SecurityModeCommand first), so the UE never recovered.
+    #[test]
+    fn a_failed_re_establishment_does_not_leave_srb1_suspended() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(as_security_on_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            task.set_pending_kgnb(TEST_KGNB);
+            deliver_gnb_smc(&mut task, 0).await;
+            let _ = next_uplink_rrc(&mut rls_rx);
+            task.suspend_srb1_for_reestablishment();
+            assert!(task.srb1_suspended_for_reestablishment);
+            task.enter_idle_after_radio_link_failure().await;
+            assert!(
+                !task.srb1_suspended_for_reestablishment,
+                "the next connection's SRB1 is not suspended"
+            );
         });
     }
 
