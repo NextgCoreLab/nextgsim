@@ -2,8 +2,8 @@
 //!
 //! NRPPa (NR Positioning Protocol A) runs between the LMF and an NG-RAN node.
 //! It is NOT an NGAP procedure: NGAP merely tunnels it as an opaque
-//! `NRPPa-PDU ::= OCTET STRING` (TS 38.413 §9.3.3.17) inside the four transport
-//! procedures of TS 38.413 §8.14:
+//! `NRPPa-PDU ::= OCTET STRING` (TS 38.413 §9.3.3.14) inside the four transport
+//! procedures of TS 38.413 §8.10:
 //!
 //! | NGAP procedure code | Message | Direction |
 //! |---|---|---|
@@ -172,19 +172,25 @@ pub enum NrppaError {
 /// Which NGAP transport an NRPPa PDU arrived on, and therefore which uplink
 /// transport its answer must use.
 ///
-/// TS 38.413 §8.14: a UE-associated NRPPa PDU is bound to a UE's NGAP
-/// association and carries the two NGAP UE IDs; a non-UE-associated one carries
-/// a `RoutingID` identifying the LMF instead. The two are not interchangeable.
+/// TS 38.413 §8.10: a UE-associated NRPPa PDU is bound to a UE's NGAP
+/// association and carries the two NGAP UE IDs; a non-UE-associated one names
+/// no UE. Both carry the `Routing ID` of the LMF (§9.2.9.1-§9.2.9.4, mandatory,
+/// criticality reject), which the answer echoes. The two are not
+/// interchangeable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NrppaAssociation {
-    /// UE-associated (NGAP 8 down / 46 up). Carries the NGAP UE ID pair.
+    /// UE-associated (NGAP 8 down / 50 up). Carries the NGAP UE ID pair and the
+    /// LMF's `Routing ID`.
     UeAssociated {
         /// `AMF-UE-NGAP-ID` of the target UE.
         amf_ue_ngap_id: u64,
         /// `RAN-UE-NGAP-ID` of the target UE.
         ran_ue_ngap_id: u32,
+        /// The `Routing ID` octets exactly as received (#374: TS 38.413
+        /// §9.2.9.2 makes it mandatory in the uplink transport too).
+        routing_id: Vec<u8>,
     },
-    /// Non-UE-associated (NGAP 7 down / 45 up). Carries the LMF `RoutingID`
+    /// Non-UE-associated (NGAP 5 down / 47 up). Carries the LMF `RoutingID`
     /// verbatim so the answer can be routed back to the originating LMF.
     NonUeAssociated {
         /// The `Routing-ID` octets exactly as received.
@@ -321,25 +327,28 @@ fn unwrap_dl_ue_associated(
 
     let mut amf_ue_ngap_id = None;
     let mut ran_ue_ngap_id = None;
+    let mut routing_id = None;
     let mut payload = None;
 
     for ie in &dl.protocol_i_es.0 {
         match &ie.value {
             V::Id_AMF_UE_NGAP_ID(id) => amf_ue_ngap_id = Some(id.0),
             V::Id_RAN_UE_NGAP_ID(id) => ran_ue_ngap_id = Some(id.0),
+            V::Id_RoutingID(r) => routing_id = Some(r.0.clone()),
             V::Id_NRPPa_PDU(p) => payload = Some(p.0.clone()),
-            _ => {}
         }
     }
 
-    // All three IEs are mandatory in TS 38.413 §9.2.9.4, so a request missing
-    // any of them cannot be answered on the right association.
+    // All four IEs are mandatory in TS 38.413 §9.2.9.1, so a request missing
+    // any of them cannot be answered on the right association: the answer
+    // echoes the Routing ID (§9.2.9.2, #374).
     Ok((
         NrppaAssociation::UeAssociated {
             amf_ue_ngap_id: amf_ue_ngap_id
                 .ok_or(NrppaError::MissingMandatoryIe("AMF-UE-NGAP-ID"))?,
             ran_ue_ngap_id: ran_ue_ngap_id
                 .ok_or(NrppaError::MissingMandatoryIe("RAN-UE-NGAP-ID"))?,
+            routing_id: routing_id.ok_or(NrppaError::MissingMandatoryIe("RoutingID"))?,
         },
         payload.ok_or(NrppaError::MissingMandatoryIe("NRPPa-PDU"))?,
     ))
@@ -844,14 +853,16 @@ pub fn build_nrppa_answer(
 
 /// Wrap an NRPPa answer into the matching uplink NGAP transport and encode it.
 ///
-/// TS 38.413 §8.14.3/§8.14.4: the uplink transport mirrors the downlink one, so a
-/// UE-associated request is answered on NGAP 46 with the same UE ID pair and a
-/// non-UE-associated one on NGAP 45 with the same `RoutingID`.
+/// TS 38.413 §8.10.2: the uplink transport mirrors the downlink one, so a
+/// UE-associated request is answered on NGAP 50 with the same UE ID pair and
+/// `Routing ID` (§9.2.9.2), and a non-UE-associated one on NGAP 47 with the same
+/// `Routing ID` (§9.2.9.4).
 pub fn encode_uplink_nrppa_transport(response: &NrppaResponse) -> Result<Vec<u8>, NrppaError> {
     let pdu = match &response.association {
         NrppaAssociation::UeAssociated {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
+            routing_id,
         } => {
             use crate::codec::generated::{AMF_UE_NGAP_ID, RAN_UE_NGAP_ID};
             use UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V;
@@ -866,6 +877,12 @@ pub fn encode_uplink_nrppa_transport(response: &NrppaResponse) -> Result<Vec<u8>
                     id: crate::codec::generated::ProtocolIE_ID(85),
                     criticality: crate::codec::generated::Criticality(CRITICALITY_REJECT),
                     value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(*ran_ue_ngap_id)),
+                },
+                // TS 38.413 §9.2.9.2: mandatory, criticality reject (#374).
+                UplinkUEAssociatedNRPPaTransportProtocolIEs_Entry {
+                    id: crate::codec::generated::ProtocolIE_ID(89),
+                    criticality: crate::codec::generated::Criticality(CRITICALITY_REJECT),
+                    value: V::Id_RoutingID(RoutingID(routing_id.clone())),
                 },
                 UplinkUEAssociatedNRPPaTransportProtocolIEs_Entry {
                     id: crate::codec::generated::ProtocolIE_ID(46),

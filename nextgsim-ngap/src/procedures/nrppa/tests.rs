@@ -185,6 +185,10 @@ fn build_positioning_information_request(transaction_id: u16) -> nrppa::NRPPA_PD
     })
 }
 
+/// The `Routing ID` the downlink fixtures carry: an LMF's NF instance id, which
+/// is what nextgcore amfd puts there.
+const LMF_ROUTING_ID: &[u8] = b"7a31ef31-6d17-4ace-9aa7-d7697cbed513";
+
 /// Wrap an NRPPa PDU into a downlink UE-associated NGAP transport (NGAP 8),
 /// standing in for what the AMF relays from the LMF.
 fn wrap_dl_ue_associated(nrppa_pdu: &nrppa::NRPPA_PDU, amf_id: u64, ran_id: u32) -> Vec<u8> {
@@ -206,6 +210,11 @@ fn wrap_dl_ue_associated(nrppa_pdu: &nrppa::NRPPA_PDU, amf_id: u64, ran_id: u32)
             id: NgapIeId(85),
             criticality: NgapCriticality(CRITICALITY_REJECT),
             value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(ran_id)),
+        },
+        Entry {
+            id: NgapIeId(89),
+            criticality: NgapCriticality(CRITICALITY_REJECT),
+            value: V::Id_RoutingID(RoutingID(LMF_ROUTING_ID.to_vec())),
         },
         Entry {
             id: NgapIeId(46),
@@ -338,6 +347,7 @@ fn ecid_request_over_dl_ue_transport_yields_a_response_with_the_serving_cell_and
         NrppaAssociation::UeAssociated {
             amf_ue_ngap_id: 0x0102_0304,
             ran_ue_ngap_id: 0x0506,
+            routing_id: LMF_ROUTING_ID.to_vec(),
         }
     );
     assert_eq!(request.transaction_id, 7);
@@ -365,13 +375,14 @@ fn ecid_request_over_dl_ue_transport_yields_a_response_with_the_serving_cell_and
     use crate::codec::generated::UplinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V;
     let mut amf_id = None;
     let mut ran_id = None;
+    let mut routing_id = None;
     let mut payload = None;
     for ie in &ul.protocol_i_es.0 {
         match &ie.value {
             V::Id_AMF_UE_NGAP_ID(id) => amf_id = Some(id.0),
             V::Id_RAN_UE_NGAP_ID(id) => ran_id = Some(id.0),
+            V::Id_RoutingID(r) => routing_id = Some(r.0.clone()),
             V::Id_NRPPa_PDU(p) => payload = Some(p.0.clone()),
-            _ => {}
         }
     }
     assert_eq!(
@@ -380,6 +391,13 @@ fn ecid_request_over_dl_ue_transport_yields_a_response_with_the_serving_cell_and
         "the answer must name the same UE"
     );
     assert_eq!(ran_id, Some(0x0506));
+    // #374: TS 38.413 §9.2.9.2 makes the Routing ID mandatory (reject); amfd
+    // rejected every answer without it.
+    assert_eq!(
+        routing_id.as_deref(),
+        Some(LMF_ROUTING_ID),
+        "the Routing ID is echoed"
+    );
 
     // Now the positive assertion that matters: the measurements survive.
     let inner = decode_nrppa_pdu(&payload.expect("NRPPa-PDU IE present")).expect("NRPPa decodes");
@@ -1210,4 +1228,48 @@ fn point_a_is_half_the_carrier_below_its_centre() {
     assert_eq!(srs_point_a(632_628), 632_628 - 612);
     // 1836 steps of 5 kHz below 3 GHz.
     assert_eq!(srs_point_a(400_000), 400_000 - 1836);
+}
+
+/// #374: the Routing ID is mandatory in the downlink UE-associated transport
+/// (TS 38.413 §9.2.9.1), and the answer must echo it, so a transport without
+/// one is refused.
+#[test]
+fn a_ue_associated_transport_without_a_routing_id_is_refused() {
+    use crate::codec::generated::{
+        Criticality as NgapCriticality, DownlinkUEAssociatedNRPPaTransportProtocolIEs,
+        DownlinkUEAssociatedNRPPaTransportProtocolIEs_Entry as Entry,
+        DownlinkUEAssociatedNRPPaTransportProtocolIEs_EntryValue as V, ProtocolIE_ID as NgapIeId,
+        AMF_UE_NGAP_ID, RAN_UE_NGAP_ID,
+    };
+    let payload = encode_nrppa_pdu(&build_ecid_request(7, 3)).unwrap();
+    let pdu = NGAP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: NgapProcedureCode(NGAP_PROC_DL_UE_NRPPA),
+        criticality: crate::codec::generated::Criticality(CRITICALITY_IGNORE),
+        value: InitiatingMessageValue::Id_DownlinkUEAssociatedNRPPaTransport(
+            DownlinkUEAssociatedNRPPaTransport {
+                protocol_i_es: DownlinkUEAssociatedNRPPaTransportProtocolIEs(vec![
+                    Entry {
+                        id: NgapIeId(10),
+                        criticality: NgapCriticality(CRITICALITY_REJECT),
+                        value: V::Id_AMF_UE_NGAP_ID(AMF_UE_NGAP_ID(1)),
+                    },
+                    Entry {
+                        id: NgapIeId(85),
+                        criticality: NgapCriticality(CRITICALITY_REJECT),
+                        value: V::Id_RAN_UE_NGAP_ID(RAN_UE_NGAP_ID(2)),
+                    },
+                    Entry {
+                        id: NgapIeId(46),
+                        criticality: NgapCriticality(CRITICALITY_REJECT),
+                        value: V::Id_NRPPa_PDU(NgapNrppaPdu(payload)),
+                    },
+                ]),
+            },
+        ),
+    });
+    let dl = encode_ngap_pdu(&pdu).unwrap();
+    assert!(matches!(
+        parse_downlink_nrppa_transport(&dl),
+        Err(NrppaError::MissingMandatoryIe("RoutingID"))
+    ));
 }
