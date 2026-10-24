@@ -61,6 +61,14 @@
 //! a periodic measurement has been set up; it is not the answer to the request.
 //! So this module answers with the response.
 
+pub mod multi_rtt;
+
+pub use multi_rtt::{
+    build_srs_configuration, gnb_rx_tx_k0_report, srs_point_a, CellTime, NrppaRadioCause,
+    SrsActivation, SrsAllocation, SrsDeactivation, SrsResourceType, TrpMeasurementRequest,
+    TrpRxTxMeasurement, TRP_MEASUREMENT_GNB_RX_TX_TIME_DIFF,
+};
+
 use crate::codec::nrppa_generated as nrppa;
 use crate::codec::{decode_ngap_pdu, encode_ngap_pdu, NgapCodecError};
 use asn1_codecs::aper::AperCodec;
@@ -155,6 +163,10 @@ pub enum NrppaError {
     /// A mandatory IE was absent from the request.
     #[error("missing mandatory NRPPa IE: {0}")]
     MissingMandatoryIe(&'static str),
+
+    /// The caller's decision is not one this procedure is answered with.
+    #[error("NRPPa answer: {0}")]
+    DecisionMismatch(&'static str),
 }
 
 /// Which NGAP transport an NRPPa PDU arrived on, and therefore which uplink
@@ -208,9 +220,20 @@ pub enum NrppaProcedure {
         lmf_ue_measurement_id: u16,
     },
     /// Positioning Information Request (§8.2.6). Every IE of this request is
-    /// OPTIONAL (TS 38.455 §9.1.10), so there is nothing mandatory to extract:
-    /// the request's arrival is the whole trigger.
-    PositioningInformationExchange,
+    /// OPTIONAL (TS 38.455 §9.1.10).
+    PositioningInformationExchange {
+        /// The resource type of `RequestedSRSTransmissionCharacteristics`, when
+        /// the request carries it. §8.2.6.2: then the node "shall include the SRS
+        /// Configuration IE and the SFN Initialisation Time IE in the POSITIONING
+        /// INFORMATION RESPONSE message".
+        requested_srs: Option<SrsResourceType>,
+    },
+    /// Positioning Activation Request (§8.2.9).
+    PositioningActivation(SrsActivation),
+    /// Positioning Deactivation (§8.2.10), a class 2 procedure: no answer.
+    PositioningDeactivation(SrsDeactivation),
+    /// Measurement Request (§8.5.1), non-UE-associated.
+    Measurement(TrpMeasurementRequest),
     /// TRP Information Request (§8.2.8).
     TrpInformationExchange {
         /// `TRPList`, OPTIONAL: when present, only these TRPs are asked about;
@@ -377,9 +400,26 @@ pub fn parse_downlink_nrppa_transport(pdu_bytes: &[u8]) -> Result<NrppaRequest, 
         nrppa::InitiatingMessageValue::Id_e_CIDMeasurementInitiation(req) => {
             parse_e_cid_request(req)?
         }
-        nrppa::InitiatingMessageValue::Id_positioningInformationExchange(_) => {
-            NrppaProcedure::PositioningInformationExchange
+        nrppa::InitiatingMessageValue::Id_positioningInformationExchange(req) => {
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: multi_rtt::requested_srs_resource_type(req),
+            }
         }
+        nrppa::InitiatingMessageValue::Id_positioningActivation(req) => {
+            NrppaProcedure::PositioningActivation(
+                multi_rtt::parse_positioning_activation(req)
+                    .ok_or(NrppaError::MissingMandatoryIe("SRSType"))?,
+            )
+        }
+        nrppa::InitiatingMessageValue::Id_positioningDeactivation(msg) => {
+            NrppaProcedure::PositioningDeactivation(
+                multi_rtt::parse_positioning_deactivation(msg)
+                    .ok_or(NrppaError::MissingMandatoryIe("AbortTransmission"))?,
+            )
+        }
+        nrppa::InitiatingMessageValue::Id_Measurement(req) => NrppaProcedure::Measurement(
+            multi_rtt::parse_measurement_request(req).map_err(NrppaError::MissingMandatoryIe)?,
+        ),
         nrppa::InitiatingMessageValue::Id_tRPInformationExchange(req) => parse_trp_request(req)?,
         _ => return Err(NrppaError::UnsupportedProcedure(init.procedure_code.0)),
     };
@@ -545,16 +585,17 @@ fn build_e_cid_response(
 /// Build a `PositioningInformationResponse` (§8.2.6, procedure 9, successful
 /// outcome).
 ///
-/// Every IE of this message is OPTIONAL (TS 38.455 §9.1.11). The gNB has no SRS
-/// configured for the target on an NRPPa-only path, so what it can honestly
-/// supply is the SFN timing reference: `id-SFNInitialisationTime`
-/// (`RelativeTime1900 ::= BIT STRING (SIZE(64))`), the NTP-format instant at
-/// which SFN 0 of the serving cell began. That is precisely the datum an LMF
-/// needs to relate a UE's reported timing to absolute time, so the response is
-/// informative rather than empty.
+/// Every IE of this message is OPTIONAL (TS 38.455 §9.1.11). It always carries
+/// the SFN timing reference, `id-SFNInitialisationTime`
+/// (`RelativeTime1900 ::= BIT STRING (SIZE(64))`): the NTP-format instant at
+/// which SFN 0 of the serving cell began, which an LMF needs to relate reported
+/// timing to absolute time. When the request asked for SRS, `srs` is the SRS
+/// this node configured for the UE and goes in as `id-SRSConfiguration`
+/// (§8.2.6.2, #347).
 fn build_positioning_information_response(
     transaction_id: u16,
     sfn_initialisation_time: u64,
+    srs: Option<&SrsAllocation>,
 ) -> nrppa::NRPPA_PDU {
     use nrppa::PositioningInformationResponseProtocolIEs_EntryValue as V;
 
@@ -563,11 +604,19 @@ fn build_positioning_information_response(
         time_bits.push((sfn_initialisation_time >> bit) & 1 == 1);
     }
 
-    let ies = vec![nrppa::PositioningInformationResponseProtocolIEs_Entry {
+    let mut ies = Vec::new();
+    if let Some(srs) = srs {
+        ies.push(nrppa::PositioningInformationResponseProtocolIEs_Entry {
+            id: nrppa::ProtocolIE_ID(multi_rtt::IE_SRS_CONFIGURATION),
+            criticality: nrppa::Criticality(CRITICALITY_IGNORE),
+            value: V::Id_SRSConfiguration(build_srs_configuration(srs)),
+        });
+    }
+    ies.push(nrppa::PositioningInformationResponseProtocolIEs_Entry {
         id: nrppa::ProtocolIE_ID(IE_SFN_INITIALISATION_TIME),
         criticality: nrppa::Criticality(CRITICALITY_IGNORE),
         value: V::Id_SFNInitialisationTime(nrppa::RelativeTime1900(time_bits)),
-    }];
+    });
 
     nrppa::NRPPA_PDU::SuccessfulOutcome(nrppa::SuccessfulOutcome {
         procedure_code: nrppa::ProcedureCode(PROC_POSITIONING_INFORMATION_EXCHANGE),
@@ -678,45 +727,128 @@ fn build_trp_information_response(
     })
 }
 
+/// What the node decided for a request whose answer depends on its state
+/// rather than on the cell configuration alone.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NrppaDecision {
+    /// Answered from the cell alone: E-CID, TRP Information, and a Positioning
+    /// Information Request that asks for no SRS.
+    FromCell,
+    /// A Positioning Information Request that asks for SRS: the SRS configured
+    /// for the UE, or why none could be.
+    PositioningInformation(Result<SrsAllocation, NrppaRadioCause>),
+    /// A Positioning Activation: when the SRS was activated, or why not.
+    PositioningActivation(Result<CellTime, NrppaRadioCause>),
+    /// A Positioning Deactivation, which is not answered.
+    PositioningDeactivation,
+    /// A Measurement: the node's RAN-Measurement-ID and one measurement per
+    /// TRP (not empty), or why nothing was measured.
+    Measurement(Result<(u32, Vec<TrpRxTxMeasurement>), NrppaRadioCause>),
+}
+
 /// Answer a decoded NRPPa request from the gNB's own cell state.
 ///
 /// `ran_ue_measurement_id` is the node's handle for an E-CID measurement; the
 /// caller allocates it so successive measurements for one UE are distinguishable.
 /// `sfn_initialisation_time` is the NTP-format instant SFN 0 began, used by the
-/// Positioning Information answer.
+/// Positioning Information answer. A request that needs the node's state is an
+/// error here; it goes through [`build_nrppa_answer`].
 pub fn build_nrppa_response(
     request: &NrppaRequest,
     cell: &NrppaCellInfo,
     ran_ue_measurement_id: u16,
     sfn_initialisation_time: u64,
 ) -> Result<NrppaResponse, NrppaError> {
-    let pdu = match &request.procedure {
-        NrppaProcedure::ECidMeasurementInitiation {
-            lmf_ue_measurement_id,
-        } => build_e_cid_response(
-            request.transaction_id,
-            *lmf_ue_measurement_id,
-            ran_ue_measurement_id,
-            cell,
-        ),
-        NrppaProcedure::PositioningInformationExchange => {
-            build_positioning_information_response(request.transaction_id, sfn_initialisation_time)
+    build_nrppa_answer(
+        request,
+        cell,
+        ran_ue_measurement_id,
+        sfn_initialisation_time,
+        &NrppaDecision::FromCell,
+    )?
+    .ok_or(NrppaError::DecisionMismatch(
+        "a Positioning Deactivation has no answer",
+    ))
+}
+
+/// Answer a decoded NRPPa request with what the node decided. `Ok(None)` for
+/// a procedure with no answer (Positioning Deactivation, class 2).
+pub fn build_nrppa_answer(
+    request: &NrppaRequest,
+    cell: &NrppaCellInfo,
+    ran_ue_measurement_id: u16,
+    sfn_initialisation_time: u64,
+    decision: &NrppaDecision,
+) -> Result<Option<NrppaResponse>, NrppaError> {
+    let tid = request.transaction_id;
+    let pdu = match (&request.procedure, decision) {
+        (
+            NrppaProcedure::ECidMeasurementInitiation {
+                lmf_ue_measurement_id,
+            },
+            NrppaDecision::FromCell,
+        ) => build_e_cid_response(tid, *lmf_ue_measurement_id, ran_ue_measurement_id, cell),
+        (
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: None,
+            },
+            NrppaDecision::FromCell,
+        ) => build_positioning_information_response(tid, sfn_initialisation_time, None),
+        (
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: Some(_),
+            },
+            NrppaDecision::PositioningInformation(outcome),
+        ) => match outcome {
+            Ok(srs) => {
+                build_positioning_information_response(tid, sfn_initialisation_time, Some(srs))
+            }
+            Err(cause) => multi_rtt::build_positioning_information_failure(tid, *cause),
+        },
+        (
+            NrppaProcedure::TrpInformationExchange {
+                requested_trps,
+                requested_types,
+            },
+            NrppaDecision::FromCell,
+        ) => build_trp_information_response(tid, requested_trps.as_deref(), requested_types, cell),
+        (
+            NrppaProcedure::PositioningActivation(_),
+            NrppaDecision::PositioningActivation(outcome),
+        ) => match outcome {
+            Ok(at) => multi_rtt::build_positioning_activation_response(tid, *at),
+            Err(cause) => multi_rtt::build_positioning_activation_failure(tid, *cause),
+        },
+        (NrppaProcedure::PositioningDeactivation(_), NrppaDecision::PositioningDeactivation) => {
+            return Ok(None)
         }
-        NrppaProcedure::TrpInformationExchange {
-            requested_trps,
-            requested_types,
-        } => build_trp_information_response(
-            request.transaction_id,
-            requested_trps.as_deref(),
-            requested_types,
-            cell,
-        ),
+        (NrppaProcedure::Measurement(req), NrppaDecision::Measurement(outcome)) => match outcome {
+            Ok((ran_measurement_id, measurements)) if !measurements.is_empty() => {
+                multi_rtt::build_measurement_response(
+                    tid,
+                    req.lmf_measurement_id,
+                    *ran_measurement_id,
+                    measurements,
+                )
+            }
+            Ok(_) => multi_rtt::build_measurement_failure(
+                tid,
+                req.lmf_measurement_id,
+                NrppaRadioCause::Unspecified,
+            ),
+            Err(cause) => multi_rtt::build_measurement_failure(tid, req.lmf_measurement_id, *cause),
+        },
+        _ => {
+            return Err(NrppaError::DecisionMismatch(
+                "the decision does not answer this procedure",
+            ))
+        }
     };
 
-    Ok(NrppaResponse {
+    Ok(Some(NrppaResponse {
         association: request.association.clone(),
         nrppa_pdu: encode_nrppa_pdu(&pdu)?,
-    })
+    }))
 }
 
 /// Wrap an NRPPa answer into the matching uplink NGAP transport and encode it.

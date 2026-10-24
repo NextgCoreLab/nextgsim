@@ -43,7 +43,7 @@ pub trait ChannelModel: core::fmt::Debug + Send + Sync {
 }
 
 /// Euclidean distance between two simulated positions, in metres.
-fn distance_m(a: &SimCoord, b: &SimCoord) -> f64 {
+pub(crate) fn distance_m(a: &SimCoord, b: &SimCoord) -> f64 {
     let dx = i64::from(a.x - b.x);
     let dy = i64::from(a.y - b.y);
     let dz = i64::from(a.z - b.z);

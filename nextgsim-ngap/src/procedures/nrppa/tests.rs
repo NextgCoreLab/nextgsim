@@ -474,7 +474,9 @@ fn positioning_information_request_yields_a_response_carrying_the_sfn_timing_ref
     let request = parse_downlink_nrppa_transport(&dl).expect("parses");
     assert_eq!(
         request.procedure,
-        NrppaProcedure::PositioningInformationExchange
+        NrppaProcedure::PositioningInformationExchange {
+            requested_srs: None
+        }
     );
 
     let sfn_time = 0x0123_4567_89ab_cdef;
@@ -768,6 +770,466 @@ fn a_downlink_transport_missing_the_nrppa_payload_is_rejected() {
     ));
 }
 
+// ---------------------------------------------------------------------------
+// Multi-RTT, nextgsim #347: TS 38.455 §8.2.6 (SRS), §8.2.9, §8.2.10, §8.5.1
+// ---------------------------------------------------------------------------
+
+fn hex(s: &str) -> Vec<u8> {
+    s.split_whitespace()
+        .map(|b| u8::from_str_radix(b, 16).expect("hex"))
+        .collect()
+}
+
+fn decode_hex_nrppa(s: &str) -> nrppa::NRPPA_PDU {
+    decode_nrppa_pdu(&hex(s)).expect("lmfd's vector decodes")
+}
+
+fn test_srs() -> SrsAllocation {
+    SrsAllocation {
+        resource_set_id: 3,
+        resource_type: SrsResourceType::SemiPersistent,
+        sequence_id: 77,
+        pci: 42,
+        point_a: srs_point_a(632_628),
+    }
+}
+
+/// nextgcore lmfd's POSITIONING INFORMATION REQUEST (transaction 1,
+/// `nrppa_downlink.rs`): semi-persistent SRS, 20 MHz.
+const LMFD_POSITIONING_INFORMATION_REQUEST: &str = "00 09 00 00 01 09 00 00 01 00 0c 40 02 01 08";
+/// nextgcore lmfd's POSITIONING ACTIVATION REQUEST: semi-persistent set 3,
+/// transaction 0.
+const LMFD_POSITIONING_ACTIVATION_REQUEST: &str = "00 11 00 00 00 09 00 00 01 00 2c 00 02 01 80";
+
+#[test]
+fn an_srs_request_asks_for_the_srs_configuration() {
+    let dl = wrap_dl_ue_associated(
+        &decode_hex_nrppa(LMFD_POSITIONING_INFORMATION_REQUEST),
+        7,
+        8,
+    );
+    let request = parse_downlink_nrppa_transport(&dl).expect("parses");
+    assert_eq!(
+        request.procedure,
+        NrppaProcedure::PositioningInformationExchange {
+            requested_srs: Some(SrsResourceType::SemiPersistent)
+        }
+    );
+    // §8.2.6.2: the SRS Configuration and the SFN Initialisation Time.
+    let answer = build_nrppa_answer(
+        &request,
+        &test_cell(),
+        1,
+        5,
+        &NrppaDecision::PositioningInformation(Ok(test_srs())),
+    )
+    .expect("builds")
+    .expect("answered");
+    let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = decode_nrppa_pdu(&answer.nrppa_pdu).unwrap()
+    else {
+        panic!("a PositioningInformationResponse");
+    };
+    let nrppa::SuccessfulOutcomeValue::Id_positioningInformationExchange(resp) = outcome.value
+    else {
+        panic!("a PositioningInformationResponse");
+    };
+    use nrppa::PositioningInformationResponseProtocolIEs_EntryValue as V;
+    let config = resp
+        .protocol_i_es
+        .0
+        .iter()
+        .find_map(|ie| match &ie.value {
+            V::Id_SRSConfiguration(c) => Some(c.clone()),
+            _ => None,
+        })
+        .expect("the SRS Configuration IE");
+    assert!(resp
+        .protocol_i_es
+        .0
+        .iter()
+        .any(|ie| matches!(ie.value, V::Id_SFNInitialisationTime(_))));
+    // What lmfd reads: the first semi-persistent positioning set's id.
+    let carrier = &config.srs_carrier_list.0[0];
+    let set = &carrier
+        .active_ulbwp
+        .srs_config
+        .pos_srs_resource_set_list
+        .as_ref()
+        .expect("a positioning SRS resource set")
+        .0[0];
+    assert_eq!(set.possrs_resource_set_id.0, 3);
+    assert!(matches!(
+        set.posresource_set_type,
+        nrppa::PosResourceSetType::Semi_persistent(_)
+    ));
+    assert_eq!(srs_configuration_sets(&config), vec![(3, Some(42))]);
+}
+
+fn srs_configuration_sets(config: &nrppa::SRSConfiguration) -> Vec<(u8, Option<u16>)> {
+    multi_rtt::srs_configuration_resource_sets(config)
+}
+
+#[test]
+fn an_srs_request_this_node_cannot_serve_is_a_positioning_information_failure() {
+    let dl = wrap_dl_ue_associated(
+        &decode_hex_nrppa(LMFD_POSITIONING_INFORMATION_REQUEST),
+        7,
+        8,
+    );
+    let request = parse_downlink_nrppa_transport(&dl).unwrap();
+    let answer = build_nrppa_answer(
+        &request,
+        &test_cell(),
+        1,
+        0,
+        &NrppaDecision::PositioningInformation(Err(
+            NrppaRadioCause::RequestedItemTemporarilyNotAvailable,
+        )),
+    )
+    .unwrap()
+    .unwrap();
+    let nrppa::NRPPA_PDU::UnsuccessfulOutcome(outcome) =
+        decode_nrppa_pdu(&answer.nrppa_pdu).unwrap()
+    else {
+        panic!("a PositioningInformationFailure");
+    };
+    assert_eq!(
+        outcome.procedure_code.0,
+        PROC_POSITIONING_INFORMATION_EXCHANGE
+    );
+    assert_eq!(outcome.nrppatransaction_id.0, 1);
+    // An SRS request answered from the cell alone would drop the SRS: refused.
+    assert!(build_nrppa_response(&request, &test_cell(), 1, 0).is_err());
+}
+
+#[test]
+fn a_positioning_activation_is_parsed_and_answered_with_its_activation_time() {
+    let dl = wrap_dl_ue_associated(&decode_hex_nrppa(LMFD_POSITIONING_ACTIVATION_REQUEST), 7, 8);
+    let request = parse_downlink_nrppa_transport(&dl).expect("parses");
+    assert_eq!(
+        request.procedure,
+        NrppaProcedure::PositioningActivation(SrsActivation::SemiPersistent { resource_set_id: 3 })
+    );
+    let at = CellTime { sfn: 513, slot: 17 };
+    let answer = build_nrppa_answer(
+        &request,
+        &test_cell(),
+        1,
+        0,
+        &NrppaDecision::PositioningActivation(Ok(at)),
+    )
+    .unwrap()
+    .unwrap();
+    let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = decode_nrppa_pdu(&answer.nrppa_pdu).unwrap()
+    else {
+        panic!("a PositioningActivationResponse");
+    };
+    assert_eq!(
+        outcome.procedure_code.0,
+        multi_rtt::PROC_POSITIONING_ACTIVATION
+    );
+    let nrppa::SuccessfulOutcomeValue::Id_positioningActivation(resp) = outcome.value else {
+        panic!("a PositioningActivationResponse");
+    };
+    use nrppa::PositioningActivationResponseProtocolIEs_EntryValue as V;
+    let mut seen = (None, None);
+    for ie in resp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_SystemFrameNumber(sfn) => seen.0 = Some(sfn.0),
+            V::Id_SlotNumber(slot) => seen.1 = Some(slot.0),
+            V::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    assert_eq!(seen, (Some(513), Some(17)));
+
+    let failure = build_nrppa_answer(
+        &request,
+        &test_cell(),
+        1,
+        0,
+        &NrppaDecision::PositioningActivation(Err(NrppaRadioCause::RequestedItemNotSupported)),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        decode_nrppa_pdu(&failure.nrppa_pdu).unwrap(),
+        nrppa::NRPPA_PDU::UnsuccessfulOutcome(_)
+    ));
+}
+
+fn positioning_deactivation(abort: nrppa::AbortTransmission) -> nrppa::NRPPA_PDU {
+    nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+        procedure_code: nrppa::ProcedureCode(multi_rtt::PROC_POSITIONING_DEACTIVATION),
+        criticality: nrppa::Criticality(CRITICALITY_IGNORE),
+        nrppatransaction_id: nrppa::NRPPATransactionID(4),
+        value: nrppa::InitiatingMessageValue::Id_positioningDeactivation(nrppa::PositioningDeactivation {
+            protocol_i_es: nrppa::PositioningDeactivationProtocolIEs(vec![
+                nrppa::PositioningDeactivationProtocolIEs_Entry {
+                    id: nrppa::ProtocolIE_ID(53),
+                    criticality: nrppa::Criticality(CRITICALITY_IGNORE),
+                    value: nrppa::PositioningDeactivationProtocolIEs_EntryValue::Id_AbortTransmission(abort),
+                },
+            ]),
+        }),
+    })
+}
+
+#[test]
+fn a_positioning_deactivation_is_parsed_and_not_answered() {
+    let dl = wrap_dl_ue_associated(
+        &positioning_deactivation(nrppa::AbortTransmission::DeactivateSRSResourceSetID(
+            nrppa::SRSResourceSetID(3),
+        )),
+        7,
+        8,
+    );
+    let request = parse_downlink_nrppa_transport(&dl).expect("parses");
+    assert_eq!(
+        request.procedure,
+        NrppaProcedure::PositioningDeactivation(SrsDeactivation::ResourceSet(3))
+    );
+    assert_eq!(
+        build_nrppa_answer(
+            &request,
+            &test_cell(),
+            1,
+            0,
+            &NrppaDecision::PositioningDeactivation
+        )
+        .unwrap(),
+        None,
+        "§8.2.10 is class 2"
+    );
+    let dl = wrap_dl_ue_associated(
+        &positioning_deactivation(nrppa::AbortTransmission::ReleaseALL(
+            nrppa::AbortTransmission_releaseALL,
+        )),
+        7,
+        8,
+    );
+    assert_eq!(
+        parse_downlink_nrppa_transport(&dl).unwrap().procedure,
+        NrppaProcedure::PositioningDeactivation(SrsDeactivation::ReleaseAll)
+    );
+}
+
+/// A MEASUREMENT REQUEST shaped as lmfd sends it (`nrppa_downlink.rs`): two
+/// TRPs, onDemand, gNB-RxTxTimeDiff, the gNB's SRS Configuration.
+fn lmfd_measurement_request(lmf_measurement_id: u32, srs: &SrsAllocation) -> nrppa::NRPPA_PDU {
+    use nrppa::MeasurementRequestProtocolIEs_EntryValue as V;
+    let ie = |id: u16, criticality: u8, value: V| nrppa::MeasurementRequestProtocolIEs_Entry {
+        id: nrppa::ProtocolIE_ID(id),
+        criticality: nrppa::Criticality(criticality),
+        value,
+    };
+    nrppa::NRPPA_PDU::InitiatingMessage(nrppa::InitiatingMessage {
+        procedure_code: nrppa::ProcedureCode(multi_rtt::PROC_MEASUREMENT),
+        criticality: nrppa::Criticality(CRITICALITY_REJECT),
+        nrppatransaction_id: nrppa::NRPPATransactionID(21),
+        value: nrppa::InitiatingMessageValue::Id_Measurement(nrppa::MeasurementRequest {
+            protocol_i_es: nrppa::MeasurementRequestProtocolIEs(vec![
+                ie(
+                    39,
+                    CRITICALITY_REJECT,
+                    V::Id_LMF_Measurement_ID(nrppa::Measurement_ID(lmf_measurement_id)),
+                ),
+                ie(
+                    41,
+                    CRITICALITY_REJECT,
+                    V::Id_TRP_MeasurementRequestList(nrppa::TRP_MeasurementRequestList(
+                        [1u16, 2]
+                            .iter()
+                            .map(|id| nrppa::TRP_MeasurementRequestItem {
+                                trp_id: nrppa::TRP_ID(*id),
+                                search_window_information: None,
+                                ie_extensions: None,
+                            })
+                            .collect(),
+                    )),
+                ),
+                ie(
+                    3,
+                    CRITICALITY_REJECT,
+                    V::Id_ReportCharacteristics(nrppa::ReportCharacteristics(0)),
+                ),
+                ie(
+                    52,
+                    CRITICALITY_REJECT,
+                    V::Id_TRPMeasurementQuantities(nrppa::TRPMeasurementQuantities(vec![
+                        nrppa::TRPMeasurementQuantitiesList_Item {
+                            trp_measurement_type: nrppa::TRPMeasurementType(0),
+                            timing_reporting_granularity_factor: None,
+                            ie_extensions: None,
+                        },
+                    ])),
+                ),
+                ie(
+                    26,
+                    CRITICALITY_IGNORE,
+                    V::Id_SRSConfiguration(build_srs_configuration(srs)),
+                ),
+            ]),
+        }),
+    })
+}
+
+/// lmfd's decoding of a k0 report (`codec_glue.rs`): `(v - 985024) * T_c`.
+fn lmfd_rx_tx_seconds(v: u32) -> f64 {
+    (f64::from(v) - 985_024.0) * multi_rtt::T_C_SECONDS
+}
+
+#[test]
+fn a_measurement_request_is_answered_with_a_gnb_rx_tx_per_trp() {
+    let dl = wrap_dl_non_ue_associated(&lmfd_measurement_request(9, &test_srs()), &[0x00, 0x01]);
+    let request = parse_downlink_nrppa_transport(&dl).expect("parses");
+    let NrppaProcedure::Measurement(req) = &request.procedure else {
+        panic!("a Measurement");
+    };
+    assert_eq!(
+        *req,
+        TrpMeasurementRequest {
+            lmf_measurement_id: 9,
+            trp_ids: vec![1, 2],
+            on_demand: true,
+            quantities: vec![TRP_MEASUREMENT_GNB_RX_TX_TIME_DIFF],
+            srs_resource_sets: vec![(3, Some(42))],
+        }
+    );
+
+    // 100 m: a 667 ns round trip.
+    let rtt = 2.0 * 100.0 / 299_792_458.0;
+    let at = CellTime { sfn: 7, slot: 3 };
+    let measurements = [1u16, 2].map(|trp_id| TrpRxTxMeasurement {
+        trp_id,
+        rx_tx_seconds: rtt,
+        time: at,
+    });
+    let answer = build_nrppa_answer(
+        &request,
+        &test_cell(),
+        1,
+        0,
+        &NrppaDecision::Measurement(Ok((44, measurements.to_vec()))),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        answer.association, request.association,
+        "non-UE-associated, same routing id"
+    );
+    let nrppa::NRPPA_PDU::SuccessfulOutcome(outcome) = decode_nrppa_pdu(&answer.nrppa_pdu).unwrap()
+    else {
+        panic!("a MeasurementResponse");
+    };
+    assert_eq!(outcome.procedure_code.0, multi_rtt::PROC_MEASUREMENT);
+    assert_eq!(outcome.nrppatransaction_id.0, 21);
+    let nrppa::SuccessfulOutcomeValue::Id_Measurement(resp) = outcome.value else {
+        panic!("a MeasurementResponse");
+    };
+    use nrppa::MeasurementResponseProtocolIEs_EntryValue as V;
+    let (mut lmf, mut ran, mut list) = (None, None, None);
+    for ie in resp.protocol_i_es.0 {
+        match ie.value {
+            V::Id_LMF_Measurement_ID(id) => lmf = Some(id.0),
+            V::Id_RAN_Measurement_ID(id) => ran = Some(id.0),
+            V::Id_TRP_MeasurementResponseList(l) => list = Some(l),
+            V::Id_CriticalityDiagnostics(_) => {}
+        }
+    }
+    assert_eq!((lmf, ran), (Some(9), Some(44)));
+    let list = list.expect("the TRP Measurement Response List");
+    assert_eq!(
+        list.0.iter().map(|i| i.trp_id.0).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    for item in &list.0 {
+        let result = &item.measurement_result.0[0];
+        let nrppa::TrpMeasuredResultsValue::GNB_RxTxTimeDiff(rx_tx) =
+            &result.measured_results_value
+        else {
+            panic!("a gNB Rx-Tx time difference");
+        };
+        let nrppa::GNBRxTxTimeDiffMeas::K0(v) = &rx_tx.rx_tx_time_diff else {
+            panic!("the k0 report");
+        };
+        let decoded = lmfd_rx_tx_seconds(v.0);
+        assert!(
+            (decoded - rtt).abs() <= multi_rtt::T_C_SECONDS,
+            "{decoded} vs {rtt}"
+        );
+        assert_eq!(result.time_stamp.system_frame_number.0, 7);
+        assert!(matches!(
+            result.time_stamp.slot_index,
+            nrppa::TimeStampSlotIndex::SCS_30(nrppa::TimeStampSlotIndex_sCS_30(3))
+        ));
+    }
+}
+
+#[test]
+fn a_measurement_nothing_was_measured_for_is_a_measurement_failure() {
+    let dl = wrap_dl_non_ue_associated(&lmfd_measurement_request(9, &test_srs()), &[0x00, 0x01]);
+    let request = parse_downlink_nrppa_transport(&dl).unwrap();
+    for decision in [
+        NrppaDecision::Measurement(Err(NrppaRadioCause::RequestedItemTemporarilyNotAvailable)),
+        NrppaDecision::Measurement(Ok((44, vec![]))),
+    ] {
+        let answer = build_nrppa_answer(&request, &test_cell(), 1, 0, &decision)
+            .unwrap()
+            .unwrap();
+        let nrppa::NRPPA_PDU::UnsuccessfulOutcome(outcome) =
+            decode_nrppa_pdu(&answer.nrppa_pdu).unwrap()
+        else {
+            panic!("§8.5.1.3: a MeasurementFailure");
+        };
+        let nrppa::UnsuccessfulOutcomeValue::Id_Measurement(failure) = outcome.value else {
+            panic!("a MeasurementFailure");
+        };
+        assert!(failure.protocol_i_es.0.iter().any(|ie| matches!(
+            ie.value,
+            nrppa::MeasurementFailureProtocolIEs_EntryValue::Id_LMF_Measurement_ID(
+                nrppa::Measurement_ID(9)
+            )
+        )));
+    }
+}
+
+#[test]
+fn the_k0_report_maps_zero_to_its_midpoint_and_stays_off_the_open_ends() {
+    assert_eq!(gnb_rx_tx_k0_report(0.0), 985_024);
+    assert_eq!(gnb_rx_tx_k0_report(multi_rtt::T_C_SECONDS), 985_025);
+    assert_eq!(gnb_rx_tx_k0_report(1.0), 1_970_048);
+    assert_eq!(gnb_rx_tx_k0_report(-1.0), 1);
+}
+
+#[test]
+fn cell_time_counts_frames_and_30_khz_slots_from_sfn_0() {
+    assert_eq!(
+        CellTime::from_micros_since_sfn0(0),
+        CellTime { sfn: 0, slot: 0 }
+    );
+    assert_eq!(
+        CellTime::from_micros_since_sfn0(9_999),
+        CellTime { sfn: 0, slot: 19 }
+    );
+    assert_eq!(
+        CellTime::from_micros_since_sfn0(10_000),
+        CellTime { sfn: 1, slot: 0 }
+    );
+    assert_eq!(
+        CellTime::from_micros_since_sfn0(10_240_000 + 25_600),
+        CellTime { sfn: 2, slot: 11 },
+        "SFN wraps every 1024 frames"
+    );
+}
+
+#[test]
+fn point_a_is_half_the_carrier_below_its_centre() {
+    // 51 PRBs * 12 * 30 kHz / 2 = 9180 kHz: 612 steps of 15 kHz at 3.5 GHz.
+    assert_eq!(srs_point_a(632_628), 632_628 - 612);
+    // 1836 steps of 5 kHz below 3 GHz.
+    assert_eq!(srs_point_a(400_000), 400_000 - 1836);
+}
+
 /// #374: the Routing ID is mandatory in the downlink UE-associated transport
 /// (TS 38.413 §9.2.9.1), and the answer must echo it, so a transport without
 /// one is refused.
@@ -810,4 +1272,38 @@ fn a_ue_associated_transport_without_a_routing_id_is_refused() {
         parse_downlink_nrppa_transport(&dl),
         Err(NrppaError::MissingMandatoryIe("RoutingID"))
     ));
+}
+
+/// #376 review: each `resourceType` of `RequestedSRSTransmissionCharacteristics`
+/// (`ENUMERATED {periodic, semi-persistent, aperiodic, ...}`, TS 38.455) maps to
+/// its own SRS resource type.
+#[test]
+fn each_requested_srs_resource_type_is_parsed_as_itself() {
+    let mut pdu = decode_hex_nrppa(LMFD_POSITIONING_INFORMATION_REQUEST);
+    for (value, expected) in [
+        (0, SrsResourceType::Periodic),
+        (1, SrsResourceType::SemiPersistent),
+        (2, SrsResourceType::Aperiodic),
+    ] {
+        if let nrppa::NRPPA_PDU::InitiatingMessage(init) = &mut pdu {
+            if let nrppa::InitiatingMessageValue::Id_positioningInformationExchange(req) =
+                &mut init.value
+            {
+                for ie in &mut req.protocol_i_es.0 {
+                    if let nrppa::PositioningInformationRequestProtocolIEs_EntryValue::Id_RequestedSRSTransmissionCharacteristics(chars) = &mut ie.value {
+                        chars.resource_type =
+                            nrppa::RequestedSRSTransmissionCharacteristicsResourceType(value);
+                    }
+                }
+            }
+        }
+        let request = parse_downlink_nrppa_transport(&wrap_dl_ue_associated(&pdu, 7, 8)).unwrap();
+        assert_eq!(
+            request.procedure,
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: Some(expected)
+            },
+            "resourceType {value}"
+        );
+    }
 }

@@ -508,6 +508,7 @@ mod tests {
             sctp_tx: TaskHandle::new(sctp_tx),
             sixg: None,
             rel18: None,
+            ue_distances: crate::tasks::UeDistances::default(),
         }
     }
 
