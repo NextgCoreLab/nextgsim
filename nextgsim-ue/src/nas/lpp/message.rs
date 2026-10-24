@@ -531,6 +531,23 @@ fn read_r16_group_nr_ecid(r: &mut UperReader<'_>, members: usize) -> UperResult<
     Ok(present[0])
 }
 
+/// A `RequestCapabilities`' extension additions: whether its r16 group asks for
+/// the NR E-CID capabilities. TS 37.355 §5.1.3 has the target answer for each
+/// requested method it supports, so a request that also names methods this UE
+/// lacks (Multi-RTT, DL-TDOA, the r13 sensor/TBS/WLAN/Bluetooth group, ...) is
+/// answered for E-CID and NR E-CID alone rather than refused (#377).
+fn read_capability_request_nr_ecid(r: &mut UperReader<'_>) -> UperResult<bool> {
+    let mut additions = r.read_extension_additions()?;
+    let Some(group) = additions.get_mut(R16_GROUP).and_then(Option::take) else {
+        return Ok(false);
+    };
+    let mut g = UperReader::new(&group);
+    let (_, present) = g.read_sequence_preamble(false, R16_CAPABILITY_MEMBERS)?;
+    // NR-ECID-RequestCapabilities-r16 is the group's first member, so nothing
+    // after it needs reading.
+    Ok(present[0])
+}
+
 /// What a present `commonIEs` root member means for a given `-r9` body.
 ///
 /// The distinction is not cosmetic: the two shapes have different *content*, so
@@ -1083,19 +1100,7 @@ impl LppBody {
                         r.skip_extension_additions()?;
                     }
                 }
-                let mut nr_ecid_requested = false;
-                if additions {
-                    if let Some(group) = read_r16_group(r)? {
-                        let mut g = UperReader::new(&group);
-                        if read_r16_group_nr_ecid(&mut g, R16_CAPABILITY_MEMBERS)? {
-                            let (inner_additions, _) = g.read_sequence_preamble(true, 0)?;
-                            if inner_additions {
-                                g.skip_extension_additions()?;
-                            }
-                            nr_ecid_requested = true;
-                        }
-                    }
-                }
+                let nr_ecid_requested = additions && read_capability_request_nr_ecid(r)?;
                 Ok(Self::RequestCapabilities {
                     ecid_requested: ecid,
                     nr_ecid_requested,

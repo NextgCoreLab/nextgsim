@@ -1084,6 +1084,43 @@ mod tests {
         assert_eq!(endpoint.replies_sent(), 1);
     }
 
+    /// nextgcore lmfd's RequestCapabilities (#906, `build_lpp_request_capabilities`,
+    /// transaction 5): E-UTRA E-CID, NR E-CID, NR Multi-RTT and NR DL-TDOA.
+    const LMFD_REQUEST_CAPABILITIES_T5: [u8; 8] = [0x90, 0x0A, 0x00, 0x88, 0x09, 0x00, 0xE8, 0x00];
+
+    /// #377, TS 37.355 §5.1.3: a request that also asks for methods this UE
+    /// lacks is answered for the ones it supports. It used to be refused whole
+    /// ("LPP NR positioning other than NR E-CID"), so lmfd took the UE's
+    /// capability as unknown and asked it for Multi-RTT.
+    #[test]
+    fn a_capability_request_naming_unsupported_methods_is_answered_for_the_supported_ones() {
+        assert_eq!(
+            LppMessage::decode(&LMFD_REQUEST_CAPABILITIES_T5)
+                .expect("lmfd's request decodes")
+                .body,
+            Some(LppBody::RequestCapabilities {
+                ecid_requested: true,
+                nr_ecid_requested: true,
+            })
+        );
+        let mut endpoint = LppEndpoint::new();
+        let LppReaction::Reply(reply) =
+            endpoint.handle_downlink(&LMFD_REQUEST_CAPABILITIES_T5, &measurements(), &[])
+        else {
+            panic!("§5.1.3: the request must be answered");
+        };
+        let decoded = LppMessage::decode(&reply).expect("the reply decodes");
+        assert_eq!(
+            decoded.transaction_id.map(|t| t.transaction_number),
+            Some(5)
+        );
+        assert!(
+            matches!(decoded.body, Some(LppBody::ProvideCapabilities { .. })),
+            "{:?}",
+            decoded.body
+        );
+    }
+
     #[test]
     fn the_advertised_capabilities_are_the_ones_the_ue_then_reports() {
         // The two halves of the transaction must not disagree: a claimed measurement
