@@ -35,6 +35,7 @@ use nextgsim_gnb::tasks::{
 use nextgsim_gnb::RlsTask as GnbRlsTask;
 use nextgsim_gnb::Task as GnbTask;
 use nextgsim_pdcp::{Pdcp, PdcpConfig, PdcpSnSize};
+use nextgsim_rls::RrcChannel;
 use nextgsim_ue::rls::{RlsTask as UeRlsTask, RlsTaskConfig};
 use nextgsim_ue::{
     NasMessage, RlsMessage as UeRlsMessage, Task as UeTask, TaskMessage as UeTaskMessage,
@@ -408,8 +409,29 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
         // Drain as we go, so no 64-deep channel fills.
         drain_all(&mut h);
     }
-    // Long enough for t-Reordering to flush anything the old entities still held.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Barrier on the first phase: a marker each way, sent after all of it. Each
+    // RX entity delivers in COUNT order, so once both markers are up nothing
+    // from the first phase is still held (a lost PDU before a marker holds it
+    // only until t-Reordering expires).
+    const MARKER: [u8; 5] = [0x55; 5];
+    h.gnb_rls_tx
+        .send(GnbRlsMessage::DownlinkData {
+            ue_id,
+            psi: PSI,
+            drb_id: DRB_ID,
+            pdu: OctetString::from_slice(&MARKER),
+        })
+        .await
+        .expect("gNB RLS task alive");
+    h.ue_rls_tx
+        .send(UeRlsMessage::DataPduDelivery {
+            psi: PSI,
+            pdu: OctetString::from_slice(&MARKER),
+        })
+        .await
+        .expect("UE RLS task alive");
+    collect_at_ue_where(&mut h.ue_nas_rx, 1, |sdu| sdu == MARKER).await;
+    collect_at_gnb_where(&mut h.gnb_gtp_rx, 1, |sdu| sdu == MARKER).await;
     drain_all(&mut h);
 
     // The new connection: the gNB's entities go (a restart, or AN release then
@@ -418,10 +440,34 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
         .send(GnbRlsMessage::ReleaseUeDrbs { ue_id })
         .await
         .expect("gNB RLS task alive");
-    // The gNB task reads its channel in order, so its release precedes the
-    // downlink below. Its uplink RX entity must also be gone before the probe
-    // further down reaches it; a channel message is processed in microseconds.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Barrier on the gNB release: the gNB task reads its channel in order, so
+    // once this RRC PDU (sent after the release) reaches the UE, the gNB's DRB
+    // entities are the new ones, its uplink RX entity included. It goes on an
+    // SRB, so no DRB COUNT moves.
+    const GNB_PROBE: [u8; 3] = [0x66; 3];
+    h.gnb_rls_tx
+        .send(GnbRlsMessage::DownlinkRrc {
+            ue_id,
+            rrc_channel: RrcChannel::DlDcch,
+            pdu_id: 0,
+            data: OctetString::from_slice(&GNB_PROBE),
+        })
+        .await
+        .expect("gNB RLS task alive");
+    tokio::time::timeout(DELIVERY_TIMEOUT, async {
+        loop {
+            match h.ue_rrc_rx.recv().await {
+                Some(UeTaskMessage::Message(nextgsim_ue::RrcMessage::DownlinkRrcDelivery {
+                    pdu,
+                    ..
+                })) if pdu.data() == GNB_PROBE => break,
+                Some(_) => continue,
+                None => panic!("UE RRC channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("the gNB's RRC probe must reach the UE");
     drain_all(&mut h);
     h.ue_rls_tx
         .send(UeRlsMessage::ReleaseDrbs)
@@ -455,10 +501,10 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
             .await
             .expect("gNB RLS task alive");
     }
-    // The new connection's SDUs are 24 octets; a first-phase one (4 octets) still
-    // on the loopback when the connection was replaced is not part of it.
+    // The new connection's SDUs are 24 octets: the first phase's are 4, the
+    // markers 5 and the uplink probe 8.
     let delivered: Vec<Vec<u8>> =
-        collect_at_ue_where(&mut h.ue_nas_rx, after.len(), |sdu| sdu.len() != 4).await;
+        collect_at_ue_where(&mut h.ue_nas_rx, after.len(), |sdu| sdu.len() == 24).await;
     // Delivered at once, by a fresh RX entity. The UE's OLD entity (RX_DELIV at
     // 2100) reads SN 0..9 as COUNT 4096.. and holds them until t-Reordering
     // (1000 ms, PdcpConfig::default) expires, so without the release they still
@@ -486,9 +532,6 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
             .await
             .expect("UE RLS task alive");
     }
-    let at_gnb = collect_at_gnb_where(&mut h.gnb_gtp_rx, after.len(), |sdu| {
-        sdu.len() != 4 && sdu != PROBE
-    })
-    .await;
+    let at_gnb = collect_at_gnb_where(&mut h.gnb_gtp_rx, after.len(), |sdu| sdu.len() == 24).await;
     assert_eq!(at_gnb, after, "and so does the uplink");
 }
