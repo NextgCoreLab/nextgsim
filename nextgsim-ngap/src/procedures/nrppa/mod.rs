@@ -585,13 +585,13 @@ fn build_e_cid_response(
 /// Build a `PositioningInformationResponse` (§8.2.6, procedure 9, successful
 /// outcome).
 ///
-/// Every IE of this message is OPTIONAL (TS 38.455 §9.1.11). The gNB has no SRS
-/// configured for the target on an NRPPa-only path, so what it can honestly
-/// supply is the SFN timing reference: `id-SFNInitialisationTime`
-/// (`RelativeTime1900 ::= BIT STRING (SIZE(64))`), the NTP-format instant at
-/// which SFN 0 of the serving cell began. That is precisely the datum an LMF
-/// needs to relate a UE's reported timing to absolute time, so the response is
-/// informative rather than empty.
+/// Every IE of this message is OPTIONAL (TS 38.455 §9.1.11). It always carries
+/// the SFN timing reference, `id-SFNInitialisationTime`
+/// (`RelativeTime1900 ::= BIT STRING (SIZE(64))`): the NTP-format instant at
+/// which SFN 0 of the serving cell began, which an LMF needs to relate reported
+/// timing to absolute time. When the request asked for SRS, `srs` is the SRS
+/// this node configured for the UE and goes in as `id-SRSConfiguration`
+/// (§8.2.6.2, #347).
 fn build_positioning_information_response(
     transaction_id: u16,
     sfn_initialisation_time: u64,

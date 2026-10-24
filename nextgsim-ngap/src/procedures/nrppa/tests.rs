@@ -1273,3 +1273,37 @@ fn a_ue_associated_transport_without_a_routing_id_is_refused() {
         Err(NrppaError::MissingMandatoryIe("RoutingID"))
     ));
 }
+
+/// #376 review: each `resourceType` of `RequestedSRSTransmissionCharacteristics`
+/// (`ENUMERATED {periodic, semi-persistent, aperiodic, ...}`, TS 38.455) maps to
+/// its own SRS resource type.
+#[test]
+fn each_requested_srs_resource_type_is_parsed_as_itself() {
+    let mut pdu = decode_hex_nrppa(LMFD_POSITIONING_INFORMATION_REQUEST);
+    for (value, expected) in [
+        (0, SrsResourceType::Periodic),
+        (1, SrsResourceType::SemiPersistent),
+        (2, SrsResourceType::Aperiodic),
+    ] {
+        if let nrppa::NRPPA_PDU::InitiatingMessage(init) = &mut pdu {
+            if let nrppa::InitiatingMessageValue::Id_positioningInformationExchange(req) =
+                &mut init.value
+            {
+                for ie in &mut req.protocol_i_es.0 {
+                    if let nrppa::PositioningInformationRequestProtocolIEs_EntryValue::Id_RequestedSRSTransmissionCharacteristics(chars) = &mut ie.value {
+                        chars.resource_type =
+                            nrppa::RequestedSRSTransmissionCharacteristicsResourceType(value);
+                    }
+                }
+            }
+        }
+        let request = parse_downlink_nrppa_transport(&wrap_dl_ue_associated(&pdu, 7, 8)).unwrap();
+        assert_eq!(
+            request.procedure,
+            NrppaProcedure::PositioningInformationExchange {
+                requested_srs: Some(expected)
+            },
+            "resourceType {value}"
+        );
+    }
+}
