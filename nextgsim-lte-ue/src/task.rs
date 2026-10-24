@@ -50,6 +50,46 @@ impl IpIo {
     }
 }
 
+/// A command to the running UE from outside the task (the `lte-ue detach`
+/// control socket, #365).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// UE-initiated detach (TS 24.301 §5.5.2.2).
+    Detach {
+        /// The detach type's switch-off bit (§9.9.3.7): no DETACH ACCEPT follows.
+        switch_off: bool,
+    },
+}
+
+/// The next control command, or never when the UE has no control channel.
+async fn next_command(
+    control: &mut Option<mpsc::UnboundedReceiver<ControlCommand>>,
+) -> ControlCommand {
+    match control {
+        Some(rx) => match rx.recv().await {
+            Some(cmd) => cmd,
+            None => {
+                *control = None;
+                std::future::pending().await
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// [`run`], also taking [`ControlCommand`]s (#365).
+pub async fn run_with_control(
+    cfg: &LteUeConfig,
+    nas: Box<dyn NasLayer>,
+    socket: UdpSocket,
+    state_tx: watch::Sender<UeRrcState>,
+    stop: watch::Receiver<bool>,
+    ip: IpIo,
+    control: mpsc::UnboundedReceiver<ControlCommand>,
+) -> std::io::Result<()> {
+    run_inner(cfg, nas, socket, state_tx, stop, ip, Some(control)).await
+}
+
 /// Run the UE until `stop` fires. Every state change is published on the
 /// returned watch channel, so a caller (a test, or a future CLI) can follow
 /// the RRC state without polling the task.
@@ -58,8 +98,20 @@ pub async fn run(
     nas: Box<dyn NasLayer>,
     socket: UdpSocket,
     state_tx: watch::Sender<UeRrcState>,
+    stop: watch::Receiver<bool>,
+    ip: IpIo,
+) -> std::io::Result<()> {
+    run_inner(cfg, nas, socket, state_tx, stop, ip, None).await
+}
+
+async fn run_inner(
+    cfg: &LteUeConfig,
+    nas: Box<dyn NasLayer>,
+    socket: UdpSocket,
+    state_tx: watch::Sender<UeRrcState>,
     mut stop: watch::Receiver<bool>,
     mut ip: IpIo,
+    mut control: Option<mpsc::UnboundedReceiver<ControlCommand>>,
 ) -> std::io::Result<()> {
     let sti = cfg.sti.unwrap_or_else(rand::random);
     let search = cfg
@@ -111,6 +163,15 @@ pub async fn run(
                 acts
             }
             _ = sleep => rrc.on_timer(Instant::now()),
+            cmd = next_command(&mut control) => match cmd {
+                ControlCommand::Detach { switch_off } => {
+                    log::info!(
+                        "control: detach requested{}",
+                        if switch_off { " (switch off)" } else { "" }
+                    );
+                    rrc.detach(switch_off, Instant::now())
+                }
+            },
             Some(packet) = ip.uplink.recv() => rrc.send_ip(&packet, Instant::now()),
             r = socket.recv_from(&mut buf) => {
                 let (n, from) = r?;

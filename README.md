@@ -152,7 +152,8 @@ The UE puts the default bearer's PDN address on a TUN (`lteuetun5`), which
 needs `cap_add: [NET_ADMIN]` and `devices: [/dev/net/tun:/dev/net/tun]`.
 `docker exec <ue> lte-ue-ping-check <target> [count]` then waits for that
 address and asserts a 0%-loss ping through the PDN (exit 0 pass, 1 no bearer,
-2 loss).
+2 loss). `docker exec <ue> lte-ue-detach [--switch-off]` makes the UE detach
+(TS 24.301 §5.5.2.2) and exits 0 once it is EMM-DEREGISTERED.
 
 ## Workspace Structure
 

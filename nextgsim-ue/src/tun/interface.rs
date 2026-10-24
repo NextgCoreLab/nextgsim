@@ -206,6 +206,20 @@ impl TunInterface {
         Ok(())
     }
 
+    /// Brings the interface up or down, keeping it (#365: a detached LTE UE has
+    /// no PDN connection to carry, so its TUN goes down).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the link state cannot be changed.
+    pub fn set_up(&self, up: bool) -> Result<(), TunError> {
+        self.device
+            .enabled(up)
+            .map_err(|e| TunError::ConfigureFailed(format!("failed to set the link state: {e}")))?;
+        info!(name = %self.name, up, "TUN interface link state changed");
+        Ok(())
+    }
+
     /// Returns the name of the TUN interface.
     #[must_use]
     pub fn name(&self) -> &str {
