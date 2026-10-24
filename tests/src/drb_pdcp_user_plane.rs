@@ -443,6 +443,7 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
     collect_at_gnb_where(&mut h.gnb_gtp_rx, 1, |sdu| sdu == PROBE).await;
 
     let after: Vec<Vec<u8>> = (0..10u8).map(|i| vec![0xE0 + i; 24]).collect();
+    let sent_at = std::time::Instant::now();
     for payload in &after {
         h.gnb_rls_tx
             .send(GnbRlsMessage::DownlinkData {
@@ -458,6 +459,17 @@ async fn drb_traffic_survives_a_new_rrc_connection_after_2048_pdus() {
     // on the loopback when the connection was replaced is not part of it.
     let delivered: Vec<Vec<u8>> =
         collect_at_ue_where(&mut h.ue_nas_rx, after.len(), |sdu| sdu.len() != 4).await;
+    // Delivered at once, by a fresh RX entity. The UE's OLD entity (RX_DELIV at
+    // 2100) reads SN 0..9 as COUNT 4096.. and holds them until t-Reordering
+    // (1000 ms, PdcpConfig::default) expires, so without the release they still
+    // arrive, in order, a second late. The bound is what tells the two apart
+    // (#364 review).
+    let waited = sent_at.elapsed();
+    assert!(
+        waited < Duration::from_millis(500),
+        "the new connection's SDUs waited {waited:?}: they went through t-Reordering, \
+         so the UE kept its old RX entity"
+    );
     assert_eq!(
         delivered, after,
         "traffic on the new connection arrives in order"

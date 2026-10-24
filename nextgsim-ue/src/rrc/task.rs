@@ -5485,6 +5485,59 @@ mod tests {
         nas
     }
 
+    /// The L2 messages RRC sent RLS, in order (#364 review).
+    fn drb_l2_messages(rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                TaskMessage::Message(RlsMessage::ReleaseDrbs) => out.push("release"),
+                TaskMessage::Message(RlsMessage::ReestablishDrbs) => out.push("reestablish"),
+                TaskMessage::Message(RlsMessage::AssignCurrentCell { .. }) => out.push("cell"),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// #315 / #364 review: a new RRC connection releases the DRB L2 entities an
+    /// earlier connection left on the RLS task, on the RRCSetup itself (TS 38.331
+    /// §5.3.3.4: the connection carries SRB1 only, so its DRBs start fresh).
+    #[test]
+    fn an_rrc_setup_releases_the_drb_entities() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camp_and_request(&mut task, &mut rls_rx).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_downlink_rrc(
+                1,
+                RrcChannel::DlCcch,
+                OctetString::from_slice(&GOLDEN_RRC_SETUP_SRB1_TID0),
+            )
+            .await;
+            assert_eq!(drb_l2_messages(&mut rls_rx), vec!["release"]);
+        });
+    }
+
+    /// #315 / #364 review: a completed handover (a reconfiguration with sync)
+    /// re-establishes the DRBs' PDCP and RLC (TS 38.323 §5.1.2, TS 38.322 §5.1.2),
+    /// before the UE switches to the target cell.
+    #[test]
+    fn a_completed_handover_reestablishes_the_drb_entities_before_the_switch() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -70).await;
+            while rls_rx.try_recv().is_ok() {}
+            let pdu = handover_command_pdu(2, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(task.serving_cell_id, Some(2), "precondition: completed");
+            assert_eq!(drb_l2_messages(&mut rls_rx), vec!["reestablish", "cell"]);
+        });
+    }
+
     // ========================================================================
     // Inter-gNB handover key derivation (issue #39)
     // ========================================================================

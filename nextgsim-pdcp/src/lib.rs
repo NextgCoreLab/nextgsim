@@ -195,6 +195,9 @@ impl PdcpSecurity {
 #[derive(Debug, Clone)]
 struct PendingSdu {
     count: u32,
+    /// The SDU itself, so a re-establishment can transmit it again under a new
+    /// COUNT (TS 38.323 §5.1.2, #364 review).
+    sdu: Vec<u8>,
     pdu: Vec<u8>,
     armed_at_ms: u64,
 }
@@ -258,8 +261,15 @@ impl Pdcp {
     /// Re-establish the entity (TS 38.323 §5.1.2) for a UM DRB, keeping its
     /// configuration and security (#315).
     ///
-    /// Transmit side: `TX_NEXT` back to its initial value, every stored PDU
-    /// discarded. Receive side: `t-Reordering` stopped, every SDU held in the
+    /// Transmit side: `TX_NEXT` back to its initial value; then, for a UM DRB,
+    /// "for each PDCP SDU already associated with a PDCP SN but for which a
+    /// corresponding PDU has not previously been submitted to lower layers", the
+    /// SDU is considered "as received from upper layer" and transmitted again
+    /// "in ascending order of the COUNT value associated to the PDCP SDU prior to
+    /// the PDCP re-establishment without restarting the discardTimer" (§5.1.2;
+    /// discarding them is the rule for SRBs). They take new COUNTs from 0 and the
+    /// security in force, so a caller with new keys installs them with
+    /// [`Self::set_security`] first. Receive side: `t-Reordering` stopped, every SDU held in the
     /// reception buffer delivered (returned here in ascending COUNT order), and
     /// `RX_NEXT`/`RX_DELIV`/`RX_REORD` back to their initial values. The keys stay
     /// as installed: §5.1.2 applies keys "provided by upper layers", and a caller
@@ -272,7 +282,11 @@ impl Pdcp {
     pub fn reestablish(&mut self) -> Vec<Vec<u8>> {
         let delivered: Vec<Vec<u8>> = std::mem::take(&mut self.rx_buffer).into_values().collect();
         self.tx_next = 0;
-        self.tx_pending.clear();
+        let mut pending = std::mem::take(&mut self.tx_pending);
+        pending.sort_by_key(|p| p.count);
+        for p in pending {
+            self.submit_sdu(&p.sdu, p.armed_at_ms);
+        }
         self.rx_next = 0;
         self.rx_deliv = 0;
         self.rx_reord = 0;
@@ -403,6 +417,7 @@ impl Pdcp {
 
         self.tx_pending.push(PendingSdu {
             count,
+            sdu: sdu.to_vec(),
             pdu,
             armed_at_ms: now_ms,
         });
@@ -795,6 +810,41 @@ mod tests {
         assert_eq!((e.rx_next(), e.rx_deliv(), e.rx_reord()), (0, 0, 0));
         assert!(!e.t_reordering_running());
         assert!(e.security().is_some(), "the keys stay");
+    }
+
+    /// #364 review, TS 38.323 §5.1.2: SDUs that had an SN but were not yet
+    /// submitted to lower layers are transmitted again after the re-establishment,
+    /// in their old COUNT order, under new COUNTs from 0, and keep their
+    /// discardTimer.
+    #[test]
+    fn a_reestablishment_transmits_the_unsent_sdus_again() {
+        let mut e = Pdcp::new(PdcpConfig {
+            discard_timer_ms: Some(100),
+            ..PdcpConfig::default()
+        });
+        for _ in 0..5 {
+            e.submit_sdu(&[0], 0);
+        }
+        e.take_transmittable(0); // COUNT 0..4 went to RLC
+        e.submit_sdu(&[0xA], 10);
+        e.submit_sdu(&[0xB], 10); // COUNT 5, 6: SN assigned, not yet submitted
+        e.reestablish();
+        assert_eq!(e.tx_count_for_next_sdu(), 2, "re-sent at COUNT 0 and 1");
+        let sent = e.take_transmittable(20);
+        assert_eq!(
+            sent,
+            vec![
+                pdu(PdcpSnSize::Sn12, 0, &[0xA]),
+                pdu(PdcpSnSize::Sn12, 1, &[0xB])
+            ]
+        );
+        // The discardTimer was not restarted: armed at 10, it expires at 110.
+        e.submit_sdu(&[0xC], 10);
+        e.reestablish();
+        assert!(
+            e.take_transmittable(110).is_empty(),
+            "discarded on the original timer"
+        );
     }
 
     // ---- header and SN/COUNT (§5.2.1, §6.2.2.2/§6.2.2.3) ----
