@@ -5933,6 +5933,44 @@ mod tests {
         });
     }
 
+    /// #315 / #364 review: an RRCRelease takes every radio bearer's PDCP and RLC
+    /// entity with the connection (TS 38.331 §5.3.11), so RLS releases the DRBs.
+    #[test]
+    fn an_rrc_release_releases_the_drb_entities() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, plain_release())
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            assert_eq!(drb_l2_messages(&mut rls_rx), vec!["release"]);
+        });
+    }
+
+    /// #315 / #364 review: a radio link failure that ends in RRC_IDLE (no AS
+    /// security, so no re-establishment) releases the radio bearers too
+    /// (§5.3.10.3, §5.3.11).
+    #[test]
+    fn going_idle_after_a_radio_link_failure_releases_the_drb_entities() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_and_connected_without_keys(&mut task, &mut rls_rx).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            let seen = drb_l2_messages(&mut rls_rx);
+            assert_eq!(
+                seen.iter().filter(|m| **m == "release").count(),
+                1,
+                "{seen:?}"
+            );
+        });
+    }
+
     /// #315 / #364 review: a completed handover (a reconfiguration with sync)
     /// re-establishes the DRBs' PDCP and RLC (TS 38.323 §5.1.2, TS 38.322 §5.1.2),
     /// before the UE switches to the target cell.

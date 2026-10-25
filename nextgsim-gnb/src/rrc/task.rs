@@ -5568,6 +5568,59 @@ mod tests {
         out
     }
 
+    /// The DRB release and downlink RRC messages RRC sent RLS, in order (#364).
+    fn drb_release_and_downlinks(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RlsMessage>>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
+            match msg {
+                crate::tasks::RlsMessage::ReleaseUeDrbs { ue_id } => {
+                    out.push(format!("release drbs {ue_id}"));
+                }
+                crate::tasks::RlsMessage::DownlinkRrc {
+                    ue_id, rrc_channel, ..
+                } => out.push(format!("{rrc_channel:?} to {ue_id}")),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// #315 / #364 review: a new RRC connection leaves no DRB L2 entity behind
+    /// (TS 38.331 §5.3.3.4: it carries SRB1 only), so RLS is told to release
+    /// the UE's DRB entities before the RRCSetup goes out.
+    #[test]
+    fn an_rrc_setup_releases_the_ues_drb_entities() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 3).await;
+        });
+        assert_eq!(
+            drb_release_and_downlinks(&mut rls_rx),
+            vec!["release drbs 3".to_string(), "DlCcch to 3".to_string()]
+        );
+    }
+
+    /// #315 / #364 review: an AN release takes the UE's DRB L2 entities with
+    /// the connection (TS 38.331 §5.3.11), after the RRCRelease.
+    #[test]
+    fn an_an_release_releases_the_ues_drb_entities() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_pending_setup(&mut task, 4).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_an_release(4).await;
+        });
+        let seen = drb_release_and_downlinks(&mut rls_rx);
+        assert_eq!(seen.last(), Some(&"release drbs 4".to_string()), "{seen:?}");
+        assert_eq!(seen.iter().filter(|m| m.starts_with("release")).count(), 1);
+    }
+
     /// The HANDOVER NOTIFYs an RRC task under test reported, by UE id.
     fn notified(rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>) -> Vec<i32> {
         let mut out = Vec::new();
