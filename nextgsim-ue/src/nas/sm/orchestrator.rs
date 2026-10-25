@@ -940,6 +940,12 @@ impl SmOrchestrator {
             );
             return Vec::new();
         }
+        self.send_release_request(psi, SmCause::RegularDeactivation)
+    }
+
+    /// Send a PDU SESSION RELEASE REQUEST for `psi` with `cause` on a fresh PTI, and
+    /// start T3582 (TS 24.501 §6.4.3.2). The session goes to INACTIVE PENDING.
+    fn send_release_request(&mut self, psi: u8, cause: SmCause) -> Vec<SmOutput> {
         let Some(pti) = self.pt.allocate() else {
             warn!("No free procedure transaction identity");
             return Vec::new();
@@ -953,7 +959,7 @@ impl SmOrchestrator {
         }
 
         let mut req = PduSessionReleaseRequest::new(psi, pti);
-        req.sm_cause = Some(ie3_cause(SmCause::RegularDeactivation));
+        req.sm_cause = Some(ie3_cause(cause));
         let mut sm_pdu = Vec::new();
         req.encode(&mut sm_pdu);
         let ul_pdu = build_ul_transport(sm_pdu, psi, None, None, None);
@@ -971,7 +977,10 @@ impl SmOrchestrator {
             },
         );
 
-        info!("Sending PDU Session Release Request: PSI={psi}, PTI={pti}, T3582 started");
+        info!(
+            "Sending PDU Session Release Request: PSI={psi}, PTI={pti}, cause #{}, T3582 started",
+            cause as u8
+        );
         vec![SmOutput::SendNasPdu(ul_pdu)]
     }
 
@@ -1326,12 +1335,27 @@ impl SmOrchestrator {
         let acc = match PduSessionEstablishmentAccept::decode(&mut &body[..], psi, pti) {
             Ok(acc) => acc,
             Err(e) => {
-                // TS 24.501 7.7.2: missing/invalid mandatory IE -> 5GSM
-                // Status with cause #96; the procedure keeps running (T3580
-                // will retransmit the request). Only the spec-conformant wire
-                // format (Table 8.3.2.1.1) is accepted.
-                warn!("Establishment Accept failed strict decoding: {e:?}");
-                return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
+                // TS 24.501 §7.5.3 a): a mandatory-IE error in a PDU SESSION
+                // ESTABLISHMENT ACCEPT is answered by releasing the session, with a
+                // PDU SESSION RELEASE REQUEST carrying #96 (nextgsim #383). It is the
+                // listed exception to §7.5.1's 5GSM STATUS. The network has
+                // established the session, so the establishment procedure ends here
+                // (T3580 stops) and the release procedure takes over (T3582). Only
+                // the spec-conformant wire format (Table 8.3.2.1.1) is accepted.
+                warn!(
+                    "Establishment Accept failed strict decoding: {e:?}; releasing PSI {psi} \
+                     with #96 (TS 24.501 §7.5.3 a)"
+                );
+                self.pt.abort(pti);
+                self.pending.remove(&pti);
+                // The attempt has failed for the layers above (#386 review); the
+                // release request then ends the session the network holds.
+                let mut outs = vec![SmOutput::SessionEstablishmentFailed {
+                    psi,
+                    cause: SmCause::InvalidMandatoryInformation,
+                }];
+                outs.extend(self.send_release_request(psi, SmCause::InvalidMandatoryInformation));
+                return outs;
             }
         };
 
@@ -1731,8 +1755,31 @@ impl SmOrchestrator {
         let cmd = match PduSessionReleaseCommand::decode(&mut &body[..], psi, pti) {
             Ok(cmd) => cmd,
             Err(e) => {
-                warn!("Failed to decode Release Command: {e:?}");
-                return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
+                // TS 24.501 §7.5.3 c): a mandatory-IE error in a PDU SESSION RELEASE
+                // COMMAND is answered with PDU SESSION RELEASE COMPLETE carrying #96,
+                // not 5GSM STATUS (nextgsim #383). The complete ends the release, so
+                // the session is released here too.
+                warn!(
+                    "Failed to decode Release Command: {e:?}; Release Complete #96 \
+                     (TS 24.501 §7.5.3 c)"
+                );
+                if pti != 0
+                    && self
+                        .validate_response_pt(pti, psi, PtMessageType::PduSessionReleaseRequest)
+                        .is_ok()
+                {
+                    self.pt.abort(pti);
+                    self.pending.remove(&pti);
+                }
+                let _ = self.take_session(psi);
+                let mut complete = PduSessionReleaseComplete::new(psi, pti);
+                complete.sm_cause = Some(ie3_cause(SmCause::InvalidMandatoryInformation));
+                let mut sm_pdu = Vec::new();
+                complete.encode(&mut sm_pdu);
+                return vec![
+                    SmOutput::SendNasPdu(build_ul_transport(sm_pdu, psi, None, None, None)),
+                    SmOutput::SessionReleased { psi },
+                ];
             }
         };
         let cause = SmCause::try_from(cmd.cause() as u8).unwrap_or_default();
@@ -2063,23 +2110,64 @@ mod tests {
         assert!(orch.pt.get(pti).unwrap().is_inactive());
     }
 
+    /// TS 24.501 §7.5.3 a) (nextgsim #383): what the UE sends for an ESTABLISHMENT
+    /// ACCEPT with a bad mandatory IE: a RELEASE REQUEST #96 on a new PTI, not 5GSM
+    /// STATUS. The establishment PTI is released, and the session is INACTIVE PENDING
+    /// under T3582.
+    fn assert_release_request_96(orch: &SmOrchestrator, outs: &[SmOutput], psi: u8, pti: u8) {
+        assert_eq!(outs.len(), 2, "{outs:?}");
+        assert_eq!(
+            outs[0],
+            SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::InvalidMandatoryInformation
+            },
+            "the attempt is reported failed"
+        );
+        let (t, inner) = unwrap_ul(first_sent_pdu(outs));
+        assert_eq!(t.pdu_session_id, Some(psi));
+        assert_eq!(
+            inner[3], 0xD1,
+            "PDU SESSION RELEASE REQUEST, not 5GSM STATUS"
+        );
+        let rel_pti = inner[2];
+        let req = PduSessionReleaseRequest::decode(&mut &inner[4..], psi, rel_pti).unwrap();
+        assert_eq!(
+            req.sm_cause.unwrap().value as u8,
+            SmCause::InvalidMandatoryInformation as u8
+        );
+        assert_eq!(orch.session(psi).unwrap().state, PsState::InactivePending);
+        // The establishment's PTI was released (it may be reused for the release):
+        // the one pending procedure is the release, under T3582.
+        let pt = orch.pt.get(rel_pti).unwrap();
+        assert!(pt.is_pending());
+        assert_eq!(
+            pt.message_type(),
+            Some(PtMessageType::PduSessionReleaseRequest)
+        );
+        if rel_pti != pti {
+            assert!(
+                orch.pt.get(pti).unwrap().is_inactive(),
+                "T3580's PTI released"
+            );
+        }
+    }
+
     #[test]
-    fn test_establishment_accept_missing_ambr_triggers_status_96() {
+    fn test_establishment_accept_missing_ambr_releases_the_session_with_96() {
         let (mut orch, psi, pti) = started_establishment();
         // Truncate the conformant accept right before the session AMBR:
         // header(4) + octet5(1) + qos LV-E(2+9) = 16
         let bytes = conformant_accept_bytes(psi, pti)[..16].to_vec();
         let outs = orch.handle_dl_nas_transport(&dl_with_container(bytes, psi));
-        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
-        assert_eq!(inner[3], 0xD6, "must reply with 5GSM Status");
-        assert_eq!(
-            inner[4],
-            SmCause::InvalidMandatoryInformation as u8,
-            "cause must be #96"
-        );
-        // Session not activated; the procedure keeps running
-        assert_eq!(orch.session(psi).unwrap().state, PsState::ActivePending);
-        assert!(orch.pt.get(pti).unwrap().is_pending());
+        assert_release_request_96(&orch, &outs, psi, pti);
+
+        // The network's Release Command completes it, as for any UE release.
+        let rel_pti = unwrap_ul(first_sent_pdu(&outs)).1[2];
+        let cmd = vec![0x2E, psi, rel_pti, 0xD3, 96];
+        let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
+        assert!(outs.contains(&SmOutput::SessionReleased { psi }));
+        assert!(orch.session(psi).is_none());
     }
 
     #[test]
@@ -2120,10 +2208,7 @@ mod tests {
 
         let (mut orch, psi, pti) = started_establishment();
         let outs = orch.handle_dl_nas_transport(&dl_with_container(legacy_accept(psi, pti), psi));
-        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
-        assert_eq!(inner[3], 0xD6); // 5GSM Status
-        assert_eq!(inner[4], SmCause::InvalidMandatoryInformation as u8);
-        assert_eq!(orch.session(psi).unwrap().state, PsState::ActivePending);
+        assert_release_request_96(&orch, &outs, psi, pti);
     }
 
     // ========================================================================
@@ -2547,6 +2632,38 @@ mod tests {
         let (t, request) = unwrap_ul(pdus[1]);
         assert_eq!(request[3], 0xC1);
         assert_eq!(t.request_type, Some(RequestType::InitialRequest));
+    }
+
+    /// TS 24.501 §7.5.3 c) (nextgsim #383): a RELEASE COMMAND whose mandatory 5GSM
+    /// cause is missing gets a RELEASE COMPLETE carrying #96, not 5GSM STATUS, and
+    /// the session is released, both network-initiated and as the answer to the UE's
+    /// own release.
+    #[test]
+    fn a_release_command_with_a_bad_mandatory_ie_is_completed_with_96() {
+        for ue_initiated in [false, true] {
+            let (mut orch, psi) = established();
+            let pti = if ue_initiated {
+                unwrap_ul(first_sent_pdu(&orch.start_release(psi))).1[2]
+            } else {
+                0
+            };
+            let cmd = vec![0x2E, psi, pti, 0xD3]; // 5GSM cause (V) missing
+            let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
+            assert_eq!(outs.len(), 2, "{outs:?}");
+            assert_eq!(outs[1], SmOutput::SessionReleased { psi });
+            let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
+            assert_eq!(
+                &inner[..4],
+                &[0x2E, psi, pti, 0xD4],
+                "PDU SESSION RELEASE COMPLETE on the command's PTI, not 5GSM STATUS"
+            );
+            // 5GSM cause IE (TV, IEI 0x59) = #96.
+            assert_eq!(&inner[4..], &[0x59, 96]);
+            assert!(orch.session(psi).is_none());
+            if ue_initiated {
+                assert!(orch.pt.get(pti).unwrap().is_inactive(), "T3582 stopped");
+            }
+        }
     }
 
     #[test]
