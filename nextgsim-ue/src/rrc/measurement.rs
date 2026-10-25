@@ -108,9 +108,11 @@ pub struct ReportTriggerConfig {
     pub threshold1: Option<i32>,
     /// Threshold2 for A5 event (neighbor cell, dBm)
     pub threshold2: Option<i32>,
-    /// Offset for A3 event (dB)
+    /// Offset for A3 event, in the signalled 0.5 dB units (`a3-Offset`, TS 38.331
+    /// §6.3.2: "field value * 0.5 dB"; e.g. 6 = 3 dB)
     pub a3_offset: Option<i32>,
-    /// Offset for A6 event (dB), i.e. `a6-Offset` of TS 38.331 §5.5.4.7
+    /// Offset for A6 event, i.e. `a6-Offset` of TS 38.331 §5.5.4.7, in the same
+    /// 0.5 dB units
     pub a6_offset: Option<i32>,
     /// Hysteresis (dB * 2, e.g., 4 = 2 dB)
     pub hysteresis: i32,
@@ -125,7 +127,7 @@ impl Default for ReportTriggerConfig {
             threshold: None,
             threshold1: None,
             threshold2: None,
-            a3_offset: Some(3), // 3 dB offset
+            a3_offset: Some(6), // 3 dB offset, in 0.5 dB units
             a6_offset: None,
             hysteresis: 2,        // 1 dB
             time_to_trigger: 640, // 640 ms
@@ -320,14 +322,18 @@ fn nr_condition(
     let hyst = trigger.hysteresis / 2;
     let entering = which == Condition::Entering;
 
+    // A3 and A6 are evaluated in 0.5 dB units, the units Off and Hys are
+    // signalled in, so a half-dB offset or hysteresis is not rounded away (#359).
+    let hys_half = trigger.hysteresis;
+
     match event_type {
         // A3-1: Mn + Ocn - Hys > Mp + Ofp + Ocp + Off
         // A3-2: Mn + Ocn + Hys < Mp + Ofp + Ocp + Off
         MeasEventType::A3 => {
-            let off = trigger.a3_offset.unwrap_or(0);
+            let off_half = trigger.a3_offset.unwrap_or(0);
             match reference_rsrp {
-                Some(mp) if entering => neighbour_rsrp > mp + off + hyst,
-                Some(mp) => neighbour_rsrp < mp + off - hyst,
+                Some(mp) if entering => 2 * neighbour_rsrp > 2 * mp + off_half + hys_half,
+                Some(mp) => 2 * neighbour_rsrp < 2 * mp + off_half - hys_half,
                 None => !entering,
             }
         }
@@ -352,10 +358,10 @@ fn nr_condition(
         // A6-1: Mn + Ocn - Hys > Ms + Ocs + Off, with Ms the SCell
         // A6-2: Mn + Ocn + Hys < Ms + Ocs + Off
         MeasEventType::A6 => {
-            let off = trigger.a6_offset.unwrap_or(0);
+            let off_half = trigger.a6_offset.unwrap_or(0);
             match reference_rsrp {
-                Some(ms) if entering => neighbour_rsrp > ms + off + hyst,
-                Some(ms) => neighbour_rsrp < ms + off - hyst,
+                Some(ms) if entering => 2 * neighbour_rsrp > 2 * ms + off_half + hys_half,
+                Some(ms) => 2 * neighbour_rsrp < 2 * ms + off_half - hys_half,
                 None => !entering,
             }
         }
@@ -1116,7 +1122,7 @@ mod tests {
         // Add A3 configuration
         let mut config = MeasConfig::default();
         config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A3);
-        config.trigger_config.a3_offset = Some(3);
+        config.trigger_config.a3_offset = Some(6); // 3 dB
         config.trigger_config.time_to_trigger = 0; // Immediate for test
         manager.add_config(config);
 
@@ -1125,6 +1131,62 @@ mod tests {
 
         // Check event state
         assert_eq!(manager.triggered_cells(1), vec![TriggeringCell::Nr(2)]);
+    }
+
+    /// #359: A3 and A6 offsets and the hysteresis are in the signalled 0.5 dB
+    /// units and are evaluated exactly, in half-dB arithmetic
+    /// (`2*Mn > 2*Mp + Off + Hys`), not truncated to whole dB. The cases are the
+    /// ones whole-dB arithmetic gets wrong: a 0.5 dB offset plus a 0.5 dB
+    /// hysteresis against a 1 dB lead (exactly at the bar: not entered), and a
+    /// -0.5 dB offset with equal levels (entered).
+    const HALF_DB_CASES: [(i32, i32, i32, bool); 6] = [
+        // (neighbour lead over the reference in dB, offset, hysteresis, enters)
+        (2, 3, 0, true),   // 2 dB > 1.5 dB
+        (2, 4, 0, false),  // 2 dB = 2 dB: not strictly above
+        (2, 5, 0, false),  // 2 dB < 2.5 dB
+        (1, 1, 1, false),  // 1 dB = 0.5 + 0.5 dB
+        (0, -1, 0, true),  // 0 dB > -0.5 dB
+        (0, -1, 1, false), // 0 dB = -0.5 + 0.5 dB
+    ];
+
+    #[test]
+    fn a_half_db_a3_offset_is_evaluated_exactly() {
+        for (lead, offset_half_db, hys_half_db, enters) in HALF_DB_CASES {
+            let mut manager = MeasurementManager::new();
+            manager.set_serving_cell(Some(1));
+            manager.update_measurement(1, -90);
+            manager.update_measurement(2, -90 + lead);
+            let mut config = MeasConfig::default();
+            config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A3);
+            config.trigger_config.a3_offset = Some(offset_half_db);
+            config.trigger_config.hysteresis = hys_half_db;
+            config.trigger_config.time_to_trigger = 0;
+            manager.add_config(config);
+            manager.evaluate_events();
+            assert_eq!(
+                !manager.triggered_cells(1).is_empty(),
+                enters,
+                "A3: lead {lead} dB, offset {offset_half_db} / hysteresis {hys_half_db} half-dB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_db_a6_offset_is_evaluated_exactly() {
+        for (lead, offset_half_db, hys_half_db, enters) in HALF_DB_CASES {
+            let mut manager = manager_with_scell(); // SCell at -95 dBm
+            manager.update_measurement(3, -95 + lead);
+            let mut config = a6_config(0);
+            config.trigger_config.a6_offset = Some(offset_half_db);
+            config.trigger_config.hysteresis = hys_half_db;
+            manager.add_config(config);
+            manager.evaluate_events();
+            assert_eq!(
+                manager.triggered_cells(6).contains(&TriggeringCell::Nr(3)),
+                enters,
+                "A6: lead {lead} dB, offset {offset_half_db} / hysteresis {hys_half_db} half-dB"
+            );
+        }
     }
 
     /// Builds a manager camped on cell 1 with an SCell on cell 2, so A6 has a
@@ -1145,7 +1207,7 @@ mod tests {
         };
         config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A6);
         config.trigger_config.a3_offset = None;
-        config.trigger_config.a6_offset = Some(offset_db);
+        config.trigger_config.a6_offset = Some(offset_db * 2);
         config.trigger_config.hysteresis = 2; // 1 dB
         config.trigger_config.time_to_trigger = 0;
         config
@@ -1800,7 +1862,7 @@ mod tests {
 
         let trigger = ReportTriggerConfig {
             trigger_type: ReportTriggerType::Event(MeasEventType::A3),
-            a3_offset: Some(3),
+            a3_offset: Some(6),
             hysteresis: 2,
             time_to_trigger: 0,
             ..Default::default()

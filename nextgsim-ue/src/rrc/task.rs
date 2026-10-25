@@ -1416,7 +1416,7 @@ impl RrcTask {
                 "Applying signalled measConfig: measId={}, a3Offset={} dB, \
                  hysteresis={} dB, timeToTrigger={} ms",
                 binding.meas_id,
-                binding.a3_offset_db,
+                f64::from(binding.a3_offset_half_db) / 2.0,
                 f64::from(binding.hysteresis_half_db) / 2.0,
                 binding.time_to_trigger_ms
             );
@@ -1430,7 +1430,7 @@ impl RrcTask {
                     threshold: None,
                     threshold1: None,
                     threshold2: None,
-                    a3_offset: Some(i32::from(binding.a3_offset_db)),
+                    a3_offset: Some(i32::from(binding.a3_offset_half_db)),
                     a6_offset: None,
                     hysteresis: i32::from(binding.hysteresis_half_db),
                     time_to_trigger: u64::from(binding.time_to_trigger_ms),
@@ -1894,7 +1894,7 @@ impl RrcTask {
                 threshold: None,
                 threshold1: None,
                 threshold2: None,
-                a3_offset: Some(3), // Neighbor 3dB better than serving
+                a3_offset: Some(6), // Neighbor 3 dB better than serving (0.5 dB units)
                 a6_offset: None,
                 hysteresis: 2,        // 1dB hysteresis
                 time_to_trigger: 640, // 640ms
@@ -4171,7 +4171,8 @@ impl RrcTask {
     }
 
     /// The A3 offset and hysteresis this UE is evaluating under `meas_id`, as
-    /// `(offset_db, hysteresis_half_db)` — the signalled units (issue #170).
+    /// `(offset_half_db, hysteresis_half_db)` — the signalled 0.5 dB units
+    /// (issue #170, #359).
     ///
     /// `None` when nothing is installed under that `measId` or its trigger is not
     /// an A3. Read-only, and the single question #170 is about: after this change
@@ -7333,8 +7334,8 @@ mod tests {
 
         assert_eq!(
             task.a3_margin(1),
-            Some((3, 2)),
-            "precondition: the UE's OWN default is 3 dB offset / 1 dB (2 half-dB) \
+            Some((6, 2)),
+            "precondition: the UE's OWN default is 3 dB (6 half-dB) offset / 1 dB (2 half-dB) \
              hysteresis -- which is what the signalled configuration must replace"
         );
         let before = task.measurement_manager.config_count();
@@ -7344,8 +7345,8 @@ mod tests {
         assert_eq!(installed, 1, "one A3 binding was signalled");
         assert_eq!(
             task.a3_margin(1),
-            Some((11, 9)),
-            "the gNB's 11 dB offset and 4.5 dB (9 half-dB) hysteresis must now be \
+            Some((22, 9)),
+            "the gNB's 11 dB (22 half-dB) offset and 4.5 dB (9 half-dB) hysteresis must now be \
              what the UE evaluates"
         );
         assert_eq!(
@@ -7421,7 +7422,7 @@ mod tests {
             camped_connected_and_keyed(&mut task, &mut rls_rx).await;
             assert_eq!(
                 task.a3_margin(1),
-                Some((3, 2)),
+                Some((6, 2)),
                 "precondition: the UE is on its own default after RRCSetup"
             );
 
@@ -7457,7 +7458,7 @@ mod tests {
 
             assert_eq!(
                 task.a3_margin(1),
-                Some((13, 12)),
+                Some((26, 12)),
                 "the margin the gNB put on the wire must be the one the UE evaluates"
             );
         });
@@ -7480,7 +7481,7 @@ mod tests {
             // Put a NON-default margin in place first, so "unchanged" is a claim
             // about preservation rather than about the default surviving.
             task.apply_signalled_meas_config(&signalled_a3(11.0, 4.5));
-            assert_eq!(task.a3_margin(1), Some((11, 9)), "precondition");
+            assert_eq!(task.a3_margin(1), Some((22, 9)), "precondition");
 
             let pdu = encode_rrc_reconfiguration(&RrcReconfigurationParams {
                 rrc_transaction_id: 0,
@@ -7501,7 +7502,7 @@ mod tests {
 
             assert_eq!(
                 task.a3_margin(1),
-                Some((11, 9)),
+                Some((22, 9)),
                 "a reconfiguration carrying no measConfig must not disturb the one \
                  in force"
             );
@@ -7654,7 +7655,7 @@ mod tests {
                 threshold1: None,
                 threshold2: None,
                 a3_offset: None,
-                a6_offset: Some(3),
+                a6_offset: Some(6),
                 hysteresis: 2, // 1 dB
                 time_to_trigger: 0,
             },

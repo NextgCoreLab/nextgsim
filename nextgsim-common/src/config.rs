@@ -224,6 +224,9 @@ pub struct GnbConfig {
     /// The neighbour must beat the serving cell by this much. Defaults to 3 dB, the
     /// value the UE's own A3 measurement configuration uses, so an armed candidate and
     /// a measurement report agree about what "better" means.
+    ///
+    /// Signalled in `a3-Offset` as 0.5 dB units (TS 38.331 §6.3.2), so -15..15 dB
+    /// in 0.5 dB steps can reach the UE's measurement configuration (#359).
     #[serde(default = "default_cho_a3_offset_db")]
     pub cho_a3_offset_db: f64,
     /// Hysteresis in dB for the CHO execution condition. Defaults to 1 dB.
