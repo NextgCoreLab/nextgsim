@@ -46,7 +46,9 @@ use nextgsim_nas::messages::sm::{
     PduSessionTypeValue, SmCause, SscModeValue,
 };
 
-use crate::timer::{GprsTimer3, UeTimer, MAX_T3580_RETRIES, MAX_T3581_RETRIES, MAX_T3582_RETRIES};
+use crate::timer::{
+    GprsTimer3, GprsTimer3Unit, UeTimer, MAX_T3580_RETRIES, MAX_T3581_RETRIES, MAX_T3582_RETRIES,
+};
 
 use super::procedure::{
     ProcedureTransactionManager, SmMessageType as PtMessageType, SM_TIMER_T3580, SM_TIMER_T3581,
@@ -59,6 +61,32 @@ pub const PSI_MAX: u8 = 15;
 /// Timer code used for the T3396-class per-DNN / per-S-NSSAI back-off
 /// timers (TS 24.008 Section 11.2.2.1A applied to 5GS, TS 24.501 6.4.1.4)
 pub const SM_TIMER_BACKOFF: u16 = 3396;
+
+/// Timer code used for the §6.4.1.4.3 back-off timer (#70), which has no
+/// T-number of its own; distinct from T3396 so the two never share an entry
+pub const SM_TIMER_GENERIC_BACKOFF: u16 = 0;
+
+/// Timer code of T3584, the [S-NSSAI, DNN] back-off of cause #67
+/// (TS 24.501 §6.2.8, §6.4.1.4.2)
+pub const SM_TIMER_T3584: u16 = 3584;
+
+/// Timer code of T3585, the S-NSSAI back-off of cause #69
+/// (TS 24.501 §6.2.8, §6.4.1.4.2)
+pub const SM_TIMER_T3585: u16 = 3585;
+
+/// First wait of the UE's own re-attempt policy for a configured PDU session
+/// whose establishment failed with no network-given wait: a reject with no
+/// Back-off timer value IE or a zero one, a #90 "payload was not forwarded"
+/// echo, T3580 exhaustion (TS 24.501 §6.4.1.4.2, §6.4.1.6, §5.4.5.3.3).
+/// Doubled per consecutive failure up to [`SM_RETRY_MAX_SECS`].
+pub const SM_RETRY_BASE_SECS: u32 = 2;
+
+/// Ceiling of the UE's own re-attempt wait.
+pub const SM_RETRY_MAX_SECS: u32 = 64;
+
+/// The SM Retry Timer default (TS 24.501 §6.4.1.4.3, TS 24.368): the back-off
+/// a #70 reject without a Back-off timer value IE starts.
+pub const SM_RETRY_TIMER_DEFAULT_SECS: u32 = 12 * 60;
 
 /// PDU session states (TS 24.501 Section 6.1.3.2.1)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -203,6 +231,13 @@ pub struct PduSession {
     pub authorized_qos_rules: Vec<u8>,
     /// Authorized session AMBR from the network
     pub session_ambr: Option<IeSessionAmbr>,
+    /// The configured session this one serves, when the UE holds it as one of
+    /// its configured sessions (#379): a failed establishment is then
+    /// re-attempted. `None` for a one-off (CLI or application) session.
+    wanted: Option<SmSessionParams>,
+    /// Consecutive failed establishments of `wanted` before this attempt;
+    /// scales the UE's own re-attempt wait.
+    failures: u32,
 }
 
 impl PduSession {
@@ -216,6 +251,8 @@ impl PduSession {
             ipv4: None,
             authorized_qos_rules: Vec::new(),
             session_ambr: None,
+            wanted: None,
+            failures: 0,
         }
     }
 }
@@ -259,20 +296,81 @@ pub enum SmOutput {
     },
 }
 
+/// One component of a back-off scope (TS 24.501 §6.2.7, §6.2.8)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Scope<T> {
+    /// The timer is not associated with this component (T3396 has no
+    /// S-NSSAI, T3585 no DNN): any value matches
+    Any,
+    /// The timer is associated with this value, where `None` is "no DNN" /
+    /// "no S-NSSAI" -- a request that provided none, which is not a wildcard
+    /// (§6.2.7: "T3396 is associated with no DNN")
+    Is(Option<T>),
+}
+
 /// Back-off scope key (TS 24.501 Section 6.4.1.4: the back-off applies per
 /// [S-NSSAI, DNN] combination depending on the reject cause)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BackoffKey {
-    s_nssai: Option<Vec<u8>>,
-    dnn: Option<String>,
+    /// Which timer (T3396, T3584, T3585, or the §6.4.1.4.3 back-off timer):
+    /// each runs on its own, so one never replaces or stops another in the
+    /// same scope (#380 review)
+    timer: u16,
+    s_nssai: Scope<Vec<u8>>,
+    dnn: Scope<String>,
+}
+
+impl BackoffKey {
+    /// Whether this back-off applies to a request for `s_nssai` / `dnn`.
+    fn covers(&self, s_nssai: Option<&[u8]>, dnn: Option<&str>) -> bool {
+        let nssai_match = match &self.s_nssai {
+            Scope::Any => true,
+            Scope::Is(v) => v.as_deref() == s_nssai,
+        };
+        let dnn_match = match &self.dnn {
+            Scope::Any => true,
+            Scope::Is(v) => v.as_deref() == dnn,
+        };
+        nssai_match && dnn_match
+    }
 }
 
 /// A running (or permanently blocking) back-off entry
 #[derive(Debug)]
 struct BackoffEntry {
+    /// Which timer this is, for the logs: T3396 (#26), T3584 (#67), T3585
+    /// (#69) or the §6.4.1.4.3 back-off timer (#70)
+    name: &'static str,
+    /// Whether a PDU SESSION MODIFICATION / RELEASE COMMAND in its scope
+    /// stops it: T3396, T3584 and T3585 (§6.3.2.3, §6.3.3.3); the
+    /// §6.4.1.4.3 back-off timer runs to expiry
+    stoppable: bool,
     /// Running timer; `None` for a deactivated back-off timer value, which
-    /// blocks retries until the UE is restarted (TS 24.501 6.4.1.4)
+    /// blocks retries until the UE is restarted or the network sends a PDU
+    /// SESSION MODIFICATION / RELEASE COMMAND in the same scope
+    /// (TS 24.501 6.4.1.4.2)
     timer: Option<UeTimer>,
+}
+
+/// A configured PDU session waiting to be re-attempted after a failed
+/// establishment (#379, TS 24.501 §6.4.1.4.2)
+#[derive(Debug, Clone)]
+struct RetryEntry {
+    /// The configured session parameters (before URSP and type overrides)
+    base: SmSessionParams,
+    /// End of the UE's own re-attempt wait. A running back-off timer bars the
+    /// re-attempt on top of this.
+    due_at: std::time::Instant,
+    /// Consecutive failed establishments so far
+    failures: u32,
+}
+
+/// The UE's own re-attempt wait after `failures` consecutive failures.
+fn retry_wait(failures: u32) -> u32 {
+    let doublings = failures.saturating_sub(1).min(16);
+    SM_RETRY_BASE_SECS
+        .saturating_mul(1 << doublings)
+        .min(SM_RETRY_MAX_SECS)
 }
 
 /// A pending UE-initiated SM procedure (for retransmission on timer expiry)
@@ -299,6 +397,13 @@ pub struct SmOrchestrator {
     /// PDU session type override per DNN after cause #50/#51/#57
     /// (TS 24.501 Section 6.4.1.4.2)
     type_override: HashMap<Option<String>, PduSessionTypeValue>,
+    /// The configured sessions the UE holds (#379): the last set given to
+    /// [`SmOrchestrator::establish_default_sessions`], less any the UE released
+    /// itself.
+    wanted: Vec<SmSessionParams>,
+    /// Configured sessions whose establishment failed, waiting to be
+    /// re-attempted (#379)
+    retries: Vec<RetryEntry>,
 }
 
 impl Default for SmOrchestrator {
@@ -321,6 +426,8 @@ impl SmOrchestrator {
             pending: HashMap::new(),
             backoff: HashMap::new(),
             type_override: HashMap::new(),
+            wanted: Vec::new(),
+            retries: Vec::new(),
         }
     }
 
@@ -396,26 +503,53 @@ impl SmOrchestrator {
     /// Whether a back-off timer currently blocks the given [S-NSSAI, DNN]
     pub fn is_backed_off(&self, s_nssai: Option<&[u8]>, dnn: Option<&str>) -> bool {
         self.backoff.iter().any(|(key, entry)| {
-            let nssai_match = key.s_nssai.is_none() || key.s_nssai.as_deref() == s_nssai;
-            let dnn_match = key.dnn.is_none() || key.dnn.as_deref() == dnn;
             let blocking = match &entry.timer {
                 Some(t) => t.is_running(),
                 None => true, // deactivated timer value: permanent block
             };
-            nssai_match && dnn_match && blocking
+            key.covers(s_nssai, dnn) && blocking
         })
     }
 
-    /// Remaining back-off seconds for the given [S-NSSAI, DNN], if running
+    /// Whether a configured session waits to be re-attempted (#379).
+    pub fn has_pending_retry(&self) -> bool {
+        !self.retries.is_empty()
+    }
+
+    /// Whether a configured session's re-attempt is due now: its own wait is
+    /// over and no back-off timer bars it (#379). The caller uses this to bring
+    /// up a NAS signalling connection (a Service Request) before calling
+    /// [`SmOrchestrator::retry_wanted_sessions`] from 5GMM-IDLE.
+    pub fn has_due_retry(&self) -> bool {
+        self.retries.iter().any(|r| self.retry_is_due(r))
+    }
+
+    /// Test hook: end every queued re-attempt's own wait now.
+    #[cfg(test)]
+    pub(crate) fn end_retry_waits_for_test(&mut self) {
+        for r in &mut self.retries {
+            r.due_at = std::time::Instant::now();
+        }
+    }
+
+    fn retry_is_due(&self, r: &RetryEntry) -> bool {
+        if std::time::Instant::now() < r.due_at {
+            return false;
+        }
+        let resolved = self.resolve_session_params(&self.application_for(&r.base), &r.base);
+        resolved.emergency
+            || !self.is_backed_off(resolved.s_nssai.as_deref(), resolved.dnn.as_deref())
+    }
+
+    /// Remaining seconds of the longest running back-off timer that applies
+    /// to a request for the given [S-NSSAI, DNN], if any
     pub fn backoff_remaining(&self, s_nssai: Option<&[u8]>, dnn: Option<&str>) -> Option<u32> {
-        let key = BackoffKey {
-            s_nssai: s_nssai.map(<[u8]>::to_vec),
-            dnn: dnn.map(str::to_string),
-        };
         self.backoff
-            .get(&key)
-            .and_then(|e| e.timer.as_ref())
+            .iter()
+            .filter(|(key, _)| key.covers(s_nssai, dnn))
+            .filter_map(|(_, e)| e.timer.as_ref().filter(|t| t.is_running()))
             .map(UeTimer::remaining)
+            .max()
     }
 
     // ========================================================================
@@ -433,25 +567,109 @@ impl SmOrchestrator {
 
     /// Start establishment for every configured session that has not been
     /// set up yet.
+    ///
+    /// These are the sessions the UE holds (#379): one whose establishment
+    /// fails with a cause that allows asking again, or that a back-off timer
+    /// keeps from going out now, is re-attempted by
+    /// [`SmOrchestrator::retry_wanted_sessions`] once the back-off timer
+    /// expires or is stopped, or after the UE's own wait when the network gave
+    /// none (TS 24.501 §6.4.1.4.2).
     pub fn establish_default_sessions(&mut self, params: &[SmSessionParams]) -> Vec<SmOutput> {
+        self.wanted = params.to_vec();
+        // This pass asks for every configured session again; a queued
+        // re-attempt it does not get out is queued afresh.
+        self.retries.clear();
         let mut outs = Vec::new();
         for p in params {
-            // TS 24.526 §5.2 / TS 23.503 §6.6.2.3: resolve the parameters through
-            // URSP before deciding whether a session already serves them, so the
-            // reuse check compares against what would actually be established.
-            // Checking first and resolving second would reuse a session on the
-            // wrong slice. A no-op while `ursp_evaluation` is off.
-            let resolved = self.resolve_session_params(&self.application_for(p), p);
-            let already = self
-                .sessions
-                .iter()
-                .flatten()
-                .any(|s| s.params == resolved && s.state != PsState::Inactive);
-            if !already {
-                outs.extend(self.start_establishment(resolved));
-            }
+            outs.extend(self.establish_wanted(p.clone(), 0));
         }
         outs
+    }
+
+    /// Establish the configured session `base` unless a session already
+    /// serves it. `failures` counts its consecutive failed establishments.
+    fn establish_wanted(&mut self, base: SmSessionParams, failures: u32) -> Vec<SmOutput> {
+        // TS 24.526 §5.2 / TS 23.503 §6.6.2.3: resolve the parameters through
+        // URSP before deciding whether a session already serves them, so the
+        // reuse check compares against what would actually be established.
+        // Checking first and resolving second would reuse a session on the
+        // wrong slice. A no-op while `ursp_evaluation` is off.
+        let resolved = self.resolve_session_params(&self.application_for(&base), &base);
+        let already = self.sessions.iter().flatten().any(|s| {
+            s.state != PsState::Inactive
+                && (s.params == resolved || s.wanted.as_ref() == Some(&base))
+        });
+        if already {
+            return Vec::new();
+        }
+        self.start_establishment_inner(resolved, Some(base), failures)
+    }
+
+    /// Re-attempt every configured session whose re-attempt is due (#379,
+    /// TS 24.501 §6.4.1.4.2): its back-off timer expired or was stopped, or the
+    /// UE's own wait is over. Call when the UE may send 5GSM signalling: it is
+    /// registered with a NAS signalling connection up.
+    pub fn retry_wanted_sessions(&mut self) -> Vec<SmOutput> {
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.retries)
+            .into_iter()
+            .partition(|r| self.retry_is_due(r));
+        self.retries = waiting;
+        let mut outs = Vec::new();
+        for r in due {
+            info!(
+                "Re-attempting the configured PDU session for DNN {:?} / S-NSSAI {:?} \
+                 ({} failed attempt(s) so far)",
+                r.base.dnn, r.base.s_nssai, r.failures
+            );
+            outs.extend(self.establish_wanted(r.base, r.failures));
+        }
+        outs
+    }
+
+    /// Queue the configured session `base` for a re-attempt (#379). `failures`
+    /// counts its consecutive failed establishments including this one.
+    fn queue_retry(&mut self, base: SmSessionParams, failures: u32) {
+        if !self.wanted.contains(&base) || self.retries.iter().any(|r| r.base == base) {
+            return;
+        }
+        let resolved = self.resolve_session_params(&self.application_for(&base), &base);
+        let backed_off = !resolved.emergency
+            && self.is_backed_off(resolved.s_nssai.as_deref(), resolved.dnn.as_deref());
+        // A running back-off timer is the wait: the request goes out once it
+        // expires or is stopped. Otherwise the network named no wait, and
+        // the UE's own one keeps a refusing network from being asked every
+        // second.
+        let wait = if backed_off { 0 } else { retry_wait(failures) };
+        if backed_off {
+            info!(
+                "Configured PDU session for DNN {:?} / S-NSSAI {:?} re-attempted when its \
+                 back-off timer expires or is stopped",
+                base.dnn, base.s_nssai
+            );
+        } else {
+            info!(
+                "Configured PDU session for DNN {:?} / S-NSSAI {:?} re-attempted in {wait}s",
+                base.dnn, base.s_nssai
+            );
+        }
+        self.retries.push(RetryEntry {
+            base,
+            due_at: std::time::Instant::now() + std::time::Duration::from_secs(u64::from(wait)),
+            failures,
+        });
+    }
+
+    /// Queue a re-attempt for a session whose establishment just failed, if
+    /// it serves a configured session (#379).
+    fn retry_failed_establishment(&mut self, session: Option<PduSession>) {
+        if let Some(PduSession {
+            wanted: Some(base),
+            failures,
+            ..
+        }) = session
+        {
+            self.queue_retry(base, failures.saturating_add(1));
+        }
     }
 
     // ========================================================================
@@ -547,7 +765,22 @@ impl SmOrchestrator {
     }
 
     /// Start a PDU session establishment procedure (TS 24.501 6.4.1.2).
-    pub fn start_establishment(&mut self, mut params: SmSessionParams) -> Vec<SmOutput> {
+    ///
+    /// A one-off request: it is not re-attempted when it fails. The configured
+    /// sessions go through [`SmOrchestrator::establish_default_sessions`].
+    pub fn start_establishment(&mut self, params: SmSessionParams) -> Vec<SmOutput> {
+        self.start_establishment_inner(params, None, 0)
+    }
+
+    /// Start a PDU session establishment procedure (TS 24.501 6.4.1.2) for
+    /// `params`, serving the configured session `wanted` if any. A configured
+    /// session's request that cannot go out now is queued for a re-attempt.
+    fn start_establishment_inner(
+        &mut self,
+        mut params: SmSessionParams,
+        wanted: Option<SmSessionParams>,
+        failures: u32,
+    ) -> Vec<SmOutput> {
         // Back-off consultation (TS 24.501 6.4.1.4 / 6.2.8)
         if self.is_backed_off(params.s_nssai.as_deref(), params.dnn.as_deref()) && !params.emergency
         {
@@ -556,6 +789,9 @@ impl SmOrchestrator {
                 params.dnn,
                 self.backoff_remaining(params.s_nssai.as_deref(), params.dnn.as_deref())
             );
+            if let Some(base) = wanted {
+                self.queue_retry(base, failures);
+            }
             return Vec::new();
         }
 
@@ -573,10 +809,16 @@ impl SmOrchestrator {
 
         let Some(psi) = self.allocate_psi() else {
             warn!("No free PDU session identity");
+            if let Some(base) = wanted {
+                self.queue_retry(base, failures.saturating_add(1));
+            }
             return Vec::new();
         };
         let Some(pti) = self.pt.allocate() else {
             warn!("No free procedure transaction identity");
+            if let Some(base) = wanted {
+                self.queue_retry(base, failures.saturating_add(1));
+            }
             return Vec::new();
         };
 
@@ -610,6 +852,8 @@ impl SmOrchestrator {
 
         let mut session = PduSession::new(psi, params);
         session.state = PsState::ActivePending;
+        session.wanted = wanted;
+        session.failures = failures;
         self.sessions[psi as usize] = Some(session);
 
         if let Some(pt) = self.pt.get_mut(pti) {
@@ -701,6 +945,13 @@ impl SmOrchestrator {
             return Vec::new();
         };
 
+        // The UE no longer holds a configured session it releases itself, so
+        // nothing re-establishes it (#379)
+        if let Some(base) = self.session(psi).and_then(|s| s.wanted.clone()) {
+            self.wanted.retain(|w| *w != base);
+            self.retries.retain(|r| r.base != base);
+        }
+
         let mut req = PduSessionReleaseRequest::new(psi, pti);
         req.sm_cause = Some(ie3_cause(SmCause::RegularDeactivation));
         let mut sm_pdu = Vec::new();
@@ -780,6 +1031,10 @@ impl SmOrchestrator {
             self.pt.abort(pti);
             self.pending.remove(&pti);
         }
+        // The next registration asks for the configured sessions again
+        // (establish_default_sessions); a re-attempt queued before must not race
+        // it from 5GMM-DEREGISTERED.
+        self.retries.clear();
         outs
     }
 
@@ -797,14 +1052,16 @@ impl SmOrchestrator {
             outs.extend(self.handle_procedure_timer_expiry(pti));
         }
 
-        // Back-off timers: drop entries whose timer has expired
+        // Back-off timers: drop entries whose timer has expired. A configured
+        // session it barred is re-attempted by `retry_wanted_sessions` (#379,
+        // TS 24.501 §6.4.1.4.2: no new request "until timer T3396 expires").
         self.backoff
             .retain(|key, entry| match entry.timer.as_mut() {
                 Some(timer) => {
                     if timer.perform_tick() {
                         info!(
-                            "Back-off timer expired for S-NSSAI {:?} / DNN {:?}",
-                            key.s_nssai, key.dnn
+                            "Back-off timer expired for S-NSSAI {:?} / DNN {:?} ({})",
+                            key.s_nssai, key.dnn, entry.name
                         );
                         false
                     } else {
@@ -858,8 +1115,11 @@ impl SmOrchestrator {
 
         match msg_type {
             PtMessageType::PduSessionEstablishmentRequest => {
-                // 6.4.1.6 d): abort the procedure, release the allocated PSI
-                self.sessions[psi as usize] = None;
+                // 6.4.1.6 d): abort the procedure, release the allocated PSI.
+                // A configured session is asked for again after the UE's own
+                // wait (#379).
+                let session = self.take_session(psi);
+                self.retry_failed_establishment(session);
                 vec![SmOutput::SessionEstablishmentFailed {
                     psi,
                     cause: SmCause::ProtocolErrorUnspecified,
@@ -934,7 +1194,28 @@ impl SmOrchestrator {
         self.pending.remove(&pti);
         match msg_type {
             PtMessageType::PduSessionEstablishmentRequest => {
-                self.clear_session(psi);
+                // TS 24.501 §5.4.5.3.3 g): the request was not forwarded. A
+                // configured session is asked for again (#379):
+                // - #22 / #67 / #69: congestion control, with the Back-off
+                //   timer value as T3396 / T3584 / T3585 (§6.4.1.4.2);
+                // - #90 (routing failure, e.g. no SMF reachable): per the UE's
+                //   own policy; the Back-off timer value IE is ignored.
+                // Any other cause is not re-attempted.
+                let session = self.take_session(psi);
+                let congestion = match cause {
+                    22 => Some(SmCause::InsufficientResources),
+                    67 => Some(SmCause::InsufficientResourcesForSliceAndDnn),
+                    69 => Some(SmCause::InsufficientResourcesForSlice),
+                    _ => None,
+                };
+                if let Some(sm_cause) = congestion {
+                    if let Some(p) = session.as_ref().map(|s| s.params.clone()) {
+                        self.arm_backoff(sm_cause, &p, dl.back_off_timer_value);
+                    }
+                    self.retry_failed_establishment(session);
+                } else if cause == 90 {
+                    self.retry_failed_establishment(session);
+                }
                 vec![SmOutput::SessionEstablishmentFailed {
                     psi,
                     cause: SmCause::NetworkFailure,
@@ -1124,7 +1405,9 @@ impl SmOrchestrator {
         self.pt.abort(pti);
         self.pending.remove(&pti);
         let session = self.take_session(psi);
-        let params = session.map(|s| s.params);
+        let params = session.as_ref().map(|s| s.params.clone());
+        let wanted = session.as_ref().and_then(|s| s.wanted.clone());
+        let failures = session.as_ref().map_or(0, |s| s.failures);
 
         let mut outs = Vec::new();
         match cause {
@@ -1137,6 +1420,11 @@ impl SmOrchestrator {
                 if let Some(ref p) = params {
                     self.arm_backoff(cause, p, rej.back_off_timer_value);
                 }
+                // A configured session is asked for again once the back-off
+                // timer expires or is stopped, or after the UE's own wait when
+                // the timer value was zero or absent (#379, §6.4.1.4.2). A
+                // deactivated value bars it until a command in its scope.
+                self.retry_failed_establishment(session);
             }
             // #50 / #51 / #57: PDU session type restriction; retry once
             // with the network-allowed type (TS 24.501 6.4.1.4.2)
@@ -1153,7 +1441,7 @@ impl SmOrchestrator {
                     if p.session_type != allowed {
                         info!("Retrying establishment with allowed PDU session type {allowed:?}");
                         p.session_type = allowed;
-                        outs.extend(self.start_establishment(p));
+                        outs.extend(self.start_establishment_inner(p, wanted, failures));
                     }
                 }
             }
@@ -1165,7 +1453,7 @@ impl SmOrchestrator {
                         if p.ssc_mode != ssc {
                             info!("Retrying establishment with allowed SSC mode {ssc:?}");
                             p.ssc_mode = ssc;
-                            outs.extend(self.start_establishment(p));
+                            outs.extend(self.start_establishment_inner(p, wanted, failures));
                         }
                     }
                 }
@@ -1181,27 +1469,73 @@ impl SmOrchestrator {
     /// Arm the T3396-class back-off timer for the scope mandated by the
     /// reject cause (TS 24.501 6.4.1.4).
     fn arm_backoff(&mut self, cause: SmCause, params: &SmSessionParams, timer_byte: Option<u8>) {
-        let key = match cause {
-            // #26: associated with the DNN (no S-NSSAI scope)
-            SmCause::InsufficientResources => BackoffKey {
-                s_nssai: None,
-                dnn: params.dnn.clone(),
-            },
-            // #69: associated with the S-NSSAI only
-            SmCause::InsufficientResourcesForSlice => BackoffKey {
-                s_nssai: params.s_nssai.clone(),
-                dnn: None,
-            },
-            // #67 / #70: associated with the [S-NSSAI, DNN] combination
-            _ => BackoffKey {
-                s_nssai: params.s_nssai.clone(),
-                dnn: params.dnn.clone(),
-            },
+        let dnn = Scope::Is(params.dnn.clone());
+        let s_nssai = Scope::Is(params.s_nssai.clone());
+        let (key, name, code) = match cause {
+            // #26: T3396, associated with the DNN, or with no DNN (§6.2.7)
+            SmCause::InsufficientResources => (
+                BackoffKey {
+                    timer: SM_TIMER_BACKOFF,
+                    s_nssai: Scope::Any,
+                    dnn,
+                },
+                "T3396",
+                SM_TIMER_BACKOFF,
+            ),
+            // #69: T3585, associated with the S-NSSAI only (§6.2.8)
+            SmCause::InsufficientResourcesForSlice => (
+                BackoffKey {
+                    timer: SM_TIMER_T3585,
+                    s_nssai,
+                    dnn: Scope::Any,
+                },
+                "T3585",
+                SM_TIMER_T3585,
+            ),
+            // #67: T3584, associated with the [S-NSSAI, DNN] combination
+            SmCause::InsufficientResourcesForSliceAndDnn => (
+                BackoffKey {
+                    timer: SM_TIMER_T3584,
+                    s_nssai,
+                    dnn,
+                },
+                "T3584",
+                SM_TIMER_T3584,
+            ),
+            // #70: the §6.4.1.4.3 back-off timer, for the [S-NSSAI, DNN]
+            // combination
+            _ => (
+                BackoffKey {
+                    timer: SM_TIMER_GENERIC_BACKOFF,
+                    s_nssai,
+                    dnn,
+                },
+                "back-off timer",
+                SM_TIMER_GENERIC_BACKOFF,
+            ),
         };
+        let stoppable = cause != SmCause::MissingOrUnknownDnnInSlice;
 
         let Some(byte) = timer_byte else {
-            // No back-off timer IE: the UE may retry after an
-            // implementation specific delay (no timer armed)
+            if !stoppable {
+                // §6.4.1.4.3 a): #70 without the IE uses the SM Retry Timer,
+                // 12 minutes when none is configured
+                info!("#70 without a back-off timer value: {name} started for {key:?}: {SM_RETRY_TIMER_DEFAULT_SECS}s");
+                let mut timer = UeTimer::new(code, false, SM_RETRY_TIMER_DEFAULT_SECS);
+                timer.start(true);
+                self.backoff.insert(
+                    key,
+                    BackoffEntry {
+                        name,
+                        stoppable,
+                        timer: Some(timer),
+                    },
+                );
+                return;
+            }
+            // No back-off timer IE: the UE may ask again, after a local
+            // back-off of its own (§6.2.7: "a local back-off timer that has
+            // exponential value"); `queue_retry` paces it
             info!(
                 "Reject cause #{} without back-off timer IE: no back-off armed",
                 cause as u8
@@ -1209,18 +1543,65 @@ impl SmOrchestrator {
             return;
         };
         let timer3 = GprsTimer3::from_byte(byte);
-        let secs = timer3.to_seconds();
-        if secs == 0 {
-            // Deactivated timer value: block until restart
-            warn!("Back-off timer deactivated for {key:?}: establishment blocked until restart");
-            self.backoff.insert(key, BackoffEntry { timer: None });
+        if timer3.unit == GprsTimer3Unit::Deactivated {
+            // Deactivated: no new request in this scope until the UE is
+            // switched off or the network sends a PDU SESSION MODIFICATION /
+            // RELEASE COMMAND in it (§6.4.1.4.2)
+            warn!("{name} deactivated for {key:?}: establishment blocked");
+            self.backoff.insert(
+                key,
+                BackoffEntry {
+                    name,
+                    stoppable,
+                    timer: None,
+                },
+            );
             return;
         }
-        let mut timer = UeTimer::new(SM_TIMER_BACKOFF, false, secs);
+        let secs = timer3.to_seconds();
+        if secs == 0 {
+            // Zero: stop the timer if it is running; the UE may ask again
+            // (§6.4.1.4.2). Before #379 a zero value was taken for a
+            // deactivated one and barred the DNN for good.
+            if self.backoff.remove(&key).is_some() {
+                info!("{name} for {key:?} stopped: back-off timer value zero");
+            } else {
+                info!("{name} value zero for {key:?}: no back-off");
+            }
+            return;
+        }
+        // A new value replaces a running timer (§6.4.1.4.2: "stop timer
+        // T3396 ... if it is running" and start it with the new value)
+        let mut timer = UeTimer::new(code, false, secs);
         timer.start(true);
-        info!("Back-off timer started for {key:?}: {secs}s");
-        self.backoff
-            .insert(key, BackoffEntry { timer: Some(timer) });
+        info!("Back-off timer started for {key:?}: {secs}s ({name})");
+        self.backoff.insert(
+            key,
+            BackoffEntry {
+                name,
+                stoppable,
+                timer: Some(timer),
+            },
+        );
+    }
+
+    /// Stop every back-off timer that applies to the session `params`, running
+    /// or deactivated: the network sent a PDU SESSION MODIFICATION COMMAND or
+    /// RELEASE COMMAND for it (TS 24.501 §6.4.1.4.2, §6.3.2.3, §6.3.3.3). A
+    /// command for an emergency PDU session stops none. A configured session
+    /// the timer barred is then re-attempted (#379).
+    fn stop_backoff_for(&mut self, params: &SmSessionParams, command: &str) {
+        if params.emergency {
+            return;
+        }
+        let (s_nssai, dnn) = (params.s_nssai.as_deref(), params.dnn.as_deref());
+        self.backoff.retain(|key, entry| {
+            let stop = entry.stoppable && key.covers(s_nssai, dnn);
+            if stop {
+                info!("{} for {key:?} stopped: {command} received", entry.name);
+            }
+            !stop
+        });
     }
 
     /// PDU Session Modification Command (TS 24.501 6.3.2 network-initiated
@@ -1238,6 +1619,12 @@ impl SmOrchestrator {
                 return self.send_sm_status(psi, pti, SmCause::InvalidMandatoryInformation);
             }
         };
+
+        // §6.4.1.4.2 / §6.3.2.3: the command stops a back-off timer in the
+        // session's scope (#379)
+        if let Some(p) = self.session(psi).map(|s| s.params.clone()) {
+            self.stop_backoff_for(&p, "PDU SESSION MODIFICATION COMMAND");
+        }
 
         // If this answers our UE-initiated modification, complete it
         let mut outs = Vec::new();
@@ -1364,7 +1751,26 @@ impl SmOrchestrator {
             self.pending.remove(&pti);
         }
 
-        let params = self.sessions[psi as usize].take().map(|s| s.params);
+        let session = self.take_session(psi);
+        if let Some(ref s) = session {
+            // §6.4.1.4.2 / §6.3.3.3: a command without a Back-off timer value
+            // IE, or with #39, stops a back-off timer in the session's scope
+            // (#379) ...
+            if cmd.back_off_timer_value.is_none() || cause == SmCause::ReactivationRequested {
+                self.stop_backoff_for(&s.params, "PDU SESSION RELEASE COMMAND");
+            }
+            // ... and a #26 / #67 / #69 / #70 with a Back-off timer value
+            // starts one (§6.3.3.3)
+            if matches!(
+                cause,
+                SmCause::InsufficientResources
+                    | SmCause::InsufficientResourcesForSliceAndDnn
+                    | SmCause::InsufficientResourcesForSlice
+                    | SmCause::MissingOrUnknownDnnInSlice
+            ) {
+                self.arm_backoff(cause, &s.params, cmd.back_off_timer_value);
+            }
+        }
 
         // Reply with PDU Session Release Complete (TS 24.501 6.3.3.3)
         let complete = PduSessionReleaseComplete::new(psi, pti);
@@ -1377,13 +1783,27 @@ impl SmOrchestrator {
             SmOutput::SessionReleased { psi },
         ];
 
-        // Cause #39 "reactivation requested": re-establish the session
-        // (TS 24.501 6.3.3.3)
-        if cause == SmCause::ReactivationRequested {
-            if let Some(p) = params {
+        match (cause, session) {
+            // Cause #39 "reactivation requested": re-establish the session
+            // (TS 24.501 6.3.3.3). A configured session whose request cannot
+            // go out now is queued for a re-attempt (#379).
+            (SmCause::ReactivationRequested, Some(s)) => {
                 info!("Release Command requested reactivation: re-establishing the session");
-                outs.extend(self.start_establishment(p));
+                outs.extend(self.start_establishment_inner(s.params, s.wanted, 0));
             }
+            // Released for lack of resources: a configured session is asked
+            // for again once the back-off timer it started runs out, or after
+            // the UE's own wait (#379)
+            (
+                SmCause::InsufficientResources
+                | SmCause::InsufficientResourcesForSliceAndDnn
+                | SmCause::InsufficientResourcesForSlice
+                | SmCause::MissingOrUnknownDnnInSlice,
+                Some(PduSession {
+                    wanted: Some(base), ..
+                }),
+            ) => self.queue_retry(base, 1),
+            _ => {}
         }
         outs
     }
@@ -2665,5 +3085,832 @@ mod tests {
         }];
         let params = SmSessionParams::from_config(&config);
         assert_eq!(params[0].dnn.as_deref(), Some("custom-xr"));
+    }
+
+    // ========================================================================
+    // #379: re-attempting a configured session after a failed establishment
+    // (TS 24.501 §6.4.1.4.2 / §6.4.1.4.3, §6.3.2.3, §6.3.3.3, §5.4.5.3.3)
+    // ========================================================================
+
+    /// GPRS timer 3 (TS 24.008 §10.5.7.4a), unit 2 s (0b011): `n` × 2 s.
+    fn two_s(n: u8) -> u8 {
+        0x60 | (n & 0x1F)
+    }
+
+    /// GPRS timer 3 value zero (unit 2 s, value 0)
+    const BACKOFF_ZERO: u8 = 0x60;
+
+    /// GPRS timer 3 "deactivated" (unit 0b111)
+    const BACKOFF_DEACTIVATED: u8 = 0xE0;
+
+    /// Every PDU SESSION ESTABLISHMENT REQUEST in `outs`, decoded off the
+    /// wire: (UL NAS TRANSPORT, PSI, PTI).
+    fn sent_establishment_requests(outs: &[SmOutput]) -> Vec<(UlNasTransport, u8, u8)> {
+        outs.iter()
+            .filter_map(|o| match o {
+                SmOutput::SendNasPdu(pdu) => Some(unwrap_ul(pdu)),
+                _ => None,
+            })
+            .filter(|(_, inner)| inner[3] == NasSmMessageType::PduSessionEstablishmentRequest as u8)
+            .map(|(t, inner)| {
+                let psi = t.pdu_session_id.unwrap();
+                (t, psi, inner[2])
+            })
+            .collect()
+    }
+
+    /// The single establishment request in `outs`: (PSI, PTI).
+    fn one_request(outs: &[SmOutput]) -> (u8, u8) {
+        let reqs = sent_establishment_requests(outs);
+        assert_eq!(
+            reqs.len(),
+            1,
+            "one PDU SESSION ESTABLISHMENT REQUEST: {outs:?}"
+        );
+        let (t, psi, pti) = &reqs[0];
+        assert_eq!(t.request_type, Some(RequestType::InitialRequest));
+        (*psi, *pti)
+    }
+
+    /// An orchestrator holding `params` as its configured sessions, with each
+    /// one's request sent: returns (orchestrator, [(psi, pti)]).
+    fn configured(params: &[SmSessionParams]) -> (SmOrchestrator, Vec<(u8, u8)>) {
+        let mut orch = new_orch();
+        let outs = orch.establish_default_sessions(params);
+        let ids = sent_establishment_requests(&outs)
+            .into_iter()
+            .map(|(_, psi, pti)| (psi, pti))
+            .collect();
+        (orch, ids)
+    }
+
+    fn deliver(orch: &mut SmOrchestrator, container: Vec<u8>, psi: u8) -> Vec<SmOutput> {
+        orch.handle_dl_nas_transport(&dl_with_container(container, psi))
+    }
+
+    /// Run every back-off timer out through the real `perform_tick` path (the
+    /// timers are wall-clock driven) and tick once.
+    fn expire_backoffs(orch: &mut SmOrchestrator) -> Vec<SmOutput> {
+        for entry in orch.backoff.values_mut() {
+            if let Some(timer) = entry.timer.as_mut() {
+                let mut zero = UeTimer::new(timer.code(), false, 0);
+                zero.start(true);
+                *timer = zero;
+            }
+        }
+        orch.tick()
+    }
+
+    /// Let every re-attempt's own wait run out.
+    fn elapse_retry_waits(orch: &mut SmOrchestrator) {
+        orch.end_retry_waits_for_test();
+    }
+
+    /// The UE's own wait queued for the configured session `base`, in whole
+    /// seconds (rounded up).
+    fn queued_wait(orch: &SmOrchestrator, base: &SmSessionParams) -> u64 {
+        let r = orch
+            .retries
+            .iter()
+            .find(|r| r.base == *base)
+            .expect("a queued re-attempt");
+        let left = r
+            .due_at
+            .saturating_duration_since(std::time::Instant::now());
+        left.as_secs() + u64::from(left.subsec_nanos() > 0)
+    }
+
+    fn release_command_bytes(psi: u8, cause: SmCause, backoff: Option<u8>) -> Vec<u8> {
+        use nextgsim_nas::ies::ie3;
+        let mut cmd =
+            PduSessionReleaseCommand::new(psi, 0, ie3::SmCause::try_from(cause as u8).unwrap());
+        cmd.back_off_timer_value = backoff;
+        let mut buf = Vec::new();
+        cmd.encode(&mut buf);
+        buf
+    }
+
+    /// The devtest1 trace of #379: the configured session is released with #39,
+    /// its re-establishment is rejected #26 with a back-off timer, and the UE
+    /// asks again the moment T3396 expires -- not at T3512.
+    #[test]
+    fn a_configured_session_rejected_26_is_re_requested_when_t3396_expires() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(&mut orch, conformant_accept_bytes(psi, pti), psi);
+
+        // #39: Release Complete and a fresh request
+        let outs = deliver(
+            &mut orch,
+            release_command_bytes(psi, SmCause::ReactivationRequested, None),
+            psi,
+        );
+        let (psi, pti) = one_request(&outs);
+
+        // #26 with a 2 s back-off: T3396 runs for the DNN
+        let outs = deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(two_s(1))),
+            psi,
+        );
+        assert!(outs.contains(&SmOutput::SessionEstablishmentFailed {
+            psi,
+            cause: SmCause::InsufficientResources
+        }));
+        assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        assert!(orch.has_pending_retry());
+
+        // While T3396 runs nothing goes out for the DNN
+        assert!(orch.tick().is_empty());
+        assert!(!orch.has_due_retry());
+        assert!(orch.retry_wanted_sessions().is_empty());
+
+        // T3396 expires: the configured session is asked for again
+        expire_backoffs(&mut orch);
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        assert!(orch.has_due_retry());
+        let outs = orch.retry_wanted_sessions();
+        let reqs = sent_establishment_requests(&outs);
+        assert_eq!(reqs.len(), 1, "{outs:?}");
+        let (t, psi, pti) = &reqs[0];
+        assert_eq!(t.dnn, Some(encode_dnn_value("internet")));
+        assert_eq!(t.s_nssai, Some(vec![0x01]));
+        assert!(!orch.has_pending_retry());
+
+        // ... and the session comes back
+        let outs = deliver(&mut orch, conformant_accept_bytes(*psi, *pti), *psi);
+        assert!(outs.contains(&SmOutput::SessionEstablished {
+            psi: *psi,
+            ipv4: Some([10, 45, 0, 2])
+        }));
+        assert!(orch.retry_wanted_sessions().is_empty());
+    }
+
+    /// The same for the initial establishment, and only for the configured
+    /// sessions: a one-off request is not re-attempted.
+    #[test]
+    fn only_configured_sessions_are_re_attempted() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(two_s(1))),
+            psi,
+        );
+        expire_backoffs(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+
+        let mut one_off = test_params();
+        one_off.dnn = Some("ims".to_string());
+        let (psi, pti) = one_request(&orch.start_establishment(one_off));
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(two_s(1))),
+            psi,
+        );
+        expire_backoffs(&mut orch);
+        elapse_retry_waits(&mut orch);
+        assert!(!orch.has_pending_retry());
+        assert!(orch.retry_wanted_sessions().is_empty());
+    }
+
+    /// §6.4.1.4.2: a zero back-off timer value stops T3396 and lets the UE ask
+    /// again; the UE's own wait paces it. Before #379 zero was taken for
+    /// "deactivated" and barred the DNN until restart.
+    #[test]
+    fn a_zero_back_off_value_is_no_back_off() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(BACKOFF_ZERO)),
+            psi,
+        );
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        assert_eq!(
+            queued_wait(&orch, &test_params()),
+            u64::from(SM_RETRY_BASE_SECS)
+        );
+        assert!(!orch.has_due_retry(), "the UE's own wait first");
+        elapse_retry_waits(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// §6.4.1.4.2: a zero value also stops a T3396 that is running, and a new
+    /// value replaces the running one.
+    #[test]
+    fn a_zero_back_off_value_stops_a_running_t3396() {
+        let mut orch = new_orch();
+        let p = test_params();
+        orch.arm_backoff(SmCause::InsufficientResources, &p, Some(two_s(30)));
+        assert_eq!(orch.backoff_remaining(None, Some("internet")), Some(60));
+        orch.arm_backoff(SmCause::InsufficientResources, &p, Some(two_s(5)));
+        assert_eq!(orch.backoff_remaining(None, Some("internet")), Some(10));
+        orch.arm_backoff(SmCause::InsufficientResources, &p, Some(BACKOFF_ZERO));
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+    }
+
+    /// No Back-off timer value IE: the UE asks again after its own wait, which
+    /// doubles with each consecutive failure up to the ceiling.
+    #[test]
+    fn without_a_back_off_timer_the_ue_waits_its_own_growing_interval() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (mut psi, mut pti) = ids[0];
+        let mut expected = u64::from(SM_RETRY_BASE_SECS);
+        for _ in 0..8 {
+            deliver(
+                &mut orch,
+                reject_bytes(psi, pti, SmCause::InsufficientResources, None),
+                psi,
+            );
+            assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+            assert_eq!(queued_wait(&orch, &test_params()), expected);
+            assert!(
+                orch.retry_wanted_sessions().is_empty(),
+                "not before the wait"
+            );
+            elapse_retry_waits(&mut orch);
+            (psi, pti) = one_request(&orch.retry_wanted_sessions());
+            expected = (expected * 2).min(u64::from(SM_RETRY_MAX_SECS));
+        }
+        assert_eq!(expected, u64::from(SM_RETRY_MAX_SECS));
+        // An accept ends the failures: the next failure waits the base again
+        deliver(&mut orch, conformant_accept_bytes(psi, pti), psi);
+        let outs = deliver(
+            &mut orch,
+            release_command_bytes(psi, SmCause::ReactivationRequested, None),
+            psi,
+        );
+        let (psi, pti) = one_request(&outs);
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, None),
+            psi,
+        );
+        assert_eq!(
+            queued_wait(&orch, &test_params()),
+            u64::from(SM_RETRY_BASE_SECS)
+        );
+    }
+
+    /// §6.4.1.4.2: a deactivated timer bars the DNN until the network sends a
+    /// PDU SESSION MODIFICATION COMMAND or RELEASE COMMAND for it; either one
+    /// stops the bar and the configured session is asked for again.
+    #[test]
+    fn a_deactivated_back_off_lifts_on_a_command_for_the_same_dnn() {
+        for release in [false, true] {
+            let first = test_params();
+            let mut second = test_params();
+            second.session_type = PduSessionTypeValue::Ipv6;
+            let (mut orch, ids) = configured(&[first.clone(), second.clone()]);
+            let [(psi1, pti1), (psi2, pti2)] = ids[..] else {
+                panic!("two requests: {ids:?}");
+            };
+            deliver(&mut orch, conformant_accept_bytes(psi1, pti1), psi1);
+            deliver(
+                &mut orch,
+                reject_bytes(
+                    psi2,
+                    pti2,
+                    SmCause::InsufficientResources,
+                    Some(BACKOFF_DEACTIVATED),
+                ),
+                psi2,
+            );
+
+            // Neither time nor ticking lifts it
+            for _ in 0..3 {
+                orch.tick();
+            }
+            elapse_retry_waits(&mut orch);
+            assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
+            assert!(orch.retry_wanted_sessions().is_empty(), "release={release}");
+
+            // A command for the session on the same DNN stops it
+            if release {
+                let outs = deliver(
+                    &mut orch,
+                    release_command_bytes(psi1, SmCause::RegularDeactivation, None),
+                    psi1,
+                );
+                assert!(outs.contains(&SmOutput::SessionReleased { psi: psi1 }));
+            } else {
+                deliver(&mut orch, vec![0x2E, psi1, 0x00, 0xCB], psi1);
+            }
+            assert!(
+                !orch.is_backed_off(Some(&[0x01]), Some("internet")),
+                "release={release}"
+            );
+            let reqs = sent_establishment_requests(&orch.retry_wanted_sessions());
+            assert_eq!(reqs.len(), 1, "release={release}: only the rejected one");
+            let (t, _, _) = &reqs[0];
+            assert_eq!(t.dnn, Some(encode_dnn_value("internet")));
+        }
+    }
+
+    /// §6.4.1.4.2: a running T3396 is stopped by a command for the same DNN
+    /// too, and a command for another DNN leaves it running.
+    #[test]
+    fn a_command_stops_a_running_back_off_only_in_its_scope() {
+        let internet = test_params();
+        let mut ims = test_params();
+        ims.dnn = Some("ims".to_string());
+        let mut internet6 = test_params();
+        internet6.session_type = PduSessionTypeValue::Ipv6;
+        let (mut orch, ids) = configured(&[ims.clone(), internet.clone(), internet6.clone()]);
+        let [(p_ims, t_ims), (p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+            panic!("three requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(p_ims, t_ims), p_ims);
+        deliver(&mut orch, conformant_accept_bytes(p_in, t_in), p_in);
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_in6,
+                t_in6,
+                SmCause::InsufficientResources,
+                Some(two_s(30)),
+            ),
+            p_in6,
+        );
+        assert!(orch.is_backed_off(None, Some("internet")));
+
+        // A command on the "ims" session: T3396 for "internet" keeps running
+        deliver(&mut orch, vec![0x2E, p_ims, 0x00, 0xCB], p_ims);
+        assert!(orch.is_backed_off(None, Some("internet")));
+        assert!(orch.retry_wanted_sessions().is_empty());
+
+        // A command on the "internet" session stops it
+        deliver(&mut orch, vec![0x2E, p_in, 0x00, 0xCB], p_in);
+        assert!(!orch.is_backed_off(None, Some("internet")));
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// The per-S-NSSAI variants (§6.2.8, §6.4.1.4.2): #67 starts T3584 for the
+    /// [S-NSSAI, DNN], #69 starts T3585 for the S-NSSAI, and each re-attempts
+    /// the configured session on expiry. #70 is keyed like #67.
+    #[test]
+    fn t3584_and_t3585_re_attempt_on_expiry() {
+        for (cause, code, other_dnn_blocked) in [
+            (
+                SmCause::InsufficientResourcesForSliceAndDnn,
+                SM_TIMER_T3584,
+                false,
+            ),
+            (SmCause::InsufficientResourcesForSlice, SM_TIMER_T3585, true),
+            (
+                SmCause::MissingOrUnknownDnnInSlice,
+                SM_TIMER_GENERIC_BACKOFF,
+                false,
+            ),
+        ] {
+            let (mut orch, ids) = configured(&[test_params()]);
+            let (psi, pti) = ids[0];
+            deliver(
+                &mut orch,
+                reject_bytes(psi, pti, cause, Some(two_s(1))),
+                psi,
+            );
+            let codes: Vec<_> = orch
+                .backoff
+                .values()
+                .filter_map(|e| e.timer.as_ref().map(UeTimer::code))
+                .collect();
+            assert_eq!(codes, vec![code], "{cause:?}");
+            assert!(
+                orch.is_backed_off(Some(&[0x01]), Some("internet")),
+                "{cause:?}"
+            );
+            assert_eq!(
+                orch.is_backed_off(Some(&[0x01]), Some("ims")),
+                other_dnn_blocked,
+                "{cause:?}"
+            );
+            assert!(
+                !orch.is_backed_off(Some(&[0x02]), Some("internet")),
+                "{cause:?}: other slice"
+            );
+            assert!(orch.retry_wanted_sessions().is_empty(), "{cause:?}");
+
+            expire_backoffs(&mut orch);
+            let reqs = sent_establishment_requests(&orch.retry_wanted_sessions());
+            assert_eq!(reqs.len(), 1, "{cause:?}");
+            assert_eq!(reqs[0].0.s_nssai, Some(vec![0x01]), "{cause:?}");
+        }
+    }
+
+    /// T3585 is stopped by a command for a session on the same S-NSSAI,
+    /// whatever its DNN.
+    #[test]
+    fn t3585_is_stopped_by_a_command_on_the_same_slice() {
+        let mut ims = test_params();
+        ims.dnn = Some("ims".to_string());
+        let (mut orch, ids) = configured(&[ims, test_params()]);
+        let [(p_ims, t_ims), (p_in, t_in)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(p_ims, t_ims), p_ims);
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_in,
+                t_in,
+                SmCause::InsufficientResourcesForSlice,
+                Some(two_s(30)),
+            ),
+            p_in,
+        );
+        assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        deliver(&mut orch, vec![0x2E, p_ims, 0x00, 0xCB], p_ims);
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// §6.3.3.3: a RELEASE COMMAND with #26 and a Back-off timer value starts
+    /// T3396, and a configured session it released is asked for again on
+    /// expiry -- not before.
+    #[test]
+    fn a_release_command_with_26_and_a_back_off_re_requests_on_expiry() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(&mut orch, conformant_accept_bytes(psi, pti), psi);
+        let outs = deliver(
+            &mut orch,
+            release_command_bytes(psi, SmCause::InsufficientResources, Some(two_s(1))),
+            psi,
+        );
+        assert!(outs.contains(&SmOutput::SessionReleased { psi }));
+        assert!(sent_establishment_requests(&outs).is_empty());
+        assert!(orch.is_backed_off(None, Some("internet")));
+        elapse_retry_waits(&mut orch);
+        assert!(orch.retry_wanted_sessions().is_empty());
+        expire_backoffs(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// A regular network release (#36) is not undone, and a session the UE
+    /// released itself is no longer one it holds.
+    #[test]
+    fn a_released_session_is_not_re_requested() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(&mut orch, conformant_accept_bytes(psi, pti), psi);
+        deliver(
+            &mut orch,
+            release_command_bytes(psi, SmCause::RegularDeactivation, None),
+            psi,
+        );
+        assert!(!orch.has_pending_retry());
+
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(&mut orch, conformant_accept_bytes(psi, pti), psi);
+        let (_, rel) = unwrap_ul(first_sent_pdu(&orch.start_release(psi)));
+        // The network answers the release with #26 + back-off: still released
+        let mut cmd = release_command_bytes(psi, SmCause::InsufficientResources, Some(two_s(1)));
+        cmd[2] = rel[2];
+        deliver(&mut orch, cmd, psi);
+        expire_backoffs(&mut orch);
+        elapse_retry_waits(&mut orch);
+        assert!(!orch.has_pending_retry());
+        assert!(orch.retry_wanted_sessions().is_empty());
+    }
+
+    /// TS 24.501 §5.4.5.3.3: a request the AMF could not forward (#90, no SMF
+    /// reachable) is asked for again per the UE's own policy.
+    #[test]
+    fn a_request_not_forwarded_is_re_attempted_after_the_ue_wait() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        let (_, sm) = unwrap_ul(&orch.pending.get(&pti).unwrap().ul_pdu.clone());
+        let mut dl = DlNasTransport::new(PayloadContainerType::N1SmInformation, sm);
+        dl.pdu_session_id = Some(psi);
+        dl.mm_cause = Some(90);
+        let outs = orch.handle_dl_nas_transport(&dl);
+        assert!(outs.contains(&SmOutput::SessionEstablishmentFailed {
+            psi,
+            cause: SmCause::NetworkFailure
+        }));
+        assert_eq!(
+            queued_wait(&orch, &test_params()),
+            u64::from(SM_RETRY_BASE_SECS)
+        );
+        assert!(orch.retry_wanted_sessions().is_empty());
+        elapse_retry_waits(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// Echo our request back in a DL NAS TRANSPORT with 5GMM `cause` and an
+    /// optional Back-off timer value (TS 24.501 §5.4.5.3.3 g)).
+    fn not_forwarded(
+        orch: &mut SmOrchestrator,
+        psi: u8,
+        pti: u8,
+        cause: u8,
+        backoff: Option<u8>,
+    ) -> Vec<SmOutput> {
+        let (_, sm) = unwrap_ul(&orch.pending.get(&pti).unwrap().ul_pdu.clone());
+        let mut dl = DlNasTransport::new(PayloadContainerType::N1SmInformation, sm);
+        dl.pdu_session_id = Some(psi);
+        dl.mm_cause = Some(cause);
+        dl.back_off_timer_value = backoff;
+        orch.handle_dl_nas_transport(&dl)
+    }
+
+    /// §5.4.5.3.3 g) 6): with #90 the UE ignores the Back-off timer value IE;
+    /// its own wait applies.
+    #[test]
+    fn a_not_forwarded_back_off_value_is_ignored_for_90() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        not_forwarded(&mut orch, psi, pti, 90, Some(two_s(30)));
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        assert_eq!(
+            queued_wait(&orch, &test_params()),
+            u64::from(SM_RETRY_BASE_SECS)
+        );
+    }
+
+    /// §5.4.5.3.3 g) 1), 4), 5) and §6.4.1.4.2: a request not forwarded for
+    /// DNN or S-NSSAI based congestion (#22 / #67 / #69) starts T3396 / T3584 /
+    /// T3585 with the Back-off timer value, and is re-attempted on expiry.
+    #[test]
+    fn a_request_not_forwarded_for_congestion_waits_the_back_off() {
+        for (cause, code) in [
+            (22, SM_TIMER_BACKOFF),
+            (67, SM_TIMER_T3584),
+            (69, SM_TIMER_T3585),
+        ] {
+            let (mut orch, ids) = configured(&[test_params()]);
+            let (psi, pti) = ids[0];
+            not_forwarded(&mut orch, psi, pti, cause, Some(two_s(1)));
+            let codes: Vec<_> = orch
+                .backoff
+                .values()
+                .filter_map(|e| e.timer.as_ref().map(UeTimer::code))
+                .collect();
+            assert_eq!(codes, vec![code], "#{cause}");
+            elapse_retry_waits(&mut orch);
+            assert!(
+                orch.retry_wanted_sessions().is_empty(),
+                "#{cause}: not before expiry"
+            );
+            expire_backoffs(&mut orch);
+            one_request(&orch.retry_wanted_sessions());
+        }
+    }
+
+    /// Any other not-forwarded cause (#28 restricted service area here) is
+    /// not re-attempted.
+    #[test]
+    fn other_not_forwarded_causes_are_not_re_attempted() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        not_forwarded(&mut orch, psi, pti, 28, None);
+        assert!(!orch.has_pending_retry());
+    }
+
+    /// §6.4.1.4.3 a): #70 without a Back-off timer value starts the back-off
+    /// with the SM Retry Timer default (12 minutes); a command does not stop
+    /// it (it is not T3396 / T3584 / T3585).
+    #[test]
+    fn a_70_without_back_off_waits_the_sm_retry_timer() {
+        let mut internet6 = test_params();
+        internet6.session_type = PduSessionTypeValue::Ipv6;
+        let (mut orch, ids) = configured(&[test_params(), internet6]);
+        let [(p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(p_in6, t_in6), p_in6);
+        deliver(
+            &mut orch,
+            reject_bytes(p_in, t_in, SmCause::MissingOrUnknownDnnInSlice, None),
+            p_in,
+        );
+        assert_eq!(
+            orch.backoff_remaining(Some(&[0x01]), Some("internet")),
+            Some(SM_RETRY_TIMER_DEFAULT_SECS)
+        );
+        elapse_retry_waits(&mut orch);
+        assert!(orch.retry_wanted_sessions().is_empty());
+        // A command for a session in the same [S-NSSAI, DNN] does not stop the
+        // §6.4.1.4.3 timer
+        deliver(&mut orch, vec![0x2E, p_in6, 0x00, 0xCB], p_in6);
+        assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        expire_backoffs(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// #380 review: T3584 (#67) and the §6.4.1.4.3 back-off (#70) for the same
+    /// [S-NSSAI, DNN] are separate timers. A RELEASE COMMAND #67 with a new
+    /// value, or with zero, leaves the 12-minute #70 back-off alone.
+    #[test]
+    fn a_67_release_leaves_the_70_back_off_alone() {
+        for value in [two_s(1), BACKOFF_ZERO] {
+            let mut internet6 = test_params();
+            internet6.session_type = PduSessionTypeValue::Ipv6;
+            let (mut orch, ids) = configured(&[test_params(), internet6]);
+            let [(p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+                panic!("two requests: {ids:?}");
+            };
+            deliver(&mut orch, conformant_accept_bytes(p_in6, t_in6), p_in6);
+            deliver(
+                &mut orch,
+                reject_bytes(p_in, t_in, SmCause::MissingOrUnknownDnnInSlice, None),
+                p_in,
+            );
+            deliver(
+                &mut orch,
+                release_command_bytes(
+                    p_in6,
+                    SmCause::InsufficientResourcesForSliceAndDnn,
+                    Some(value),
+                ),
+                p_in6,
+            );
+            let generic = orch
+                .backoff
+                .iter()
+                .find(|(k, _)| k.timer == SM_TIMER_GENERIC_BACKOFF)
+                .and_then(|(_, e)| e.timer.as_ref())
+                .map(UeTimer::remaining);
+            assert_eq!(
+                generic,
+                Some(SM_RETRY_TIMER_DEFAULT_SECS),
+                "value {value:#04x}"
+            );
+            elapse_retry_waits(&mut orch);
+            assert!(
+                orch.retry_wanted_sessions().is_empty(),
+                "value {value:#04x}: §6.4.1.4.3 still bars the [S-NSSAI, DNN]"
+            );
+        }
+    }
+
+    /// §6.3.3.3: a RELEASE COMMAND with #39 stops T3396 even when it carries a
+    /// Back-off timer value IE, so the reactivation and the barred configured
+    /// session both go out.
+    #[test]
+    fn a_39_release_with_a_back_off_value_still_stops_t3396() {
+        let mut internet6 = test_params();
+        internet6.session_type = PduSessionTypeValue::Ipv6;
+        let (mut orch, ids) = configured(&[test_params(), internet6]);
+        let [(p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(p_in, t_in), p_in);
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_in6,
+                t_in6,
+                SmCause::InsufficientResources,
+                Some(two_s(30)),
+            ),
+            p_in6,
+        );
+        assert!(orch.is_backed_off(None, Some("internet")));
+        let outs = deliver(
+            &mut orch,
+            release_command_bytes(p_in, SmCause::ReactivationRequested, Some(two_s(30))),
+            p_in,
+        );
+        assert!(!orch.is_backed_off(None, Some("internet")));
+        one_request(&outs);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// `backoff_remaining` reports the longest running back-off that applies.
+    #[test]
+    fn backoff_remaining_is_the_longest_that_applies() {
+        let mut ims = test_params();
+        ims.dnn = Some("ims".to_string());
+        let (mut orch, ids) = configured(&[test_params(), ims]);
+        let [(p_in, t_in), (p_ims, t_ims)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        // T3396 60 s for "internet", T3585 10 s for the slice
+        deliver(
+            &mut orch,
+            reject_bytes(p_in, t_in, SmCause::InsufficientResources, Some(two_s(30))),
+            p_in,
+        );
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_ims,
+                t_ims,
+                SmCause::InsufficientResourcesForSlice,
+                Some(two_s(5)),
+            ),
+            p_ims,
+        );
+        assert_eq!(
+            orch.backoff_remaining(Some(&[0x01]), Some("internet")),
+            Some(60)
+        );
+        assert_eq!(orch.backoff_remaining(Some(&[0x01]), Some("ims")), Some(10));
+    }
+
+    /// §6.2.7: T3396 started for a request without a DNN is associated with
+    /// "no DNN", not with every DNN.
+    #[test]
+    fn t3396_for_no_dnn_does_not_bar_other_dnns() {
+        let mut no_dnn = test_params();
+        no_dnn.dnn = None;
+        let (mut orch, ids) = configured(&[no_dnn]);
+        let (psi, pti) = ids[0];
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(two_s(30))),
+            psi,
+        );
+        assert!(orch.is_backed_off(Some(&[0x01]), None));
+        assert!(!orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        one_request(&orch.start_establishment(test_params()));
+    }
+
+    /// §6.3.3.3: a RELEASE COMMAND that carries a Back-off timer value IE
+    /// (with a cause other than #39) does not lift a deactivated T3396.
+    #[test]
+    fn a_release_command_with_a_back_off_does_not_lift_a_deactivated_t3396() {
+        let mut second = test_params();
+        second.session_type = PduSessionTypeValue::Ipv6;
+        let (mut orch, ids) = configured(&[test_params(), second]);
+        let [(psi1, pti1), (psi2, pti2)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(psi1, pti1), psi1);
+        deliver(
+            &mut orch,
+            reject_bytes(
+                psi2,
+                pti2,
+                SmCause::InsufficientResources,
+                Some(BACKOFF_DEACTIVATED),
+            ),
+            psi2,
+        );
+        deliver(
+            &mut orch,
+            release_command_bytes(psi1, SmCause::RegularDeactivation, Some(two_s(1))),
+            psi1,
+        );
+        assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
+        elapse_retry_waits(&mut orch);
+        assert!(orch.retry_wanted_sessions().is_empty());
+    }
+
+    /// TS 24.501 §6.4.1.6: T3580 exhausted -- a configured session is asked for
+    /// again after the UE's own wait.
+    #[test]
+    fn t3580_exhaustion_re_attempts_a_configured_session() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        for _ in 0..MAX_T3580_RETRIES {
+            force_expire(&mut orch, pti);
+            orch.handle_procedure_timer_expiry(pti);
+        }
+        assert!(orch.session(psi).is_none());
+        assert_eq!(
+            queued_wait(&orch, &test_params()),
+            u64::from(SM_RETRY_BASE_SECS)
+        );
+        elapse_retry_waits(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// A configured session the back-off bars when the defaults are asked for
+    /// (a registration while T3396 runs) is queued, not dropped.
+    #[test]
+    fn a_configured_session_barred_at_registration_is_asked_for_on_expiry() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, Some(two_s(1))),
+            psi,
+        );
+        // The next Registration Accept asks for the defaults again
+        assert!(orch.establish_default_sessions(&[test_params()]).is_empty());
+        assert!(orch.has_pending_retry());
+        expire_backoffs(&mut orch);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// A local release of everything (deregistration) drops the queue: the
+    /// next registration asks for the defaults itself.
+    #[test]
+    fn deregistration_drops_queued_re_attempts() {
+        let (mut orch, ids) = configured(&[test_params()]);
+        let (psi, pti) = ids[0];
+        deliver(
+            &mut orch,
+            reject_bytes(psi, pti, SmCause::InsufficientResources, None),
+            psi,
+        );
+        assert!(orch.has_pending_retry());
+        orch.release_all_locally();
+        assert!(!orch.has_pending_retry());
     }
 }

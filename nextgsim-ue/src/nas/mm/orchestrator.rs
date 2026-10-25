@@ -8015,6 +8015,152 @@ mod tests {
         }
     }
 
+    /// A configured PDU session rejected #26 with no back-off, its UE wait
+    /// over: a re-attempt is due (#379).
+    fn sm_with_due_retry() -> crate::nas::sm::SmOrchestrator {
+        use crate::nas::sm::{SmOrchestrator, SmOutput, SmSessionParams};
+        use nextgsim_nas::ies::ie1::PayloadContainerType;
+        use nextgsim_nas::messages::mm::DlNasTransport;
+        use nextgsim_nas::messages::sm::{
+            PduSessionEstablishmentReject, PduSessionTypeValue, SmCause, SscModeValue,
+        };
+        let mut sm = SmOrchestrator::new();
+        let outs = sm.establish_default_sessions(&[SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: Some("internet".to_string()),
+            s_nssai: Some(vec![0x01]),
+            emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
+        }]);
+        let Some(SmOutput::SendNasPdu(ul)) = outs.first() else {
+            panic!("an establishment request: {outs:?}");
+        };
+        let t = nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &ul[3..]).unwrap();
+        let (psi, pti) = (t.payload_container[1], t.payload_container[2]);
+        let mut rej = Vec::new();
+        PduSessionEstablishmentReject::new(psi, pti, SmCause::InsufficientResources)
+            .encode(&mut rej);
+        let mut dl = DlNasTransport::new(PayloadContainerType::N1SmInformation, rej);
+        dl.pdu_session_id = Some(psi);
+        sm.handle_dl_nas_transport(&dl);
+        sm.end_retry_waits_for_test();
+        assert!(sm.has_due_retry());
+        sm
+    }
+
+    /// Whether `outs` carries a PDU SESSION ESTABLISHMENT REQUEST.
+    fn carries_establishment_request(outs: &[crate::nas::sm::SmOutput]) -> bool {
+        outs.iter().any(|o| match o {
+            crate::nas::sm::SmOutput::SendNasPdu(ul) => {
+                nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &ul[3..])
+                    .is_ok_and(|t| t.payload_container.get(3) == Some(&0xC1))
+            }
+            _ => false,
+        })
+    }
+
+    /// #379: a due re-attempt goes out at once on a NAS signalling connection;
+    /// from 5GMM-IDLE the UE first sends a SERVICE REQUEST for signalling
+    /// (TS 24.501 §5.6.1.2) and asks once the Service Accept brings it up.
+    #[test]
+    fn a_due_session_re_attempt_rides_a_signalling_connection() {
+        use crate::nas::drive_session_retries;
+
+        // Connected: straight out
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty(), "{mm_outs:?}");
+        assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
+        assert!(!sm.has_pending_retry());
+
+        // Idle: a signalling Service Request first, once
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(sm_outs.is_empty(), "{sm_outs:?}");
+        assert!(mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))));
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Signalling));
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(
+            mm_outs.is_empty() && sm_outs.is_empty(),
+            "one request in flight"
+        );
+
+        // Service Accept: the session request goes out
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty(), "{mm_outs:?}");
+        assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
+    }
+
+    /// #379, TS 24.501 §5.6.1.5 #22 / §5.6.1.7: a SERVICE REJECT #22 with T3346
+    /// holds the re-attempt's signalling Service Request back until T3346
+    /// expires; then the UE asks again.
+    #[test]
+    fn t3346_holds_a_session_re_attempt_until_it_expires() {
+        use crate::nas::drive_session_retries;
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, _) = drive_session_retries(&mut orch, &mut sm);
+        assert!(!mm_outs.is_empty());
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        orch.on_nas_signalling_connection_released();
+        assert!(orch.timers().t3346.is_running());
+        for _ in 0..3 {
+            let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+            assert!(
+                mm_outs.is_empty() && sm_outs.is_empty(),
+                "barred under T3346"
+            );
+        }
+
+        orch.timers.stop(TIMER_T3346, true);
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+        let (mm_outs, _) = drive_session_retries(&mut orch, &mut sm);
+        assert!(
+            mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "T3346 over: the Service Request goes out: {mm_outs:?}"
+        );
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Signalling));
+    }
+
+    /// #379: nothing is re-attempted while the UE is not in
+    /// 5GMM-REGISTERED.NORMAL-SERVICE: deregistered, or connected with a
+    /// registration update in progress.
+    #[test]
+    fn no_session_re_attempt_outside_normal_service() {
+        let mut orch = new_orch();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = crate::nas::drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty());
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredInitiated);
+        let (mm_outs, sm_outs) = crate::nas::drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty(), "{sm_outs:?}");
+        assert!(sm.has_due_retry(), "still due for later");
+    }
+
     /// The complement: with no uplink held (the rejected request was signalling),
     /// T3346 expiry starts nothing.
     #[test]
