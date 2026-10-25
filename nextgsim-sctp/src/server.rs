@@ -564,6 +564,27 @@ impl SctpServer {
         }
     }
 
+    /// Shuts one association down gracefully (RFC 9260 §9.2): a SHUTDOWN goes
+    /// to the peer, and the peer's SHUTDOWN ACK is answered with a SHUTDOWN
+    /// COMPLETE as [`recv`](Self::recv) / [`poll`](Self::poll) run on.
+    pub async fn shutdown_association(&mut self, association_id: u64) -> Result<()> {
+        let handle = *self
+            .id_to_handle
+            .get(&association_id)
+            .ok_or(ServerError::AssociationNotFound(association_id))?;
+        let Some(managed) = self.associations.get_mut(&handle) else {
+            return Err(ServerError::AssociationNotFound(association_id));
+        };
+        managed
+            .association
+            .shutdown()
+            .map_err(|e| ServerError::SendError(e.to_string()))?;
+        while let Some(transmit) = managed.association.poll_transmit(Instant::now()) {
+            managed.pending_transmits.push_back(transmit);
+        }
+        self.flush_all_transmits().await
+    }
+
     /// Close a specific association
     pub fn close_association(&mut self, association_id: u64) -> Result<()> {
         if let Some(handle) = self.id_to_handle.remove(&association_id) {

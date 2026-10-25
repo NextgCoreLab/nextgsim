@@ -204,7 +204,10 @@ impl MintSecondary {
             if !sub.started {
                 continue;
             }
-            let mut sm_outs = sub.sm.tick();
+            // A 5GSM retransmission waits for the shared connection: a
+            // secondary MM has no NAS signalling connection of its own and so
+            // asks for none (#409 follow-up)
+            let mut sm_outs = sub.sm.tick_with_connection(radio_connected);
             if radio_connected
                 && sub.mm.state().mm_substate() == MmSubState::RegisteredNormalService
             {
@@ -336,6 +339,43 @@ mod tests {
         mint.subs[0].sm.expire_procedure_timers_for_test();
         let outs = mint.tick_sessions(true);
         assert_eq!(outs, vec![(1, request)], "the retransmission");
+    }
+
+    /// #409 follow-up, TS 24.501 §6.4.1.6 a): the whole T3580 sequence on a
+    /// secondary subscription: four retransmissions of the identical octets,
+    /// then the fifth expiry aborts the establishment. One of them falls while
+    /// the shared radio connection is down: it is held, and goes when the
+    /// connection is back (a secondary asks for no connection of its own).
+    #[test]
+    fn a_secondary_subscriptions_t3580_runs_its_whole_sequence() {
+        let mut mint = secondary_rejected_26();
+        mint.subs[0].sm.expire_backoffs_for_test();
+        let outs = mint.tick_sessions(true);
+        let Some((1, sent)) = outs.first() else {
+            panic!("the re-attempt: {outs:?}");
+        };
+        let request = sent.clone();
+        for n in 1..4u8 {
+            mint.subs[0].sm.expire_procedure_timers_for_test();
+            if n == 2 {
+                assert!(
+                    mint.tick_sessions(false).is_empty(),
+                    "held while the radio is down"
+                );
+            }
+            assert_eq!(mint.tick_sessions(true), vec![(1, request.clone())], "#{n}");
+        }
+        mint.subs[0].sm.expire_procedure_timers_for_test();
+        assert_eq!(mint.tick_sessions(true), vec![(1, request)], "#4");
+        mint.subs[0].sm.expire_procedure_timers_for_test();
+        let outs = mint.tick_sessions(true);
+        assert!(
+            matches!(
+                outs.as_slice(),
+                [(1, o)] if matches!(o.as_slice(), [SmOutput::SessionEstablishmentFailed { .. }])
+            ),
+            "the fifth expiry aborts: {outs:?}"
+        );
     }
 
     /// #409: a subscription not in NORMAL-SERVICE is not re-attempted, and an

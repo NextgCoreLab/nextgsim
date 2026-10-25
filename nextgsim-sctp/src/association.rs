@@ -349,6 +349,18 @@ impl SctpAssociation {
             }
         }
 
+        // A peer's graceful shutdown (RFC 9260 §9.2) ends in a SHUTDOWN COMPLETE
+        // that closes sctp-proto's association without an `AssociationLost`
+        // event, so the state is read as well (#411). Without this the
+        // association stayed `Established` here until the next send failed.
+        if self.state == AssociationState::Established && self.association.is_closed() {
+            info!("Association shut down by the peer (RFC 9260 §9.2)");
+            self.state = AssociationState::Closed;
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(SctpEvent::Disconnected);
+            }
+        }
+
         // Handle timeouts
         if let Some(timeout_instant) = self.association.poll_timeout() {
             if Instant::now() >= timeout_instant {
