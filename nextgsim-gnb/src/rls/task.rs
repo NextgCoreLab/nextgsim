@@ -125,6 +125,11 @@ pub struct RlsTask {
     /// Tracker UE id -> the id the upper tasks know the UE by, for a UE that
     /// arrived on a handover-in (#324, `RlsMessage::RebindUe`).
     ue_alias: HashMap<i32, i32>,
+    /// Tracker ids whose upper-layer identity moved to another tracker by a
+    /// rebind: an RRC re-establishment heard under a new RLS id while the old
+    /// incarnation's tracker had not timed out yet. Their eventual loss is the
+    /// stale incarnation's, not the UE's, and is not reported.
+    retired_trackers: std::collections::HashSet<i32>,
 }
 
 impl RlsTask {
@@ -159,6 +164,7 @@ impl RlsTask {
             load_window_start: Instant::now(),
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
+            retired_trackers: std::collections::HashSet::new(),
         }
     }
 
@@ -189,6 +195,7 @@ impl RlsTask {
             load_window_start: Instant::now(),
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
+            retired_trackers: std::collections::HashSet::new(),
         }
     }
 
@@ -1108,6 +1115,22 @@ impl RlsTask {
             .find(|(_, ext)| **ext == from)
             .map(|(t, _)| *t)
             .unwrap_or(from);
+        // A re-establishment can rebind to an id whose old incarnation is still
+        // tracked (heard under a new RLS id before the old one timed out). That
+        // tracker, and the STIs that named the old incarnation, no longer stand
+        // for the UE: retire the tracker so its loss is not reported as the
+        // UE's, and drop the old STI mappings (the new one is remapped below).
+        let old_tracker = self
+            .ue_alias
+            .iter()
+            .find(|(_, ext)| **ext == to)
+            .map(|(t, _)| *t)
+            .or_else(|| (self.cell_tracker.get_ue(to as u32).is_some()).then_some(to));
+        if let Some(old) = old_tracker.filter(|old| *old != tracker) {
+            self.ue_alias.remove(&old);
+            self.retired_trackers.insert(old);
+        }
+        self.sti_to_ue_id.retain(|_, id| *id != to);
         self.ue_alias.insert(tracker, to);
         if let Some(addr) = self.ue_addresses.remove(&from) {
             self.ue_addresses.insert(to, addr);
@@ -1158,30 +1181,41 @@ impl RlsTask {
 
         for event in events {
             if let GnbTrackerEvent::UeLost { ue_id } = event {
-                let ue_id_i32 = self.external_ue_id(ue_id as i32);
-                self.ue_alias.remove(&(ue_id as i32));
-                info!("UE[{}] lost due to heartbeat timeout", ue_id_i32);
-
-                self.ue_addresses.remove(&ue_id_i32);
-                self.pending_acks.remove(&ue_id_i32);
-                self.task_base.ue_distances.remove(ue_id_i32);
-                // A capability-derived ceiling belongs to the UE, not to the id. Left
-                // behind, it would narrow the grants of whichever UE is allocated this
-                // id next -- which may not be RedCap at all.
-                self.ue_grant_ceiling.remove(&ue_id_i32);
-
-                // Find and remove STI mapping
-                let sti_to_remove: Vec<u64> = self
-                    .sti_to_ue_id
-                    .iter()
-                    .filter(|(_, &id)| id == ue_id_i32)
-                    .map(|(&sti, _)| sti)
-                    .collect();
-
-                for sti in sti_to_remove {
-                    self.sti_to_ue_id.remove(&sti);
-                }
+                self.handle_tracker_ue_lost(ue_id);
             }
+        }
+    }
+
+    /// The tracker lost UE `ue_id` (heartbeat timeout): drop what RLS holds for
+    /// the UE it stands for. A retired tracker, a rebound UE's stale
+    /// incarnation, stands for nobody.
+    fn handle_tracker_ue_lost(&mut self, ue_id: u32) {
+        if self.retired_trackers.remove(&(ue_id as i32)) {
+            debug!("Tracker UE[{ue_id}] lost: a stale incarnation of a rebound UE, not reported");
+            return;
+        }
+        let ue_id_i32 = self.external_ue_id(ue_id as i32);
+        self.ue_alias.remove(&(ue_id as i32));
+        info!("UE[{}] lost due to heartbeat timeout", ue_id_i32);
+
+        self.ue_addresses.remove(&ue_id_i32);
+        self.pending_acks.remove(&ue_id_i32);
+        self.task_base.ue_distances.remove(ue_id_i32);
+        // A capability-derived ceiling belongs to the UE, not to the id. Left
+        // behind, it would narrow the grants of whichever UE is allocated this
+        // id next -- which may not be RedCap at all.
+        self.ue_grant_ceiling.remove(&ue_id_i32);
+
+        // Find and remove STI mapping
+        let sti_to_remove: Vec<u64> = self
+            .sti_to_ue_id
+            .iter()
+            .filter(|(_, &id)| id == ue_id_i32)
+            .map(|(&sti, _)| sti)
+            .collect();
+
+        for sti in sti_to_remove {
+            self.sti_to_ue_id.remove(&sti);
         }
     }
 
@@ -1717,6 +1751,62 @@ mod tests {
             "a loss of tracker UE 9 is UE 1000's"
         );
         assert_eq!(task.external_ue_id(8), 8, "other UEs keep their ids");
+    }
+
+    /// A rebind onto an id whose old incarnation is still tracked (a
+    /// re-establishment heard under a new RLS id before the old one timed out)
+    /// retires the old tracker: its later loss is not reported as the UE's and
+    /// does not remove the UE's new address or STI, and the old STI no longer
+    /// names the UE.
+    #[test]
+    fn a_rebind_retires_the_old_incarnations_tracker() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::new(task_base);
+        let old_addr: SocketAddr = "127.0.0.1:4001".parse().unwrap();
+        let new_addr: SocketAddr = "127.0.0.1:4002".parse().unwrap();
+        // The old incarnation: tracker 1, STI 0xA.
+        task.cell_tracker
+            .process_heartbeat(0xA, old_addr, &nextgsim_rls::RlsHeartbeat::new(0xA));
+        let old_id = task.cell_tracker.get_ue_by_sti(0xA).unwrap().ue_id as i32;
+        task.sti_to_ue_id.insert(0xA, old_id);
+        task.ue_addresses.insert(old_id, old_addr);
+        // The UE again, under a new tracker and STI 0xB.
+        task.cell_tracker
+            .process_heartbeat(0xB, new_addr, &nextgsim_rls::RlsHeartbeat::new(0xB));
+        let new_id = task.cell_tracker.get_ue_by_sti(0xB).unwrap().ue_id as i32;
+        task.sti_to_ue_id.insert(0xB, new_id);
+        task.ue_addresses.insert(new_id, new_addr);
+
+        task.rebind_ue(new_id, old_id);
+        assert_eq!(task.ue_addresses.get(&old_id), Some(&new_addr));
+        assert_eq!(task.sti_to_ue_id.get(&0xB), Some(&old_id));
+        assert_eq!(task.sti_to_ue_id.get(&0xA), None, "the old STI is gone");
+        assert!(task.retired_trackers.contains(&old_id));
+
+        // The old tracker times out: nothing of the UE goes with it.
+        task.handle_tracker_ue_lost(old_id as u32);
+        assert_eq!(task.ue_addresses.get(&old_id), Some(&new_addr));
+        assert_eq!(task.sti_to_ue_id.get(&0xB), Some(&old_id));
+        assert!(!task.retired_trackers.contains(&old_id));
+
+        // Heard yet again, under a third tracker: the second one, aliased to the
+        // context's id by the first rebind, is retired and loses its alias.
+        let third_addr: SocketAddr = "127.0.0.1:4003".parse().unwrap();
+        task.cell_tracker
+            .process_heartbeat(0xC, third_addr, &nextgsim_rls::RlsHeartbeat::new(0xC));
+        let third_id = task.cell_tracker.get_ue_by_sti(0xC).unwrap().ue_id as i32;
+        task.sti_to_ue_id.insert(0xC, third_id);
+        task.ue_addresses.insert(third_id, third_addr);
+        task.rebind_ue(third_id, old_id);
+        assert_eq!(
+            task.external_ue_id(new_id),
+            new_id,
+            "the stale alias is gone"
+        );
+        assert_eq!(task.external_ue_id(third_id), old_id);
+        assert!(task.retired_trackers.contains(&new_id));
+        assert_eq!(task.ue_addresses.get(&old_id), Some(&third_addr));
     }
 
     /// A zero ceiling is refused, because `build_pdu(0)` yields nothing at all: it would
