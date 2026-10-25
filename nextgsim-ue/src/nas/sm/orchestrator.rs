@@ -62,6 +62,10 @@ pub const PSI_MAX: u8 = 15;
 /// timers (TS 24.008 Section 11.2.2.1A applied to 5GS, TS 24.501 6.4.1.4)
 pub const SM_TIMER_BACKOFF: u16 = 3396;
 
+/// Timer code used for the §6.4.1.4.3 back-off timer (#70), which has no
+/// T-number of its own; distinct from T3396 so the two never share an entry
+pub const SM_TIMER_GENERIC_BACKOFF: u16 = 0;
+
 /// Timer code of T3584, the [S-NSSAI, DNN] back-off of cause #67
 /// (TS 24.501 §6.2.8, §6.4.1.4.2)
 pub const SM_TIMER_T3584: u16 = 3584;
@@ -308,6 +312,10 @@ enum Scope<T> {
 /// [S-NSSAI, DNN] combination depending on the reject cause)
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BackoffKey {
+    /// Which timer (T3396, T3584, T3585, or the §6.4.1.4.3 back-off timer):
+    /// each runs on its own, so one never replaces or stops another in the
+    /// same scope (#380 review)
+    timer: u16,
     s_nssai: Scope<Vec<u8>>,
     dnn: Scope<String>,
 }
@@ -1467,6 +1475,7 @@ impl SmOrchestrator {
             // #26: T3396, associated with the DNN, or with no DNN (§6.2.7)
             SmCause::InsufficientResources => (
                 BackoffKey {
+                    timer: SM_TIMER_BACKOFF,
                     s_nssai: Scope::Any,
                     dnn,
                 },
@@ -1476,6 +1485,7 @@ impl SmOrchestrator {
             // #69: T3585, associated with the S-NSSAI only (§6.2.8)
             SmCause::InsufficientResourcesForSlice => (
                 BackoffKey {
+                    timer: SM_TIMER_T3585,
                     s_nssai,
                     dnn: Scope::Any,
                 },
@@ -1483,15 +1493,25 @@ impl SmOrchestrator {
                 SM_TIMER_T3585,
             ),
             // #67: T3584, associated with the [S-NSSAI, DNN] combination
-            SmCause::InsufficientResourcesForSliceAndDnn => {
-                (BackoffKey { s_nssai, dnn }, "T3584", SM_TIMER_T3584)
-            }
+            SmCause::InsufficientResourcesForSliceAndDnn => (
+                BackoffKey {
+                    timer: SM_TIMER_T3584,
+                    s_nssai,
+                    dnn,
+                },
+                "T3584",
+                SM_TIMER_T3584,
+            ),
             // #70: the §6.4.1.4.3 back-off timer, for the [S-NSSAI, DNN]
             // combination
             _ => (
-                BackoffKey { s_nssai, dnn },
+                BackoffKey {
+                    timer: SM_TIMER_GENERIC_BACKOFF,
+                    s_nssai,
+                    dnn,
+                },
                 "back-off timer",
-                SM_TIMER_BACKOFF,
+                SM_TIMER_GENERIC_BACKOFF,
             ),
         };
         let stoppable = cause != SmCause::MissingOrUnknownDnnInSlice;
@@ -3438,7 +3458,11 @@ mod tests {
                 false,
             ),
             (SmCause::InsufficientResourcesForSlice, SM_TIMER_T3585, true),
-            (SmCause::MissingOrUnknownDnnInSlice, SM_TIMER_BACKOFF, false),
+            (
+                SmCause::MissingOrUnknownDnnInSlice,
+                SM_TIMER_GENERIC_BACKOFF,
+                false,
+            ),
         ] {
             let (mut orch, ids) = configured(&[test_params()]);
             let (psi, pti) = ids[0];
@@ -3675,6 +3699,117 @@ mod tests {
         assert!(orch.is_backed_off(Some(&[0x01]), Some("internet")));
         expire_backoffs(&mut orch);
         one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// #380 review: T3584 (#67) and the §6.4.1.4.3 back-off (#70) for the same
+    /// [S-NSSAI, DNN] are separate timers. A RELEASE COMMAND #67 with a new
+    /// value, or with zero, leaves the 12-minute #70 back-off alone.
+    #[test]
+    fn a_67_release_leaves_the_70_back_off_alone() {
+        for value in [two_s(1), BACKOFF_ZERO] {
+            let mut internet6 = test_params();
+            internet6.session_type = PduSessionTypeValue::Ipv6;
+            let (mut orch, ids) = configured(&[test_params(), internet6]);
+            let [(p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+                panic!("two requests: {ids:?}");
+            };
+            deliver(&mut orch, conformant_accept_bytes(p_in6, t_in6), p_in6);
+            deliver(
+                &mut orch,
+                reject_bytes(p_in, t_in, SmCause::MissingOrUnknownDnnInSlice, None),
+                p_in,
+            );
+            deliver(
+                &mut orch,
+                release_command_bytes(
+                    p_in6,
+                    SmCause::InsufficientResourcesForSliceAndDnn,
+                    Some(value),
+                ),
+                p_in6,
+            );
+            let generic = orch
+                .backoff
+                .iter()
+                .find(|(k, _)| k.timer == SM_TIMER_GENERIC_BACKOFF)
+                .and_then(|(_, e)| e.timer.as_ref())
+                .map(UeTimer::remaining);
+            assert_eq!(
+                generic,
+                Some(SM_RETRY_TIMER_DEFAULT_SECS),
+                "value {value:#04x}"
+            );
+            elapse_retry_waits(&mut orch);
+            assert!(
+                orch.retry_wanted_sessions().is_empty(),
+                "value {value:#04x}: §6.4.1.4.3 still bars the [S-NSSAI, DNN]"
+            );
+        }
+    }
+
+    /// §6.3.3.3: a RELEASE COMMAND with #39 stops T3396 even when it carries a
+    /// Back-off timer value IE, so the reactivation and the barred configured
+    /// session both go out.
+    #[test]
+    fn a_39_release_with_a_back_off_value_still_stops_t3396() {
+        let mut internet6 = test_params();
+        internet6.session_type = PduSessionTypeValue::Ipv6;
+        let (mut orch, ids) = configured(&[test_params(), internet6]);
+        let [(p_in, t_in), (p_in6, t_in6)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        deliver(&mut orch, conformant_accept_bytes(p_in, t_in), p_in);
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_in6,
+                t_in6,
+                SmCause::InsufficientResources,
+                Some(two_s(30)),
+            ),
+            p_in6,
+        );
+        assert!(orch.is_backed_off(None, Some("internet")));
+        let outs = deliver(
+            &mut orch,
+            release_command_bytes(p_in, SmCause::ReactivationRequested, Some(two_s(30))),
+            p_in,
+        );
+        assert!(!orch.is_backed_off(None, Some("internet")));
+        one_request(&outs);
+        one_request(&orch.retry_wanted_sessions());
+    }
+
+    /// `backoff_remaining` reports the longest running back-off that applies.
+    #[test]
+    fn backoff_remaining_is_the_longest_that_applies() {
+        let mut ims = test_params();
+        ims.dnn = Some("ims".to_string());
+        let (mut orch, ids) = configured(&[test_params(), ims]);
+        let [(p_in, t_in), (p_ims, t_ims)] = ids[..] else {
+            panic!("two requests: {ids:?}");
+        };
+        // T3396 60 s for "internet", T3585 10 s for the slice
+        deliver(
+            &mut orch,
+            reject_bytes(p_in, t_in, SmCause::InsufficientResources, Some(two_s(30))),
+            p_in,
+        );
+        deliver(
+            &mut orch,
+            reject_bytes(
+                p_ims,
+                t_ims,
+                SmCause::InsufficientResourcesForSlice,
+                Some(two_s(5)),
+            ),
+            p_ims,
+        );
+        assert_eq!(
+            orch.backoff_remaining(Some(&[0x01]), Some("internet")),
+            Some(60)
+        );
+        assert_eq!(orch.backoff_remaining(Some(&[0x01]), Some("ims")), Some(10));
     }
 
     /// §6.2.7: T3396 started for a request without a DNN is associated with
