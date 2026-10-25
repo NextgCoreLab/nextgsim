@@ -42,10 +42,11 @@ use nextgsim_nas::messages::mm::ue_policy::{
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
-    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, Ie5gsMobileIdentity,
-    MmCause, MobileIdentityType, RegistrationAccept, RegistrationComplete, RegistrationReject,
-    RegistrationRequest, SecurityModeCommand, SecurityModeComplete, SecurityModeReject,
-    ServiceAccept, ServiceReject, ServiceRequest,
+    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, DlNasTransport,
+    FiveGMmStatus, IdentityRequest, Ie5gsMobileIdentity, MmCause, MobileIdentityType,
+    RegistrationAccept, RegistrationComplete, RegistrationReject, RegistrationRequest,
+    SecurityModeCommand, SecurityModeComplete, SecurityModeReject, ServiceAccept, ServiceReject,
+    ServiceRequest,
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
@@ -2029,7 +2030,7 @@ impl MmOrchestrator {
             Ok(acc) => acc,
             Err(e) => {
                 warn!("Failed to decode Registration Accept: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -2251,7 +2252,7 @@ impl MmOrchestrator {
             Ok(rej) => rej,
             Err(e) => {
                 warn!("Failed to decode Registration Reject: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
         let cause = rej.mm_cause.value;
@@ -2579,7 +2580,7 @@ impl MmOrchestrator {
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode Authentication Request: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -3478,7 +3479,7 @@ impl MmOrchestrator {
             Ok(rej) => rej,
             Err(e) => {
                 warn!("Failed to decode Service Reject: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
         // The cause octet as sent: #78 has no MmCause variant, so the decoded
@@ -3863,7 +3864,7 @@ impl MmOrchestrator {
             Ok(m) => m,
             Err(e) => {
                 warn!("Malformed network DEREGISTRATION REQUEST: {e}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -4152,8 +4153,36 @@ impl MmOrchestrator {
                 warn!("Security Mode Command without integrity protection: discarded");
                 Vec::new()
             }
+            // Owned by the caller, but their mandatory IEs are checked here so an
+            // undecodable one is answered with 5GMM STATUS #96 like the rest
+            // (TS 24.501 §7.5.1).
+            MmMessageType::IdentityRequest
+                if IdentityRequest::decode(&mut plain.as_slice()).is_err() =>
+            {
+                warn!("Failed to decode Identity Request");
+                self.send_invalid_mandatory_information_status()
+            }
+            MmMessageType::DlNasTransport if DlNasTransport::decode(&mut &plain[3..]).is_err() => {
+                warn!("Failed to decode DL NAS Transport");
+                self.send_invalid_mandatory_information_status()
+            }
             _ => vec![MmOutput::NotHandled(plain)],
         }
+    }
+
+    /// 5GMM STATUS with cause #96 "invalid mandatory information" (TS 24.501
+    /// §7.5.1, §8.2.29), the UE's answer to a 5GMM message with an imperative
+    /// part error, a missing or syntactically incorrect mandatory IE, or an
+    /// unknown "comprehension required" IE. §7.5.2 lists no 5GMM exception, so
+    /// the procedure the message belonged to is otherwise left as it was: its
+    /// timer keeps running and its retransmission decides what happens next.
+    /// Before #932 (nextgcore) the UE logged the failure and sent nothing.
+    fn send_invalid_mandatory_information_status(&mut self) -> Vec<MmOutput> {
+        let mut pdu = Vec::new();
+        FiveGMmStatus::new(MmCause::InvalidMandatoryInformation).encode(&mut pdu);
+        info!("Sending 5GMM STATUS (cause #96, invalid mandatory information)");
+        let pdu = self.protect_if_active(pdu);
+        vec![MmOutput::SendNasPdu(pdu)]
     }
 
     /// TS 24.501 4.4.4.2 allow-list: messages the UE may process when received
@@ -6772,6 +6801,97 @@ mod tests {
         pdu.extend_from_slice(&plain_acc);
         let outs = orch.handle_downlink(&pdu);
         assert!(outs.is_empty());
+    }
+
+    // ========================================================================
+    // Mandatory-IE errors: 5GMM STATUS #96 (TS 24.501 §7.5.1, nextgcore #932)
+    // ========================================================================
+
+    /// The plain 5GMM message inside an uplink PDU the UE sent: as is when it
+    /// went out unprotected, deciphered with the uplink COUNT it used otherwise.
+    fn open_uplink(orch: &MmOrchestrator, pdu: &[u8]) -> Vec<u8> {
+        if pdu[1] == 0x00 {
+            return pdu.to_vec();
+        }
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        let mut payload = pdu[7..].to_vec();
+        if pdu[1] == 0x02 {
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                &mut payload,
+            );
+        }
+        payload
+    }
+
+    /// The exact 5GMM STATUS #96 octets (TS 24.501 §8.2.29): EPD 0x7E, plain
+    /// security header, message type 0x64, 5GMM cause 96.
+    const STATUS_96: [u8; 4] = [0x7E, 0x00, 0x64, 96];
+
+    /// Every UE-owned downlink 5GMM message whose mandatory part does not decode
+    /// is answered with 5GMM STATUS #96, protected like any other uplink.
+    #[test]
+    fn a_protected_message_with_a_bad_mandatory_ie_is_answered_with_status_96() {
+        let cases: &[(&str, Vec<u8>)] = &[
+            // 5GS registration result (LV) missing.
+            ("REGISTRATION ACCEPT", vec![0x7E, 0x00, 0x42]),
+            // 5GMM cause missing.
+            ("REGISTRATION REJECT", vec![0x7E, 0x00, 0x44]),
+            ("SERVICE REJECT", vec![0x7E, 0x00, 0x4D]),
+            // De-registration type + ngKSI octet missing.
+            ("DEREGISTRATION REQUEST", vec![0x7E, 0x00, 0x47]),
+            // ngKSI octet present, ABBA (LV) missing.
+            ("AUTHENTICATION REQUEST", vec![0x7E, 0x00, 0x56, 0x00]),
+            // 5GS identity type missing.
+            ("IDENTITY REQUEST", vec![0x7E, 0x00, 0x5B]),
+            // Payload container type present, payload container (LV-E) missing.
+            ("DL NAS TRANSPORT", vec![0x7E, 0x00, 0x68, 0x01]),
+        ];
+        for (name, inner) in cases {
+            let mut orch = establish_security_context();
+            let protected = protect_downlink(&orch, inner, 1);
+            let outs = orch.handle_downlink(&protected);
+            assert_eq!(outs.len(), 1, "{name}: one uplink, nothing else: {outs:?}");
+            let sent = first_sent_pdu(&outs).to_vec();
+            assert_eq!(sent[1], 0x02, "{name}: the STATUS goes out protected");
+            assert_eq!(open_uplink(&orch, &sent), STATUS_96, "{name}");
+        }
+    }
+
+    /// Before security is established, a message on the TS 24.501 §4.4.4.2
+    /// allow-list with a bad mandatory IE gets a plain STATUS #96.
+    #[test]
+    fn a_plain_allowed_message_with_a_bad_mandatory_ie_is_answered_with_status_96() {
+        for inner in [
+            vec![0x7E, 0x00, 0x56, 0x00],
+            vec![0x7E, 0x00, 0x44],
+            vec![0x7E, 0x00, 0x4D],
+        ] {
+            let mut orch = new_orch();
+            orch.start_registration(RegistrationType::InitialRegistration);
+            let outs = orch.handle_downlink(&inner);
+            assert_eq!(first_sent_pdu(&outs), STATUS_96, "{inner:02x?}");
+            // The procedure is otherwise untouched: T3510 still runs.
+            assert!(orch.timers().t3510.is_running());
+            assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
+        }
+    }
+
+    /// A well-formed DL NAS TRANSPORT still goes to the caller, not to STATUS.
+    #[test]
+    fn a_decodable_dl_nas_transport_is_not_answered_with_status() {
+        let mut orch = establish_security_context();
+        let inner = vec![0x7E, 0x00, 0x68, 0x01, 0x00, 0x01, 0xAA];
+        let protected = protect_downlink(&orch, &inner, 1);
+        assert_eq!(
+            orch.handle_downlink(&protected),
+            vec![MmOutput::NotHandled(inner)]
+        );
     }
 
     #[test]
