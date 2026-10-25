@@ -898,3 +898,85 @@ async fn an_n2_handover_under_as_security_agrees_end_to_end() {
         "and the UE's next UL PDU verifies at the target"
     );
 }
+
+/// #396 review: a re-establishment commits the NH chain it synchronised. Re-
+/// establish at NCC 3 (keyed from NH(3)), then take a handover command at NCC 0:
+/// the UE has to go on from NH(3) through NCC 4..7 to NH(8), not restart from the
+/// KgNB of the SecurityModeCommand. A chain left at NCC 0 would key the handover
+/// from the KgNB itself, because the chain is deterministic and only an NCC wrap
+/// shows the difference.
+#[tokio::test]
+async fn a_re_establishment_commits_the_nh_chain_for_the_next_handover() {
+    use nextgsim_crypto::kdf::{
+        derive_kgnb_star, derive_nh, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+    };
+    use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reconfiguration::{
+        encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+    };
+    use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
+    use nextgsim_ue::tasks::RlfCause;
+
+    let mut nh = KGNB;
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        nh = derive_nh(&KAMF, &nh);
+        chain.push(nh);
+    }
+    let (nh3, nh8) = (chain[2], chain[7]);
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        mut ue_rls_rx,
+        mut gnb_rls_rx,
+        ..
+    } = nea2_secured(3, None).await;
+    gnb.handle_as_security_for_reestablishment(
+        UE_ID,
+        ReestablishmentSecurity {
+            k_rrc_int: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcInt, 2),
+            k_rrc_enc: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcEnc, 2),
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
+            next_hop_chaining_count: 3,
+            kgnb: nh3,
+        },
+    );
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+        .await;
+    ue.perform_cycle().await;
+    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
+    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    let (ch, complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlDcch, "re-established at NCC 3");
+    gnb.handle_uplink_rrc(UE_ID, ch, complete).await;
+    while gnb_rls_rx.try_recv().is_ok() {}
+
+    // A handover command at NCC 0, on the re-established SRB1
+    const TARGET_PCI: u16 = 32;
+    let command = encode_handover_command(&HandoverCommandParams {
+        rrc_transaction_id: 0,
+        target_phys_cell_id: TARGET_PCI,
+        new_ue_identity: 0x03E8,
+        t304_ms: 1000,
+        full_config: true,
+        master_key_update: Some(MasterKeyUpdateParams {
+            key_set_change_indicator: false,
+            next_hop_chaining_count: 0,
+        }),
+    })
+    .expect("encode the handover command");
+    gnb.handle_send_handover_command(UE_ID, OctetString::from_slice(&command))
+        .await;
+    let (_, ch, protected) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, protected).await;
+    assert_eq!(
+        ue.as_security().expect("keyed").kgnb,
+        derive_kgnb_star(&nh8, TARGET_PCI, gnb_config().dl_arfcn),
+        "KgNB* from NH(8), chained on from the re-establishment's NH(3)"
+    );
+}

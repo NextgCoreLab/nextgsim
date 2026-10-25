@@ -5850,6 +5850,53 @@ mod tests {
         assert_eq!(ctx.pdcp_counts(), (0, 0), "SRB1 PDCP re-established");
     }
 
+    /// #396 review: under a secured expectation, a PLAINTEXT UL-DCCH PDU from the
+    /// expected C-RNTI (here an ULInformationTransfer carrying NAS) fails the
+    /// KgNB* integrity check and is discarded outright: it is neither bound nor
+    /// dispatched, so no NAS reaches NGAP and no HANDOVER NOTIFY goes out.
+    #[test]
+    fn a_plaintext_pdu_under_a_secured_expectation_is_discarded() {
+        use nextgsim_rrc::procedures::information_transfer::{
+            encode_ul_information_transfer, UlInformationTransferParams,
+        };
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(
+                GnbConfig {
+                    as_security_enabled: true,
+                    ..test_config()
+                },
+                16,
+            );
+        let mut task = RrcTask::new(task_base);
+        let plain = encode_ul_information_transfer(&UlInformationTransferParams {
+            dedicated_nas_message: Some(vec![0x7E, 0x00, 0x67, 0x01]),
+        })
+        .expect("encode ULInformationTransfer");
+        run_async(async {
+            task.handle_expect_secured_handover_arrival(1000, 0x03E8, Some(arrival_security()));
+            task.handle_uplink_rrc_with_c_rnti(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&plain),
+                Some(0x03E8),
+            )
+            .await;
+        });
+        assert!(rebinds(&mut rls_rx).is_empty());
+        let mut nas = 0;
+        let mut notify = 0;
+        while let Ok(msg) = ngap_rx.try_recv() {
+            match msg {
+                TaskMessage::Message(NgapMessage::UplinkNasDelivery { .. })
+                | TaskMessage::Message(NgapMessage::InitialNasDelivery { .. }) => nas += 1,
+                TaskMessage::Message(NgapMessage::HandoverAccessCompleted { .. }) => notify += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((nas, notify), (0, 0), "discarded, not dispatched");
+        assert!(task.expects_handover_arrival(1000));
+    }
+
     /// #324, #355 review: two concurrent handovers into one target. Each arriving
     /// UE speaks first under an RLS id of its own, and is bound to the admission
     /// whose C-RNTI it presents, whatever the order of arrival. The binding used to
