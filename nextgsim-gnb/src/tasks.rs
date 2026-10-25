@@ -500,6 +500,8 @@ pub enum UeReleaseRequestCause {
     RadioLinkFailure,
     /// RAN originated release
     RanOriginated,
+    /// No user-plane activity for `inactivity_timer_secs` (#352)
+    UserInactivity,
 }
 
 /// GUTI mobile identity for S-TMSI.

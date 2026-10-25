@@ -22,6 +22,7 @@ use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelError, TunnelManager, GT
 
 use nextgsim_ngap::procedures::pdu_session_resource_notify::NotifyCause;
 
+use crate::tasks::UeReleaseRequestCause;
 use crate::tasks::{
     GnbTaskBase, GtpMessage, GtpUeContextUpdate, NgapMessage, PduSessionResource, RlsMessage, Task,
     TaskMessage,
@@ -101,6 +102,10 @@ pub struct GtpTask {
     /// hot downlink path.
     #[cfg(feature = "sdap-dataplane")]
     sdap_sessions: HashMap<(i32, u8), SdapSessionState>,
+    /// When each UE with a PDU session last had a user-plane packet forwarded,
+    /// in either direction (#352). Kept only while `inactivity_timer_secs` is
+    /// set; see [`GtpTask::take_inactive_ues`].
+    last_user_plane_activity: HashMap<i32, tokio::time::Instant>,
 }
 
 impl GtpTask {
@@ -165,6 +170,7 @@ impl GtpTask {
             path_supervisor,
             #[cfg(feature = "sdap-dataplane")]
             sdap_sessions: HashMap::new(),
+            last_user_plane_activity: HashMap::new(),
         }
     }
 
@@ -194,8 +200,67 @@ impl GtpTask {
         debug!("UE context updated: ue_id={}", ue_id);
     }
 
+    /// The user-inactivity timer (#352), if configured.
+    fn inactivity_timer(&self) -> Option<std::time::Duration> {
+        self.task_base
+            .config
+            .inactivity_timer_secs
+            .filter(|s| *s > 0)
+            .map(std::time::Duration::from_secs)
+    }
+
+    /// A user-plane packet was forwarded for `ue_id` (#352).
+    fn note_user_plane_activity(&mut self, ue_id: i32) {
+        if self.inactivity_timer().is_some() {
+            self.last_user_plane_activity
+                .insert(ue_id, tokio::time::Instant::now());
+        }
+    }
+
+    /// The UEs whose user plane has been idle for the inactivity timer, as of
+    /// `now` (TS 23.502 §4.2.6, #352). Each is reported once: its entry is
+    /// dropped, and only new traffic arms it again.
+    fn take_inactive_ues(&mut self, now: tokio::time::Instant) -> Vec<i32> {
+        let Some(timer) = self.inactivity_timer() else {
+            return Vec::new();
+        };
+        let mut idle: Vec<i32> = self
+            .last_user_plane_activity
+            .iter()
+            .filter(|(_, last)| now.saturating_duration_since(**last) >= timer)
+            .map(|(ue, _)| *ue)
+            .collect();
+        idle.sort_unstable();
+        for ue in &idle {
+            self.last_user_plane_activity.remove(ue);
+        }
+        idle
+    }
+
+    /// Ask the AMF to release each UE whose user plane has been inactive for
+    /// the inactivity timer: UE CONTEXT RELEASE REQUEST, cause user-inactivity
+    /// (TS 38.413 §8.3.2, §9.3.1.2). The AMF's UE CONTEXT RELEASE COMMAND then
+    /// releases RRC through the existing path, and the UE goes to CM-IDLE.
+    async fn release_inactive_ues(&mut self) {
+        for ue_id in self.take_inactive_ues(tokio::time::Instant::now()) {
+            info!(
+                "UE[{ue_id}]: no user-plane activity for {:?}; requesting a release \
+                 (user-inactivity)",
+                self.inactivity_timer().unwrap_or_default()
+            );
+            let msg = NgapMessage::UeContextReleaseRequest {
+                ue_id,
+                cause: UeReleaseRequestCause::UserInactivity,
+            };
+            if let Err(e) = self.task_base.ngap_tx.send(msg).await {
+                error!("Failed to request the user-inactivity release of UE[{ue_id}]: {e}");
+            }
+        }
+    }
+
     /// Handle UE context release from NGAP
     fn handle_ue_context_release(&mut self, ue_id: i32) {
+        self.last_user_plane_activity.remove(&ue_id);
         // Delete all PDU sessions for this UE
         let deleted = self.tunnel_manager.delete_sessions_for_ue(ue_id as u32);
         debug!("Deleted {} PDU sessions for UE {}", deleted.len(), ue_id);
@@ -215,6 +280,10 @@ impl GtpTask {
     /// Handle PDU session create from NGAP
     fn handle_session_create(&mut self, ue_id: i32, resource: PduSessionResource) {
         let created = self.create_tunnel_session(ue_id, &resource);
+        // A new session starts the inactivity clock (#352)
+        if created {
+            self.note_user_plane_activity(ue_id);
+        }
 
         // Stand up the session's SDAP entity from the flows the core admitted
         // (issue #44), but only for a session that actually exists -- an entity for a
@@ -381,6 +450,14 @@ impl GtpTask {
                 error!("PDU session release failed: {}", e);
             }
         }
+        // With no PDU session left there is no user plane to be inactive (#352)
+        if self
+            .tunnel_manager
+            .get_sessions_for_ue(ue_id as u32)
+            .is_empty()
+        {
+            self.last_user_plane_activity.remove(&ue_id);
+        }
     }
 
     /// Handle uplink data PDU from RLS (UE -> UPF)
@@ -438,6 +515,7 @@ impl GtpTask {
                 if let Err(e) = socket.send_to(&encoded, dest_addr).await {
                     error!("Failed to send GTP-U uplink: {}", e);
                 } else {
+                    self.note_user_plane_activity(ue_id);
                     debug!(
                         "Sent uplink GTP-U: ue_id={}, psi={}, teid={:#x}, {} bytes",
                         ue_id,
@@ -729,6 +807,7 @@ impl GtpTask {
                     resolved
                 };
 
+                self.note_user_plane_activity(ue_id);
                 let msg = RlsMessage::DownlinkData {
                     ue_id,
                     psi,
@@ -1177,10 +1256,23 @@ impl Task for GtpTask {
             }
         };
 
+        // User-inactivity release (#352): checked once a second, never when the
+        // timer is not configured.
+        let inactivity_enabled = self.inactivity_timer().is_some();
+        if let Some(t) = self.inactivity_timer() {
+            info!("User-inactivity release after {t:?} without user-plane traffic");
+        }
+        let mut inactivity_check = tokio::time::interval(std::time::Duration::from_secs(1));
+        inactivity_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         info!("GTP task started");
 
         loop {
             tokio::select! {
+                _ = inactivity_check.tick(), if inactivity_enabled => {
+                    self.release_inactive_ues().await;
+                }
+
                 // GTP-U Echo path supervision (never fires when disabled)
                 _ = echo_interval.tick(), if echo_period > 0 => {
                     self.run_echo_supervision_period().await;
@@ -1370,6 +1462,136 @@ mod tests {
             "the signalled UPF TEID"
         );
         assert_eq!(task.uplink_without_session_drops, 3);
+    }
+
+    /// A session for UE `ue_id`, PSI 1, pointing at `upf` (#352 tests).
+    fn session_for(ue_id: u32, upf: SocketAddr) -> PduSession {
+        PduSession::new(
+            ue_id,
+            1,
+            GtpTunnel::new(0xABCD + ue_id, upf),
+            GtpTunnel::new(
+                0x2000 + ue_id,
+                SocketAddr::new(IpAddr::from([127, 0, 0, 1]), GTP_U_PORT),
+            ),
+        )
+        .with_qfi(1)
+    }
+
+    /// Pretend UE `ue`'s last user-plane packet was `ago` before now (#352 tests).
+    fn last_activity_ago(task: &mut GtpTask, ue: i32, ago: std::time::Duration) {
+        task.last_user_plane_activity
+            .insert(ue, tokio::time::Instant::now() - ago);
+    }
+
+    /// #352: with `inactivity_timer_secs` set, a UE whose user plane carried
+    /// nothing for that long is reported once; uplink restarts the clock. With
+    /// the timer absent (the default) nothing is tracked or reported.
+    #[tokio::test]
+    async fn an_idle_user_plane_is_reported_once_after_the_inactivity_timer() {
+        use std::time::Duration;
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.upf_addr = Some("127.0.0.1".to_string());
+        config.upf_port = upf.local_addr().unwrap().port();
+        config.inactivity_timer_secs = Some(10);
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::new(task_base);
+        task.udp_socket = Some(Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        for ue in [1u32, 2] {
+            task.tunnel_manager
+                .create_session(session_for(ue, upf.local_addr().unwrap()))
+                .unwrap();
+        }
+        last_activity_ago(&mut task, 1, Duration::from_secs(20));
+        last_activity_ago(&mut task, 2, Duration::from_secs(20));
+        assert!(
+            task.take_inactive_ues(tokio::time::Instant::now() - Duration::from_secs(11))
+                .is_empty(),
+            "idle 9 s: not yet"
+        );
+        // UE 2 sends uplink: its clock restarts
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        task.handle_uplink_data(2, 1, ip).await;
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            task.take_inactive_ues(now),
+            vec![1],
+            "UE 1 idle 20 s, UE 2 just sent"
+        );
+        assert!(task.take_inactive_ues(now).is_empty(), "reported once");
+        assert_eq!(
+            task.take_inactive_ues(now + Duration::from_secs(11)),
+            vec![2]
+        );
+
+        // Off by default: nothing is tracked or reported
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(test_config(), 16);
+        let mut off = GtpTask::new(task_base);
+        off.note_user_plane_activity(1);
+        assert!(off.last_user_plane_activity.is_empty());
+        assert!(off
+            .take_inactive_ues(tokio::time::Instant::now() + Duration::from_secs(3600))
+            .is_empty());
+    }
+
+    /// #352: downlink traffic restarts the clock too, and a released session is
+    /// no longer tracked.
+    #[tokio::test]
+    async fn downlink_restarts_the_inactivity_clock_and_a_release_stops_it() {
+        use std::time::Duration;
+        let mut config = test_config();
+        config.inactivity_timer_secs = Some(10);
+        let (task_base, _, _, _, _, mut rls_rx, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::new(task_base);
+        let upf: SocketAddr = "127.0.0.1:2152".parse().unwrap();
+        task.tunnel_manager
+            .create_session(session_for(1, upf))
+            .unwrap();
+        last_activity_ago(&mut task, 1, Duration::from_secs(20));
+        // A downlink G-PDU on the session's downlink TEID
+        let mut ip = vec![0u8; 20];
+        ip[0] = 0x45;
+        let gpdu = GtpHeader::g_pdu(0x2001, Bytes::from(ip));
+        task.handle_downlink_gpdu(&gpdu, upf).await;
+        assert!(rls_rx.try_recv().is_ok(), "the downlink was forwarded");
+        let now = tokio::time::Instant::now();
+        assert!(
+            task.take_inactive_ues(now + Duration::from_secs(5))
+                .is_empty(),
+            "idle only 5 s since the downlink"
+        );
+        task.handle_session_release(1, 1);
+        assert!(
+            task.take_inactive_ues(now + Duration::from_secs(60))
+                .is_empty(),
+            "no session, no user plane to be idle"
+        );
+    }
+
+    /// #352: the release goes to NGAP as UE CONTEXT RELEASE REQUEST with the
+    /// user-inactivity cause.
+    #[tokio::test]
+    async fn an_inactive_ue_is_released_through_ngap() {
+        let mut config = test_config();
+        config.inactivity_timer_secs = Some(1);
+        let (task_base, _, mut ngap_rx, _, _, _, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::new(task_base);
+        task.tunnel_manager
+            .create_session(session_for(3, "127.0.0.1:2152".parse().unwrap()))
+            .unwrap();
+        last_activity_ago(&mut task, 3, std::time::Duration::from_secs(2));
+        task.release_inactive_ues().await;
+        match ngap_rx.try_recv() {
+            Ok(TaskMessage::Message(NgapMessage::UeContextReleaseRequest {
+                ue_id: 3,
+                cause: UeReleaseRequestCause::UserInactivity,
+            })) => {}
+            other => panic!("expected a user-inactivity release request, got {other:?}"),
+        }
     }
 
     /// #340: the uplink of a signalled session is tunnelled whatever the SDU is.
