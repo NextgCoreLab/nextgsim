@@ -139,6 +139,10 @@ pub struct SctpTask {
     reresolving: bool,
     reresolve_tx: mpsc::UnboundedSender<ReresolveOutcome>,
     reresolve_rx: mpsc::UnboundedReceiver<ReresolveOutcome>,
+    /// The SCTP transport parameters each association starts from (RTO
+    /// bounds, Association.Max.Retrans); the backend comes from the gNB
+    /// config. Tests shorten the RTO so a lost peer is noticed in seconds.
+    sctp_template: SctpConfig,
 }
 
 impl SctpTask {
@@ -163,6 +167,7 @@ impl SctpTask {
             reresolving: false,
             reresolve_tx,
             reresolve_rx,
+            sctp_template: SctpConfig::default(),
         }
     }
 
@@ -420,6 +425,7 @@ impl SctpTask {
             },
         );
         let connect_timeout = self.connect_timeout;
+        let sctp_template = self.sctp_template.clone();
         let remote = target.remote;
         tokio::spawn(async move {
             let work = async {
@@ -436,7 +442,7 @@ impl SctpTask {
                     secondary_addresses,
                     sctp_config: SctpConfig {
                         backend,
-                        ..SctpConfig::default()
+                        ..sctp_template
                     },
                 };
                 let mut connection = AmfConnection::new(client_id, conn_config.clone());
@@ -976,6 +982,73 @@ mod tests {
                 NgapMessage::SctpAssociationUp { client_id: 0, .. }
             ),
             "the gNB must reconnect to the AMF's new address"
+        );
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        let _ = runner.await;
+    }
+
+    /// #338: an AMF that restarts at the SAME address silently drops the old
+    /// association's packets (sctp-proto answers no out-of-the-blue packet).
+    /// The gNB's unanswered DATA exhausts Association.Max.Retrans (RFC 9260
+    /// §8.1), the association is reported down to NGAP, and the gNB
+    /// reconnects to the restarted AMF. Before, sctp-proto retransmitted
+    /// forever and the poll path swallowed any loss, so the association stayed
+    /// up for good.
+    #[tokio::test]
+    async fn an_amf_restarted_at_the_same_address_is_detected_and_reconnected() {
+        let (a, a_task) = amf_stand_in("127.0.0.1:0".parse().unwrap()).await;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = SctpTask::new(task_base);
+        task.reconnect_delay = Duration::from_millis(100);
+        task.sctp_template = SctpConfig {
+            rto_initial_ms: 300,
+            rto_min_ms: 300,
+            rto_max_ms: 400,
+            max_association_retrans: 3,
+            ..SctpConfig::default()
+        };
+        let (tx, rx) = mpsc::channel(16);
+        let runner = tokio::spawn(async move { task.run(rx).await });
+        tx.send(TaskMessage::Message(SctpMessage::ConnectionRequest {
+            client_id: 0,
+            local_address: "127.0.0.1".into(),
+            local_port: 0,
+            remote_address: a.ip().to_string(),
+            remote_port: a.port(),
+            ppid: nextgsim_sctp::NGAP_PPID,
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(
+            next_association_event(&mut ngap_rx).await,
+            NgapMessage::SctpAssociationUp { client_id: 0, .. }
+        ));
+
+        // The AMF restarts in place: same address, a fresh endpoint that knows
+        // nothing of the old association.
+        a_task.abort();
+        let _ = a_task.await;
+        let (a2, _a2_task) = amf_stand_in(a).await;
+        assert_eq!(a2, a);
+        tx.send(TaskMessage::Message(SctpMessage::SendMessage {
+            client_id: 0,
+            stream: 0,
+            buffer: OctetString::from_slice(&[0x00, 0x15]),
+        }))
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            next_association_event(&mut ngap_rx).await,
+            NgapMessage::SctpAssociationDown { client_id: 0 }
+        ));
+        assert!(
+            matches!(
+                next_association_event(&mut ngap_rx).await,
+                NgapMessage::SctpAssociationUp { client_id: 0, .. }
+            ),
+            "the gNB must reconnect to the restarted AMF"
         );
         tx.send(TaskMessage::Shutdown).await.unwrap();
         let _ = runner.await;

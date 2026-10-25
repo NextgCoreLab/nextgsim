@@ -30,6 +30,10 @@ pub use nextgcore_sctp::{
     NEXTGCORE_S1AP_SCTP_PORT as S1AP_SCTP_PORT, NEXTGCORE_SCTP_S1AP_PPID as S1AP_PPID,
 };
 
+/// Association.Max.Retrans default (RFC 9260 §16 "Association.Max.Retrans -
+/// 10 attempts").
+pub const DEFAULT_MAX_ASSOCIATION_RETRANS: u32 = 10;
+
 /// SCTP association errors
 #[derive(Debug, Error)]
 pub enum SctpError {
@@ -96,6 +100,11 @@ pub struct SctpConfig {
     pub rto_initial_ms: u64,
     pub rto_min_ms: u64,
     pub rto_max_ms: u64,
+    /// Association.Max.Retrans (RFC 9260 §8.1, default 10 in §16): the
+    /// association is declared lost after this many consecutive T3-rtx
+    /// expiries with no SACK or DATA from the peer (#338). sctp-proto's T3-rtx
+    /// never fails by design, so this crate supervises it.
+    pub max_association_retrans: u32,
     /// Which transport backend to use. Defaults to
     /// [`SctpBackend::Userspace`] so all existing call sites are unchanged.
     pub backend: SctpBackend,
@@ -112,6 +121,7 @@ impl Default for SctpConfig {
             rto_initial_ms: 3000,
             rto_min_ms: 1000,
             rto_max_ms: 60000,
+            max_association_retrans: DEFAULT_MAX_ASSOCIATION_RETRANS,
             backend: SctpBackend::Userspace,
         }
     }
@@ -141,6 +151,34 @@ pub struct SctpAssociation {
     config: SctpConfig,
     /// Track streams that we've opened for sending (so we can also read responses from them)
     opened_streams: Vec<u16>,
+    /// Peer-liveness supervision (#338, RFC 9260 §8.1): the T3-rtx expiry
+    /// count and the SACK + DATA count seen at the last sign of life.
+    liveness: PeerLiveness,
+}
+
+/// RFC 9260 §8.1 error counting over sctp-proto's statistics (#338).
+///
+/// sctp-proto retransmits DATA forever ("T3-rtx timer will not fail by
+/// design"), so a peer that restarted at the same address -- and silently drops
+/// the old association's packets -- was never noticed. Each T3-rtx expiry is
+/// one error; any SACK or DATA from the peer is a sign of life that clears
+/// the count. More than `max` consecutive errors loses the association.
+#[derive(Debug, Clone, Copy, Default)]
+struct PeerLiveness {
+    t3_at_last_life: u64,
+    life_seen: u64,
+}
+
+impl PeerLiveness {
+    /// Fold in the current statistics; returns the consecutive error count.
+    fn update(&mut self, t3_timeouts: u64, sacks: u64, datas: u64) -> u64 {
+        let life = sacks.saturating_add(datas);
+        if life != self.life_seen {
+            self.life_seen = life;
+            self.t3_at_last_life = t3_timeouts;
+        }
+        t3_timeouts.saturating_sub(self.t3_at_last_life)
+    }
 }
 
 impl SctpAssociation {
@@ -179,6 +217,10 @@ impl SctpAssociation {
             .with_max_receive_buffer_size(config.max_receive_buffer_size)
             .with_rto_initial_ms(config.rto_initial_ms)
             .with_rto_min_ms(config.rto_min_ms)
+            // T3-rtx stays unlimited (sctp-proto's default): a limit there
+            // only stops retransmitting, silently, and reports nothing.
+            // `supervise_peer` counts the expiries and loses the association
+            // instead (#338).
             .with_rto_max_ms(config.rto_max_ms);
 
         // Create client config
@@ -203,6 +245,7 @@ impl SctpAssociation {
             event_tx: None,
             config,
             opened_streams: Vec::new(),
+            liveness: PeerLiveness::default(),
         };
 
         // Perform handshake
@@ -313,6 +356,8 @@ impl SctpAssociation {
             }
         }
 
+        self.supervise_peer();
+
         // Collect transmits from association
         while let Some(transmit) = self.association.poll_transmit(Instant::now()) {
             self.pending_transmits.push_back(transmit);
@@ -321,6 +366,35 @@ impl SctpAssociation {
         // Collect transmits from endpoint
         while let Some(transmit) = self.endpoint.poll_transmit() {
             self.pending_transmits.push_back(transmit);
+        }
+    }
+
+    /// RFC 9260 §8.1 (#338): more than Association.Max.Retrans consecutive
+    /// T3-rtx expiries with no SACK or DATA from the peer mean the peer is
+    /// unreachable -- for example restarted at the same address, where it drops
+    /// the old association's packets. The association is closed and reported
+    /// lost, so the NGAP layer reconnects.
+    fn supervise_peer(&mut self) {
+        if self.state != AssociationState::Established {
+            return;
+        }
+        let mut stats = self.association.stats();
+        let errors = self.liveness.update(
+            stats.get_num_t3timeouts(),
+            stats.get_num_sacks(),
+            stats.get_num_datas(),
+        );
+        if errors > u64::from(self.config.max_association_retrans) {
+            warn!(
+                "SCTP association with {} lost: {errors} consecutive T3-rtx expiries without \
+                 an answer exceed Association.Max.Retrans {} (RFC 9260 §8.1)",
+                self.remote_addr, self.config.max_association_retrans
+            );
+            let _ = self.association.close();
+            self.state = AssociationState::Closed;
+            if let Some(tx) = &self.event_tx {
+                let _ = tx.send(SctpEvent::Disconnected);
+            }
         }
     }
 
@@ -825,6 +899,11 @@ impl MultihomeSctpAssociation {
     /// SCTP state machine before calling `try_recv`.
     pub async fn poll(&mut self) -> Result<()> {
         self.active.poll().await
+    }
+
+    /// Whether the active path's association is closed (#338).
+    pub fn is_closed(&self) -> bool {
+        self.active.is_closed()
     }
 
     /// Try to receive a message without blocking (delegates to the active path).
@@ -1677,6 +1756,27 @@ mod tests {
         assert_eq!(config.max_message_size, DEFAULT_MAX_MESSAGE_SIZE);
         assert_eq!(config.max_receive_buffer_size, DEFAULT_RECEIVE_BUFFER_SIZE);
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
+    }
+
+    /// #338: T3-rtx expiries count up until the peer shows life (a SACK or
+    /// DATA), which clears the count.
+    #[test]
+    fn peer_liveness_counts_t3_expiries_since_the_last_sign_of_life() {
+        let mut l = PeerLiveness::default();
+        assert_eq!(l.update(0, 0, 0), 0);
+        assert_eq!(l.update(1, 0, 0), 1);
+        assert_eq!(l.update(3, 0, 0), 3);
+        // A SACK arrives: the count restarts from here
+        assert_eq!(l.update(3, 1, 0), 0);
+        assert_eq!(l.update(5, 1, 0), 2);
+        // So does DATA from the peer
+        assert_eq!(l.update(5, 1, 1), 0);
+        assert_eq!(l.update(16, 1, 1), 11);
+        assert_eq!(
+            SctpConfig::default().max_association_retrans,
+            10,
+            "RFC 9260 §16 Association.Max.Retrans"
+        );
     }
 
     #[test]
