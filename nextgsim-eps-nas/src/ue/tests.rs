@@ -1062,10 +1062,20 @@ fn udp4(dst: [u8; 4], dport: u16) -> Vec<u8> {
 }
 
 /// The UE's (unprotected) reply to a protected ESM request from the MME.
+/// Anything after it can only be a BEARER RESOURCE MODIFICATION REQUEST for
+/// filters a precedence clash deleted (#408).
 fn esm_reply(ue: &mut EpsNasUe, mme: &mut Mme, esm: &[u8]) -> Vec<u8> {
     let out = ue.on_downlink(&mme.protect(esm, 2), Instant::now());
-    assert_eq!(out.uplink.len(), 1, "one reply");
-    mme.unprotect(&out.uplink[0])
+    assert!(!out.uplink.is_empty(), "a reply");
+    let reply = mme.unprotect(&out.uplink[0]);
+    for extra in &out.uplink[1..] {
+        assert_eq!(
+            mme.unprotect(extra)[2],
+            0xD6,
+            "only a bearer resource modification follows"
+        );
+    }
+    reply
 }
 
 /// #283, §6.4.2.3: the UE accepts a dedicated bearer linked to its default
@@ -1303,4 +1313,249 @@ fn a_detach_drops_the_dedicated_bearers() {
     esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
     ue.on_downlink(&mme.protect(&detach_request(1, None), 2), Instant::now());
     assert!(ue.dedicated_bearers().is_empty());
+}
+
+// ---- #408: precedence clashes (§6.4.2.4 d) 2), §6.4.3.4 d) 2)) and the
+// UE-requested bearer resource modification (§6.5.4) ----
+
+/// The plain uplink PDUs of `out`.
+fn plain_uplinks(mme: &mut Mme, out: &NasOutput) -> Vec<Vec<u8>> {
+    out.uplink.iter().map(|p| mme.unprotect(p)).collect()
+}
+
+/// An attached UE with dedicated bearers 6 (SIP, filter 1 at precedence 0x10)
+/// and the TCP bearer 7 given a filter 1 at the same precedence 0x10: EBI 6's
+/// filter is deleted. Returns the plain uplinks of the activation of 7.
+fn clash_on_dedicated() -> (EpsNasUe, Mme, Vec<Vec<u8>>, Instant) {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    let tcp = [0x21, 0x21, 0x10, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&activate_dedicated(7, 5, &tcp), 2), now);
+    let sent = plain_uplinks(&mut mme, &out);
+    (ue, mme, sent, now)
+}
+
+/// #408, §6.4.2.4 d) 2) and §6.5.4.2 / §8.3.10: the deletion of another
+/// dedicated bearer's filters is followed by a BEARER RESOURCE MODIFICATION
+/// REQUEST that deletes them in the network: EBI 0 and its PTI in the header,
+/// type D6, EBI for packet filter 6, Traffic flow aggregate "Delete packet
+/// filters from existing TFT" (101, one filter) with identifier 1 (TS 24.008
+/// §10.5.6.12), ESM cause #36. T3481 runs; the network's DEACTIVATE EPS
+/// BEARER CONTEXT REQUEST with that PTI stops it (§6.5.4.3).
+#[test]
+fn a_deleted_dedicated_filter_is_deleted_in_the_network_too() {
+    let (mut ue, mut mme, sent, now) = clash_on_dedicated();
+    assert_eq!(sent.len(), 2, "{sent:02x?}");
+    assert_eq!(sent[0], vec![0x72, 0x00, 0xC6], "EBI 7's ACCEPT first");
+    let pti = sent[1][1];
+    assert_ne!(pti, 0, "an assigned PTI");
+    assert_eq!(
+        sent[1],
+        vec![0x02, pti, 0xD6, 0x06, 0x02, 0xA1, 0x01, 0x58, 36],
+        "BEARER RESOURCE MODIFICATION REQUEST"
+    );
+    assert_eq!(ue.next_deadline(), Some(now + T3481));
+
+    // The network deactivates EBI 6, which has no filter left
+    let deactivate = [0x62, pti, 0xCD, 36];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &deactivate),
+        vec![0x62, pti, 0xCE]
+    );
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+    assert_eq!(ue.dedicated_bearers().len(), 1);
+}
+
+/// #408, §6.5.4.5 a): T3481 retransmits the identical request four times; on
+/// the fifth expiry the procedure is aborted and, as it released every
+/// traffic flow of EBI 6, EBI 6 is deactivated locally.
+#[test]
+fn t3481_retransmits_four_times_then_releases_the_bearer_locally() {
+    let (mut ue, mut mme, sent, mut now) = clash_on_dedicated();
+    for n in 1..=4 {
+        now += T3481;
+        let out = ue.on_timer(now);
+        assert_eq!(plain_uplinks(&mut mme, &out), vec![sent[1].clone()], "#{n}");
+    }
+    now += T3481;
+    assert!(ue.on_timer(now).uplink.is_empty());
+    assert_eq!(ue.next_deadline(), None);
+    assert!(
+        ue.dedicated_bearers().iter().all(|b| b.ebi != 6),
+        "EBI 6 deactivated locally"
+    );
+}
+
+/// #408, §6.5.4.4.1 / §6.5.4.5 b), §7.3.1 d): a BEARER RESOURCE MODIFICATION
+/// REJECT for a PTI not in use is ignored; with the PTI and #43 it stops T3481
+/// and EBI 6 is deactivated locally. #26 only ends the procedure.
+#[test]
+fn a_bearer_resource_modification_reject_ends_the_procedure() {
+    let (mut ue, mut mme, sent, _) = clash_on_dedicated();
+    let pti = sent[1][1];
+    let reject = |pti: u8, cause: u8| vec![0x02, pti, 0xD7, cause];
+    let out = ue.on_downlink(&mme.protect(&reject(pti ^ 0x40, 43), 2), Instant::now());
+    assert!(out.uplink.is_empty());
+    assert!(ue.next_deadline().is_some(), "another PTI: ignored");
+    let out = ue.on_downlink(&mme.protect(&reject(pti, 43), 2), Instant::now());
+    assert!(out.uplink.is_empty());
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+    assert!(ue.dedicated_bearers().iter().all(|b| b.ebi != 6));
+
+    let (mut ue, mut mme, sent, _) = clash_on_dedicated();
+    ue.on_downlink(&mme.protect(&reject(sent[1][1], 26), 2), Instant::now());
+    assert_eq!(ue.next_deadline(), None);
+    assert!(ue.dedicated_bearers().iter().any(|b| b.ebi == 6), "kept");
+}
+
+/// The attached UE whose default bearer (EBI 5) has an uplink UDP filter at
+/// precedence 1.
+fn default_bearer_with_a_filter() -> (EpsNasUe, Mme) {
+    let (mut ue, mut mme, _) = attach();
+    let udp = [0x21, 0x21, 0x01, 0x02, 0x30, 0x11];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &modify_tft(5, &udp)),
+        vec![0x52, 0x00, 0xCA]
+    );
+    (ue, mme)
+}
+
+/// The DETACH REQUEST of a release of the last PDN connection, then the
+/// DETACH ACCEPT, the release, and the re-attach.
+fn detaches_and_reattaches(ue: &mut EpsNasUe, mme: &mut Mme, out: &NasOutput, now: Instant) {
+    assert_eq!(
+        out.uplink.len(),
+        1,
+        "the DETACH REQUEST only, no ESM answer"
+    );
+    let plain = detach_request_body(mme, &out.uplink[0]);
+    assert_eq!(plain[2] & 0x0F, 0x01, "EPS detach, not switch off");
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+    ue.on_downlink(&mme.protect(&[0x07, 0x46], 2), now);
+    assert_eq!(ue.state(), EmmState::Deregistered, "an attach is due");
+    assert!(ue.default_bearer().is_none());
+    ue.on_released(now);
+    let req = ue.initial_message(now).expect("the re-attach");
+    assert_eq!(&mme.unprotect(&req)[..2], &[0x07, 0x41], "ATTACH REQUEST");
+}
+
+/// #408, §6.4.2.4 d) 2): a dedicated bearer whose TFT takes a precedence of a
+/// default-bearer filter releases the PDN connection. It is the UE's last,
+/// and the UE does not support EMM-REGISTERED without PDN connection, so it
+/// detaches and re-attaches.
+#[test]
+fn an_activation_clashing_with_the_default_bearer_detaches_and_reattaches() {
+    let (mut ue, mut mme) = default_bearer_with_a_filter();
+    let now = Instant::now();
+    let tcp = [0x21, 0x21, 0x01, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&activate_dedicated(6, 5, &tcp), 2), now);
+    assert!(ue.dedicated_bearers().is_empty(), "not activated");
+    detaches_and_reattaches(&mut ue, &mut mme, &out, now);
+}
+
+/// #408, §6.4.3.4 d) 2): the same for a modification of a dedicated bearer.
+#[test]
+fn a_modification_clashing_with_the_default_bearer_detaches_and_reattaches() {
+    let (mut ue, mut mme) = default_bearer_with_a_filter();
+    let now = Instant::now();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    // Add to EBI 6 a filter (id 2) at the default bearer's precedence 1
+    let add = [0x61, 0x22, 0x01, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&modify_tft(6, &add), 2), now);
+    detaches_and_reattaches(&mut ue, &mut mme, &out, now);
+}
+
+/// #408, §6.5.4.3 ii): a MODIFY EPS BEARER CONTEXT REQUEST with the request's
+/// PTI is the network's answer too: T3481 stops, the bearer stays.
+#[test]
+fn a_modification_with_the_requests_pti_stops_t3481() {
+    let (mut ue, mut mme, sent, _) = clash_on_dedicated();
+    let pti = sent[1][1];
+    // EBI 6, the request's PTI, new EPS QoS (5B) QCI 1
+    let modify = [0x62, pti, 0xC9, 0x5B, 0x01, 0x01];
+    assert_eq!(esm_reply(&mut ue, &mut mme, &modify), vec![0x62, pti, 0xCA]);
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+    assert!(ue.dedicated_bearers().iter().any(|b| b.ebi == 6));
+}
+
+/// #417 review, §6.5.4.5 c): a DEACTIVATE EPS BEARER CONTEXT REQUEST of the
+/// bearer under modification aborts the procedure even without its PTI:
+/// T3481 stops.
+#[test]
+fn a_deactivation_of_the_bearer_aborts_its_bearer_resource_modification() {
+    let (mut ue, mut mme, _, _) = clash_on_dedicated();
+    assert!(ue.next_deadline().is_some(), "T3481 running");
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xCD, 36]),
+        vec![0x62, 0x00, 0xCE]
+    );
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+}
+
+/// #417 review, §6.5.4.5 d): REJECT #31 deactivates the bearer locally only
+/// when the request released every traffic flow of it. EBI 6 keeps a second
+/// filter here, so it stays.
+#[test]
+fn a_reject_31_keeps_a_bearer_with_filters_left() {
+    let (mut ue, mut mme, _) = attach();
+    let now = Instant::now();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    // EBI 6 gets a second filter (id 2) at precedence 0x30
+    let add = [0x61, 0x22, 0x30, 0x02, 0x30, 0x06];
+    esm_reply(&mut ue, &mut mme, &modify_tft(6, &add));
+    let tcp = [0x21, 0x21, 0x10, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&activate_dedicated(7, 5, &tcp), 2), now);
+    let sent = plain_uplinks(&mut mme, &out);
+    let pti = sent[1][1];
+    assert_eq!(&sent[1][5..7], &[0xA1, 0x01], "only filter 1 of EBI 6");
+    ue.on_downlink(&mme.protect(&[0x02, pti, 0xD7, 31], 2), now);
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+    let six = ue.dedicated_bearers().iter().find(|b| b.ebi == 6);
+    assert_eq!(six.map(|b| b.filters.len()), Some(1), "kept, with filter 2");
+
+    // With every flow released, #31 deactivates it
+    let (mut ue, mut mme, sent, _) = clash_on_dedicated();
+    ue.on_downlink(&mme.protect(&[0x02, sent[1][1], 0xD7, 31], 2), now);
+    assert!(ue.dedicated_bearers().iter().all(|b| b.ebi != 6));
+}
+
+/// #417 review: the user's switch-off during the detach-and-re-attach of a
+/// default-bearer clash wins: a switch-off DETACH REQUEST goes, and no attach
+/// follows.
+#[test]
+fn a_switch_off_during_the_reattach_detach_does_not_reattach() {
+    let (mut ue, mut mme) = default_bearer_with_a_filter();
+    let now = Instant::now();
+    let tcp = [0x21, 0x21, 0x01, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&activate_dedicated(6, 5, &tcp), 2), now);
+    detach_request_body(&mut mme, &out.uplink[0]);
+    assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
+
+    let out = ue.detach(true, true, now);
+    let plain = detach_request_body(&mut mme, &out.uplink[0]);
+    assert_eq!(plain[2] & 0x08, 0x08, "switch off");
+    assert_eq!(ue.state(), EmmState::Detached);
+    ue.on_released(now);
+    assert_eq!(ue.initial_message(now), None, "no re-attach");
+}
+
+/// #417 review, §5.5.2.2.4 d): a network DETACH REQUEST "re-attach not
+/// required" crossing the detach-and-re-attach wins: "the UE need not
+/// initiate the attach", and it does not.
+#[test]
+fn a_crossing_network_detach_cancels_the_reattach() {
+    let (mut ue, mut mme) = default_bearer_with_a_filter();
+    let now = Instant::now();
+    let tcp = [0x21, 0x21, 0x01, 0x02, 0x30, 0x06];
+    let out = ue.on_downlink(&mme.protect(&activate_dedicated(6, 5, &tcp), 2), now);
+    detach_request_body(&mut mme, &out.uplink[0]);
+    let out = ue.on_downlink(&mme.protect(&detach_request(2, Some(7)), 2), now);
+    assert_eq!(
+        mme.unprotect(&out.uplink[0]),
+        vec![0x07, 0x46],
+        "DETACH ACCEPT"
+    );
+    ue.on_released(now);
+    assert_eq!(ue.initial_message(now), None, "no re-attach");
 }

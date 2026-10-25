@@ -97,6 +97,10 @@ pub mod esm_type {
     pub const PDN_CONNECTIVITY_REQUEST: u8 = 0xD0;
     /// PDN CONNECTIVITY REJECT.
     pub const PDN_CONNECTIVITY_REJECT: u8 = 0xD1;
+    /// BEARER RESOURCE MODIFICATION REQUEST (Table 9.8.2: 1101 0110).
+    pub const BEARER_RESOURCE_MODIFICATION_REQUEST: u8 = 0xD6;
+    /// BEARER RESOURCE MODIFICATION REJECT (Table 9.8.2: 1101 0111).
+    pub const BEARER_RESOURCE_MODIFICATION_REJECT: u8 = 0xD7;
     /// ESM INFORMATION REQUEST.
     pub const ESM_INFORMATION_REQUEST: u8 = 0xD9;
     /// ESM INFORMATION RESPONSE.
@@ -494,6 +498,31 @@ pub fn encode_modify_reject(ebi: u8, pti: u8, esm_cause: u8) -> Vec<u8> {
     vec![(ebi << 4) | PD_ESM, pti, esm_type::MODIFY_REJECT, esm_cause]
 }
 
+/// BEARER RESOURCE MODIFICATION REQUEST (§8.3.10, #408): EPS bearer
+/// identity 0 in the header (§9.3.2: a UE-requested procedure), the PTI, the
+/// EPS bearer identity for packet filter in bits 4-1 with a spare half octet
+/// in bits 8-5, the LV Traffic flow aggregate description (§9.9.4.15, coded
+/// as the TFT of TS 24.008 §10.5.6.12), and the optional ESM cause (TV 58).
+pub fn encode_bearer_resource_modification_request(
+    pti: u8,
+    ebi_for_packet_filter: u8,
+    traffic_flow_aggregate: &[u8],
+    esm_cause: Option<u8>,
+) -> Vec<u8> {
+    let mut out = vec![
+        PD_ESM,
+        pti,
+        esm_type::BEARER_RESOURCE_MODIFICATION_REQUEST,
+        ebi_for_packet_filter & 0x0F,
+        traffic_flow_aggregate.len() as u8,
+    ];
+    out.extend_from_slice(traffic_flow_aggregate);
+    if let Some(c) = esm_cause {
+        out.extend_from_slice(&[0x58, c]);
+    }
+    out
+}
+
 /// DEACTIVATE EPS BEARER CONTEXT ACCEPT (§8.3.11).
 pub fn encode_deactivate_accept(ebi: u8, pti: u8) -> Vec<u8> {
     vec![(ebi << 4) | PD_ESM, pti, esm_type::DEACTIVATE_ACCEPT]
@@ -866,6 +895,13 @@ pub enum DownlinkEsm {
         /// ESM cause.
         cause: u8,
     },
+    /// BEARER RESOURCE MODIFICATION REJECT (§8.3.9, #408).
+    BearerResourceModificationReject {
+        /// PTI.
+        pti: u8,
+        /// ESM cause.
+        cause: u8,
+    },
     /// Any other ESM message: (EBI, PTI, type).
     Other(u8, u8, u8),
 }
@@ -949,6 +985,12 @@ pub fn decode_downlink_esm(msg: &[u8]) -> Result<DownlinkEsm, NasDecodeError> {
             pti,
             cause: r.u8()?,
         },
+        esm_type::BEARER_RESOURCE_MODIFICATION_REJECT => {
+            DownlinkEsm::BearerResourceModificationReject {
+                pti,
+                cause: r.u8()?,
+            }
+        }
         other => DownlinkEsm::Other(ebi, pti, other),
     })
 }
