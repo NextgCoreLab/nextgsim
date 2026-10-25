@@ -8213,6 +8213,35 @@ mod tests {
         assert_eq!(orch.sr_abort_retries, 0);
     }
 
+    /// #388 review: a Registration Accept that brings the held uplink's user
+    /// plane back ends the abort retries; one that does not leaves them.
+    #[test]
+    fn a_registration_accept_restoring_the_user_plane_ends_the_abort_retries() {
+        for (failed, ended) in [(Some(0x0000), true), (Some(0x0002), false)] {
+            let mut orch = idle_with_data_service_request_in_flight();
+            orch.on_rrc_establishment_failure();
+            assert_eq!(orch.sr_abort_retries, 1);
+            assert!(orch.sr_abort_retry_at.is_some());
+            orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+            assert_eq!(
+                orch.registration_uplink_data_status,
+                uplink_data_status(&[1])
+            );
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            acc.pdu_session_reactivation_result = failed;
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+            assert_eq!(orch.sr_abort_retries == 0, ended, "failed={failed:?}");
+            assert_eq!(orch.sr_abort_retry_at.is_none(), ended, "failed={failed:?}");
+        }
+    }
+
     /// #344: nothing is retried for a signalling request (no uplink held), or
     /// when the abort was a registration starting (its REGISTRATION REQUEST
     /// carries the Uplink data status itself, §5.5.1.3.2).
