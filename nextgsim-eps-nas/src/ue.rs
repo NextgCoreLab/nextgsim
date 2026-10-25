@@ -87,6 +87,16 @@ pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 
 /// ESM cause #81 "invalid PTI value" (§9.9.4.4).
 const ESM_INVALID_PTI: u8 = 81;
+/// ESM cause #31 "request rejected, unspecified".
+const ESM_REQUEST_REJECTED_UNSPECIFIED: u8 = 31;
+/// ESM cause #36 "regular deactivation".
+const ESM_REGULAR_DEACTIVATION: u8 = 36;
+/// T3481, the UE-requested bearer resource modification's timer (Table
+/// 10.3.2: 8 s).
+pub const T3481: Duration = Duration::from_secs(8);
+/// BEARER RESOURCE MODIFICATION REQUEST retransmissions before the procedure
+/// is aborted on the fifth T3481 expiry (§6.5.4.5 a)).
+pub const MAX_BEARER_RESOURCE_MODIFICATION_RETRANSMISSIONS: u8 = 4;
 /// ESM cause #43 invalid EPS bearer identity.
 const ESM_INVALID_EPS_BEARER_IDENTITY: u8 = 43;
 /// ESM cause #95 "semantically incorrect message".
@@ -172,6 +182,33 @@ pub struct DedicatedBearer {
     pub filters: Vec<crate::tft::PacketFilter>,
 }
 
+/// A UE-requested bearer resource modification in progress (TS 24.301
+/// §6.5.4, #408): PROCEDURE TRANSACTION PENDING on `pti`, T3481 running.
+#[derive(Debug, Clone)]
+struct BearerResourceModification {
+    pti: u8,
+    /// The EPS bearer of the traffic flow aggregate.
+    ebi: u8,
+    /// The BEARER RESOURCE MODIFICATION REQUEST, plain, for retransmission.
+    request: Vec<u8>,
+    /// The request releases every traffic flow of the bearer, which a fifth
+    /// T3481 expiry or a REJECT #31 then deactivates locally (§6.5.4.5 a), d)).
+    releases_all: bool,
+    retransmissions: u8,
+    t3481: Instant,
+}
+
+/// The outcome of the §6.4.2.4 d) 2) / §6.4.3.4 d) 2) precedence check of a
+/// TFT a bearer gets.
+enum PrecedenceClash {
+    /// An old filter of the default bearer has a precedence of the new TFT:
+    /// the PDN connection is released. Nothing was changed.
+    DefaultBearer,
+    /// The old filters of other dedicated bearers with those precedences were
+    /// deleted, as (EBI, packet filter identifiers, whether none is left).
+    Deleted(Vec<(u8, Vec<u8>, bool)>),
+}
+
 /// What a NAS event asks of the layers below.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NasOutput {
@@ -245,6 +282,11 @@ pub struct EpsNasUe {
     /// retransmitted (§5.5.2.2.4 c), for T3421.
     detach_request: Option<(Vec<u8>, u8)>,
     t3421: Option<Instant>,
+    /// The detach in progress is the "detach and re-attach" of §6.4.2.4 d) 2)
+    /// (#408): it ends in EMM-DEREGISTERED.NORMAL-SERVICE, with an attach due.
+    reattach_after_detach: bool,
+    /// UE-requested bearer resource modifications in progress (#408).
+    bearer_resource_modifications: Vec<BearerResourceModification>,
 }
 
 /// How the network paged the UE (TS 24.301 §5.6.2.2).
@@ -301,6 +343,8 @@ impl EpsNasUe {
             detach_pending: None,
             detach_request: None,
             t3421: None,
+            reattach_after_detach: false,
+            bearer_resource_modifications: Vec::new(),
         }
     }
 
@@ -415,6 +459,14 @@ impl EpsNasUe {
         self.t3421 = None;
         self.retry_at = None;
         self.state = EmmState::Detached;
+        if std::mem::take(&mut self.reattach_after_detach) {
+            // §6.4.2.4 d) 2): "the UE shall detach and re-attach to the
+            // network": EMM-DEREGISTERED.NORMAL-SERVICE, so the attach is the
+            // next initial message (#408).
+            log::info!("EMM: detached to re-attach; attach due");
+            self.state = EmmState::Deregistered;
+            self.attempts = 0;
+        }
     }
 
     /// The UE was paged for the PS domain (TS 24.301 §5.6.2.2, #351). Returns
@@ -518,6 +570,7 @@ impl EpsNasUe {
         self.bearer = None;
         self.default_filters.clear();
         self.dedicated.clear();
+        self.bearer_resource_modifications.clear();
     }
 
     /// The GUTI, once assigned.
@@ -691,6 +744,10 @@ impl EpsNasUe {
             self.t3346,
             self.t3421,
             self.retry_at,
+            self.bearer_resource_modifications
+                .iter()
+                .map(|m| m.t3481)
+                .min(),
             self.stored_auth.as_ref().map(|a| a.t3416),
         ]
         .into_iter()
@@ -767,6 +824,13 @@ impl EpsNasUe {
         }
         if self.t3346.is_some_and(|t| now >= t) {
             self.t3346 = None;
+        }
+        if self
+            .bearer_resource_modifications
+            .iter()
+            .any(|m| now >= m.t3481)
+        {
+            return self.on_t3481(now);
         }
         if self.retry_at.is_some_and(|t| now >= t) && self.state == EmmState::AttemptingToAttach {
             log::info!("EMM: retry timer expired; attach due again");
@@ -952,7 +1016,7 @@ impl EpsNasUe {
 
     fn on_protected_plain(&mut self, plain: &[u8], now: Instant) -> NasOutput {
         match plain.first().map(|b| b & 0x0F) {
-            Some(PD_ESM) => self.on_esm(plain),
+            Some(PD_ESM) => self.on_esm(plain, now),
             Some(PD_EMM) => match msg::decode_downlink_emm(plain) {
                 Ok(m) => self.on_emm(m, now),
                 Err(e) => {
@@ -1520,8 +1584,33 @@ impl EpsNasUe {
         self.retry_at = None;
     }
 
-    fn on_esm(&mut self, plain: &[u8]) -> NasOutput {
-        match msg::decode_downlink_esm(plain) {
+    fn on_esm(&mut self, plain: &[u8], now: Instant) -> NasOutput {
+        let decoded = msg::decode_downlink_esm(plain);
+        if let Ok(
+            DownlinkEsm::ActivateDedicatedBearerRequest(msg::ActivateDedicatedBearerRequest {
+                pti,
+                ..
+            })
+            | DownlinkEsm::ModifyBearerRequest(msg::ModifyBearerRequest { pti, .. })
+            | DownlinkEsm::DeactivateBearerRequest { pti, .. },
+        ) = &decoded
+        {
+            // §6.5.4.3: the network's answer to a UE-requested bearer resource
+            // modification carries its PTI; T3481 stops (#408).
+            if *pti != 0 {
+                self.bearer_resource_modifications.retain(|m| {
+                    let answered = m.pti == *pti;
+                    if answered {
+                        log::info!(
+                            "ESM: bearer resource modification PTI {} answered; T3481 stopped",
+                            m.pti
+                        );
+                    }
+                    !answered
+                });
+            }
+        }
+        match decoded {
             Ok(DownlinkEsm::EsmInformationRequest { pti }) => {
                 // §6.6.1.2: answer with the APN (or none, for the default).
                 log::info!("ESM: ESM INFORMATION REQUEST; ESM INFORMATION RESPONSE");
@@ -1543,16 +1632,23 @@ impl EpsNasUe {
                 ))
             }
             Ok(DownlinkEsm::ActivateDedicatedBearerRequest(req)) => {
-                let reply = self.on_activate_dedicated(req);
-                self.send_emm(reply)
+                let answer = self.on_activate_dedicated(req);
+                self.esm_answer(answer, now)
             }
             Ok(DownlinkEsm::ModifyBearerRequest(req)) => {
-                let reply = self.on_modify_bearer(req);
-                self.send_emm(reply)
+                let answer = self.on_modify_bearer(req);
+                self.esm_answer(answer, now)
             }
             Ok(DownlinkEsm::DeactivateBearerRequest { ebi, pti, cause }) => {
+                // §6.5.4.5 c): a deactivation of a bearer this UE asked to
+                // modify aborts the modification (T3481 stopped).
+                self.bearer_resource_modifications.retain(|m| m.ebi != ebi);
                 self.on_deactivate_bearer(ebi, cause);
                 self.send_emm(msg::encode_deactivate_accept(ebi, pti))
+            }
+            Ok(DownlinkEsm::BearerResourceModificationReject { pti, cause }) => {
+                self.on_bearer_resource_modification_reject(pti, cause);
+                NasOutput::default()
             }
             Ok(DownlinkEsm::Other(ebi, pti, ty)) => {
                 log::warn!("ESM: message type 0x{ty:02x} not implemented; ESM STATUS #97");
@@ -1575,7 +1671,7 @@ impl EpsNasUe {
 impl EpsNasUe {
     /// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.2.3-5):
     /// the ACCEPT or REJECT to send.
-    fn on_activate_dedicated(&mut self, req: msg::ActivateDedicatedBearerRequest) -> Vec<u8> {
+    fn on_activate_dedicated(&mut self, req: msg::ActivateDedicatedBearerRequest) -> EsmAnswer {
         use crate::tft::{Tft, TftError, TftOperation};
         let reject = |cause: u8| {
             log::warn!(
@@ -1583,7 +1679,9 @@ impl EpsNasUe {
                 req.ebi,
                 req.linked_ebi
             );
-            msg::encode_activate_dedicated_reject(req.ebi, req.pti, cause)
+            EsmAnswer::reply(msg::encode_activate_dedicated_reject(
+                req.ebi, req.pti, cause,
+            ))
         };
         // §6.4.2.5 c): no default bearer with the linked EBI
         if self.bearer.as_ref().map(|b| b.ebi) != Some(req.linked_ebi) {
@@ -1611,8 +1709,13 @@ impl EpsNasUe {
             );
             self.clear_bearers();
         }
+        // §6.4.2.4 d) 2): a precedence of the default bearer's releases the
+        // PDN connection, and the activation with it.
+        let PrecedenceClash::Deleted(deleted) = self.drop_precedence_clashes(req.ebi, &tft.filters)
+        else {
+            return EsmAnswer::ReleasePdnConnection;
+        };
         self.dedicated.retain(|b| b.ebi != req.ebi);
-        self.drop_precedence_clashes(req.ebi, &tft.filters);
         log::info!(
             "ESM: dedicated EPS bearer {} activated (linked {}), QCI {}, {} packet filter(s)",
             req.ebi,
@@ -1626,41 +1729,69 @@ impl EpsNasUe {
             qci: req.qci,
             filters: tft.filters,
         });
-        msg::encode_activate_dedicated_accept(req.ebi, req.pti)
+        EsmAnswer {
+            reply: Some(msg::encode_activate_dedicated_accept(req.ebi, req.pti)),
+            deleted,
+        }
     }
 
-    /// TS 24.301 §6.4.2.4 d) 2) / §6.4.3.4 d) 2): an old packet filter of
-    /// another dedicated bearer with the precedence of one in `filters`, the
-    /// TFT bearer `ebi` gets, is deleted. Not done: the UE-requested bearer
-    /// resource modification that should tell the network, and the release of
-    /// the PDN connection when the old filter is the default bearer's (it is
-    /// kept, and only logged): #408.
-    fn drop_precedence_clashes(&mut self, ebi: u8, filters: &[crate::tft::PacketFilter]) {
+    /// TS 24.301 §6.4.2.4 d) 2) / §6.4.3.4 d) 2): the precedences of
+    /// `filters`, the TFT bearer `ebi` gets, against the old filters of the
+    /// other bearers of the PDN connection.
+    /// - An old filter of the default bearer with one of them: the PDN
+    ///   connection is to be released ([`PrecedenceClash::DefaultBearer`]);
+    ///   nothing is changed here.
+    /// - Old filters of other dedicated bearers with one of them are deleted
+    ///   and listed, for the UE-requested bearer resource modification that
+    ///   deletes them in the network too (#408).
+    fn drop_precedence_clashes(
+        &mut self,
+        ebi: u8,
+        filters: &[crate::tft::PacketFilter],
+    ) -> PrecedenceClash {
         let clashes =
             |old: &crate::tft::PacketFilter| filters.iter().any(|f| f.precedence == old.precedence);
         let default = self.bearer.as_ref().map(|b| b.ebi);
         if default != Some(ebi) && self.default_filters.iter().any(clashes) {
             log::warn!(
                 "ESM: EPS bearer {ebi}'s TFT reuses a precedence of the default bearer's; \
-                 the PDN connection release §6.4.2.4 d) 2) asks for is not implemented"
+                 the PDN connection is released (§6.4.2.4 d) 2))"
             );
+            return PrecedenceClash::DefaultBearer;
         }
+        let mut deleted = Vec::new();
         // `ebi`'s own old filters are replaced by `filters` anyway
-        for b in &mut self.dedicated {
+        for b in self.dedicated.iter_mut().filter(|b| b.ebi != ebi) {
+            let ids: Vec<u8> = b
+                .filters
+                .iter()
+                .filter(|o| clashes(o))
+                .map(|o| o.id)
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
             b.filters.retain(|old| !clashes(old));
+            log::info!(
+                "ESM: EPS bearer {}'s packet filter(s) {ids:?} share a precedence with EPS \
+                 bearer {ebi}'s new TFT; deleted (§6.4.2.4 d) 2))",
+                b.ebi
+            );
+            deleted.push((b.ebi, ids, b.filters.is_empty()));
         }
+        PrecedenceClash::Deleted(deleted)
     }
 
     /// MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.3.3-4): the ACCEPT or
     /// REJECT to send.
-    fn on_modify_bearer(&mut self, req: msg::ModifyBearerRequest) -> Vec<u8> {
+    fn on_modify_bearer(&mut self, req: msg::ModifyBearerRequest) -> EsmAnswer {
         use crate::tft::{apply_operation, Tft};
         let reject = |cause: u8| {
             log::warn!(
                 "ESM: modification of EPS bearer {} rejected, #{cause}",
                 req.ebi
             );
-            msg::encode_modify_reject(req.ebi, req.pti, cause)
+            EsmAnswer::reply(msg::encode_modify_reject(req.ebi, req.pti, cause))
         };
         let is_default = self.bearer.as_ref().map(|b| b.ebi) == Some(req.ebi);
         let dedicated_idx = self.dedicated.iter().position(|b| b.ebi == req.ebi);
@@ -1684,9 +1815,14 @@ impl EpsNasUe {
                 }
             }
         };
-        if let Some(f) = &new_filters {
-            self.drop_precedence_clashes(req.ebi, f);
-        }
+        let deleted = match &new_filters {
+            None => Vec::new(),
+            Some(f) => match self.drop_precedence_clashes(req.ebi, f) {
+                PrecedenceClash::Deleted(d) => d,
+                // §6.4.3.4 d) 2): the PDN connection is released
+                PrecedenceClash::DefaultBearer => return EsmAnswer::ReleasePdnConnection,
+            },
+        };
         match dedicated_idx {
             Some(i) => {
                 let b = &mut self.dedicated[i];
@@ -1707,7 +1843,10 @@ impl EpsNasUe {
             }
         }
         log::info!("ESM: EPS bearer {} modified", req.ebi);
-        msg::encode_modify_accept(req.ebi, req.pti)
+        EsmAnswer {
+            reply: Some(msg::encode_modify_accept(req.ebi, req.pti)),
+            deleted,
+        }
     }
 
     /// DEACTIVATE EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.4.3): a dedicated
@@ -1725,6 +1864,187 @@ impl EpsNasUe {
         } else {
             log::info!("ESM: deactivation of EPS bearer {ebi}, which is not active; accepted");
         }
+    }
+}
+
+/// What an ESM request is answered with (#408).
+struct EsmAnswer {
+    /// The ACCEPT or REJECT.
+    reply: Option<Vec<u8>>,
+    /// Packet filters of other dedicated bearers deleted for a precedence
+    /// clash, as (EBI, identifiers, whether none is left): each bearer's are
+    /// deleted in the network with a UE-requested bearer resource
+    /// modification (§6.4.2.4 d) 2)).
+    deleted: Vec<(u8, Vec<u8>, bool)>,
+}
+
+#[allow(non_upper_case_globals)]
+impl EsmAnswer {
+    /// §6.4.2.4 d) 2) / §6.4.3.4 d) 2): an old filter of the default bearer
+    /// clashes; the PDN connection is released instead of answering.
+    const ReleasePdnConnection: Self = Self {
+        reply: None,
+        deleted: Vec::new(),
+    };
+
+    fn reply(pdu: Vec<u8>) -> Self {
+        Self {
+            reply: Some(pdu),
+            deleted: Vec::new(),
+        }
+    }
+}
+
+impl EpsNasUe {
+    /// Send an [`EsmAnswer`]: the reply, then a BEARER RESOURCE MODIFICATION
+    /// REQUEST per bearer whose filters were deleted. No reply means the PDN
+    /// connection is released.
+    fn esm_answer(&mut self, answer: EsmAnswer, now: Instant) -> NasOutput {
+        let Some(reply) = answer.reply else {
+            return self.release_pdn_connection(now);
+        };
+        let mut out = self.send_emm(reply);
+        for (ebi, ids, releases_all) in answer.deleted {
+            let req = self.start_bearer_resource_modification(ebi, ids, releases_all, now);
+            out.uplink.extend(req.uplink);
+        }
+        out
+    }
+
+    /// §6.4.2.4 d) 2) / §6.4.3.4 d) 2): "the UE shall release the relevant
+    /// PDN connection. If the relevant PDN connection is the last one that the
+    /// UE has and EMM-REGISTERED without PDN connection is not supported by
+    /// the UE or the MME, the UE shall detach and re-attach to the network."
+    /// This UE has one PDN connection, and its UE network capability (§9.9.3.34,
+    /// octets 3-4 only) does not indicate EMM-REGISTERED without PDN
+    /// connection, so it detaches ("EPS detach", not switched off) and the
+    /// attach follows once the detach ends (#408).
+    fn release_pdn_connection(&mut self, now: Instant) -> NasOutput {
+        log::warn!(
+            "ESM: the PDN connection is released, and it is the last one: detach and \
+             re-attach (§6.4.2.4 d) 2))"
+        );
+        self.reattach_after_detach = true;
+        let out = self.detach(false, true, now);
+        if self.state != EmmState::DeregisteredInitiated {
+            // No detach was started; the flag must not outlive it
+            self.reattach_after_detach = false;
+        }
+        out
+    }
+
+    /// BEARER RESOURCE MODIFICATION REQUEST deleting `ids` from EPS bearer
+    /// `ebi`'s traffic flow aggregate (§6.5.4.2): TFT operation "Delete packet
+    /// filters from existing TFT" with the packet filter identifiers, ESM cause
+    /// #36 "regular deactivation" (the release of bearer resources). T3481
+    /// starts, PROCEDURE TRANSACTION PENDING.
+    fn start_bearer_resource_modification(
+        &mut self,
+        ebi: u8,
+        ids: Vec<u8>,
+        releases_all: bool,
+        now: Instant,
+    ) -> NasOutput {
+        use crate::tft::{Tft, TftOperation};
+        let pti = self.alloc_pti();
+        let aggregate = Tft {
+            operation: TftOperation::DeleteFilters,
+            filters: Vec::new(),
+            deleted_ids: ids.clone(),
+        }
+        .encode();
+        let request = msg::encode_bearer_resource_modification_request(
+            pti,
+            ebi,
+            &aggregate,
+            Some(ESM_REGULAR_DEACTIVATION),
+        );
+        log::info!(
+            "ESM: BEARER RESOURCE MODIFICATION REQUEST, PTI {pti}: delete packet filter(s) \
+             {ids:?} of EPS bearer {ebi}; T3481 started (§6.5.4.2)"
+        );
+        self.bearer_resource_modifications
+            .push(BearerResourceModification {
+                pti,
+                ebi,
+                request: request.clone(),
+                releases_all,
+                retransmissions: 0,
+                t3481: now + T3481,
+            });
+        self.send_emm(request)
+    }
+
+    /// T3481 expiry (§6.5.4.5 a)): the request is retransmitted on the first
+    /// four expiries; on the fifth the procedure is aborted and its PTI
+    /// released, and a bearer whose every traffic flow it released is
+    /// deactivated locally.
+    fn on_t3481(&mut self, now: Instant) -> NasOutput {
+        let mut out = NasOutput::default();
+        let mut aborted = Vec::new();
+        let mut resend = Vec::new();
+        for m in &mut self.bearer_resource_modifications {
+            if now < m.t3481 {
+                continue;
+            }
+            if m.retransmissions < MAX_BEARER_RESOURCE_MODIFICATION_RETRANSMISSIONS {
+                m.retransmissions += 1;
+                m.t3481 = now + T3481;
+                log::warn!(
+                    "ESM: T3481 expired; BEARER RESOURCE MODIFICATION REQUEST PTI {} \
+                     retransmitted ({})",
+                    m.pti,
+                    m.retransmissions
+                );
+                resend.push(m.request.clone());
+            } else {
+                aborted.push((m.pti, m.ebi, m.releases_all));
+            }
+        }
+        for pdu in resend {
+            out.uplink.extend(self.send_emm(pdu).uplink);
+        }
+        for (pti, ebi, releases_all) in aborted {
+            log::warn!(
+                "ESM: T3481 expired a fifth time; bearer resource modification PTI {pti} \
+                 aborted (§6.5.4.5 a))"
+            );
+            self.bearer_resource_modifications.retain(|m| m.pti != pti);
+            if releases_all {
+                self.deactivate_dedicated_locally(ebi);
+            }
+        }
+        out
+    }
+
+    /// BEARER RESOURCE MODIFICATION REJECT (§6.5.4.4.1): T3481 stops and the
+    /// PTI is released. #43 deactivates the bearer locally (§6.5.4.5 b)), and
+    /// so does #31 when the request released every traffic flow of it
+    /// (§6.5.4.5 d)). A PTI not in use is ignored (§7.3.1 d)).
+    fn on_bearer_resource_modification_reject(&mut self, pti: u8, cause: u8) {
+        let Some(i) = self
+            .bearer_resource_modifications
+            .iter()
+            .position(|m| m.pti == pti)
+        else {
+            log::warn!(
+                "ESM: BEARER RESOURCE MODIFICATION REJECT for PTI {pti} not in use; ignored"
+            );
+            return;
+        };
+        let m = self.bearer_resource_modifications.remove(i);
+        log::warn!("ESM: BEARER RESOURCE MODIFICATION REJECT #{cause}, PTI {pti}; T3481 stopped");
+        if cause == ESM_INVALID_EPS_BEARER_IDENTITY
+            || (cause == ESM_REQUEST_REJECTED_UNSPECIFIED && m.releases_all)
+        {
+            self.deactivate_dedicated_locally(m.ebi);
+        }
+    }
+
+    /// Deactivate dedicated EPS bearer `ebi` without peer-to-peer signalling.
+    fn deactivate_dedicated_locally(&mut self, ebi: u8) {
+        log::info!("ESM: EPS bearer {ebi} deactivated locally");
+        self.dedicated.retain(|b| b.ebi != ebi);
     }
 }
 
