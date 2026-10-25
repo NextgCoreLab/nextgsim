@@ -56,7 +56,7 @@ use nextgsim_nas::security::{
 use crate::timer::{
     GprsTimer2, GprsTimer3, NasTimerManager, TimerExpiryEvent, TIMER_T3346, TIMER_T3502,
     TIMER_T3510, TIMER_T3511, TIMER_T3512, TIMER_T3516, TIMER_T3517, TIMER_T3519, TIMER_T3520,
-    TIMER_T3521,
+    TIMER_T3521, TIMER_T3525,
 };
 
 use super::config_update::ConfigUpdateResult;
@@ -597,6 +597,10 @@ pub const SERVICE_REJECT_BACKOFF_BASE: std::time::Duration = std::time::Duration
 /// Ceiling of the Service Reject backoff.
 pub const SERVICE_REJECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(80);
 
+/// Service request attempt counter value at which T3525 starts (TS 24.501
+/// §5.6.1.7 a): "greater than or equal to 5").
+pub const SR_ATTEMPT_LIMIT: u32 = 5;
+
 /// 5GMM procedure orchestrator (UE side).
 pub struct MmOrchestrator {
     identity: MmUeIdentity,
@@ -649,6 +653,15 @@ pub struct MmOrchestrator {
     held_uplink_data_status: Option<u16>,
     /// Service type of the last SERVICE REQUEST sent (§5.6.1.5 #28 depends on it).
     pending_service_type: Option<ServiceType>,
+    /// Whether the last SERVICE REQUEST was sent from 5GMM-IDLE (#323): T3517
+    /// expiry then counts the attempt and releases the connection locally
+    /// (TS 24.501 §5.6.1.7 a)).
+    sr_from_idle: bool,
+    /// The service request attempt counter (TS 24.501 §5.6.1.1, #323): SERVICE
+    /// REQUESTs from 5GMM-IDLE the network never answered. At
+    /// [`SR_ATTEMPT_LIMIT`] T3525 starts. Reset by a completed or rejected
+    /// service request, a completed registration, and 5GMM-DEREGISTERED.
+    sr_attempt_counter: u32,
     /// The Uplink data status the last registration update carried (#313 review):
     /// the sessions whose user plane the Registration Accept is to bring back.
     registration_uplink_data_status: Option<u16>,
@@ -804,6 +817,8 @@ impl MmOrchestrator {
             sr_backoff_until: None,
             held_uplink_data_status: None,
             pending_service_type: None,
+            sr_from_idle: false,
+            sr_attempt_counter: 0,
             registration_uplink_data_status: None,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
@@ -1541,6 +1556,26 @@ impl MmOrchestrator {
 
     /// Drive all NAS timers; call roughly once a second.
     pub fn tick(&mut self) -> Vec<MmOutput> {
+        // §5.6.1.1: 5GMM-DEREGISTERED resets the service request attempt
+        // counter; Table 10.2.1: T3525 stops on leaving NORMAL-SERVICE and
+        // NON-ALLOWED-SERVICE (#323). SERVICE-REQUEST-INITIATED is not leaving:
+        // only exempt requests go out under T3525.
+        let substate = self.state.mm_substate();
+        if self.state.is_deregistered() {
+            if self.sr_attempt_counter > 0 || self.timers.t3525.is_running() {
+                self.reset_service_request_attempts();
+            }
+        } else if self.timers.t3525.is_running()
+            && !matches!(
+                substate,
+                MmSubState::RegisteredNormalService
+                    | MmSubState::RegisteredNonAllowedService
+                    | MmSubState::ServiceRequestInitiated
+            )
+        {
+            info!("T3525 stopped: left 5GMM-REGISTERED.NORMAL-SERVICE ({substate:?})");
+            self.timers.stop(TIMER_T3525, true);
+        }
         let events = self.timers.perform_tick();
         let mut outs = Vec::new();
         for ev in events {
@@ -1681,17 +1716,85 @@ impl MmOrchestrator {
                     Vec::new()
                 }
             }
-            TIMER_T3517 => {
-                // TS 24.501 5.6.1.7: abort the service request procedure
-                warn!("T3517 expired: service request procedure timed out");
-                if self.state.mm_substate() == MmSubState::ServiceRequestInitiated {
-                    self.state
-                        .switch_mm_state(MmSubState::RegisteredNormalService);
-                }
-                Vec::new()
+            TIMER_T3517 => self.handle_t3517_expiry(),
+            TIMER_T3525 => {
+                // §5.6.1.7 a): no service request "until expiry of timer
+                // T3525"; held uplink asks again now
+                info!("T3525 expired: service requests allowed again");
+                self.retry_held_uplink_service_request("T3525 expired")
             }
             _ => Vec::new(),
         }
+    }
+
+    /// T3517 expired: TS 24.501 §5.6.1.7 a) (#323).
+    ///
+    /// The UE enters 5GMM-REGISTERED and the procedure is aborted. A request
+    /// sent from 5GMM-IDLE also has its connection released locally, and,
+    /// unless it was for emergency services fallback, counts against the
+    /// service request attempt counter; at [`SR_ATTEMPT_LIMIT`] T3525 starts and
+    /// bars new requests until it expires. Not counted: a request for an
+    /// emergency PDU session, a response to paging or notification, and any
+    /// request of a UE configured for high priority access. A request sent in
+    /// 5GMM-CONNECTED is aborted and the UE stays connected.
+    fn handle_t3517_expiry(&mut self) -> Vec<MmOutput> {
+        warn!("T3517 expired: service request procedure timed out");
+        if self.state.mm_substate() == MmSubState::ServiceRequestInitiated {
+            self.state
+                .switch_mm_state(MmSubState::RegisteredNormalService);
+        }
+        if !self.sr_from_idle {
+            // §5.6.1.7 a): "abort the procedure, and stay in 5GMM-CONNECTED"
+            return Vec::new();
+        }
+        self.sr_from_idle = false;
+        let service_type = self.pending_service_type;
+        let counted = !self.high_priority_access
+            && !matches!(
+                service_type,
+                Some(
+                    ServiceType::EmergencyServicesFallback
+                        | ServiceType::EmergencyServices
+                        | ServiceType::MobileTerminatedServices
+                )
+            );
+        if counted {
+            self.sr_attempt_counter = self.sr_attempt_counter.saturating_add(1);
+            info!(
+                "Service request attempt counter: {} of {SR_ATTEMPT_LIMIT}",
+                self.sr_attempt_counter
+            );
+            if self.sr_attempt_counter >= SR_ATTEMPT_LIMIT {
+                self.timers.start(TIMER_T3525, true);
+                warn!(
+                    "Service request attempt counter at {}: T3525 started ({}s), no service \
+                     request until it expires",
+                    self.sr_attempt_counter,
+                    self.timers.t3525.interval()
+                );
+            }
+        }
+        // "release locally any resources allocated for the service request
+        // procedure": the connection the request opened from 5GMM-IDLE
+        info!("T3517 expired on a request from 5GMM-IDLE: releasing the NAS signalling connection locally");
+        self.state.switch_cm_state(CmState::Idle);
+        self.secure_exchange = false;
+        vec![MmOutput::ReleaseConnectionLocally]
+    }
+
+    /// Reset the service request attempt counter and stop T3525 (TS 24.501
+    /// §5.6.1.1, Table 10.2.1, #323).
+    fn reset_service_request_attempts(&mut self) {
+        self.sr_attempt_counter = 0;
+        if self.timers.t3525.is_running() {
+            info!("T3525 stopped");
+        }
+        self.timers.stop(TIMER_T3525, true);
+    }
+
+    /// Service request attempt counter (TS 24.501 §5.6.1.1)
+    pub fn service_request_attempt_counter(&self) -> u32 {
+        self.sr_attempt_counter
     }
 
     fn may_retry_registration(&self) -> bool {
@@ -2035,6 +2138,10 @@ impl MmOrchestrator {
 
         self.timers.stop(TIMER_T3510, true);
         self.timers.stop(TIMER_T3346, true);
+        // §5.6.1.1: a completed registration resets the service request
+        // attempt counter (an initial one follows 5GMM-DEREGISTERED, which
+        // resets it too); Table 10.2.1: T3525 stops on a new PLMN (#323)
+        self.reset_service_request_attempts();
         // A retry scheduled by an earlier failed attempt is moot once one is
         // accepted; left running, its expiry would re-run a registration update
         // from 5GMM-REGISTERED (#277).
@@ -3224,6 +3331,7 @@ impl MmOrchestrator {
         let initial = self.state.is_idle();
 
         self.pending_service_type = Some(service_type);
+        self.sr_from_idle = initial;
         self.state
             .switch_mm_state(MmSubState::ServiceRequestInitiated);
         self.timers.start(TIMER_T3517, true);
@@ -3392,6 +3500,12 @@ impl MmOrchestrator {
         if exempt {
             return None;
         }
+        // §5.6.1.7 a): no service request until T3525 expires. The exempt
+        // requests above (paging response, emergency, emergency services
+        // fallback, high priority access) are not held.
+        if self.timers.t3525.is_running() {
+            return Some("T3525 (service request attempts exhausted) is running");
+        }
         // A configured high-priority UE passed the `exempt` check above, so it
         // is not held here. §5.6.1.5 #28 withdraws that exemption when the
         // network indicates "High priority access UEs are not exempt from
@@ -3426,6 +3540,9 @@ impl MmOrchestrator {
 
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
+        // §5.6.1.1: "a service request procedure is successfully completed";
+        // Table 10.2.1: user-plane resources established stops T3525 (#323)
+        self.reset_service_request_attempts();
         self.up_reactivation_pending = false;
         self.held_uplink_data_status = None;
         self.sr_reject_count = 0;
@@ -3495,6 +3612,9 @@ impl MmOrchestrator {
         let cause = rej.mm_cause.value;
         warn!("Service Reject: cause {:?} (#{raw_cause})", cause);
         self.timers.stop(TIMER_T3517, true);
+        // §5.6.1.1: "a service request procedure is rejected" resets the
+        // attempt counter (#323)
+        self.reset_service_request_attempts();
         // `up_reactivation_pending` is NOT cleared here (#313). Only the arms
         // that release the PDU sessions clear it; after any other reject the
         // user plane is still down, so uplink stays held and a new request is
@@ -8013,6 +8133,210 @@ mod tests {
                 "the PSI the rejected request named"
             );
         }
+    }
+
+    /// A registered UE in 5GMM-IDLE (#323).
+    fn registered_idle() -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert!(orch.state().is_idle());
+        orch
+    }
+
+    /// Send a SERVICE REQUEST from 5GMM-IDLE (the RRC connection then comes up,
+    /// as in the NAS task) and let T3517 run out unanswered.
+    fn unanswered_service_request_from_idle(
+        orch: &mut MmOrchestrator,
+        service_type: ServiceType,
+    ) -> Vec<MmOutput> {
+        assert!(orch.state().is_idle());
+        let outs = orch.start_service_request(service_type, None);
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "{service_type:?}: a SERVICE REQUEST: {outs:?}"
+        );
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.timers.stop(TIMER_T3517, true);
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3517, true, 1))
+    }
+
+    /// #323, TS 24.501 §5.6.1.7 a): T3517 expiry on a request from 5GMM-IDLE
+    /// counts the attempt and releases the connection locally; the fifth starts
+    /// T3525, which bars new requests except the exempt ones.
+    #[test]
+    fn t3517_expiry_from_idle_counts_releases_and_starts_t3525_at_five() {
+        let mut orch = registered_idle();
+        for n in 1..=SR_ATTEMPT_LIMIT {
+            let outs = unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+            assert_eq!(
+                outs,
+                vec![MmOutput::ReleaseConnectionLocally],
+                "attempt {n}"
+            );
+            assert!(orch.state().is_idle(), "attempt {n}: released locally");
+            assert_eq!(
+                orch.state().mm_substate(),
+                MmSubState::RegisteredNormalService
+            );
+            assert_eq!(orch.service_request_attempt_counter(), n);
+            assert_eq!(
+                orch.timers().t3525.is_running(),
+                n == SR_ATTEMPT_LIMIT,
+                "attempt {n}"
+            );
+        }
+        assert!(
+            orch.start_service_request(ServiceType::Data, None)
+                .is_empty(),
+            "barred while T3525 runs"
+        );
+        assert!(orch
+            .start_service_request(ServiceType::Signalling, None)
+            .is_empty());
+        assert!(
+            !orch
+                .start_service_request(ServiceType::MobileTerminatedServices, None)
+                .is_empty(),
+            "a paging response is exempt"
+        );
+    }
+
+    /// #323: a request sent in 5GMM-CONNECTED is aborted, the UE stays
+    /// connected and nothing is counted.
+    #[test]
+    fn t3517_expiry_in_connected_aborts_and_stays_connected() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(!orch
+            .start_service_request(ServiceType::Data, None)
+            .is_empty());
+        orch.timers.stop(TIMER_T3517, true);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3517, true, 1));
+        assert!(outs.is_empty(), "{outs:?}");
+        assert!(orch.state().is_connected());
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        assert_eq!(orch.service_request_attempt_counter(), 0);
+    }
+
+    /// #323: a paging response, an emergency request and emergency services
+    /// fallback are not counted; each is still released locally.
+    #[test]
+    fn exempt_service_requests_are_not_counted() {
+        for service_type in [
+            ServiceType::MobileTerminatedServices,
+            ServiceType::EmergencyServices,
+            ServiceType::EmergencyServicesFallback,
+        ] {
+            let mut orch = registered_idle();
+            let outs = unanswered_service_request_from_idle(&mut orch, service_type);
+            assert_eq!(
+                outs,
+                vec![MmOutput::ReleaseConnectionLocally],
+                "{service_type:?}"
+            );
+            assert_eq!(
+                orch.service_request_attempt_counter(),
+                0,
+                "{service_type:?}"
+            );
+        }
+    }
+
+    /// #323: a UE configured for high priority access is not counted.
+    #[test]
+    fn a_high_priority_ue_is_not_counted() {
+        let mut identity = test_identity();
+        identity.high_priority_access = true;
+        let mut orch = establish_security_context_with(MmOrchestrator::new(identity));
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        assert_eq!(orch.service_request_attempt_counter(), 0);
+    }
+
+    /// #323, §5.6.1.1: a SERVICE REJECT and a SERVICE ACCEPT reset the counter
+    /// and stop T3525.
+    #[test]
+    fn a_service_reject_or_accept_resets_the_attempt_counter() {
+        for accept in [false, true] {
+            let mut orch = registered_idle();
+            for _ in 0..SR_ATTEMPT_LIMIT {
+                unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+            }
+            assert!(orch.timers().t3525.is_running());
+            // The network answers a paging-response request
+            orch.start_service_request(ServiceType::MobileTerminatedServices, None);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            if accept {
+                let mut plain = Vec::new();
+                ServiceAccept::new().encode(&mut plain);
+                orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+            } else {
+                reject_service_request(&mut orch, MmCause::Congestion, None, 2);
+            }
+            assert_eq!(orch.service_request_attempt_counter(), 0, "accept={accept}");
+            assert!(!orch.timers().t3525.is_running(), "accept={accept}");
+        }
+    }
+
+    /// #323, §5.6.1.1: a completed registration resets the counter and stops
+    /// T3525.
+    #[test]
+    fn a_registration_accept_resets_the_attempt_counter() {
+        let mut orch = registered_idle();
+        for _ in 0..SR_ATTEMPT_LIMIT {
+            unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        }
+        assert!(orch.timers().t3525.is_running());
+        orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 2);
+        orch.handle_downlink(&acc);
+        assert_eq!(orch.service_request_attempt_counter(), 0);
+        assert!(!orch.timers().t3525.is_running());
+    }
+
+    /// #323: T3525 expiry lets held uplink ask again.
+    #[test]
+    fn t3525_expiry_retries_held_uplink() {
+        let mut orch = registered_idle();
+        for _ in 0..SR_ATTEMPT_LIMIT {
+            unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        }
+        assert!(orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        orch.timers.stop(TIMER_T3525, true);
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3525, true, 1));
+        assert!(
+            outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "{outs:?}"
+        );
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Data));
+    }
+
+    /// #323, §5.6.1.1 / Table 10.2.1: 5GMM-DEREGISTERED resets the counter and
+    /// stops T3525, noticed on the tick.
+    #[test]
+    fn deregistration_resets_the_attempt_counter() {
+        let mut orch = registered_idle();
+        for _ in 0..SR_ATTEMPT_LIMIT {
+            unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        }
+        assert_eq!(orch.service_request_attempt_counter(), SR_ATTEMPT_LIMIT);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::DeregisteredNormalService);
+        assert!(orch.state().is_deregistered());
+        orch.tick();
+        assert_eq!(orch.service_request_attempt_counter(), 0);
+        assert!(!orch.timers().t3525.is_running());
     }
 
     /// The complement: with no uplink held (the rejected request was signalling),
