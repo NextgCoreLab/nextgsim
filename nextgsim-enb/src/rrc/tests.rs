@@ -27,7 +27,10 @@ fn only_s1(acts: &[Action]) -> (u16, S1AP_PDU) {
         .iter()
         .filter_map(|a| match a {
             Action::S1 { stream, pdu } => Some((*stream, decode_s1ap_pdu(pdu).unwrap())),
-            Action::Rrc { .. } | Action::UserPlane { .. } | Action::Broadcast { .. } => None,
+            Action::Rrc { .. }
+            | Action::UserPlane { .. }
+            | Action::ReleaseUserPlane { .. }
+            | Action::Broadcast { .. } => None,
         })
         .collect();
     assert_eq!(s1.len(), 1, "{acts:?}");
@@ -402,6 +405,7 @@ fn reconfiguration_adds_srb2_and_nas_moves_onto_it() {
             erabs: vec![ErabToSetup {
                 e_rab_id: 5,
                 qci: 9,
+                gbr_info: false,
                 sgw_address: vec![10, 0, 0, 9],
                 sgw_teid: 0x1234,
                 nas: Some(vec![0x27, 0, 0, 0, 0, 0, 0x07, 0x42]),
@@ -738,4 +742,484 @@ fn an_s1_imsi_paging_decodes_the_tbcd_digits_low_nibble_first() {
             "{tbcd:02X?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// E-RAB management (TS 36.413 §8.2; #283)
+// ---------------------------------------------------------------------------
+
+/// A connected UE `5` with MME UE S1AP ID 77, AS security on and E-RAB 5 on
+/// DRB 1 (LCID 3) -- what Initial Context Setup leaves (run end to end in
+/// tests/lte_radio_e2e.rs). Returns the eNB UE S1AP ID.
+fn established(e: &mut EnbRrc) -> u32 {
+    let mut ue_pdcp = LteSrbPdcp::new();
+    connect(e, 5, &mut ue_pdcp, &[0x07, 0x41]);
+    let enb = e.enb_ue_s1ap_id(5).unwrap();
+    let ctx = e.ues.get_mut(&5).unwrap();
+    ctx.mme_ue_s1ap_id = Some(77);
+    ctx.security = Some(AsSecurity {
+        eea: 2,
+        eia: 2,
+        k_rrc_int: [1; 16],
+        k_rrc_enc: [2; 16],
+        k_up_enc: [3; 16],
+    });
+    ctx.drbs.push(DrbConfig {
+        eps_bearer_identity: 5,
+        drb_identity: 1,
+        logical_channel_identity: 3,
+        rlc: DrbRlc::UmSn10,
+    });
+    enb
+}
+
+fn to_setup(e_rab_id: u8) -> ErabToSetup {
+    ErabToSetup {
+        e_rab_id,
+        qci: 5,
+        gbr_info: false,
+        sgw_address: vec![10, 0, 0, 9],
+        sgw_teid: 0x5600 + u32::from(e_rab_id),
+        nas: Some(vec![0x27, e_rab_id]),
+    }
+}
+
+fn erab_setup(enb: u32, erabs: Vec<ErabToSetup>) -> ErabRequest {
+    ErabRequest::Setup(s1ap_ue::ErabSetupRequest {
+        mme_ue_s1ap_id: 77,
+        enb_ue_s1ap_id: enb,
+        erabs,
+    })
+}
+
+fn erab_release(enb: u32, erabs: Vec<u8>, nas: Option<Vec<u8>>) -> ErabRequest {
+    ErabRequest::Release(s1ap_ue::ErabReleaseCommand {
+        mme_ue_s1ap_id: 77,
+        enb_ue_s1ap_id: enb,
+        erabs,
+        nas,
+    })
+}
+
+/// The RRCConnectionReconfiguration on SRB1 among `acts`, as the UE reads it
+/// (no SRB1 security in the hand-built context; `count` is its PDCP COUNT).
+fn erab_reconfiguration(acts: &[Action], count: u32) -> msg::Reconfiguration {
+    let pdu = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Rrc {
+                lcid: LCID_SRB1,
+                pdu,
+                ..
+            } => Some(pdu.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no reconfiguration on SRB1: {acts:?}"));
+    let mut ue_srb1 = LteSrbPdcp::new();
+    for _ in 0..count {
+        ue_srb1.receive(&[0, 0, 0, 0, 0]).unwrap();
+    }
+    let msg::DlDcch::ConnectionReconfiguration(r) =
+        msg::decode_dl_dcch(&ue_srb1.receive(&pdu).unwrap().sdu).unwrap()
+    else {
+        panic!("not a reconfiguration");
+    };
+    r
+}
+
+/// (E-RAB ID, radio network cause) of each item of an E-RAB List.
+fn failed_items(l: &E_RABList) -> Vec<(u8, u8)> {
+    l.0.iter()
+        .map(|i| {
+            let E_RABList_EntryValue::Id_E_RABItem(i) = &i.value;
+            let Cause::RadioNetwork(c) = &i.cause else {
+                panic!("{:?}", i.cause);
+            };
+            (i.e_rab_id.0, c.0)
+        })
+        .collect()
+}
+
+/// What an E-RAB response lists: the E-RABs that succeeded, and the failed
+/// ones with their radio network causes.
+type ErabAnswer<T> = (Vec<T>, Vec<(u8, u8)>);
+
+/// E-RAB SETUP RESPONSE: the set-up E-RABs with their eNB TEIDs, the failed
+/// ones with their causes.
+fn setup_response(acts: &[Action]) -> ErabAnswer<(u8, u32)> {
+    let (_, pdu) = only_s1(acts);
+    let S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        value: SuccessfulOutcomeValue::Id_E_RABSetup(r),
+        ..
+    }) = pdu
+    else {
+        panic!("not an E-RAB SETUP RESPONSE: {pdu:?}");
+    };
+    let (mut ok, mut failed) = (vec![], vec![]);
+    for ie in r.protocol_i_es.0 {
+        match ie.value {
+            E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABSetupListBearerSURes(l) => {
+                ok = l
+                    .0
+                    .iter()
+                    .map(|i| {
+                        let E_RABSetupListBearerSURes_EntryValue::Id_E_RABSetupItemBearerSURes(i) =
+                            &i.value;
+                        (
+                            i.e_rab_id.0,
+                            u32::from_be_bytes(i.gtp_teid.0.as_slice().try_into().unwrap()),
+                        )
+                    })
+                    .collect();
+            }
+            E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABFailedToSetupListBearerSURes(l) => {
+                failed = failed_items(&l);
+            }
+            _ => {}
+        }
+    }
+    (ok, failed)
+}
+
+/// E-RAB RELEASE RESPONSE: the released E-RABs, the failed ones with causes.
+fn release_response(acts: &[Action]) -> ErabAnswer<u8> {
+    let (_, pdu) = only_s1(acts);
+    let S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        value: SuccessfulOutcomeValue::Id_E_RABRelease(r),
+        ..
+    }) = pdu
+    else {
+        panic!("not an E-RAB RELEASE RESPONSE: {pdu:?}");
+    };
+    let (mut ok, mut failed) = (vec![], vec![]);
+    for ie in r.protocol_i_es.0 {
+        match ie.value {
+            E_RABReleaseResponseProtocolIEs_EntryValue::Id_E_RABReleaseListBearerRelComp(l) => {
+                ok = l
+                    .0
+                    .iter()
+                    .map(|i| {
+                        let E_RABReleaseListBearerRelComp_EntryValue::Id_E_RABReleaseItemBearerRelComp(i) =
+                            &i.value;
+                        i.e_rab_id.0
+                    })
+                    .collect();
+            }
+            E_RABReleaseResponseProtocolIEs_EntryValue::Id_E_RABFailedToReleaseList(l) => {
+                failed = failed_items(&l);
+            }
+            _ => {}
+        }
+    }
+    (ok, failed)
+}
+
+fn pending_tid(e: &EnbRrc) -> u8 {
+    e.ues[&5]
+        .erab
+        .as_ref()
+        .expect("an E-RAB procedure runs")
+        .transaction_id
+}
+
+/// §8.2.1.2: the DRB goes to the UE first, with the NAS-PDU; the user plane
+/// and E-RAB SETUP RESPONSE (with the eNB's TEID) follow its completion.
+#[test]
+fn an_erab_setup_adds_a_drb_and_answers_once_the_ue_completes() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    let acts = e.on_erab_request(erab_setup(enb, vec![to_setup(6)]));
+    assert!(
+        !acts.iter().any(|a| matches!(a, Action::S1 { .. })),
+        "{acts:?}"
+    );
+    let r = erab_reconfiguration(&acts, 0);
+    assert_eq!(
+        r.drbs,
+        vec![DrbConfig {
+            eps_bearer_identity: 6,
+            drb_identity: 2,
+            logical_channel_identity: 4,
+            rlc: DrbRlc::UmSn10,
+        }],
+        "the lowest free DRB identity"
+    );
+    assert!(r.drbs_released.is_empty() && !r.srb2);
+    assert_eq!(r.nas, vec![vec![0x27, 6]]);
+
+    // Another transaction id completes nothing.
+    assert!(e
+        .on_reconfiguration_complete(5, r.transaction_id ^ 1)
+        .is_empty());
+    let acts = e.on_reconfiguration_complete(5, r.transaction_id);
+    let Some(Action::UserPlane { ue: 5, bearers }) = acts.first() else {
+        panic!("no user plane: {acts:?}");
+    };
+    let b = &bearers[0];
+    assert_eq!(
+        (b.e_rab_id, b.lcid, b.sgw, b.sgw_teid, b.eea, b.k_up_enc),
+        (6, 4, "10.0.0.9:2152".parse().unwrap(), 0x5606, 2, [3; 16])
+    );
+    assert_eq!(setup_response(&acts), (vec![(6, b.enb_teid)], vec![]));
+    assert!(e.ues[&5].erab.is_none());
+    assert_eq!(e.ues[&5].drbs.len(), 2);
+}
+
+/// §8.2.1.4: an E-RAB ID given twice, or of an E-RAB already set up, fails
+/// "Multiple E-RAB ID instances" -- once -- and the rest is set up; with
+/// nothing to set up, or no security yet, the answer comes at once.
+#[test]
+fn an_erab_setup_fails_repeated_and_active_ids_and_answers_at_once_with_nothing_to_do() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    let acts = e.on_erab_request(erab_setup(
+        enb,
+        vec![to_setup(5), to_setup(7), to_setup(7), to_setup(8)],
+    ));
+    let r = erab_reconfiguration(&acts, 0);
+    assert_eq!(
+        r.drbs
+            .iter()
+            .map(|d| d.eps_bearer_identity)
+            .collect::<Vec<_>>(),
+        vec![8]
+    );
+    let acts = e.on_reconfiguration_complete(5, r.transaction_id);
+    let (ok, failed) = setup_response(&acts);
+    assert_eq!(ok.iter().map(|(id, _)| *id).collect::<Vec<_>>(), vec![8]);
+    let multiple = CauseRadioNetwork::MULTIPLE_E_RAB_ID_INSTANCES;
+    assert_eq!(failed, vec![(5, multiple), (7, multiple)]);
+
+    let acts = e.on_erab_request(erab_setup(enb, vec![to_setup(8)]));
+    assert_eq!(setup_response(&acts), (vec![], vec![(8, multiple)]));
+    assert!(e.ues[&5].erab.is_none());
+
+    // §8.2.1.4: a GBR QCI without GBR QoS Information fails.
+    let acts = e.on_erab_request(erab_setup(
+        enb,
+        vec![ErabToSetup {
+            qci: 1,
+            ..to_setup(9)
+        }],
+    ));
+    assert_eq!(
+        setup_response(&acts),
+        (
+            vec![],
+            vec![(9, CauseRadioNetwork::INVALID_QOS_COMBINATION)]
+        )
+    );
+
+    e.ues.get_mut(&5).unwrap().security = None;
+    let acts = e.on_erab_request(erab_setup(enb, vec![to_setup(9)]));
+    assert_eq!(
+        setup_response(&acts),
+        (vec![], vec![(9, CauseRadioNetwork::UNSPECIFIED)])
+    );
+}
+
+/// §8.2.3.2.1: the DRB goes in drb-ToReleaseList with the NAS-PDU; its
+/// S1-U tunnel and the E-RAB go once the UE completes. An unknown E-RAB ID
+/// fails; with nothing to release the NAS-PDU still goes to the UE.
+#[test]
+fn an_erab_release_releases_the_drb_and_forwards_the_nas_pdu() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    // §8.2.3.3: E-RAB 5 twice releases it once.
+    let acts = e.on_erab_request(erab_release(enb, vec![5, 9, 5], Some(vec![0x27, 0xCD])));
+    let r = erab_reconfiguration(&acts, 0);
+    assert_eq!(
+        (r.drbs_released, r.drbs, r.nas),
+        (vec![1], vec![], vec![vec![0x27, 0xCD]])
+    );
+    let acts = e.on_reconfiguration_complete(5, r.transaction_id);
+    assert!(
+        matches!(acts.first(), Some(Action::ReleaseUserPlane { ue: 5, lcids }) if lcids == &[3]),
+        "{acts:?}"
+    );
+    assert_eq!(
+        release_response(&acts),
+        (vec![5], vec![(9, CauseRadioNetwork::UNKNOWN_E_RAB_ID)])
+    );
+    assert!(e.ues[&5].drbs.is_empty());
+
+    let acts = e.on_erab_request(erab_release(enb, vec![5], Some(vec![0x27, 0xCE])));
+    assert_eq!(
+        release_response(&acts),
+        (vec![], vec![(5, CauseRadioNetwork::UNKNOWN_E_RAB_ID)])
+    );
+    let r = acts
+        .iter()
+        .find_map(|a| match a {
+            Action::Rrc { pdu, .. } => {
+                let mut ue_srb1 = LteSrbPdcp::new();
+                ue_srb1.receive(&[0, 0, 0, 0, 0]).unwrap();
+                Some(msg::decode_dl_dcch(&ue_srb1.receive(pdu).unwrap().sdu).unwrap())
+            }
+            _ => None,
+        })
+        .expect("the NAS-PDU to the UE");
+    assert_eq!(
+        r,
+        msg::DlDcch::InformationTransfer {
+            nas: vec![0x27, 0xCE]
+        }
+    );
+}
+
+/// §8.2.2.4: modifying an E-RAB the UE does not have fails "Unknown E-RAB
+/// ID" at once; a known one goes to the UE and is answered on completion.
+#[test]
+fn an_erab_modify_of_an_unknown_id_or_to_gbr_without_gbr_information_fails() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    let modify = |ids: &[u8]| {
+        ErabRequest::Modify(s1ap_ue::ErabModifyRequest {
+            mme_ue_s1ap_id: 77,
+            enb_ue_s1ap_id: enb,
+            erabs: ids
+                .iter()
+                .map(|id| s1ap_ue::ErabToModify {
+                    e_rab_id: *id,
+                    qci: 6,
+                    gbr_info: false,
+                    nas: vec![0x27, 0xC9, *id],
+                })
+                .collect(),
+        })
+    };
+    let modify_response = |acts: &[Action]| {
+        let (_, pdu) = only_s1(acts);
+        let S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_E_RABModify(r),
+            ..
+        }) = pdu
+        else {
+            panic!("not an E-RAB MODIFY RESPONSE: {pdu:?}");
+        };
+        let (mut ok, mut failed) = (vec![], vec![]);
+        for ie in r.protocol_i_es.0 {
+            match ie.value {
+                E_RABModifyResponseProtocolIEs_EntryValue::Id_E_RABModifyListBearerModRes(l) => {
+                    ok = l
+                        .0
+                        .iter()
+                        .map(|i| {
+                            let E_RABModifyListBearerModRes_EntryValue::Id_E_RABModifyItemBearerModRes(i) = &i.value;
+                            i.e_rab_id.0
+                        })
+                        .collect();
+                }
+                E_RABModifyResponseProtocolIEs_EntryValue::Id_E_RABFailedToModifyList(l) => {
+                    failed = failed_items(&l);
+                }
+                _ => {}
+            }
+        }
+        (ok, failed)
+    };
+    let unknown = CauseRadioNetwork::UNKNOWN_E_RAB_ID;
+    let acts = e.on_erab_request(modify(&[9]));
+    assert_eq!(modify_response(&acts), (vec![], vec![(9, unknown)]));
+
+    let acts = e.on_erab_request(modify(&[5, 9]));
+    let r = erab_reconfiguration(&acts, 0);
+    assert_eq!(
+        (r.drbs, r.drbs_released, r.nas),
+        (vec![], vec![], vec![vec![0x27, 0xC9, 5]])
+    );
+    let acts = e.on_reconfiguration_complete(5, r.transaction_id);
+    assert_eq!(modify_response(&acts), (vec![5], vec![(9, unknown)]));
+    assert_eq!(e.ues[&5].erab_qci.get(&5), Some(&6), "the new QCI kept");
+
+    // A non-GBR E-RAB turned GBR (QCI 1) needs GBR QoS Information; once GBR,
+    // a modification within GBR does not.
+    let to_gbr = |gbr_info| {
+        ErabRequest::Modify(s1ap_ue::ErabModifyRequest {
+            mme_ue_s1ap_id: 77,
+            enb_ue_s1ap_id: enb,
+            erabs: vec![s1ap_ue::ErabToModify {
+                e_rab_id: 5,
+                qci: 1,
+                gbr_info,
+                nas: vec![0x27, 0xC9],
+            }],
+        })
+    };
+    let acts = e.on_erab_request(to_gbr(false));
+    assert_eq!(
+        modify_response(&acts),
+        (
+            vec![],
+            vec![(5, CauseRadioNetwork::INVALID_QOS_COMBINATION)]
+        )
+    );
+    for gbr_info in [true, false] {
+        let acts = e.on_erab_request(to_gbr(gbr_info));
+        let tid = erab_reconfiguration(&acts, 1 + u32::from(!gbr_info)).transaction_id;
+        let acts = e.on_reconfiguration_complete(5, tid);
+        assert_eq!(
+            modify_response(&acts),
+            (vec![5], vec![]),
+            "GBR info {gbr_info}"
+        );
+    }
+}
+
+/// One E-RAB procedure at a time per UE, none during Initial Context Setup:
+/// a later request waits and starts when the running one completes.
+#[test]
+fn an_erab_request_waits_for_the_reconfiguration_in_progress() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    let acts = e.on_erab_request(erab_setup(enb, vec![to_setup(6)]));
+    let first = pending_tid(&e);
+    assert_eq!(acts.len(), 1);
+    assert!(e
+        .on_erab_request(erab_release(enb, vec![5], None))
+        .is_empty());
+
+    let acts = e.on_reconfiguration_complete(5, first);
+    let (ok, _) = setup_response(&acts);
+    assert_eq!(ok.len(), 1);
+    let r = erab_reconfiguration(&acts, 1);
+    assert_eq!(r.drbs_released, vec![1], "the release follows the setup");
+    assert_ne!(r.transaction_id, first);
+    let acts = e.on_reconfiguration_complete(5, r.transaction_id);
+    assert_eq!(release_response(&acts), (vec![5], vec![]));
+
+    // During an Initial Context Setup nothing starts.
+    e.ues.get_mut(&5).unwrap().ics = Some(PendingIcs {
+        erabs: vec![],
+        notify: vec![],
+        rx_ciphering: (0, [0; 16]),
+        smc_transaction_id: 0,
+        reconfiguration_transaction_id: None,
+        teids: vec![],
+    });
+    assert!(e
+        .on_erab_request(erab_release(enb, vec![6], None))
+        .is_empty());
+    assert_eq!(e.ues[&5].erab_queue.len(), 1);
+}
+
+/// An E-RAB procedure for a UE this eNB does not know is answered with an
+/// ERROR INDICATION "Unknown eNB UE S1AP ID" (§8.2.1.4 by way of §10.6).
+#[test]
+fn an_erab_request_for_an_unknown_ue_is_reported() {
+    let mut e = rrc();
+    let enb = established(&mut e);
+    let acts = e.on_erab_request(erab_setup(enb + 1, vec![to_setup(6)]));
+    let (stream, pdu) = only_s1(&acts);
+    assert_eq!(stream, NON_UE_ASSOCIATED_STREAM);
+    assert!(
+        matches!(
+            pdu,
+            S1AP_PDU::InitiatingMessage(InitiatingMessage {
+                value: InitiatingMessageValue::Id_ErrorIndication(_),
+                ..
+            })
+        ),
+        "{pdu:?}"
+    );
 }

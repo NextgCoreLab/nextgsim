@@ -723,3 +723,377 @@ async fn a_network_detach_with_reattach_required_is_accepted_and_the_ue_reattach
     );
     assert_eq!(&mme.unprotect(&nas)[..2], &[0x07, 0x41]);
 }
+
+/// E-RAB Level QoS Parameters (TS 36.413 §9.2.1.15) for a non-GBR `qci`.
+fn erab_qos(qci: u8) -> E_RABLevelQoSParameters {
+    E_RABLevelQoSParameters {
+        qci: QCI(qci),
+        allocation_retention_priority: AllocationAndRetentionPriority {
+            priority_level: PriorityLevel(8),
+            pre_emption_capability: Pre_emptionCapability(1),
+            pre_emption_vulnerability: Pre_emptionVulnerability(1),
+            ie_extensions: None,
+        },
+        gbr_qos_information: None,
+        ie_extensions: None,
+    }
+}
+
+/// E-RAB SETUP REQUEST (TS 36.413 §9.1.3.1) for one E-RAB `id` carrying `nas`.
+fn erab_setup_request(
+    mme: u32,
+    enb: u32,
+    id: u8,
+    sgw: Ipv4Addr,
+    sgw_teid: u32,
+    nas: &[u8],
+) -> Vec<u8> {
+    use E_RABSetupRequestProtocolIEs_EntryValue as V;
+    let ie = |id, v| E_RABSetupRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(id),
+        criticality: Criticality(Criticality::REJECT),
+        value: v,
+    };
+    let erab = E_RABToBeSetupListBearerSUReq_Entry {
+        id: ProtocolIE_ID(ID_E_RAB_TO_BE_SETUP_ITEM_BEARER_SU_REQ),
+        criticality: Criticality(Criticality::REJECT),
+        value: E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(
+            E_RABToBeSetupItemBearerSUReq {
+                e_rab_id: E_RAB_ID(id),
+                e_ra_blevel_qo_s_parameters: erab_qos(5),
+                transport_layer_address: TransportLayerAddress(bits(&sgw.octets())),
+                gtp_teid: GTP_TEID(sgw_teid.to_be_bytes().to_vec()),
+                nas_pdu: NAS_PDU(nas.to_vec()),
+                ie_extensions: None,
+            },
+        ),
+    };
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_E_RAB_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_E_RABSetup(E_RABSetupRequest {
+            protocol_i_es: E_RABSetupRequestProtocolIEs(vec![
+                ie(ID_MME_UE_S1AP_ID, V::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(mme))),
+                ie(
+                    ID_E_NB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(enb)),
+                ),
+                ie(
+                    ID_E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ,
+                    V::Id_E_RABToBeSetupListBearerSUReq(E_RABToBeSetupListBearerSUReq(vec![erab])),
+                ),
+            ]),
+        }),
+    }))
+    .unwrap()
+}
+
+/// E-RAB MODIFY REQUEST (TS 36.413 §9.1.3.3) for one E-RAB `id` carrying `nas`.
+fn erab_modify_request(mme: u32, enb: u32, id: u8, nas: &[u8]) -> Vec<u8> {
+    use E_RABModifyRequestProtocolIEs_EntryValue as V;
+    let ie = |id, v| E_RABModifyRequestProtocolIEs_Entry {
+        id: ProtocolIE_ID(id),
+        criticality: Criticality(Criticality::REJECT),
+        value: v,
+    };
+    let erab = E_RABToBeModifiedListBearerModReq_Entry {
+        id: ProtocolIE_ID(ID_E_RAB_TO_BE_MODIFIED_ITEM_BEARER_MOD_REQ),
+        criticality: Criticality(Criticality::REJECT),
+        value: E_RABToBeModifiedListBearerModReq_EntryValue::Id_E_RABToBeModifiedItemBearerModReq(
+            E_RABToBeModifiedItemBearerModReq {
+                e_rab_id: E_RAB_ID(id),
+                e_rab_level_qo_s_parameters: erab_qos(5),
+                nas_pdu: NAS_PDU(nas.to_vec()),
+                ie_extensions: None,
+            },
+        ),
+    };
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_E_RAB_MODIFY),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_E_RABModify(E_RABModifyRequest {
+            protocol_i_es: E_RABModifyRequestProtocolIEs(vec![
+                ie(ID_MME_UE_S1AP_ID, V::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(mme))),
+                ie(
+                    ID_E_NB_UE_S1AP_ID,
+                    V::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(enb)),
+                ),
+                ie(
+                    ID_E_RAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ,
+                    V::Id_E_RABToBeModifiedListBearerModReq(E_RABToBeModifiedListBearerModReq(
+                        vec![erab],
+                    )),
+                ),
+            ]),
+        }),
+    }))
+    .unwrap()
+}
+
+/// E-RAB RELEASE COMMAND (TS 36.413 §9.1.3.5) for E-RAB `id` carrying `nas`.
+fn erab_release_command(mme: u32, enb: u32, id: u8, nas: &[u8]) -> Vec<u8> {
+    use E_RABReleaseCommandProtocolIEs_EntryValue as V;
+    let ie = |id, criticality, v| E_RABReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(id),
+        criticality: Criticality(criticality),
+        value: v,
+    };
+    let erab = E_RABList_Entry {
+        id: ProtocolIE_ID(ID_E_RAB_ITEM),
+        criticality: Criticality(Criticality::IGNORE),
+        value: E_RABList_EntryValue::Id_E_RABItem(E_RABItem {
+            e_rab_id: E_RAB_ID(id),
+            cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+            ie_extensions: None,
+        }),
+    };
+    encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_E_RAB_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_E_RABRelease(E_RABReleaseCommand {
+            protocol_i_es: E_RABReleaseCommandProtocolIEs(vec![
+                ie(
+                    ID_MME_UE_S1AP_ID,
+                    Criticality::REJECT,
+                    V::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(mme)),
+                ),
+                ie(
+                    ID_E_NB_UE_S1AP_ID,
+                    Criticality::REJECT,
+                    V::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(enb)),
+                ),
+                ie(
+                    ID_E_RAB_TO_BE_RELEASED_LIST,
+                    Criticality::IGNORE,
+                    V::Id_E_RABToBeReleasedList(E_RABList(vec![erab])),
+                ),
+                ie(
+                    ID_NAS_PDU,
+                    Criticality::IGNORE,
+                    V::Id_NAS_PDU(NAS_PDU(nas.to_vec())),
+                ),
+            ]),
+        }),
+    }))
+    .unwrap()
+}
+
+/// The eNB's answer to an E-RAB procedure and the UE's NAS reply to the ESM
+/// request it carried, in whichever order they reach the MME.
+async fn erab_answer_and_nas(
+    h: &mut Harness,
+    mme: &mut MmeNas,
+) -> (SuccessfulOutcomeValue, Vec<u8>) {
+    let (mut answer, mut nas) = (None, None);
+    while answer.is_none() || nas.is_none() {
+        match next_s1(&mut h.mme_rx).await.1 {
+            S1AP_PDU::SuccessfulOutcome(o) => answer = Some(o.value),
+            pdu => nas = Some(mme.unprotect(&uplink_nas(pdu).1)),
+        }
+    }
+    (answer.unwrap(), nas.unwrap())
+}
+
+/// A UDP/IPv4 packet from the UE's address to 8.8.8.8 on `dport`.
+fn udp_to(dport: u16, tag: u8) -> Vec<u8> {
+    let mut p = vec![
+        0x45, 0, 0, 29, 0, tag, 0, 0, 64, 17, 0, 0, 10, 45, 0, 2, 8, 8, 8, 8,
+    ];
+    p.extend_from_slice(&40000u16.to_be_bytes());
+    p.extend_from_slice(&dport.to_be_bytes());
+    p.extend_from_slice(&[0, 9, 0, 0, tag]);
+    p
+}
+
+/// Send `packet` up from the UE and return the SGW TEID of the G-PDU it
+/// leaves the eNB in, checking the payload is the packet unchanged.
+async fn uplink_teid(h: &mut Harness, sgw: &tokio::net::UdpSocket, packet: &[u8]) -> u32 {
+    h.ip_ul.send(packet.to_vec()).await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    let (n, from) = tokio::time::timeout(Duration::from_secs(5), sgw.recv_from(&mut buf))
+        .await
+        .expect("no G-PDU at the SGW")
+        .unwrap();
+    assert_eq!(from, h.enb_s1u);
+    assert_eq!(&buf[..2], &[0x30, 0xFF], "G-PDU");
+    assert_eq!(&buf[8..n], packet, "the packet unchanged");
+    u32::from_be_bytes(buf[4..8].try_into().unwrap())
+}
+
+/// Send a G-PDU on the eNB's `teid` and check it reaches the UE's IP stack.
+async fn downlink_on(h: &mut Harness, sgw: &tokio::net::UdpSocket, teid: u32, tag: u8) {
+    let reply = vec![
+        0x45, 0, 0, 24, 0, tag, 0, 0, 64, 1, 0, 0, 8, 8, 8, 8, 10, 45, 0, 2, 0, 0, 0, tag,
+    ];
+    let mut g = vec![0x30, 0xFF, 0x00, reply.len() as u8];
+    g.extend_from_slice(&teid.to_be_bytes());
+    g.extend_from_slice(&reply);
+    sgw.send_to(&g, h.enb_s1u).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), h.ip_dl.recv())
+        .await
+        .expect("no downlink packet at the UE")
+        .unwrap();
+    assert_eq!(got, reply, "downlink on TEID {teid:#x}");
+}
+
+/// #283: a dedicated EPS bearer end to end. E-RAB SETUP REQUEST carries
+/// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST with a TFT for UDP to port
+/// 5060; the eNB adds the DRB (TS 36.413 §8.2.1.2) and answers with its S1-U
+/// endpoint, the UE accepts (TS 24.301 §6.4.2.3) and from then on sends what
+/// the TFT matches on the dedicated bearer -- so it lands on the dedicated
+/// SGW TEID -- and everything else on the default one. E-RAB MODIFY with
+/// MODIFY EPS BEARER CONTEXT REQUEST replaces the filter (§6.4.3.3, port
+/// 5061); E-RAB RELEASE with DEACTIVATE EPS BEARER CONTEXT REQUEST releases
+/// the DRB (TS 36.331 §5.3.10.2) and the bearer (§6.4.4.3), and port 5061
+/// traffic falls back to the default bearer.
+#[tokio::test]
+async fn a_dedicated_bearer_carries_the_uplink_its_tft_matches() {
+    const DEFAULT_SGW_TEID: u32 = 0x1234;
+    const DEDICATED_SGW_TEID: u32 = 0x5678;
+    let sgw_ip = Ipv4Addr::new(127, 0, 0, 78);
+    let sgw = tokio::net::UdpSocket::bind((sgw_ip, 2152)).await.unwrap();
+    let mut h = start().await;
+    let (default_teid, mut mme) = attach(&mut h, sgw_ip).await;
+    assert_eq!(
+        uplink_teid(&mut h, &sgw, &udp_to(5060, 0)).await,
+        DEFAULT_SGW_TEID
+    );
+
+    // TS 24.008 §10.5.6.12: create new TFT, one filter, id 1, uplink only,
+    // precedence 0x10: protocol UDP (0x30), single remote port 5060 (0x50).
+    let tft = [0x21, 0x21, 0x10, 0x05, 0x30, 0x11, 0x50, 0x13, 0xC4];
+    // TS 24.301 Table 8.3.3.1: EBI 6, PTI 0, linked EBI 5, EPS QoS QCI 5, TFT.
+    let mut activate = vec![0x62, 0x00, 0xC5, 0x05, 0x01, 0x05, tft.len() as u8];
+    activate.extend_from_slice(&tft);
+    let nas = mme.protect(&activate, 2);
+    h.to_enb
+        .send(erab_setup_request(
+            4242,
+            h.enb_ue_id,
+            6,
+            sgw_ip,
+            DEDICATED_SGW_TEID,
+            &nas,
+        ))
+        .unwrap();
+    let (answer, accept) = erab_answer_and_nas(&mut h, &mut mme).await;
+    let SuccessfulOutcomeValue::Id_E_RABSetup(resp) = answer else {
+        panic!("expected E-RAB SETUP RESPONSE, got {answer:?}");
+    };
+    let mut setup = None;
+    for ie in resp.protocol_i_es.0 {
+        match ie.value {
+            E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABSetupListBearerSURes(l) => {
+                let E_RABSetupListBearerSURes_EntryValue::Id_E_RABSetupItemBearerSURes(i) =
+                    &l.0[0].value;
+                setup = Some((
+                    i.e_rab_id.0,
+                    i.transport_layer_address.0.len(),
+                    i.gtp_teid.0.clone(),
+                ));
+            }
+            E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABFailedToSetupListBearerSURes(l) => {
+                panic!("E-RAB failed to set up: {l:?}")
+            }
+            _ => {}
+        }
+    }
+    let (id, addr_bits, teid) = setup.expect("E-RAB Setup List");
+    assert_eq!((id, addr_bits), (6, 32));
+    let dedicated_teid = u32::from_be_bytes(teid.try_into().unwrap());
+    assert_ne!(dedicated_teid, 0);
+    assert_ne!(dedicated_teid, default_teid, "a TEID of its own");
+    assert_eq!(
+        &accept[..3],
+        &[0x62, 0x00, 0xC6],
+        "ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT for EBI 6"
+    );
+
+    // The TFT picks the bearer: UDP to 5060 rides EBI 6, the rest EBI 5.
+    for i in 1..4u8 {
+        assert_eq!(
+            uplink_teid(&mut h, &sgw, &udp_to(5060, i)).await,
+            DEDICATED_SGW_TEID
+        );
+        assert_eq!(
+            uplink_teid(&mut h, &sgw, &udp_to(5061, i)).await,
+            DEFAULT_SGW_TEID
+        );
+    }
+    downlink_on(&mut h, &sgw, dedicated_teid, 1).await;
+    downlink_on(&mut h, &sgw, default_teid, 2).await;
+
+    // §6.4.3: replace packet filter 1 with one for port 5061.
+    let tft = [0x81, 0x21, 0x10, 0x05, 0x30, 0x11, 0x50, 0x13, 0xC5];
+    let mut modify = vec![0x62, 0x00, 0xC9, 0x36, tft.len() as u8];
+    modify.extend_from_slice(&tft);
+    let nas = mme.protect(&modify, 2);
+    h.to_enb
+        .send(erab_modify_request(4242, h.enb_ue_id, 6, &nas))
+        .unwrap();
+    let (answer, accept) = erab_answer_and_nas(&mut h, &mut mme).await;
+    let SuccessfulOutcomeValue::Id_E_RABModify(resp) = answer else {
+        panic!("expected E-RAB MODIFY RESPONSE, got {answer:?}");
+    };
+    assert!(
+        resp.protocol_i_es.0.iter().any(|ie| matches!(
+            &ie.value,
+            E_RABModifyResponseProtocolIEs_EntryValue::Id_E_RABModifyListBearerModRes(l)
+                if matches!(&l.0[0].value,
+                    E_RABModifyListBearerModRes_EntryValue::Id_E_RABModifyItemBearerModRes(i)
+                        if i.e_rab_id.0 == 6)
+        )),
+        "E-RAB 6 modified: {resp:?}"
+    );
+    assert_eq!(
+        &accept[..3],
+        &[0x62, 0x00, 0xCA],
+        "MODIFY EPS BEARER CONTEXT ACCEPT"
+    );
+    assert_eq!(
+        uplink_teid(&mut h, &sgw, &udp_to(5061, 4)).await,
+        DEDICATED_SGW_TEID
+    );
+    assert_eq!(
+        uplink_teid(&mut h, &sgw, &udp_to(5060, 4)).await,
+        DEFAULT_SGW_TEID
+    );
+
+    // §6.4.4: deactivate EBI 6 (cause #36 regular deactivation).
+    let nas = mme.protect(&[0x62, 0x00, 0xCD, 36], 2);
+    h.to_enb
+        .send(erab_release_command(4242, h.enb_ue_id, 6, &nas))
+        .unwrap();
+    let (answer, accept) = erab_answer_and_nas(&mut h, &mut mme).await;
+    let SuccessfulOutcomeValue::Id_E_RABRelease(resp) = answer else {
+        panic!("expected E-RAB RELEASE RESPONSE, got {answer:?}");
+    };
+    assert!(
+        resp.protocol_i_es.0.iter().any(|ie| matches!(
+            &ie.value,
+            E_RABReleaseResponseProtocolIEs_EntryValue::Id_E_RABReleaseListBearerRelComp(l)
+                if matches!(&l.0[0].value,
+                    E_RABReleaseListBearerRelComp_EntryValue::Id_E_RABReleaseItemBearerRelComp(i)
+                        if i.e_rab_id.0 == 6)
+        )),
+        "E-RAB 6 released: {resp:?}"
+    );
+    assert_eq!(
+        &accept[..3],
+        &[0x62, 0x00, 0xCE],
+        "DEACTIVATE EPS BEARER CONTEXT ACCEPT"
+    );
+    for i in 5..7u8 {
+        assert_eq!(
+            uplink_teid(&mut h, &sgw, &udp_to(5061, i)).await,
+            DEFAULT_SGW_TEID
+        );
+    }
+    // The dedicated tunnel is gone: a G-PDU on its TEID reaches nobody, so
+    // the next packet at the UE is the one on the default bearer's.
+    let mut g = vec![0x30, 0xFF, 0x00, 4];
+    g.extend_from_slice(&dedicated_teid.to_be_bytes());
+    g.extend_from_slice(&[0x45, 0, 0, 4]);
+    sgw.send_to(&g, h.enb_s1u).await.unwrap();
+    downlink_on(&mut h, &sgw, default_teid, 3).await;
+}

@@ -99,6 +99,14 @@ pub enum Action {
         /// The E-RABs.
         bearers: Vec<UpBearer>,
     },
+    /// Release the DRBs on `lcids` of `ue` and their S1-U tunnels (E-RAB
+    /// RELEASE, TS 36.413 §8.2.3; #283).
+    ReleaseUserPlane {
+        /// RLS UE id.
+        ue: u32,
+        /// The DRBs' LCIDs.
+        lcids: Vec<u8>,
+    },
     /// Broadcast an RRC PDU on a common channel to every UE the cell hears
     /// (PCCH paging, TS 36.331 §5.3.2). RLS has no paging occasions, so it goes
     /// out at once.
@@ -153,6 +161,36 @@ impl std::fmt::Debug for PendingIcs {
     }
 }
 
+/// An E-RAB management request waiting for, or running, its
+/// RRCConnectionReconfiguration (TS 36.413 §8.2; #283).
+#[derive(Debug, Clone)]
+enum ErabRequest {
+    Setup(s1ap_ue::ErabSetupRequest),
+    Modify(s1ap_ue::ErabModifyRequest),
+    Release(s1ap_ue::ErabReleaseCommand),
+}
+
+/// What the running E-RAB procedure answers once the UE has completed its
+/// RRCConnectionReconfiguration.
+#[derive(Debug, Clone)]
+enum ErabOutcome {
+    /// E-RABs set up: item, eNB TEID, DRB.
+    Setup(Vec<(ErabToSetup, u32, DrbConfig)>),
+    /// E-RABs modified, with their new QCIs.
+    Modify(Vec<(u8, u8)>),
+    /// E-RABs released, with their DRBs' LCIDs.
+    Release(Vec<(u8, u8)>),
+}
+
+#[derive(Debug, Clone)]
+struct PendingErab {
+    mme: u32,
+    enb: u32,
+    transaction_id: u8,
+    outcome: ErabOutcome,
+    failed: Vec<(u8, Cause)>,
+}
+
 /// AS security of a UE (TS 33.401 §7.2.4). Keys never printed.
 #[derive(Clone)]
 struct AsSecurity {
@@ -190,6 +228,12 @@ struct UeContext {
     security: Option<AsSecurity>,
     ics: Option<PendingIcs>,
     drbs: Vec<DrbConfig>,
+    /// The QCI of each E-RAB set up, by E-RAB ID (#283).
+    erab_qci: HashMap<u8, u8>,
+    /// The E-RAB procedure whose RRCConnectionReconfiguration is out (#283).
+    erab: Option<PendingErab>,
+    /// E-RAB procedures that arrived while another reconfiguration ran (#283).
+    erab_queue: VecDeque<ErabRequest>,
     /// The last user data or signalling to or from the UE, for the
     /// user-inactivity release (#350).
     last_activity: Instant,
@@ -517,6 +561,9 @@ impl EnbRrc {
             security: None,
             ics: None,
             drbs: Vec::new(),
+            erab_qci: HashMap::new(),
+            erab: None,
+            erab_queue: VecDeque::new(),
             last_activity: Instant::now(),
             inactivity_release_requested_at: None,
         };
@@ -778,6 +825,9 @@ impl EnbRrc {
                 pdu,
             }],
             S1Inbound::Paging(p) => self.on_paging(&p),
+            S1Inbound::ErabSetup(r) => self.on_erab_request(ErabRequest::Setup(*r)),
+            S1Inbound::ErabModify(r) => self.on_erab_request(ErabRequest::Modify(*r)),
+            S1Inbound::ErabRelease(r) => self.on_erab_request(ErabRequest::Release(*r)),
             S1Inbound::ErrorIndication(pdu) => vec![Action::S1 {
                 stream: NON_UE_ASSOCIATED_STREAM,
                 pdu,
@@ -1141,6 +1191,7 @@ impl EnbRrc {
             nas.len()
         );
         ctx.drbs = drbs;
+        ctx.erab_qci = ics.erabs.iter().map(|e| (e.e_rab_id, e.qci)).collect();
         let (pdcp, _) = ctx.srb1.transmit(&reconf);
         vec![Action::Rrc {
             ue,
@@ -1179,6 +1230,9 @@ impl EnbRrc {
             return vec![];
         };
         let Some(ics) = ctx.ics.as_ref() else {
+            if ctx.erab.as_ref().map(|p| p.transaction_id) == Some(transaction_id) {
+                return self.on_erab_reconfiguration_complete(ue);
+            }
             log::info!("UE {ue}: RRCConnectionReconfigurationComplete");
             return vec![];
         };
@@ -1243,6 +1297,8 @@ impl EnbRrc {
                 pdu,
             });
         }
+        // E-RAB procedures that waited for the Initial Context Setup
+        acts.extend(self.next_erab_request(ue));
         acts
     }
 
@@ -1298,6 +1354,428 @@ impl EnbRrc {
         )) {
             acts.push(Action::S1 { stream, pdu });
         }
+        acts
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E-RAB management (TS 36.413 §8.2; TS 36.331 §5.3.5, §5.3.10; #283)
+// ---------------------------------------------------------------------------
+
+fn radio_network(v: u8) -> Cause {
+    Cause::RadioNetwork(CauseRadioNetwork(v))
+}
+
+/// Whether `qci` is of GBR resource type (TS 23.203 Table 6.1.7-A; the
+/// standardized values are those of TS 23.501 Table 5.7.4-1): an E-RAB with
+/// one needs the GBR QoS Information IE (TS 36.413 §8.2.1.4, §8.2.2.4).
+fn is_gbr_qci(qci: u8) -> bool {
+    matches!(qci, 1..=4 | 65..=67 | 71..=76 | 82..=90)
+}
+
+/// E-RAB IDs that occur more than once in a request (§8.2.1.4, §8.2.2.4).
+fn duplicated(ids: &[u8]) -> Vec<u8> {
+    let mut seen = std::collections::HashSet::new();
+    let mut dup = Vec::new();
+    for id in ids {
+        if !seen.insert(*id) && !dup.contains(id) {
+            dup.push(*id);
+        }
+    }
+    dup
+}
+
+impl EnbRrc {
+    /// An E-RAB SETUP / MODIFY REQUEST or E-RAB RELEASE COMMAND. One E-RAB
+    /// procedure runs per UE at a time, and none during an Initial Context
+    /// Setup: their RRCConnectionReconfigurations are told apart by transaction
+    /// id, and the radio configuration they change is the one the previous one
+    /// left. Later requests wait in order.
+    fn on_erab_request(&mut self, req: ErabRequest) -> Vec<Action> {
+        let (mme, enb) = match &req {
+            ErabRequest::Setup(r) => (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id),
+            ErabRequest::Modify(r) => (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id),
+            ErabRequest::Release(r) => (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id),
+        };
+        let found = self
+            .by_enb_id
+            .get(&enb)
+            .copied()
+            .filter(|ue| self.ues[ue].mme_ue_s1ap_id == Some(mme));
+        let Some(ue) = found else {
+            log::warn!("E-RAB procedure for unknown UE (MME {mme}, eNB {enb})");
+            return s1ap_ue::unknown_enb_ue_s1ap_id_error(mme, enb)
+                .map(|pdu| {
+                    vec![Action::S1 {
+                        stream: NON_UE_ASSOCIATED_STREAM,
+                        pdu,
+                    }]
+                })
+                .unwrap_or_default();
+        };
+        self.ues
+            .get_mut(&ue)
+            .expect("present")
+            .erab_queue
+            .push_back(req);
+        self.next_erab_request(ue)
+    }
+
+    /// Start the next queued E-RAB procedure of `ue`, if none runs.
+    fn next_erab_request(&mut self, ue: u32) -> Vec<Action> {
+        let mut acts = Vec::new();
+        loop {
+            let Some(ctx) = self.ues.get_mut(&ue) else {
+                return acts;
+            };
+            if ctx.erab.is_some() || ctx.ics.is_some() {
+                if !ctx.erab_queue.is_empty() {
+                    log::info!(
+                        "UE {ue}: {} E-RAB procedure(s) wait for the reconfiguration in progress",
+                        ctx.erab_queue.len()
+                    );
+                }
+                return acts;
+            }
+            let Some(req) = ctx.erab_queue.pop_front() else {
+                return acts;
+            };
+            let started = match req {
+                ErabRequest::Setup(r) => self.start_erab_setup(ue, r),
+                ErabRequest::Modify(r) => self.start_erab_modify(ue, r),
+                ErabRequest::Release(r) => self.start_erab_release(ue, r),
+            };
+            acts.extend(started);
+        }
+    }
+
+    /// Send the RRCConnectionReconfiguration of an E-RAB procedure on SRB1
+    /// and record what its completion answers.
+    #[allow(clippy::too_many_arguments)]
+    fn send_erab_reconfiguration(
+        &mut self,
+        ue: u32,
+        mme: u32,
+        enb: u32,
+        add: &[DrbConfig],
+        release: &[u8],
+        nas: &[Vec<u8>],
+        outcome: ErabOutcome,
+        failed: Vec<(u8, Cause)>,
+    ) -> Vec<Action> {
+        let ctx = self.ues.get_mut(&ue).expect("present");
+        let tid = ctx.next_tid();
+        let reconf = match msg::encode_rrc_connection_reconfiguration_with_release(
+            tid, false, add, release, nas,
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                log::error!("UE {ue}: cannot encode RRCConnectionReconfiguration: {e}");
+                return vec![];
+            }
+        };
+        let (pdcp, _) = ctx.srb1.transmit(&reconf);
+        ctx.erab = Some(PendingErab {
+            mme,
+            enb,
+            transaction_id: tid,
+            outcome,
+            failed,
+        });
+        vec![Action::Rrc {
+            ue,
+            channel: RrcChannel::DlDcch,
+            lcid: LCID_SRB1,
+            pdu: pdcp,
+        }]
+    }
+
+    fn s1_to_ue(&self, enb: u32, pdu: &S1AP_PDU) -> Vec<Action> {
+        encode_s1(pdu)
+            .map(|pdu| {
+                vec![Action::S1 {
+                    stream: self.ue_stream(enb),
+                    pdu,
+                }]
+            })
+            .unwrap_or_default()
+    }
+
+    /// E-RAB SETUP REQUEST (TS 36.413 §8.2.1.2): one DRB per E-RAB that can be
+    /// set up, its NAS-PDU to the UE in the reconfiguration; §8.2.1.4: an
+    /// E-RAB ID given twice, or of an active E-RAB, fails "Multiple E-RAB ID
+    /// instances".
+    fn start_erab_setup(&mut self, ue: u32, r: s1ap_ue::ErabSetupRequest) -> Vec<Action> {
+        let (mme, enb) = (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id);
+        let ctx = &self.ues[&ue];
+        let ids: Vec<u8> = r.erabs.iter().map(|e| e.e_rab_id).collect();
+        let dup = duplicated(&ids);
+        let mut failed = Vec::new();
+        let mut ok = Vec::new();
+        let secured = ctx.security.is_some();
+        let mut used: Vec<u8> = ctx.drbs.iter().map(|d| d.drb_identity).collect();
+        for e in r.erabs {
+            let cause = if !secured {
+                // §8.2.1: E-RABs go on an established UE context, after Initial
+                // Context Setup
+                Some(radio_network(CauseRadioNetwork::UNSPECIFIED))
+            } else if dup.contains(&e.e_rab_id)
+                || ctx.drbs.iter().any(|d| d.eps_bearer_identity == e.e_rab_id)
+            {
+                Some(radio_network(
+                    CauseRadioNetwork::MULTIPLE_E_RAB_ID_INSTANCES,
+                ))
+            } else if is_gbr_qci(e.qci) && !e.gbr_info {
+                // §8.2.1.4: a GBR QCI without GBR QoS Information
+                Some(radio_network(CauseRadioNetwork::INVALID_QOS_COMBINATION))
+            } else if sgw_endpoint(&e.sgw_address).is_none() {
+                Some(Cause::Transport(CauseTransport(
+                    CauseTransport::UNSPECIFIED,
+                )))
+            } else {
+                None
+            };
+            if let Some(c) = cause {
+                // A repeated E-RAB ID fails once
+                if !failed.iter().any(|(f, _)| *f == e.e_rab_id) {
+                    failed.push((e.e_rab_id, c));
+                }
+                continue;
+            }
+            // The lowest free DRB identity; LCID = DRB identity + 2, as the
+            // Initial Context Setup assigns them
+            let Some(drb_identity) = (1..=MAX_DRBS as u8).find(|d| !used.contains(d)) else {
+                failed.push((
+                    e.e_rab_id,
+                    radio_network(CauseRadioNetwork::RADIO_RESOURCES_NOT_AVAILABLE),
+                ));
+                continue;
+            };
+            used.push(drb_identity);
+            let drb = DrbConfig {
+                eps_bearer_identity: e.e_rab_id,
+                drb_identity,
+                logical_channel_identity: drb_identity + 2,
+                rlc: DrbRlc::UmSn10,
+            };
+            ok.push((e, drb));
+        }
+        if ok.is_empty() {
+            log::warn!("UE {ue}: E-RAB SETUP REQUEST: no E-RAB set up");
+            return self.s1_to_ue(
+                enb,
+                &s1ap_ue::build_erab_setup_response(mme, enb, &[], &failed),
+            );
+        }
+        let setup: Vec<(ErabToSetup, u32, DrbConfig)> = ok
+            .into_iter()
+            .map(|(e, d)| {
+                let t = self.next_teid;
+                self.next_teid = self.next_teid.wrapping_add(1).max(1);
+                (e, t, d)
+            })
+            .collect();
+        let add: Vec<DrbConfig> = setup.iter().map(|(_, _, d)| *d).collect();
+        let nas: Vec<Vec<u8>> = setup.iter().filter_map(|(e, _, _)| e.nas.clone()).collect();
+        log::info!(
+            "UE {ue}: E-RAB SETUP REQUEST; RRCConnectionReconfiguration adds {} DRB(s), {} failed",
+            add.len(),
+            failed.len()
+        );
+        self.send_erab_reconfiguration(
+            ue,
+            mme,
+            enb,
+            &add,
+            &[],
+            &nas,
+            ErabOutcome::Setup(setup),
+            failed,
+        )
+    }
+
+    /// E-RAB MODIFY REQUEST (TS 36.413 §8.2.2.2): the NAS-PDUs to the UE in
+    /// a reconfiguration; this eNB's DRBs carry no QoS of their own over RLS,
+    /// so the radio configuration does not change. §8.2.2.4: an unknown or
+    /// repeated E-RAB ID fails.
+    fn start_erab_modify(&mut self, ue: u32, r: s1ap_ue::ErabModifyRequest) -> Vec<Action> {
+        let (mme, enb) = (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id);
+        let ctx = &self.ues[&ue];
+        let ids: Vec<u8> = r.erabs.iter().map(|e| e.e_rab_id).collect();
+        let dup = duplicated(&ids);
+        let mut failed = Vec::new();
+        let mut modified = Vec::new();
+        let mut nas = Vec::new();
+        for e in r.erabs {
+            if dup.contains(&e.e_rab_id) {
+                if !failed.iter().any(|(f, _)| *f == e.e_rab_id) {
+                    failed.push((
+                        e.e_rab_id,
+                        radio_network(CauseRadioNetwork::MULTIPLE_E_RAB_ID_INSTANCES),
+                    ));
+                }
+            } else if !ctx.drbs.iter().any(|d| d.eps_bearer_identity == e.e_rab_id) {
+                failed.push((
+                    e.e_rab_id,
+                    radio_network(CauseRadioNetwork::UNKNOWN_E_RAB_ID),
+                ));
+            } else if is_gbr_qci(e.qci)
+                && !e.gbr_info
+                && !ctx
+                    .erab_qci
+                    .get(&e.e_rab_id)
+                    .copied()
+                    .is_some_and(is_gbr_qci)
+            {
+                // §8.2.2.4: non-GBR to GBR without GBR QoS Information
+                failed.push((
+                    e.e_rab_id,
+                    radio_network(CauseRadioNetwork::INVALID_QOS_COMBINATION),
+                ));
+            } else {
+                modified.push((e.e_rab_id, e.qci));
+                nas.push(e.nas);
+            }
+        }
+        if modified.is_empty() {
+            log::warn!("UE {ue}: E-RAB MODIFY REQUEST: no E-RAB modified");
+            return self.s1_to_ue(
+                enb,
+                &s1ap_ue::build_erab_modify_response(mme, enb, &[], &failed),
+            );
+        }
+        log::info!("UE {ue}: E-RAB MODIFY REQUEST for {modified:?}; RRCConnectionReconfiguration");
+        self.send_erab_reconfiguration(
+            ue,
+            mme,
+            enb,
+            &[],
+            &[],
+            &nas,
+            ErabOutcome::Modify(modified),
+            failed,
+        )
+    }
+
+    /// E-RAB RELEASE COMMAND (TS 36.413 §8.2.3.2.1): the DRBs go in
+    /// `drb-ToReleaseList`, with the NAS-PDU; the S1-U tunnels go once the UE
+    /// has completed it. §8.2.3.3: an E-RAB ID given more than once releases
+    /// one E-RAB; an unknown one fails.
+    fn start_erab_release(&mut self, ue: u32, r: s1ap_ue::ErabReleaseCommand) -> Vec<Action> {
+        let (mme, enb) = (r.mme_ue_s1ap_id, r.enb_ue_s1ap_id);
+        let ctx = &self.ues[&ue];
+        let mut failed: Vec<(u8, Cause)> = Vec::new();
+        let mut released = Vec::new();
+        let mut release = Vec::new();
+        for (i, &id) in r.erabs.iter().enumerate() {
+            if r.erabs[..i].contains(&id) {
+                continue;
+            }
+            match ctx.drbs.iter().find(|d| d.eps_bearer_identity == id) {
+                Some(d) => {
+                    released.push((id, d.logical_channel_identity));
+                    release.push(d.drb_identity);
+                }
+                None => failed.push((id, radio_network(CauseRadioNetwork::UNKNOWN_E_RAB_ID))),
+            }
+        }
+        if released.is_empty() {
+            log::warn!("UE {ue}: E-RAB RELEASE COMMAND: no E-RAB released");
+            let mut acts = self.s1_to_ue(
+                enb,
+                &s1ap_ue::build_erab_release_response(mme, enb, &[], &failed),
+            );
+            // "If a NAS-PDU IE is contained in the message, the eNB shall pass
+            // it to the UE"
+            if let Some(nas) = r.nas {
+                acts.extend(self.on_downlink_nas(mme, enb, nas));
+            }
+            return acts;
+        }
+        let nas: Vec<Vec<u8>> = r.nas.into_iter().collect();
+        log::info!(
+            "UE {ue}: E-RAB RELEASE COMMAND for {:?}; RRCConnectionReconfiguration releases DRB(s) {release:?}",
+            released.iter().map(|(e, _)| e).collect::<Vec<_>>()
+        );
+        self.send_erab_reconfiguration(
+            ue,
+            mme,
+            enb,
+            &[],
+            &release,
+            &nas,
+            ErabOutcome::Release(released),
+            failed,
+        )
+    }
+
+    /// The UE completed an E-RAB procedure's RRCConnectionReconfiguration
+    /// (TS 36.331 §5.3.5.3): set up or release the user plane and answer the
+    /// MME, then start the next queued procedure.
+    fn on_erab_reconfiguration_complete(&mut self, ue: u32) -> Vec<Action> {
+        let gtp_ip = self.gtp_ip;
+        let ctx = self.ues.get_mut(&ue).expect("present");
+        let p = ctx.erab.take().expect("checked by the caller");
+        let mut acts = Vec::new();
+        let response = match p.outcome {
+            ErabOutcome::Setup(setup) => {
+                let sec = ctx.security.clone().expect("checked at the request");
+                let bearers: Vec<UpBearer> = setup
+                    .iter()
+                    .filter_map(|(e, teid, d)| {
+                        Some(UpBearer {
+                            e_rab_id: e.e_rab_id,
+                            lcid: d.logical_channel_identity,
+                            enb_teid: *teid,
+                            sgw: sgw_endpoint(&e.sgw_address)?,
+                            sgw_teid: e.sgw_teid,
+                            eea: sec.eea,
+                            k_up_enc: sec.k_up_enc,
+                        })
+                    })
+                    .collect();
+                ctx.drbs.extend(setup.iter().map(|(_, _, d)| *d));
+                ctx.erab_qci
+                    .extend(setup.iter().map(|(e, _, _)| (e.e_rab_id, e.qci)));
+                let erabs: Vec<ErabSetup> = setup
+                    .iter()
+                    .map(|(e, t, _)| ErabSetup {
+                        e_rab_id: e.e_rab_id,
+                        address: gtp_ip,
+                        teid: *t,
+                    })
+                    .collect();
+                log::info!(
+                    "UE {ue}: RRCConnectionReconfigurationComplete; E-RAB SETUP RESPONSE ({} set up, {} failed)",
+                    erabs.len(),
+                    p.failed.len()
+                );
+                acts.push(Action::UserPlane { ue, bearers });
+                s1ap_ue::build_erab_setup_response(p.mme, p.enb, &erabs, &p.failed)
+            }
+            ErabOutcome::Modify(modified) => {
+                ctx.erab_qci.extend(modified.iter().copied());
+                log::info!("UE {ue}: RRCConnectionReconfigurationComplete; E-RAB MODIFY RESPONSE");
+                let ids: Vec<u8> = modified.iter().map(|(e, _)| *e).collect();
+                s1ap_ue::build_erab_modify_response(p.mme, p.enb, &ids, &p.failed)
+            }
+            ErabOutcome::Release(released) => {
+                ctx.drbs
+                    .retain(|d| !released.iter().any(|(e, _)| *e == d.eps_bearer_identity));
+                for (e, _) in &released {
+                    ctx.erab_qci.remove(e);
+                }
+                log::info!("UE {ue}: RRCConnectionReconfigurationComplete; E-RAB RELEASE RESPONSE");
+                acts.push(Action::ReleaseUserPlane {
+                    ue,
+                    lcids: released.iter().map(|(_, l)| *l).collect(),
+                });
+                let ids: Vec<u8> = released.iter().map(|(e, _)| *e).collect();
+                s1ap_ue::build_erab_release_response(p.mme, p.enb, &ids, &p.failed)
+            }
+        };
+        acts.extend(self.s1_to_ue(p.enb, &response));
+        acts.extend(self.next_erab_request(ue));
         acts
     }
 }

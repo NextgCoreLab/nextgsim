@@ -320,6 +320,12 @@ pub enum S1Inbound {
     },
     /// S1AP PAGING (§8.5), to broadcast on the cell when its TAI is listed.
     Paging(PagingRequest),
+    /// E-RAB SETUP REQUEST (§8.2.1, #283).
+    ErabSetup(Box<ErabSetupRequest>),
+    /// E-RAB MODIFY REQUEST (§8.2.2, #283).
+    ErabModify(Box<ErabModifyRequest>),
+    /// E-RAB RELEASE COMMAND (§8.2.3, #283).
+    ErabRelease(Box<ErabReleaseCommand>),
     /// Nothing to relay; send this Error Indication (§10).
     ErrorIndication(Vec<u8>),
     /// A PDU this build does not act on, for the log.
@@ -624,6 +630,8 @@ pub struct ErabToSetup {
     pub e_rab_id: u8,
     /// QCI.
     pub qci: u8,
+    /// Whether the GBR QoS Information IE is present (§9.2.1.15).
+    pub gbr_info: bool,
     /// The SGW's S1-U transport layer address, as octets (4 IPv4, 16 IPv6).
     pub sgw_address: Vec<u8>,
     /// The SGW's S1-U GTP-TEID.
@@ -736,6 +744,7 @@ fn handle_initial_context_setup(
                             ErabToSetup {
                                 e_rab_id: i.e_rab_id.0,
                                 qci: i.e_ra_blevel_qo_s_parameters.qci.0,
+                                gbr_info: i.e_ra_blevel_qo_s_parameters.gbr_qos_information.is_some(),
                                 sgw_address: bit_octets(&i.transport_layer_address.0),
                                 sgw_teid: u32::from_be_bytes(
                                     i.gtp_teid.0.as_slice().try_into().unwrap_or([0; 4]),
@@ -1076,6 +1085,18 @@ pub fn handle_s1_pdu(bytes: &[u8]) -> S1Inbound {
             value: InitiatingMessageValue::Id_Paging(paging),
             ..
         }) => handle_paging(paging),
+        S1AP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_E_RABSetup(req),
+            ..
+        }) => handle_erab_setup(req, &unknown),
+        S1AP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_E_RABModify(req),
+            ..
+        }) => handle_erab_modify(req, &unknown),
+        S1AP_PDU::InitiatingMessage(InitiatingMessage {
+            value: InitiatingMessageValue::Id_E_RABRelease(cmd),
+            ..
+        }) => handle_erab_release(cmd, &unknown),
         S1AP_PDU::InitiatingMessage(m) => S1Inbound::NotHandled(format!(
             "initiating message, procedure {} (not supported in this build)",
             m.procedure_code.0
@@ -1104,6 +1125,478 @@ pub fn unknown_enb_ue_s1ap_id_error(mme: u32, enb: u32) -> Option<Vec<u8>> {
         None,
         &[],
     ))
+}
+
+// ===========================================================================
+// E-RAB management (TS 36.413 §8.2, nextgsim #283)
+// ===========================================================================
+
+/// E-RAB SETUP REQUEST (§9.1.3.1), the parts the eNB acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabSetupRequest {
+    /// MME UE S1AP ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID.
+    pub enb_ue_s1ap_id: u32,
+    /// The E-RABs to set up, each with the NAS-PDU for the UE.
+    pub erabs: Vec<ErabToSetup>,
+}
+
+/// One item of E-RAB MODIFY REQUEST (§9.1.3.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabToModify {
+    /// E-RAB ID.
+    pub e_rab_id: u8,
+    /// The new QCI.
+    pub qci: u8,
+    /// Whether the GBR QoS Information IE is present (§9.2.1.15).
+    pub gbr_info: bool,
+    /// NAS-PDU for the UE (the MODIFY EPS BEARER CONTEXT REQUEST).
+    pub nas: Vec<u8>,
+}
+
+/// E-RAB MODIFY REQUEST (§9.1.3.3), the parts the eNB acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabModifyRequest {
+    /// MME UE S1AP ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID.
+    pub enb_ue_s1ap_id: u32,
+    /// The E-RABs to modify.
+    pub erabs: Vec<ErabToModify>,
+}
+
+/// E-RAB RELEASE COMMAND (§9.1.3.5), the parts the eNB acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErabReleaseCommand {
+    /// MME UE S1AP ID.
+    pub mme_ue_s1ap_id: u32,
+    /// eNB UE S1AP ID.
+    pub enb_ue_s1ap_id: u32,
+    /// The E-RAB IDs to release.
+    pub erabs: Vec<u8>,
+    /// NAS-PDU for the UE (the DEACTIVATE EPS BEARER CONTEXT REQUEST).
+    pub nas: Option<Vec<u8>>,
+}
+
+/// The Error Indication for an E-RAB procedure missing a mandatory IE, or with
+/// a reject-criticality IE not comprehended (§10.3.4.2, §10.3.5): E-RAB Setup,
+/// Modify and Release have no unsuccessful outcome to carry it.
+fn erab_ie_errors(
+    unknown: &[UnknownIe],
+    mandatory: &[(bool, u16)],
+    mme: Option<u32>,
+    enb: Option<u32>,
+    procedure_code: u8,
+    name: &str,
+) -> Option<S1Inbound> {
+    let mut diag: Vec<DiagnosedIe> = unknown
+        .iter()
+        .filter(|u| {
+            u.criticality
+                .as_ref()
+                .is_none_or(|c| c.0 == Criticality::REJECT)
+        })
+        .filter_map(|u| {
+            Some(DiagnosedIe {
+                id: u16::try_from(u.id).ok()?,
+                criticality: Criticality::REJECT,
+                type_of_error: TypeOfError::NOT_UNDERSTOOD,
+            })
+        })
+        .collect();
+    for (present, id) in mandatory {
+        if !present {
+            diag.push(DiagnosedIe {
+                id: *id,
+                criticality: Criticality::REJECT,
+                type_of_error: TypeOfError::MISSING,
+            });
+        }
+    }
+    if diag.is_empty() {
+        return None;
+    }
+    Some(
+        encode_or_log(&build_ue_error_indication(
+            mme,
+            enb,
+            protocol(CauseProtocol::ABSTRACT_SYNTAX_ERROR_REJECT),
+            Some((
+                procedure_code,
+                TriggeringMessage::INITIATING_MESSAGE,
+                Criticality::REJECT,
+            )),
+            &diag,
+        ))
+        .map_or_else(
+            || S1Inbound::NotHandled(format!("{name} rejected")),
+            S1Inbound::ErrorIndication,
+        ),
+    )
+}
+
+fn handle_erab_setup(req: &E_RABSetupRequest, unknown: &[UnknownIe]) -> S1Inbound {
+    let (mut mme, mut enb, mut erabs) = (None, None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            E_RABSetupRequestProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            E_RABSetupRequestProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            E_RABSetupRequestProtocolIEs_EntryValue::Id_E_RABToBeSetupListBearerSUReq(l) => {
+                erabs = Some(
+                    l.0.iter()
+                        .map(|e| {
+                            let E_RABToBeSetupListBearerSUReq_EntryValue::Id_E_RABToBeSetupItemBearerSUReq(i) =
+                                &e.value;
+                            ErabToSetup {
+                                e_rab_id: i.e_rab_id.0,
+                                qci: i.e_ra_blevel_qo_s_parameters.qci.0,
+                                gbr_info: i.e_ra_blevel_qo_s_parameters.gbr_qos_information.is_some(),
+                                sgw_address: bit_octets(&i.transport_layer_address.0),
+                                sgw_teid: u32::from_be_bytes(
+                                    i.gtp_teid.0.as_slice().try_into().unwrap_or([0; 4]),
+                                ),
+                                nas: Some(i.nas_pdu.0.clone()),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Some(err) = erab_ie_errors(
+        unknown,
+        &[
+            (mme.is_some(), ID_MME_UE_S1AP_ID),
+            (enb.is_some(), ID_E_NB_UE_S1AP_ID),
+            (erabs.is_some(), ID_E_RAB_TO_BE_SETUP_LIST_BEARER_SU_REQ),
+        ],
+        mme,
+        enb,
+        ID_E_RAB_SETUP,
+        "E-RAB SETUP REQUEST",
+    ) {
+        return err;
+    }
+    let (Some(mme), Some(enb), Some(erabs)) = (mme, enb, erabs) else {
+        unreachable!("checked above");
+    };
+    S1Inbound::ErabSetup(Box::new(ErabSetupRequest {
+        mme_ue_s1ap_id: mme,
+        enb_ue_s1ap_id: enb,
+        erabs,
+    }))
+}
+
+fn handle_erab_modify(req: &E_RABModifyRequest, unknown: &[UnknownIe]) -> S1Inbound {
+    let (mut mme, mut enb, mut erabs) = (None, None, None);
+    for ie in &req.protocol_i_es.0 {
+        match &ie.value {
+            E_RABModifyRequestProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            E_RABModifyRequestProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            E_RABModifyRequestProtocolIEs_EntryValue::Id_E_RABToBeModifiedListBearerModReq(l) => {
+                erabs = Some(
+                    l.0.iter()
+                        .map(|e| {
+                            let E_RABToBeModifiedListBearerModReq_EntryValue::Id_E_RABToBeModifiedItemBearerModReq(i) =
+                                &e.value;
+                            ErabToModify {
+                                e_rab_id: i.e_rab_id.0,
+                                qci: i.e_rab_level_qo_s_parameters.qci.0,
+                                gbr_info: i.e_rab_level_qo_s_parameters.gbr_qos_information.is_some(),
+                                nas: i.nas_pdu.0.clone(),
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            _ => {}
+        }
+    }
+    if let Some(err) = erab_ie_errors(
+        unknown,
+        &[
+            (mme.is_some(), ID_MME_UE_S1AP_ID),
+            (enb.is_some(), ID_E_NB_UE_S1AP_ID),
+            (erabs.is_some(), ID_E_RAB_TO_BE_MODIFIED_LIST_BEARER_MOD_REQ),
+        ],
+        mme,
+        enb,
+        ID_E_RAB_MODIFY,
+        "E-RAB MODIFY REQUEST",
+    ) {
+        return err;
+    }
+    let (Some(mme), Some(enb), Some(erabs)) = (mme, enb, erabs) else {
+        unreachable!("checked above");
+    };
+    S1Inbound::ErabModify(Box::new(ErabModifyRequest {
+        mme_ue_s1ap_id: mme,
+        enb_ue_s1ap_id: enb,
+        erabs,
+    }))
+}
+
+fn handle_erab_release(cmd: &E_RABReleaseCommand, unknown: &[UnknownIe]) -> S1Inbound {
+    let (mut mme, mut enb, mut erabs, mut nas) = (None, None, None, None);
+    for ie in &cmd.protocol_i_es.0 {
+        match &ie.value {
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(v) => mme = Some(v.0),
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(v) => enb = Some(v.0),
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_E_RABToBeReleasedList(l) => {
+                erabs = Some(
+                    l.0.iter()
+                        .map(|e| {
+                            let E_RABList_EntryValue::Id_E_RABItem(i) = &e.value;
+                            i.e_rab_id.0
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_NAS_PDU(n) => nas = Some(n.0.clone()),
+            _ => {}
+        }
+    }
+    if let Some(err) = erab_ie_errors(
+        unknown,
+        &[
+            (mme.is_some(), ID_MME_UE_S1AP_ID),
+            (enb.is_some(), ID_E_NB_UE_S1AP_ID),
+            (erabs.is_some(), ID_E_RAB_TO_BE_RELEASED_LIST),
+        ],
+        mme,
+        enb,
+        ID_E_RAB_RELEASE,
+        "E-RAB RELEASE COMMAND",
+    ) {
+        return err;
+    }
+    let (Some(mme), Some(enb), Some(erabs)) = (mme, enb, erabs) else {
+        unreachable!("checked above");
+    };
+    S1Inbound::ErabRelease(Box::new(ErabReleaseCommand {
+        mme_ue_s1ap_id: mme,
+        enb_ue_s1ap_id: enb,
+        erabs,
+        nas,
+    }))
+}
+
+/// E-RAB List (§9.2.1.36) of failed E-RABs and their causes, or `None` when
+/// empty (the list has at least one item).
+fn failed_list(failed: &[(u8, Cause)]) -> Option<E_RABList> {
+    (!failed.is_empty()).then(|| {
+        E_RABList(
+            failed
+                .iter()
+                .map(|(id, cause)| E_RABList_Entry {
+                    id: ProtocolIE_ID(ID_E_RAB_ITEM),
+                    criticality: Criticality(Criticality::IGNORE),
+                    value: E_RABList_EntryValue::Id_E_RABItem(E_RABItem {
+                        e_rab_id: E_RAB_ID(*id),
+                        cause: cause.clone(),
+                        ie_extensions: None,
+                    }),
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Build E-RAB SETUP RESPONSE (§9.1.3.2): IEs in message-table order, all
+/// criticality ignore; each list only when non-empty.
+pub fn build_erab_setup_response(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    setup: &[ErabSetup],
+    failed: &[(u8, Cause)],
+) -> S1AP_PDU {
+    let ignore = Criticality(Criticality::IGNORE);
+    let mut ies = vec![
+        E_RABSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MME_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABSetupResponseProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(
+                mme_ue_s1ap_id,
+            )),
+        },
+        E_RABSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_NB_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABSetupResponseProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(
+                enb_ue_s1ap_id,
+            )),
+        },
+    ];
+    if !setup.is_empty() {
+        ies.push(E_RABSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_SETUP_LIST_BEARER_SU_RES),
+            criticality: ignore.clone(),
+            value: E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABSetupListBearerSURes(
+                E_RABSetupListBearerSURes(
+                    setup
+                        .iter()
+                        .map(|e| E_RABSetupListBearerSURes_Entry {
+                            id: ProtocolIE_ID(ID_E_RAB_SETUP_ITEM_BEARER_SU_RES),
+                            criticality: ignore.clone(),
+                            value:
+                                E_RABSetupListBearerSURes_EntryValue::Id_E_RABSetupItemBearerSURes(
+                                    E_RABSetupItemBearerSURes {
+                                        e_rab_id: E_RAB_ID(e.e_rab_id),
+                                        transport_layer_address: transport_layer_address(e.address),
+                                        gtp_teid: GTP_TEID(e.teid.to_be_bytes().to_vec()),
+                                        ie_extensions: None,
+                                    },
+                                ),
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if let Some(l) = failed_list(failed) {
+        ies.push(E_RABSetupResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_FAILED_TO_SETUP_LIST_BEARER_SU_RES),
+            criticality: ignore,
+            value: E_RABSetupResponseProtocolIEs_EntryValue::Id_E_RABFailedToSetupListBearerSURes(
+                l,
+            ),
+        });
+    }
+    S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_E_RAB_SETUP),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_E_RABSetup(E_RABSetupResponse {
+            protocol_i_es: E_RABSetupResponseProtocolIEs(ies),
+        }),
+    })
+}
+
+/// Build E-RAB MODIFY RESPONSE (§9.1.3.4).
+pub fn build_erab_modify_response(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    modified: &[u8],
+    failed: &[(u8, Cause)],
+) -> S1AP_PDU {
+    let ignore = Criticality(Criticality::IGNORE);
+    let mut ies = vec![
+        E_RABModifyResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MME_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABModifyResponseProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(
+                mme_ue_s1ap_id,
+            )),
+        },
+        E_RABModifyResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_NB_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABModifyResponseProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(
+                enb_ue_s1ap_id,
+            )),
+        },
+    ];
+    if !modified.is_empty() {
+        ies.push(E_RABModifyResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_MODIFY_LIST_BEARER_MOD_RES),
+            criticality: ignore.clone(),
+            value: E_RABModifyResponseProtocolIEs_EntryValue::Id_E_RABModifyListBearerModRes(
+                E_RABModifyListBearerModRes(
+                    modified
+                        .iter()
+                        .map(|id| E_RABModifyListBearerModRes_Entry {
+                            id: ProtocolIE_ID(ID_E_RAB_MODIFY_ITEM_BEARER_MOD_RES),
+                            criticality: ignore.clone(),
+                            value: E_RABModifyListBearerModRes_EntryValue::Id_E_RABModifyItemBearerModRes(
+                                E_RABModifyItemBearerModRes {
+                                    e_rab_id: E_RAB_ID(*id),
+                                    ie_extensions: None,
+                                },
+                            ),
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if let Some(l) = failed_list(failed) {
+        ies.push(E_RABModifyResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_FAILED_TO_MODIFY_LIST),
+            criticality: ignore,
+            value: E_RABModifyResponseProtocolIEs_EntryValue::Id_E_RABFailedToModifyList(l),
+        });
+    }
+    S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_E_RAB_MODIFY),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_E_RABModify(E_RABModifyResponse {
+            protocol_i_es: E_RABModifyResponseProtocolIEs(ies),
+        }),
+    })
+}
+
+/// Build E-RAB RELEASE RESPONSE (§9.1.3.6).
+pub fn build_erab_release_response(
+    mme_ue_s1ap_id: u32,
+    enb_ue_s1ap_id: u32,
+    released: &[u8],
+    failed: &[(u8, Cause)],
+) -> S1AP_PDU {
+    let ignore = Criticality(Criticality::IGNORE);
+    let mut ies = vec![
+        E_RABReleaseResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_MME_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABReleaseResponseProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(
+                mme_ue_s1ap_id,
+            )),
+        },
+        E_RABReleaseResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_NB_UE_S1AP_ID),
+            criticality: ignore.clone(),
+            value: E_RABReleaseResponseProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(
+                enb_ue_s1ap_id,
+            )),
+        },
+    ];
+    if !released.is_empty() {
+        ies.push(E_RABReleaseResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_RELEASE_LIST_BEARER_REL_COMP),
+            criticality: ignore.clone(),
+            value: E_RABReleaseResponseProtocolIEs_EntryValue::Id_E_RABReleaseListBearerRelComp(
+                E_RABReleaseListBearerRelComp(
+                    released
+                        .iter()
+                        .map(|id| E_RABReleaseListBearerRelComp_Entry {
+                            id: ProtocolIE_ID(ID_E_RAB_RELEASE_ITEM_BEARER_REL_COMP),
+                            criticality: ignore.clone(),
+                            value: E_RABReleaseListBearerRelComp_EntryValue::Id_E_RABReleaseItemBearerRelComp(
+                                E_RABReleaseItemBearerRelComp {
+                                    e_rab_id: E_RAB_ID(*id),
+                                    ie_extensions: None,
+                                },
+                            ),
+                        })
+                        .collect(),
+                ),
+            ),
+        });
+    }
+    if let Some(l) = failed_list(failed) {
+        ies.push(E_RABReleaseResponseProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_E_RAB_FAILED_TO_RELEASE_LIST),
+            criticality: ignore,
+            value: E_RABReleaseResponseProtocolIEs_EntryValue::Id_E_RABFailedToReleaseList(l),
+        });
+    }
+    S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+        procedure_code: ProcedureCode(ID_E_RAB_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: SuccessfulOutcomeValue::Id_E_RABRelease(E_RABReleaseResponse {
+            protocol_i_es: E_RABReleaseResponseProtocolIEs(ies),
+        }),
+    })
 }
 
 #[cfg(test)]

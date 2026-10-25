@@ -188,6 +188,21 @@ impl EnbUserPlane {
         }
     }
 
+    /// Release the DRBs of `ue` on `lcids` and their S1-U tunnels (E-RAB
+    /// RELEASE, TS 36.413 §8.2.3; #283). The UE's other DRBs stay.
+    pub fn release_drbs(&mut self, ue: u32, lcids: &[u8]) {
+        for lcid in lcids {
+            if let Some(d) = self.drbs.remove(&(ue, *lcid)) {
+                log::info!(
+                    "UE {ue}: E-RAB {} on LCID {lcid}: user plane released",
+                    d.e_rab_id
+                );
+            }
+        }
+        self.by_teid
+            .retain(|_, (u, l)| !(*u == ue && lcids.contains(l)));
+    }
+
     fn to_sgw(drb: &mut Drb, sdus: Vec<Vec<u8>>, ue: u32, out: &mut Vec<(SocketAddr, Vec<u8>)>) {
         for sdu in sdus {
             match drb.pdcp.receive(&sdu) {
@@ -411,5 +426,28 @@ mod tests {
             up.downlink(&g, "10.0.0.9:2152".parse().unwrap()),
             Downlink::Reply { .. }
         ));
+    }
+
+    /// #283: releasing one E-RAB's DRB removes its tunnel only.
+    #[test]
+    fn release_drbs_keeps_the_other_bearers() {
+        let mut up = EnbUserPlane::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let dedicated = UpBearer {
+            e_rab_id: 6,
+            lcid: 4,
+            enb_teid: 2,
+            ..bearer()
+        };
+        up.install(1, &[bearer()]);
+        up.install(1, &[dedicated]);
+        up.release_drbs(1, &[4]);
+        let from: SocketAddr = "10.0.0.9:2152".parse().unwrap();
+        let g = |teid| GtpHeader::g_pdu(teid, Bytes::from_static(b"x")).encode();
+        assert!(matches!(up.downlink(&g(2), from), Downlink::Reply { .. }));
+        assert!(matches!(
+            up.downlink(&g(1), from),
+            Downlink::ToUe { ue: 1, lcid: 3, .. }
+        ));
+        assert!(!up.is_empty());
     }
 }

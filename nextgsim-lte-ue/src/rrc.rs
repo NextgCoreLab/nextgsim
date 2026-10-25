@@ -743,6 +743,20 @@ impl UeRrc {
         else {
             return vec![];
         };
+        // §5.3.10.2: release each DRB of drb-ToReleaseList that is part of the
+        // current configuration, PDCP and RLC with it (#283)
+        for id in &r.drbs_released {
+            if let Some(pos) = drbs.iter().position(|d| d.drb_identity == *id) {
+                let d = drbs.remove(pos);
+                user.remove(&d.logical_channel_identity);
+                log::info!(
+                    "DRB {} released (EPS bearer {}, logical channel {})",
+                    d.drb_identity,
+                    d.eps_bearer_identity,
+                    d.logical_channel_identity
+                );
+            }
+        }
         if r.srb2 && srb2.is_none() {
             let Some(k) = keys.as_ref() else {
                 return self.leave_connected("SRB2 setup without AS security", now);
@@ -901,16 +915,23 @@ impl UeRrc {
             self.nas.on_uplink_pending();
             return self.try_establish(now);
         }
-        let ebi = self.nas.default_bearer_ebi();
+        // The DRB of the bearer the TFTs pick (TS 23.401 §5.4.1, #283). With
+        // a default bearer, no pick means the packet is discarded; so does a
+        // pick whose DRB is not set up -- another bearer's DRB would carry it
+        // against its TFT. Without one (a NAS that keeps no bearers), the
+        // lowest DRB.
+        let ebi = self.nas.uplink_bearer_for(packet);
+        let has_default = self.nas.default_bearer_ebi().is_some();
         let State::Connected { cell, user, .. } = &mut self.state else {
             return vec![];
         };
-        let lcid = user
-            .iter()
-            .find(|(_, d)| Some(d.ebi) == ebi)
-            .map(|(l, _)| *l)
-            .or_else(|| user.keys().min().copied());
+        let lcid = match ebi {
+            Some(e) => user.iter().find(|(_, d)| d.ebi == e).map(|(l, _)| *l),
+            None if has_default => None,
+            None => user.keys().min().copied(),
+        };
         let Some(lcid) = lcid else {
+            log::debug!("uplink packet discarded: no DRB for EPS bearer {ebi:?}");
             return vec![];
         };
         let d = user.get_mut(&lcid).expect("found above");
