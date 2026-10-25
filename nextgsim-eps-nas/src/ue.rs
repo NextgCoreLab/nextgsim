@@ -395,6 +395,25 @@ impl EpsNasUe {
                 self.enter_detached();
                 return NasOutput::default();
             }
+            EmmState::DeregisteredInitiated if self.reattach_after_detach => {
+                // The detach-and-re-attach of a precedence clash is in progress
+                // (#408): the user's detach wins over the re-attach (#417
+                // review). A switch-off goes as a switch-off DETACH REQUEST
+                // (§5.5.2.2.1), after which the UE is EMM-DEREGISTERED.
+                log::info!("EMM: detach requested during the re-attach detach; no re-attach");
+                self.reattach_after_detach = false;
+                if !switch_off {
+                    return NasOutput::default();
+                }
+                if connected {
+                    return self.send_detach_request(true, now);
+                }
+                self.enter_detached();
+                return NasOutput {
+                    uplink: vec![],
+                    release: true,
+                };
+            }
             EmmState::DeregisteredInitiated | EmmState::Detached | EmmState::NoService(_) => {
                 return NasOutput::default();
             }
@@ -1149,6 +1168,10 @@ impl EpsNasUe {
                     "EMM: network DETACH REQUEST (type {detach_type}, cause {cause:?}) during \
                      this UE's detach; DETACH ACCEPT, detached (§5.5.2.2.4 d)"
                 );
+                // "the UE need not initiate the attach": the network's detach
+                // overrides a re-attach this UE's own detach was for (#417
+                // review).
+                self.reattach_after_detach = false;
                 self.enter_detached();
                 self.send_emm(msg::encode_detach_accept())
             }
