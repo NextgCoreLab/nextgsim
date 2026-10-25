@@ -204,4 +204,8 @@ asn1-compiler = { git = "https://github.com/NextgCoreLab/asn1-codegen.git", rev 
 # src/vendor/sctp-proto. This rev only has to contain #468; bump it whenever the
 # patch changes in nextgcore. When nextgcore-sctp is next bumped to a validated
 # pair at or after f428e6c, the two revs can be unified.
-sctp-proto = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "f428e6ca33846791645592eac55d0d79a91fba26" }
+#
+# b168041 (nextgcore #813 / #870) adds RFC 9260 §5.1.1 stream negotiation: the
+# outbound stream count is bounded by the peer's MIS, not its OS, and
+# `Association::max_num_outbound_streams()` reports it (nextgsim #335).
+sctp-proto = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "b16804170f983b9df203b78234c9c190238010f8" }
