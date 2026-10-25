@@ -686,7 +686,7 @@ mod tests {
         let visible = constellation.find_visible_satellites(&ground);
 
         // With Starlink-like constellation, there should be multiple visible satellites
-        assert!(visible.len() > 0);
+        assert!(!visible.is_empty());
     }
 
     #[test]

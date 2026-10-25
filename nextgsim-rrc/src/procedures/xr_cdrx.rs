@@ -575,7 +575,7 @@ mod tests {
             let config = XrCDrxConfig::for_frame_rate(XrFrameRate::Fps60, traffic_type);
             assert!(config.validate().is_ok());
             let qfi = config.recommended_qfi();
-            assert!(qfi >= 19 && qfi <= 22);
+            assert!((19..=22).contains(&qfi));
         }
     }
 }

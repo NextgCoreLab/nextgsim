@@ -786,7 +786,8 @@ mod tests {
         assert_eq!(e.rx_deliv(), 2100);
         assert_eq!(e.tx_count_for_next_sdu(), 2100);
         // A gap, so one SDU is held for reordering.
-        e.receive_pdu(&pdu(PdcpSnSize::Sn12, 2101 % 4096, &[9]), 0)
+        // SN 2101: COUNT 2101 is still below the 12-bit SN modulus (4096)
+        e.receive_pdu(&pdu(PdcpSnSize::Sn12, 2101, &[9]), 0)
             .unwrap();
         assert_eq!(e.buffered_count(), 1);
         // A fresh peer's first PDU (SN 0) is not delivered: past half the SN space
