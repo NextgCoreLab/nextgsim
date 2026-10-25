@@ -224,6 +224,9 @@ pub struct GnbConfig {
     /// The neighbour must beat the serving cell by this much. Defaults to 3 dB, the
     /// value the UE's own A3 measurement configuration uses, so an armed candidate and
     /// a measurement report agree about what "better" means.
+    ///
+    /// Signalled in `a3-Offset` as 0.5 dB units (TS 38.331 §6.3.2), so -15..15 dB
+    /// in 0.5 dB steps can reach the UE's measurement configuration (#359).
     #[serde(default = "default_cho_a3_offset_db")]
     pub cho_a3_offset_db: f64,
     /// Hysteresis in dB for the CHO execution condition. Defaults to 1 dB.
@@ -660,7 +663,9 @@ impl SimMovement {
     /// The position `elapsed` after start-up, for a UE that started at `start`.
     pub fn position_at(&self, start: SimPosition, elapsed: std::time::Duration) -> SimPosition {
         let moving_for = elapsed.as_secs_f64() - self.start_after_secs.max(0.0);
-        if moving_for <= 0.0 || !(self.speed_mps > 0.0) {
+        // A NaN speed is "not moving" as well (clippy::neg_cmp_op_on_partial_ord:
+        // spelled out rather than hidden in `!(speed > 0.0)`).
+        if moving_for <= 0.0 || self.speed_mps.is_nan() || self.speed_mps <= 0.0 {
             return start;
         }
         let (dx, dy, dz) = (
@@ -2559,6 +2564,15 @@ mod tests {
             ..m
         };
         assert_eq!(still.position_at(start, Duration::from_secs(3600)), start);
+        // Neither a negative nor a NaN speed moves the UE.
+        for speed_mps in [-5.0, f64::NAN] {
+            let still = SimMovement { speed_mps, ..m };
+            assert_eq!(
+                still.position_at(start, Duration::from_secs(3600)),
+                start,
+                "speed {speed_mps}"
+            );
+        }
         let diagonal = SimMovement {
             target: SimPosition { x: 30, y: 40, z: 0 },
             speed_mps: 25.0,

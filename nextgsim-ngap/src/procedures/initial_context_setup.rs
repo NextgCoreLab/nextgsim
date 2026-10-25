@@ -396,7 +396,9 @@ fn parse_allowed_nssai(nssai: &AllowedNSSAI) -> Vec<AllowedSnssaiValue> {
         .collect()
 }
 
-fn parse_ue_security_capabilities(caps: &UESecurityCapabilities) -> UeSecurityCapabilitiesValue {
+pub(crate) fn parse_ue_security_capabilities(
+    caps: &UESecurityCapabilities,
+) -> UeSecurityCapabilitiesValue {
     // NR encryption algorithms is 16 bits
     let nr_encryption_algorithms = parse_16bit_bitvec(&caps.n_rencryption_algorithms.0);
 
@@ -416,6 +418,33 @@ fn parse_ue_security_capabilities(caps: &UESecurityCapabilities) -> UeSecurityCa
         nr_integrity_algorithms,
         eutra_encryption_algorithms,
         eutra_integrity_algorithms,
+    }
+}
+
+/// Encode UE Security Capabilities (TS 38.413 §9.3.1.86), the inverse of
+/// [`parse_ue_security_capabilities`].
+pub(crate) fn build_ue_security_capabilities(
+    caps: &UeSecurityCapabilitiesValue,
+) -> UESecurityCapabilities {
+    fn bits(value: u16) -> BitVec<u8, Msb0> {
+        let mut bv: BitVec<u8, Msb0> = BitVec::with_capacity(16);
+        for i in (0..16).rev() {
+            bv.push((value >> i) & 1 == 1);
+        }
+        bv
+    }
+    UESecurityCapabilities {
+        n_rencryption_algorithms: NRencryptionAlgorithms(bits(caps.nr_encryption_algorithms)),
+        n_rintegrity_protection_algorithms: NRintegrityProtectionAlgorithms(bits(
+            caps.nr_integrity_algorithms,
+        )),
+        eutr_aencryption_algorithms: EUTRAencryptionAlgorithms(bits(
+            caps.eutra_encryption_algorithms.unwrap_or(0),
+        )),
+        eutr_aintegrity_protection_algorithms: EUTRAintegrityProtectionAlgorithms(bits(
+            caps.eutra_integrity_algorithms.unwrap_or(0),
+        )),
+        ie_extensions: None,
     }
 }
 

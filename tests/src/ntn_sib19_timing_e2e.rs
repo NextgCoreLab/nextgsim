@@ -140,7 +140,7 @@ fn expected_doppler_hz() -> f64 {
 /// An NTN cell configured with the geometry above.
 fn ntn_gnb_config() -> GnbConfig {
     GnbConfig {
-        nci: 0x0000_0001_0,
+        nci: 0x0000_0000_0010,
         gnb_id_length: 32,
         plmn: Plmn::new(1, 1, false),
         tac: 1,

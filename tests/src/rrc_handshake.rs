@@ -345,6 +345,10 @@ async fn the_smc_hop_reaches_the_ue_security_handler_and_answers_it() {
 /// The KgNB both ends of the NEA2 cross-end tests hold.
 const KGNB: [u8; 32] = [0x42; 32];
 
+/// The K_AMF the UE of the NEA2 cross-end tests holds: the root of its NH
+/// chain (TS 33.501 Annex A.10, #325).
+const KAMF: [u8; 32] = [0x24; 32];
+
 /// The real UE and gNB RRC tasks of the NEA2 cross-end tests, and their channels.
 struct Nea2Pair {
     ue: UeRrcTask,
@@ -359,10 +363,44 @@ struct Nea2Pair {
 /// and a re-establishment, up to the UE receiving the gNB's RRCReestablishment.
 /// The gNB's AS context holds NCC `gnb_ncc`.
 async fn nea2_up_to_the_reestablishment(gnb_ncc: u8) -> Nea2Pair {
+    use nextgsim_ue::tasks::RlfCause;
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        ue_nas_rx,
+        mut ue_rls_rx,
+        gnb_ngap_rx,
+        mut gnb_rls_rx,
+    } = nea2_secured(gnb_ncc, None).await;
+
+    // Radio link failure, then re-establishment on the same cell.
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+        .await;
+    // T311: cell selection finds the same cell, and the request goes to it.
+    ue.perform_cycle().await;
+    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlCcch);
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
+    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    Nea2Pair {
+        ue,
+        gnb,
+        ue_nas_rx,
+        ue_rls_rx,
+        gnb_ngap_rx,
+        gnb_rls_rx,
+    }
+}
+
+/// AS security with NEA2/NIA2 through the real handlers of both ends, up to the
+/// gNB having the UE's SecurityModeComplete. The gNB's AS context holds NCC
+/// `gnb_ncc` and `gnb_kgnb` (default [`KGNB`]); the UE is given `KAMF`, the root
+/// of its NH chain (#325).
+async fn nea2_secured(gnb_ncc: u8, gnb_kgnb: Option<[u8; 32]>) -> Nea2Pair {
     use nextgsim_crypto::kdf::{derive_rrc_up_key, AlgorithmTypeDistinguisher};
     use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
     use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
-    use nextgsim_ue::tasks::RlfCause;
 
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, mut ue_rls_rx) = UeTaskBase::new(
         UeConfig {
@@ -408,8 +446,11 @@ async fn nea2_up_to_the_reestablishment(gnb_ncc: u8) -> Nea2Pair {
         .await;
     assert!(try_take_initial_nas(&mut gnb_ngap_rx).is_some());
 
-    // Both ends hold the same KgNB, as the NAS layer and the NGAP task give it.
+    // Both ends hold the same KgNB, as the NAS layer and the NGAP task give it,
+    // and the UE the K_AMF it came from.
     ue.set_pending_kgnb(KGNB);
+    ue.set_kamf(KAMF);
+    let gnb_kgnb = gnb_kgnb.unwrap_or(KGNB);
     gnb.handle_as_security_for_reestablishment(
         UE_ID,
         ReestablishmentSecurity {
@@ -420,7 +461,7 @@ async fn nea2_up_to_the_reestablishment(gnb_ncc: u8) -> Nea2Pair {
             c_rnti: SIMULATED_C_RNTI,
             phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
             next_hop_chaining_count: gnb_ncc,
-            kgnb: KGNB,
+            kgnb: gnb_kgnb,
         },
     );
 
@@ -463,17 +504,6 @@ async fn nea2_up_to_the_reestablishment(gnb_ncc: u8) -> Nea2Pair {
     );
     gnb.handle_uplink_rrc(UE_ID, RrcChannel::UlDcch, smc_complete)
         .await;
-
-    // Radio link failure, then re-establishment on the same cell.
-    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
-        .await;
-    // T311: cell selection finds the same cell, and the request goes to it.
-    ue.perform_cycle().await;
-    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
-    assert_eq!(ch, RrcChannel::UlCcch);
-    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
-    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
-    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
     Nea2Pair {
         ue,
         gnb,
@@ -568,10 +598,10 @@ async fn nea2_security_and_re_establishment_agree_end_to_end() {
     );
 }
 
-/// #348 re-review, TS 33.501 §6.11: an RRCReestablishment whose NCC differs from
-/// the UE's needs the NH chain (Annex A.10/A.11), which this UE does not keep
-/// yet (#325). The UE refuses it and goes to RRC_IDLE, rather than complete on a
-/// key the network does not hold.
+/// #348 re-review, #325: an RRCReestablishment keyed with another NCC whose key
+/// is NOT the NH the UE's chain reaches there (here the gNB keyed horizontally
+/// from KgNB while signalling NCC 1) fails the UE's integrity check, and the UE
+/// goes to RRC_IDLE rather than complete on a key the network does not hold.
 #[tokio::test]
 async fn a_re_establishment_with_another_ncc_is_refused() {
     let Nea2Pair {
@@ -657,5 +687,296 @@ async fn after_a_radio_link_failure_the_ue_reselects_and_reaches_the_gnb_again()
         pdu.data(),
         &update[..],
         "the registration update NAS, byte for byte"
+    );
+}
+
+/// #325, TS 33.501 §6.11 / Annex A.10-A.11: an RRCReestablishment that signals
+/// NCC 1 is keyed from NH(1) = KDF(K_AMF, KgNB). The UE synchronises its NH
+/// chain, derives KgNB* vertically, verifies the RRCReestablishment and
+/// completes. Before, a UE with no NH chain refused any NCC but its own.
+#[tokio::test]
+async fn a_re_establishment_with_a_new_ncc_completes_on_the_vertical_key() {
+    use nextgsim_crypto::kdf::{
+        derive_kgnb_star, derive_nh, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+    };
+    use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
+    use nextgsim_ue::tasks::RlfCause;
+
+    let nh1 = derive_nh(&KAMF, &KGNB);
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        mut ue_rls_rx,
+        mut gnb_rls_rx,
+        ..
+    } = nea2_secured(1, None).await;
+    // The gNB now holds {NH(1), NCC 1}, as after a Path Switch or Handover Request
+    gnb.handle_as_security_for_reestablishment(
+        UE_ID,
+        ReestablishmentSecurity {
+            k_rrc_int: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcInt, 2),
+            k_rrc_enc: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcEnc, 2),
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
+            next_hop_chaining_count: 1,
+            kgnb: nh1,
+        },
+    );
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+        .await;
+    ue.perform_cycle().await;
+    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
+    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    let (ch, _complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(
+        ch,
+        RrcChannel::UlDcch,
+        "the UE completes the re-establishment"
+    );
+    let kgnb_star = derive_kgnb_star(
+        &nh1,
+        phys_cell_id_from_nci(gnb_config().nci),
+        gnb_config().dl_arfcn,
+    );
+    assert_eq!(
+        ue.as_security().expect("re-keyed").k_rrc_int,
+        derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2),
+        "KgNB* from NH(1), computed independently of both ends"
+    );
+}
+
+/// #325: an N2 handover under AS security, through the real handlers of the
+/// UE, the source gNB and the target gNB.
+///
+/// - The target keys from the AMF's {NH(1), NCC 1}: KgNB* = KDF(NH(1), PCI,
+///   ARFCN-DL), NEA2/NIA2 from the UE Security Capabilities.
+/// - The source delivers the target's RRCReconfiguration with
+///   reconfigurationWithSync and masterKeyUpdate (NCC 1), protected on SRB1.
+/// - The UE synchronises its NH chain to NCC 1, derives the same KgNB*
+///   vertically, re-establishes SRB1 PDCP and sends the RRCReconfigurationComplete
+///   protected at UL COUNT 0.
+/// - The target verifies it, binds the arrival and reports HANDOVER NOTIFY, and
+///   both directions then run protected on the new keys.
+///
+/// Before, the UE derived horizontally and the target held no keys, so the
+/// Complete was unreadable and SRB1 dead after every handover.
+#[tokio::test]
+async fn an_n2_handover_under_as_security_agrees_end_to_end() {
+    use nextgsim_crypto::kdf::{
+        derive_kgnb_star, derive_nh, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+    };
+    use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reconfiguration::{
+        encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+    };
+    use nextgsim_rrc::procedures::rrc_reestablishment::phys_cell_id_from_nci;
+
+    const TARGET_CELL: i32 = 2;
+    const C_RNTI: u16 = 0x03E8;
+    const ADMITTED: i32 = 1000;
+    let target_config = GnbConfig {
+        nci: 0x000000020,
+        as_security_enabled: true,
+        ..gnb_config()
+    };
+    let target_pci = phys_cell_id_from_nci(target_config.nci);
+
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        mut ue_nas_rx,
+        mut ue_rls_rx,
+        mut gnb_rls_rx,
+        ..
+    } = nea2_secured(0, None).await;
+    while gnb_rls_rx.try_recv().is_ok() {}
+
+    // The target gNB, its cell audible to the UE with its SIB1
+    let (t_base, _a, mut t_ngap_rx, _r, _g, mut t_rls_rx, _s) =
+        GnbTaskBase::new(target_config.clone(), 32);
+    let mut target = GnbRrcTask::new(t_base);
+    target.handle_radio_power_on();
+    target.broadcast_system_information(true).await;
+    ue.handle_signal_changed(TARGET_CELL, -50).await;
+    while let Ok(msg) = t_rls_rx.try_recv() {
+        if let GnbTaskMessage::Message(GnbRlsMessage::BroadcastRrc {
+            rrc_channel, data, ..
+        }) = msg
+        {
+            ue.handle_downlink_rrc(TARGET_CELL, rrc_channel, data).await;
+        }
+    }
+
+    // The target's admission: KgNB* vertical from the AMF's NH(1)
+    let nh1 = derive_nh(&KAMF, &KGNB);
+    let kgnb_star = derive_kgnb_star(&nh1, target_pci, target_config.dl_arfcn);
+    target.handle_expect_secured_handover_arrival(
+        ADMITTED,
+        C_RNTI,
+        Some(ReestablishmentSecurity {
+            k_rrc_int: derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2),
+            k_rrc_enc: derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcEnc, 2),
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: C_RNTI,
+            phys_cell_id: target_pci,
+            next_hop_chaining_count: 1,
+            kgnb: kgnb_star,
+        }),
+    );
+
+    // The source sends the target's command to the UE on its protected SRB1
+    let command = encode_handover_command(&HandoverCommandParams {
+        rrc_transaction_id: 0,
+        target_phys_cell_id: target_pci,
+        new_ue_identity: C_RNTI,
+        t304_ms: 1000,
+        full_config: true,
+        master_key_update: Some(MasterKeyUpdateParams {
+            key_set_change_indicator: false,
+            next_hop_chaining_count: 1,
+        }),
+    })
+    .expect("encode the handover command");
+    gnb.handle_send_handover_command(UE_ID, OctetString::from_slice(&command))
+        .await;
+    let (_, ch, protected_command) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, protected_command).await;
+    assert_eq!(
+        ue.as_security().expect("re-keyed").k_rrc_int,
+        derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2),
+        "the UE derives the target's KgNB* vertically from NH(1)"
+    );
+
+    // The UE's RRCReconfigurationComplete reaches the target, protected
+    let (ch, complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlDcch);
+    target
+        .handle_uplink_rrc_with_c_rnti(7, ch, complete, Some(C_RNTI))
+        .await;
+    let mut notified = false;
+    while let Ok(msg) = t_ngap_rx.try_recv() {
+        if let GnbTaskMessage::Message(NgapMessage::HandoverAccessCompleted { ue_id }) = msg {
+            assert_eq!(ue_id, ADMITTED);
+            notified = true;
+        }
+    }
+    assert!(notified, "the target verified the arrival and reported it");
+
+    // Both directions now run protected on the KgNB* keys
+    while ue_nas_rx.try_recv().is_ok() {}
+    let accept = vec![0x7E, 0x02, 0x55, 0x66];
+    target
+        .handle_nas_delivery(ADMITTED, OctetString::from_slice(&accept))
+        .await;
+    let (_, ch, dl) = next_gnb_downlink_rrc(&mut t_rls_rx);
+    ue.handle_downlink_rrc(TARGET_CELL, ch, dl).await;
+    assert!(
+        ue_received_nas_delivery(&mut ue_nas_rx),
+        "the target's first protected DL PDU verifies at the UE"
+    );
+    let uplink = vec![0x7E, 0x00, 0x67, 0x02];
+    while t_ngap_rx.try_recv().is_ok() {}
+    ue.handle_uplink_nas_delivery(3, OctetString::from_slice(&uplink))
+        .await;
+    let (ch, ul) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    target.handle_uplink_rrc(ADMITTED, ch, ul).await;
+    let mut delivered = None;
+    while let Ok(msg) = t_ngap_rx.try_recv() {
+        if let GnbTaskMessage::Message(NgapMessage::UplinkNasDelivery { pdu, .. }) = msg {
+            delivered = Some(pdu.data().to_vec());
+        }
+    }
+    assert_eq!(
+        delivered,
+        Some(uplink),
+        "and the UE's next UL PDU verifies at the target"
+    );
+}
+
+/// #396 review: a re-establishment commits the NH chain it synchronised. Re-
+/// establish at NCC 3 (keyed from NH(3)), then take a handover command at NCC 0:
+/// the UE has to go on from NH(3) through NCC 4..7 to NH(8), not restart from the
+/// KgNB of the SecurityModeCommand. A chain left at NCC 0 would key the handover
+/// from the KgNB itself, because the chain is deterministic and only an NCC wrap
+/// shows the difference.
+#[tokio::test]
+async fn a_re_establishment_commits_the_nh_chain_for_the_next_handover() {
+    use nextgsim_crypto::kdf::{
+        derive_kgnb_star, derive_nh, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+    };
+    use nextgsim_gnb::rrc::ue_context::ReestablishmentSecurity;
+    use nextgsim_rrc::procedures::rrc_reconfiguration::{
+        encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+    };
+    use nextgsim_rrc::procedures::rrc_reestablishment::{phys_cell_id_from_nci, SIMULATED_C_RNTI};
+    use nextgsim_ue::tasks::RlfCause;
+
+    let mut nh = KGNB;
+    let mut chain = Vec::new();
+    for _ in 0..8 {
+        nh = derive_nh(&KAMF, &nh);
+        chain.push(nh);
+    }
+    let (nh3, nh8) = (chain[2], chain[7]);
+    let Nea2Pair {
+        mut ue,
+        mut gnb,
+        mut ue_rls_rx,
+        mut gnb_rls_rx,
+        ..
+    } = nea2_secured(3, None).await;
+    gnb.handle_as_security_for_reestablishment(
+        UE_ID,
+        ReestablishmentSecurity {
+            k_rrc_int: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcInt, 2),
+            k_rrc_enc: derive_rrc_up_key(&KGNB, AlgorithmTypeDistinguisher::RrcEnc, 2),
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: phys_cell_id_from_nci(gnb_config().nci),
+            next_hop_chaining_count: 3,
+            kgnb: nh3,
+        },
+    );
+    ue.handle_radio_link_failure(RlfCause::RadioLinkQualityLost)
+        .await;
+    ue.perform_cycle().await;
+    let (ch, reest_req) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    gnb.handle_uplink_rrc(UE_ID, ch, reest_req).await;
+    let (_, ch, reestablishment) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, reestablishment).await;
+    let (ch, complete) = next_ue_uplink_rrc(&mut ue_rls_rx);
+    assert_eq!(ch, RrcChannel::UlDcch, "re-established at NCC 3");
+    gnb.handle_uplink_rrc(UE_ID, ch, complete).await;
+    while gnb_rls_rx.try_recv().is_ok() {}
+
+    // A handover command at NCC 0, on the re-established SRB1
+    const TARGET_PCI: u16 = 32;
+    let command = encode_handover_command(&HandoverCommandParams {
+        rrc_transaction_id: 0,
+        target_phys_cell_id: TARGET_PCI,
+        new_ue_identity: 0x03E8,
+        t304_ms: 1000,
+        full_config: true,
+        master_key_update: Some(MasterKeyUpdateParams {
+            key_set_change_indicator: false,
+            next_hop_chaining_count: 0,
+        }),
+    })
+    .expect("encode the handover command");
+    gnb.handle_send_handover_command(UE_ID, OctetString::from_slice(&command))
+        .await;
+    let (_, ch, protected) = next_gnb_downlink_rrc(&mut gnb_rls_rx);
+    ue.handle_downlink_rrc(CELL_ID, ch, protected).await;
+    assert_eq!(
+        ue.as_security().expect("keyed").kgnb,
+        derive_kgnb_star(&nh8, TARGET_PCI, gnb_config().dl_arfcn),
+        "KgNB* from NH(8), chained on from the re-establishment's NH(3)"
     );
 }

@@ -2811,7 +2811,15 @@ impl NgapTask {
         let amf_id = match self.select_amf(&serving_plmn, &requested_nssai) {
             Some(id) => id,
             None => {
-                warn!("No AMF available for UE {}", ue_id);
+                // The RRC connection this NAS arrived on can reach no core: release
+                // it, so the UE sees its connection go and retries once a cell is
+                // usable, instead of sitting on a connection that leads nowhere
+                // (#336; TS 24.501 §5.6.1.7 l) / §5.5.1.2.7 on the UE side).
+                warn!(
+                    "No AMF available for UE {}; releasing its RRC connection",
+                    ue_id
+                );
+                self.send_an_release(ue_id).await;
                 return;
             }
         };
@@ -4743,6 +4751,14 @@ impl NgapTask {
         // cell would fail with nothing to say why.
         // The NCC the AMF's {NH, NCC} carries, for the masterKeyUpdate below.
         let ho_ncc = security_context.next_hop_chaining_count;
+        // TS 38.413 §9.2.3.4 / TS 33.501 §6.7.3.1: the target selects its AS
+        // algorithms from the UE Security Capabilities the Handover Request
+        // carries (#325). Stored first, because the adoption below keys with them.
+        if let Some(caps) = ho_req.ue_security_capabilities.clone() {
+            if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+                ctx.ue_security_capabilities = Some(caps);
+            }
+        }
         self.adopt_handover_security_context(ue_id, Some(security_context));
 
         // TS 23.502 §4.9.1.3.2 step 9 (RACS): the target uses the UE radio capability
@@ -4878,6 +4894,7 @@ impl NgapTask {
                     .send(RrcMessage::ExpectHandoverArrival {
                         ue_id,
                         c_rnti: handover_c_rnti(ue_id),
+                        security: self.handover_arrival_security(ue_id, ho_ncc),
                     })
                     .await
                 {
@@ -5208,15 +5225,93 @@ impl NgapTask {
             // Keep the algorithms the UE already negotiated: a handover re-keys, it does
             // not renegotiate (TS 33.501 §6.9.2.3.1).
             Some(sec) => ((sec.ciphering_alg_id, ()), (sec.integrity_alg_id, ())),
-            // A fresh handover-in with no prior context: the algorithms come with the
-            // UE Security Capabilities in a later Initial Context Setup, so NEA0/NIA0
-            // until then rather than a guess.
-            None => ((0u8, ()), (0u8, ())),
+            // A fresh handover-in: select from the UE Security Capabilities the
+            // Handover Request carried, as Initial Context Setup does (TS 33.501
+            // §6.7.3.1, #325). They are mandatory in the request (TS 38.413
+            // §9.2.3.4); a peer that omitted them gets NEA0/NIA0 and a warning.
+            None => match self
+                .ue_contexts
+                .values()
+                .find(|c| c.ue_id == ue_id)
+                .and_then(|c| c.ue_security_capabilities.as_ref())
+            {
+                Some(caps) => {
+                    let ((ciph, _), (integ, _)) = Self::select_as_algorithms(caps);
+                    info!(
+                        "Handover for UE {ue_id}: NEA{ciph}/NIA{integ} selected from the \
+                         Handover Request's UE Security Capabilities"
+                    );
+                    ((ciph, ()), (integ, ()))
+                }
+                None => {
+                    warn!(
+                        "Handover for UE {ue_id}: the Handover Request carried no UE \
+                         Security Capabilities (TS 38.413 §9.2.3.4); NEA0/NIA0"
+                    );
+                    ((0u8, ()), (0u8, ()))
+                }
+            },
         };
         let derived = AsSecurityContext::from_kgnb(kgnb_star, ciph_id, int_id);
         if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
             ctx.as_security = Some(derived);
         }
+    }
+
+    /// The RRC plane re-keyed at re-establishment (TS 38.331 §5.3.7.5, #285
+    /// review): the AS context takes the new KgNB*, the algorithms stay, and the
+    /// DRBs that survive run on the new K_UPenc / K_UPint (TS 33.501 §6.11, #325),
+    /// or every PDU on them fails at the UE, which re-keys its side.
+    pub(crate) async fn handle_as_key_refreshed(&mut self, ue_id: i32, kgnb: [u8; 32]) {
+        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id) {
+            if let Some(old) = ctx.as_security.as_ref() {
+                ctx.as_security = Some(AsSecurityContext::from_kgnb(
+                    kgnb,
+                    old.ciphering_alg_id,
+                    old.integrity_alg_id,
+                ));
+                info!("UE[{ue_id}]: AS context re-keyed after RRC re-establishment");
+            }
+        }
+        let sessions: Vec<(u8, DrbSecurityDecision)> = self
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id == ue_id)
+            .map(|c| {
+                c.pdu_sessions
+                    .iter()
+                    .map(|(psi, s)| (*psi, s.up_security))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (psi, decision) in sessions {
+            self.install_drb_security(ue_id, psi, decision).await;
+        }
+    }
+
+    /// The SRB keys the RRC task verifies and protects a handover arrival with
+    /// (#325): the target's AS context, derived from `KgNB*` at admission, with
+    /// the NCC of the AMF's {NH, NCC} and the C-RNTI the admission allocated.
+    fn handover_arrival_security(
+        &self,
+        ue_id: i32,
+        ncc: u8,
+    ) -> Option<Box<crate::rrc::ue_context::ReestablishmentSecurity>> {
+        let sec = self
+            .ue_contexts
+            .values()
+            .find(|c| c.ue_id == ue_id)
+            .and_then(|c| c.as_security.as_ref())?;
+        Some(Box::new(crate::rrc::ue_context::ReestablishmentSecurity {
+            k_rrc_int: sec.k_rrc_int,
+            k_rrc_enc: sec.k_rrc_enc,
+            integrity_alg_id: sec.integrity_alg_id,
+            ciphering_alg_id: sec.ciphering_alg_id,
+            c_rnti: handover_c_rnti(ue_id),
+            phys_cell_id: phys_cell_id_from_nci(self.task_base.config.nci),
+            next_hop_chaining_count: ncc,
+            kgnb: sec.kgnb,
+        }))
     }
 
     /// Handles Handover Preparation Failure from AMF (source gNB side)
@@ -5947,13 +6042,20 @@ impl NgapTask {
                 error!("Failed to send status update to App: {}", e);
             }
 
-            // If initialized, notify RRC to power on radio
+            // If initialized, notify RRC to power on radio; when the last AMF goes,
+            // power it off again, so the cell is barred instead of admitting RRC
+            // connections nothing can serve (#336).
             if any_ready {
                 let msg = RrcMessage::RadioPowerOn;
                 if let Err(e) = self.task_base.rrc_tx.send(msg).await {
                     error!("Failed to send radio power on to RRC: {}", e);
                 }
                 info!("NGAP initialized, radio powered on");
+            } else {
+                if let Err(e) = self.task_base.rrc_tx.send(RrcMessage::RadioPowerOff).await {
+                    error!("Failed to send radio power off to RRC: {}", e);
+                }
+                warn!("No AMF is ready: radio powered off, the cell is barred");
             }
         }
     }
@@ -6730,21 +6832,7 @@ impl Task for NgapTask {
                         self.handle_radio_link_failure(ue_id).await;
                     }
                     NgapMessage::AsKeyRefreshed { ue_id, kgnb } => {
-                        // #285 review: the RRC plane re-keyed at re-establishment
-                        // (TS 38.331 §5.3.7.5). The algorithms stay; the key changes.
-                        if let Some(ctx) = self.ue_contexts.values_mut().find(|c| c.ue_id == ue_id)
-                        {
-                            if let Some(old) = ctx.as_security.as_ref() {
-                                ctx.as_security = Some(AsSecurityContext::from_kgnb(
-                                    kgnb,
-                                    old.ciphering_alg_id,
-                                    old.integrity_alg_id,
-                                ));
-                                info!(
-                                    "UE[{ue_id}]: AS context re-keyed after RRC re-establishment"
-                                );
-                            }
-                        }
+                        self.handle_as_key_refreshed(ue_id, kgnb).await;
                     }
                     NgapMessage::InitiateHandover(request) => {
                         self.handle_initiate_handover(*request).await;
@@ -7006,7 +7094,10 @@ mod tests {
             read[0].meas_id, 1,
             "measId 1, which REPLACES the UE's pre-signalling default"
         );
-        assert_eq!(read[0].a3_offset_db, 11, "the gNB's configured 11 dB");
+        assert_eq!(
+            read[0].a3_offset_half_db, 22,
+            "the gNB's configured 11 dB, in 0.5 dB units"
+        );
         assert_eq!(
             read[0].hysteresis_half_db, 7,
             "the gNB's configured 3.5 dB, in 0.5 dB units"
@@ -8457,6 +8548,39 @@ mod tests {
         );
     }
 
+    /// #336: when the last AMF goes the RRC task is told to power the radio off
+    /// (bar the cell), and an Initial UE Message that no AMF can take releases the
+    /// RRC connection it came on instead of being dropped silently.
+    #[tokio::test]
+    async fn with_no_amf_ready_the_cell_is_barred_and_an_initial_ue_is_released() {
+        let (mut task, mut rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        task.update_initialization_status().await; // AMF 1 is Ready: power on
+        task.handle_association_down(1).await;
+        let mut power_off = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::RadioPowerOff) = msg {
+                power_off = true;
+            }
+        }
+        assert!(power_off, "the last AMF going powers the radio off");
+
+        task.handle_initial_nas_delivery(
+            42,
+            OctetString::from_slice(&[0x7e, 0x00, 0x41]),
+            3,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let mut released = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::AnRelease { ue_id: 42 }) = msg {
+                released = true;
+            }
+        }
+        assert!(released, "the unroutable UE's RRC connection is released");
+    }
+
     /// Every NGAP PDU the task put on the SCTP channel.
     fn drain_sctp(
         rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
@@ -8520,6 +8644,15 @@ mod tests {
             source_to_target_transparent_container: vec![0x11, 0x22],
             pdu_sessions,
             security_context: security,
+            // NEA2 + NIA2 (bits 2 of the NR masks, TS 38.413 §9.3.1.86)
+            ue_security_capabilities: Some(
+                nextgsim_ngap::procedures::initial_context_setup::UeSecurityCapabilitiesValue {
+                    nr_encryption_algorithms: 0x4000,
+                    nr_integrity_algorithms: 0x4000,
+                    eutra_encryption_algorithms: Some(0),
+                    eutra_integrity_algorithms: Some(0),
+                },
+            ),
         })
         .expect("build the handover request")
     }
@@ -9018,6 +9151,60 @@ mod tests {
             "the NGAP task must arm arrival detection for the handover UE on the RRC \
              channel; nothing asserted this send existed before #169"
         );
+    }
+
+    /// #325, TS 33.501 §6.9.2.3.3 / §6.7.3.1: a handover-in selects its AS
+    /// algorithms from the Handover Request's UE Security Capabilities (NEA2/NIA2
+    /// here), keys from KgNB* = KDF(NH, PCI, ARFCN-DL) (vertical, from the AMF's
+    /// {NH, NCC}), and hands the RRC task those SRB keys with the arrival arming.
+    /// Before, a fresh handover-in ran NEA0/NIA0 and the RRC task got no keys.
+    #[tokio::test]
+    async fn the_arrival_arming_carries_the_kgnb_star_keys_and_selected_algorithms() {
+        use nextgsim_crypto::kdf::{
+            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+        };
+
+        let (mut task, mut rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let pdu = handover_request(&[5], Some(test_security_context()));
+        let ho_req =
+            nextgsim_ngap::procedures::handover::parse_handover_request(&pdu).expect("parse");
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let mut armed = None;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::ExpectHandoverArrival {
+                ue_id,
+                c_rnti,
+                security,
+            }) = msg
+            {
+                armed = Some((ue_id, c_rnti, security));
+            }
+        }
+        let (ue_id, c_rnti, security) = armed.expect("the arrival is armed");
+        let sec = security.expect("with the SRB keys");
+        let kgnb_star = derive_kgnb_star(
+            &test_security_context().next_hop_nh,
+            phys_cell_id_from_nci(task.task_base.config.nci),
+            task.task_base.config.dl_arfcn,
+        );
+        assert_eq!(
+            (sec.ciphering_alg_id, sec.integrity_alg_id),
+            (2, 2),
+            "NEA2/NIA2"
+        );
+        assert_eq!(sec.kgnb, kgnb_star, "KgNB* vertical from the AMF's NH");
+        assert_eq!(
+            sec.k_rrc_int,
+            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2)
+        );
+        assert_eq!(
+            sec.k_rrc_enc,
+            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcEnc, 2)
+        );
+        assert_eq!(sec.next_hop_chaining_count, 1, "the AMF's NCC");
+        assert_eq!(sec.c_rnti, c_rnti);
+        assert_eq!(c_rnti, handover_c_rnti(ue_id));
     }
 
     /// #169: an acknowledge that could not be DELIVERED arms nothing.
@@ -9936,6 +10123,57 @@ mod tests {
             drb_integrity_protection(&rbc, 9),
             DrbIntegrityProtection::Enabled,
             "the UE must be TOLD to integrity-protect, or it never will"
+        );
+    }
+
+    /// #325, TS 33.501 §6.11: after a re-establishment re-key the DRB that
+    /// survives is re-keyed too. The RLS task is handed a binding on the new
+    /// K_UPenc / K_UPint (derived from the new KgNB*), not left on the old keys
+    /// the UE no longer uses.
+    #[cfg(feature = "up-security")]
+    #[tokio::test]
+    async fn a_re_key_re_installs_the_surviving_drbs_keys() {
+        use nextgsim_ngap::procedures::transfer::UpProtectionPolicy;
+        let (mut task, _rrc_rx, _gtp_rx, mut rls_rx) = task_with_live_receivers(28).await;
+        key_ue(&mut task, 28, 2, 2);
+        let item = setup_item_with_policy(
+            9,
+            Some(policy(
+                UpProtectionPolicy::Required,
+                UpProtectionPolicy::Required,
+            )),
+        );
+        task.setup_one_pdu_session(28, &item, "10.0.0.1".parse().unwrap())
+            .await
+            .expect("setup");
+        while rls_rx.try_recv().is_ok() {}
+
+        let new_kgnb = [0x5A; 32];
+        task.handle_as_key_refreshed(28, new_kgnb).await;
+
+        let mut installed = None;
+        while let Ok(msg) = rls_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::RlsMessage::InstallDrbSecurity {
+                ue_id: 28,
+                psi: 9,
+                security,
+                ..
+            }) = msg
+            {
+                installed = security;
+            }
+        }
+        let installed = installed.expect("the surviving DRB is re-keyed");
+        let fresh = AsSecurityContext::from_kgnb(new_kgnb, 2, 2);
+        let expected = nextgsim_pdcp::UpSecurity::new(fresh.k_up_enc, fresh.k_up_int, 2, Some(2))
+            .expect("legal ids");
+        let (hdr, data) = ([0x80, 0x01], b"user plane");
+        assert_eq!(
+            installed
+                .security
+                .protect(1, 8, nextgsim_pdcp::DIRECTION_DOWNLINK, &hdr, data),
+            expected.protect(1, 8, nextgsim_pdcp::DIRECTION_DOWNLINK, &hdr, data),
+            "the binding runs on the K_UP keys of the new KgNB*"
         );
     }
 

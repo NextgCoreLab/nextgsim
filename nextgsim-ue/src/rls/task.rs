@@ -118,6 +118,8 @@ pub struct RlsTask {
     resolve_rounds: usize,
     /// Rate limiter for the "PDU from unknown source" warning. Bounded (#314).
     unknown_sources: UnknownSourceWarner,
+    /// The same, for HeartbeatAcks from addresses outside the search space (#345)
+    unknown_ack_sources: UnknownSourceWarner,
     sti: u64,
     /// RLC entities keyed by DRB identity.
     /// Each entry is a UM SN12 entity used for user-plane data on that bearer.
@@ -259,6 +261,11 @@ impl RlsTask {
             #[cfg(test)]
             resolve_rounds: 0,
             unknown_sources: UnknownSourceWarner::new(Instant::now()),
+            unknown_ack_sources: UnknownSourceWarner::with_what(
+                "HeartbeatAck",
+                "not in the gNB search list",
+                Instant::now(),
+            ),
             sti,
             rlc_entities: HashMap::new(),
             #[cfg(feature = "drb-pdcp")]
@@ -895,6 +902,12 @@ impl RlsTask {
         source: SocketAddr,
         ack: &nextgsim_rls::RlsHeartbeatAck,
     ) {
+        // #345: only an address this UE searches may be a cell. Warned once per
+        // source with bounded memory, like PDUs from unknown sources (#314).
+        if !self.cell_search.admits(&source) {
+            self.unknown_ack_sources.on_pdu(source, Instant::now());
+            return;
+        }
         for event in self.cell_search.process_heartbeat_ack(ack.sti, source, ack) {
             match event {
                 CellSearchEvent::CellDiscovered {
@@ -1527,6 +1540,9 @@ const UNKNOWN_SOURCE_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 /// the sender does.
 #[derive(Debug)]
 struct UnknownSourceWarner {
+    /// What is dropped ("PDU", "HeartbeatAck") and why, for the log lines
+    what: &'static str,
+    why: &'static str,
     warned: std::collections::HashSet<SocketAddr>,
     /// PDUs dropped from sources not in `warned` because it was full.
     suppressed_pdus: u64,
@@ -1536,7 +1552,13 @@ struct UnknownSourceWarner {
 
 impl UnknownSourceWarner {
     fn new(now: Instant) -> Self {
+        Self::with_what("PDU", "not a discovered cell", now)
+    }
+
+    fn with_what(what: &'static str, why: &'static str, now: Instant) -> Self {
         Self {
+            what,
+            why,
             warned: std::collections::HashSet::new(),
             suppressed_pdus: 0,
             last_summary: now,
@@ -1552,9 +1574,8 @@ impl UnknownSourceWarner {
         if self.warned.len() < UNKNOWN_SOURCE_WARN_CAP {
             self.warned.insert(source);
             warn!(
-                "PDU from unknown source {} (not a discovered cell); further PDUs \
-                 from it are dropped silently",
-                source
+                "{} from unknown source {} ({}); further ones from it are dropped silently",
+                self.what, source, self.why
             );
             return UnknownSourceLog::Warned;
         }
@@ -1563,9 +1584,14 @@ impl UnknownSourceWarner {
             return UnknownSourceLog::Silent;
         }
         warn!(
-            "Dropped {} PDU(s) from unknown sources beyond the first {} in the last {:?} \
-             (not discovered cells); latest from {}",
-            self.suppressed_pdus, UNKNOWN_SOURCE_WARN_CAP, UNKNOWN_SOURCE_SUMMARY_INTERVAL, source
+            "Dropped {} {}(s) from unknown sources beyond the first {} in the last {:?} \
+             ({}); latest from {}",
+            self.suppressed_pdus,
+            self.what,
+            UNKNOWN_SOURCE_WARN_CAP,
+            UNKNOWN_SOURCE_SUMMARY_INTERVAL,
+            self.why,
+            source
         );
         self.suppressed_pdus = 0;
         self.last_summary = now;
@@ -1960,6 +1986,39 @@ mod tests {
             }
         }
         assert!(rlf, "losing the serving cell is a radio link failure");
+    }
+
+    /// #345: a HeartbeatAck from an address outside the gNB search list, here
+    /// bytes off the wire, is no cell: nothing reaches RRC and no address is
+    /// learnt. The same ack from the searched address is a cell.
+    #[tokio::test]
+    async fn a_heartbeat_ack_from_outside_the_search_list_is_no_cell() {
+        let (task_base, _app_rx, _nas_rx, mut rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
+        let gnb: SocketAddr = "10.0.0.1:4997".parse().unwrap();
+        let stranger: SocketAddr = "10.9.9.9:4997".parse().unwrap();
+        let mut task = RlsTask::new(
+            task_base,
+            RlsTaskConfig {
+                gnb_search_list: vec![gnb],
+                ..Default::default()
+            },
+        );
+        while rrc_rx.try_recv().is_ok() {}
+        let bytes = codec::encode(&RlsProtocolMessage::HeartbeatAck(
+            nextgsim_rls::RlsHeartbeatAck::with_dbm(0x10, -60),
+        ));
+        task.handle_receive_rls_message(&bytes, stranger).await;
+        assert!(task.cell_addresses.is_empty());
+        assert_eq!(task.cell_search.cell_count(), 0);
+        assert!(rrc_rx.try_recv().is_err(), "nothing reaches RRC");
+        assert!(
+            task.unknown_ack_sources.warned.contains(&stranger),
+            "warned once"
+        );
+
+        task.handle_receive_rls_message(&bytes, gnb).await;
+        assert_eq!(task.cell_addresses.get(&0), Some(&gnb));
+        assert!(rrc_rx.try_recv().is_ok(), "the searched gNB is a cell");
     }
 
     /// #355 review: after `SetCRnti`, uplink RRC PDUs to the serving cell carry

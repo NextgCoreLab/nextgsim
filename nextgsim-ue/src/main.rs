@@ -950,7 +950,13 @@ impl UeApp {
                             // CM-IDLE, plus any registration that had to wait for
                             // the NAS signalling connection to go (TS 24.501
                             // §5.5.2.3.2, issue #265).
-                            let outs = orch.on_nas_signalling_connection_released();
+                            // A radio link failure also arms the §5.5.1.3.2 f)
+                            // recovery update on the next camp (#372).
+                            let outs = if matches!(msg, NasMessage::RadioLinkFailure) {
+                                orch.on_radio_link_failure()
+                            } else {
+                                orch.on_nas_signalling_connection_released()
+                            };
                             process_mm_outputs(
                                 outs,
                                 &mut orch,
@@ -1639,7 +1645,11 @@ async fn process_mm_outputs(
                 // derivation on the next AS SecurityModeCommand (TS 33.501 §6.7).
                 let _ = task_base
                     .rrc_tx
-                    .send(RrcMessage::AsSecurityKey { kgnb })
+                    .send(RrcMessage::AsSecurityKey {
+                        kgnb,
+                        // The NH chain's root (#325, TS 33.501 Annex A.10)
+                        kamf: orch.security_context().keys().kamf().copied(),
+                    })
                     .await;
             }
             MmOutput::NetworkPduSessionStatus(status) => {

@@ -89,6 +89,8 @@ pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 const ESM_INVALID_PTI: u8 = 81;
 /// ESM cause #95 "semantically incorrect message".
 const ESM_SEMANTICALLY_INCORRECT: u8 = 95;
+/// ESM cause #96 "invalid mandatory information" (TS 24.301 §9.9.4.4).
+const ESM_INVALID_MANDATORY_INFORMATION: u8 = 96;
 /// ESM cause #97 "message type non-existent or not implemented".
 const ESM_MESSAGE_TYPE_NOT_IMPLEMENTED: u8 = 97;
 
@@ -840,10 +842,37 @@ impl EpsNasUe {
     }
 
     fn on_plain_emm(&mut self, pdu: &[u8], now: Instant) -> NasOutput {
+        // §4.4.4.2: "Once the secure exchange of NAS messages has been
+        // established, the receiving EMM or ESM entity in the UE shall not
+        // process any NAS signalling messages unless they have been
+        // successfully integrity checked". The allow-list below is for a
+        // connection without one; on a secure exchange a plain message is
+        // discarded unread, and is not answered either (#400 review).
+        if self.secure_exchange {
+            log::warn!("EMM: plain message on a secure exchange; discarded (§4.4.4.2)");
+            return NasOutput::default();
+        }
         let m = match msg::decode_downlink_emm(pdu) {
             Ok(m) => m,
             Err(e) => {
-                log::warn!("EMM: undecodable message: {e}");
+                // §7.5.1: a mandatory-IE error is answered with EMM STATUS #96,
+                // but only for a message the UE would process unprotected
+                // (§4.4.4.2); any other plain message is discarded unread (#382).
+                let allowed = matches!(
+                    pdu.get(1).copied(),
+                    Some(
+                        msg::emm_type::IDENTITY_REQUEST
+                            | msg::emm_type::AUTHENTICATION_REQUEST
+                            | msg::emm_type::AUTHENTICATION_REJECT
+                            | msg::emm_type::ATTACH_REJECT
+                            | msg::emm_type::SERVICE_REJECT
+                    )
+                );
+                if allowed {
+                    log::warn!("EMM: undecodable message: {e}; EMM STATUS #96 (§7.5.1)");
+                    return self.emm_status_96();
+                }
+                log::warn!("EMM: undecodable unprotected message: {e}; discarded (§4.4.4.2)");
                 return NasOutput::default();
             }
         };
@@ -867,11 +896,42 @@ impl EpsNasUe {
             Some(PD_EMM) => match msg::decode_downlink_emm(plain) {
                 Ok(m) => self.on_emm(m, now),
                 Err(e) => {
-                    log::warn!("EMM: undecodable message: {e}");
-                    NasOutput::default()
+                    // §7.5.1, §7.5.2 (no EMM exception): EMM STATUS #96 (#382)
+                    log::warn!("EMM: undecodable message: {e}; EMM STATUS #96 (§7.5.1)");
+                    self.emm_status_96()
                 }
             },
             _ => NasOutput::default(),
+        }
+    }
+
+    /// EMM STATUS with cause #96 "invalid mandatory information" (TS 24.301
+    /// §7.5.1, §8.2.14): the answer to an EMM message with an imperative-part
+    /// error, a missing or syntactically incorrect mandatory IE, or an unknown
+    /// "comprehension required" IE. §7.5.2 lists no EMM exception, so the
+    /// procedure the message belonged to is left as it was. Protected like any
+    /// other uplink when a context is active. Before #382 the UE logged the
+    /// error and sent nothing.
+    fn emm_status_96(&mut self) -> NasOutput {
+        self.send_emm(msg::encode_emm_status(
+            emm_cause::INVALID_MANDATORY_INFORMATION,
+        ))
+    }
+
+    /// The ESM answer to an ESM message with a mandatory-IE error (TS 24.301
+    /// §7.5.1, §7.5.3): ACTIVATE DEFAULT EPS BEARER CONTEXT REJECT #96 for an
+    /// ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST (§7.5.3 a)), ESM STATUS #96
+    /// otherwise. The EBI and PTI are read from the header octets when they are
+    /// there. (§7.5.3 b)-d) name messages this UE does not implement; they are
+    /// answered with ESM STATUS #97 before any IE is read, §7.4.)
+    fn esm_invalid_mandatory_reply(esm: &[u8]) -> Vec<u8> {
+        let ebi = esm.first().map_or(0, |b| b >> 4);
+        let pti = esm.get(1).copied().unwrap_or(0);
+        match esm.get(2).copied() {
+            Some(msg::esm_type::ACTIVATE_DEFAULT_REQUEST) => {
+                msg::encode_activate_default_reject(ebi, pti, ESM_INVALID_MANDATORY_INFORMATION)
+            }
+            _ => msg::encode_esm_status(ebi, pti, ESM_INVALID_MANDATORY_INFORMATION),
         }
     }
 
@@ -1059,8 +1119,9 @@ impl EpsNasUe {
                 return NasOutput::default();
             }
             Err(e) => {
-                log::warn!("EMM: undecodable SECURITY MODE COMMAND: {e}");
-                return NasOutput::default();
+                // §7.5.1 / §7.5.2: EMM STATUS #96, as for any EMM message (#382)
+                log::warn!("EMM: undecodable SECURITY MODE COMMAND: {e}; EMM STATUS #96");
+                return self.emm_status_96();
             }
         };
         // The K_ASME the command's KSI names: the pending one from this
@@ -1183,8 +1244,12 @@ impl EpsNasUe {
                 msg::encode_esm_status(0, 0, ESM_SEMANTICALLY_INCORRECT)
             }
             Err(e) => {
-                log::warn!("ESM: undecodable ESM container: {e}; #95");
-                msg::encode_esm_status(0, 0, ESM_SEMANTICALLY_INCORRECT)
+                // §7.5.2: the container itself is checked for presence and length
+                // only; its ESM message gets the §7.5.3 a) treatment: an
+                // undecodable ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST is
+                // rejected with #96 in ATTACH COMPLETE (#382)
+                log::warn!("ESM: undecodable ESM container: {e}; #96 (§7.5.3 a))");
+                Self::esm_invalid_mandatory_reply(&a.esm_message)
             }
         };
         self.state = EmmState::Registered;
@@ -1416,8 +1481,9 @@ impl EpsNasUe {
                 ))
             }
             Err(e) => {
-                log::warn!("ESM: undecodable message: {e}");
-                NasOutput::default()
+                // §7.5.1 / §7.5.3 (#382)
+                log::warn!("ESM: undecodable message: {e}; #96 (§7.5.3)");
+                self.send_emm(Self::esm_invalid_mandatory_reply(plain))
             }
         }
     }

@@ -2753,7 +2753,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 [[package]]
 name = "sctp-proto"
 version = "0.6.0"
-source = "git+https://github.com/NextgCoreLab/nextgcore?rev=f428e6ca33846791645592eac55d0d79a91fba26#f428e6ca33846791645592eac55d0d79a91fba26"
+source = "git+https://github.com/NextgCoreLab/nextgcore?rev=b16804170f983b9df203b78234c9c190238010f8#b16804170f983b9df203b78234c9c190238010f8"
 dependencies = [
  "bytes",
  "crc",

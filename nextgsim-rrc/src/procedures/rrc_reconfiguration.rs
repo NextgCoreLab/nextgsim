@@ -2189,7 +2189,7 @@ mod tests {
         let read = crate::procedures::meas_config::read_a3_meas_configs(&signalled);
         assert_eq!(read.len(), 1, "one A3 binding");
         assert_eq!(read[0].meas_id, 1);
-        assert_eq!(read[0].a3_offset_db, 3, "3 dB, in whole dB");
+        assert_eq!(read[0].a3_offset_half_db, 6, "3 dB, in 0.5 dB units");
         assert_eq!(read[0].hysteresis_half_db, 2, "1 dB, in 0.5 dB units");
     }
 
