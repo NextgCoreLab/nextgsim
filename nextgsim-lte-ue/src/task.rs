@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use nextgsim_rls::{
-    codec as rls_codec, lte, CellSearchEvent, PduType, RlsMessage, RlsPduTransmission,
-    RlsPduTransmissionAck, SimCoord, UeCellSearch,
+    codec as rls_codec, lte, CellSearchEvent, PduType, RlsHeartbeatAck, RlsMessage,
+    RlsPduTransmission, RlsPduTransmissionAck, SimCoord, UeCellSearch,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
@@ -176,16 +176,12 @@ async fn run_inner(
             r = socket.recv_from(&mut buf) => {
                 let (n, from) = r?;
                 match rls_codec::decode(&buf[..n]) {
-                    // #345: an ack from outside the eNB search list is
-                    // unsolicited and creates no cell
-                    Ok(RlsMessage::HeartbeatAck(_)) if !cells.admits(&from) => {
-                        log::debug!("HeartbeatAck from {from} (not in the eNB search list) dropped");
-                        Vec::new()
-                    }
                     Ok(RlsMessage::HeartbeatAck(ack)) => {
-                        cells.process_heartbeat_ack(ack.sti, from, &ack);
-                        cell_addr.insert(ack.sti, from);
-                        rrc.on_cell_measurement(ack.sti, ack.dbm, Instant::now())
+                        if accept_heartbeat_ack(&mut cells, &mut cell_addr, &ack, from) {
+                            rrc.on_cell_measurement(ack.sti, ack.dbm, Instant::now())
+                        } else {
+                            Vec::new()
+                        }
                     }
                     Ok(RlsMessage::PduTransmission(pdu)) if pdu.pdu_type == PduType::Rrc => {
                         let _ = socket.send_to(&rls_codec::encode(&RlsMessage::PduTransmissionAck(
@@ -252,5 +248,97 @@ async fn run_inner(
             *s = now;
             changed
         });
+    }
+}
+
+/// Feed a HeartbeatAck to the cell search, and record the cell's address only
+/// when the cell search holds the cell at that address (#345). Returns whether
+/// RRC should take the measurement.
+///
+/// An ack from outside the eNB search list, a new STI past
+/// [`nextgsim_rls::MAX_DISCOVERED_CELLS`], and a second address answering for a
+/// known STI while the first is still searched (#292) are all refused by the
+/// cell search, so none of them reaches `cell_addr` or RRC.
+fn accept_heartbeat_ack(
+    cells: &mut UeCellSearch,
+    cell_addr: &mut HashMap<u64, SocketAddr>,
+    ack: &RlsHeartbeatAck,
+    from: SocketAddr,
+) -> bool {
+    cells.process_heartbeat_ack(ack.sti, from, ack);
+    if cells
+        .get_cell_by_sti(ack.sti)
+        .is_some_and(|c| c.address == from)
+    {
+        cell_addr.insert(ack.sti, from);
+        true
+    } else {
+        log::debug!(
+            "HeartbeatAck for STI {:#x} from {from} dropped: not a cell the search holds \
+             (outside the eNB search list, past the cell cap, or a second address)",
+            ack.sti
+        );
+        false
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_ack_tests {
+    use super::*;
+
+    fn addr(last: u8) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, last], 4997))
+    }
+
+    /// #345 review: an ack from outside the search list, a new STI past the
+    /// cell cap, and a second address for a known STI reach neither `cell_addr`
+    /// nor RRC; an ack from the searched eNB does.
+    #[test]
+    fn only_acks_the_cell_search_keeps_reach_cell_addr_and_rrc() {
+        let mut cells = UeCellSearch::new(1, vec![addr(1)]);
+        let mut cell_addr = HashMap::new();
+
+        let ack = RlsHeartbeatAck::with_dbm(0x10, -60);
+        assert!(!accept_heartbeat_ack(
+            &mut cells,
+            &mut cell_addr,
+            &ack,
+            addr(9)
+        ));
+        assert!(cell_addr.is_empty(), "off-list");
+
+        assert!(accept_heartbeat_ack(
+            &mut cells,
+            &mut cell_addr,
+            &ack,
+            addr(1)
+        ));
+        assert_eq!(cell_addr.get(&0x10), Some(&addr(1)));
+
+        // #292 overlap: both addresses searched, the second is refused
+        cells.set_search_space(vec![addr(1), addr(2)]);
+        assert!(!accept_heartbeat_ack(
+            &mut cells,
+            &mut cell_addr,
+            &ack,
+            addr(2)
+        ));
+        assert_eq!(cell_addr.get(&0x10), Some(&addr(1)), "not re-pointed");
+
+        // The cap: new STIs past MAX_DISCOVERED_CELLS are refused
+        for sti in 0x100..0x100 + nextgsim_rls::MAX_DISCOVERED_CELLS as u64 {
+            let ack = RlsHeartbeatAck::with_dbm(sti, -70);
+            accept_heartbeat_ack(&mut cells, &mut cell_addr, &ack, addr(1));
+        }
+        assert_eq!(cells.cell_count(), nextgsim_rls::MAX_DISCOVERED_CELLS);
+        let over = RlsHeartbeatAck::with_dbm(0xFFFF, -70);
+        assert!(!accept_heartbeat_ack(
+            &mut cells,
+            &mut cell_addr,
+            &over,
+            addr(1)
+        ));
+        assert!(!cell_addr.contains_key(&0xFFFF), "the cap bounds cell_addr");
+        assert_eq!(cell_addr.len(), nextgsim_rls::MAX_DISCOVERED_CELLS);
     }
 }
