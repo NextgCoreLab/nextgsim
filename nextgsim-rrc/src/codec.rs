@@ -70,3 +70,24 @@ pub fn decode_rrc<T: UperCodec<Output = T>>(bytes: &[u8]) -> Result<T, RrcCodecE
     let mut data = PerCodecData::from_slice_uper(bytes);
     T::uper_decode(&mut data).map_err(|e| RrcCodecError::DecodeError(format!("{e:?}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `PhysCellId ::= INTEGER (0..1007)` is a 10-bit constrained whole number
+    /// in UPER (X.691 §12.2.2): 1007 is `11 1110 1111`, padded to two octets.
+    #[test]
+    fn a_constrained_integer_round_trips_through_the_codec() {
+        let bytes = encode_rrc(&PhysCellId(PHYS_CELL_ID_MAX)).expect("encode");
+        assert_eq!(bytes, vec![0xFB, 0xC0]);
+        assert_eq!(
+            decode_rrc::<PhysCellId>(&bytes).expect("decode"),
+            PhysCellId(PHYS_CELL_ID_MAX)
+        );
+        assert!(matches!(
+            decode_rrc::<PhysCellId>(&[]),
+            Err(RrcCodecError::DecodeError(_))
+        ));
+    }
+}
