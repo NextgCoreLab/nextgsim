@@ -67,6 +67,22 @@ pub mod esm_type {
     pub const ACTIVATE_DEFAULT_ACCEPT: u8 = 0xC2;
     /// ACTIVATE DEFAULT EPS BEARER CONTEXT REJECT.
     pub const ACTIVATE_DEFAULT_REJECT: u8 = 0xC3;
+    /// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST.
+    pub const ACTIVATE_DEDICATED_REQUEST: u8 = 0xC5;
+    /// ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT.
+    pub const ACTIVATE_DEDICATED_ACCEPT: u8 = 0xC6;
+    /// ACTIVATE DEDICATED EPS BEARER CONTEXT REJECT.
+    pub const ACTIVATE_DEDICATED_REJECT: u8 = 0xC7;
+    /// MODIFY EPS BEARER CONTEXT REQUEST.
+    pub const MODIFY_REQUEST: u8 = 0xC9;
+    /// MODIFY EPS BEARER CONTEXT ACCEPT.
+    pub const MODIFY_ACCEPT: u8 = 0xCA;
+    /// MODIFY EPS BEARER CONTEXT REJECT.
+    pub const MODIFY_REJECT: u8 = 0xCB;
+    /// DEACTIVATE EPS BEARER CONTEXT REQUEST.
+    pub const DEACTIVATE_REQUEST: u8 = 0xCD;
+    /// DEACTIVATE EPS BEARER CONTEXT ACCEPT.
+    pub const DEACTIVATE_ACCEPT: u8 = 0xCE;
     /// PDN CONNECTIVITY REQUEST.
     pub const PDN_CONNECTIVITY_REQUEST: u8 = 0xD0;
     /// PDN CONNECTIVITY REJECT.
@@ -346,6 +362,70 @@ pub fn encode_activate_default_reject(ebi: u8, pti: u8, esm_cause: u8) -> Vec<u8
     ]
 }
 
+/// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST (§8.3.3), the parts the UE
+/// acts on (#283).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivateDedicatedBearerRequest {
+    /// The new bearer's EPS bearer identity.
+    pub ebi: u8,
+    /// PTI: 0 for a network-initiated activation.
+    pub pti: u8,
+    /// The default bearer of the PDN connection it belongs to.
+    pub linked_ebi: u8,
+    /// QCI (first octet of the EPS QoS).
+    pub qci: u8,
+    /// The TFT IE value, decoded by [`crate::tft::Tft::decode`].
+    pub tft: Vec<u8>,
+}
+
+/// MODIFY EPS BEARER CONTEXT REQUEST (§8.3.18), the parts the UE acts on
+/// (#283).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModifyBearerRequest {
+    /// The bearer to modify.
+    pub ebi: u8,
+    /// PTI.
+    pub pti: u8,
+    /// New QCI (IEI 5B, New EPS QoS).
+    pub qci: Option<u8>,
+    /// The TFT IE value (IEI 36).
+    pub tft: Option<Vec<u8>>,
+}
+
+/// ACTIVATE DEDICATED EPS BEARER CONTEXT ACCEPT (§8.3.1).
+pub fn encode_activate_dedicated_accept(ebi: u8, pti: u8) -> Vec<u8> {
+    vec![
+        (ebi << 4) | PD_ESM,
+        pti,
+        esm_type::ACTIVATE_DEDICATED_ACCEPT,
+    ]
+}
+
+/// ACTIVATE DEDICATED EPS BEARER CONTEXT REJECT (§8.3.2).
+pub fn encode_activate_dedicated_reject(ebi: u8, pti: u8, esm_cause: u8) -> Vec<u8> {
+    vec![
+        (ebi << 4) | PD_ESM,
+        pti,
+        esm_type::ACTIVATE_DEDICATED_REJECT,
+        esm_cause,
+    ]
+}
+
+/// MODIFY EPS BEARER CONTEXT ACCEPT (§8.3.16).
+pub fn encode_modify_accept(ebi: u8, pti: u8) -> Vec<u8> {
+    vec![(ebi << 4) | PD_ESM, pti, esm_type::MODIFY_ACCEPT]
+}
+
+/// MODIFY EPS BEARER CONTEXT REJECT (§8.3.17).
+pub fn encode_modify_reject(ebi: u8, pti: u8, esm_cause: u8) -> Vec<u8> {
+    vec![(ebi << 4) | PD_ESM, pti, esm_type::MODIFY_REJECT, esm_cause]
+}
+
+/// DEACTIVATE EPS BEARER CONTEXT ACCEPT (§8.3.11).
+pub fn encode_deactivate_accept(ebi: u8, pti: u8) -> Vec<u8> {
+    vec![(ebi << 4) | PD_ESM, pti, esm_type::DEACTIVATE_ACCEPT]
+}
+
 /// ESM INFORMATION RESPONSE (§8.3.14), with the APN (IEI 28) when one is
 /// configured.
 pub fn encode_esm_information_response(pti: u8, apn: Option<&str>) -> Vec<u8> {
@@ -623,6 +703,19 @@ pub enum DownlinkEsm {
         /// PTI.
         pti: u8,
     },
+    /// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST (§8.3.3, #283).
+    ActivateDedicatedBearerRequest(ActivateDedicatedBearerRequest),
+    /// MODIFY EPS BEARER CONTEXT REQUEST (§8.3.18, #283).
+    ModifyBearerRequest(ModifyBearerRequest),
+    /// DEACTIVATE EPS BEARER CONTEXT REQUEST (§8.3.12, #283).
+    DeactivateBearerRequest {
+        /// The EPS bearer to deactivate.
+        ebi: u8,
+        /// PTI.
+        pti: u8,
+        /// ESM cause.
+        cause: u8,
+    },
     /// Any other ESM message: (EBI, PTI, type).
     Other(u8, u8, u8),
 }
@@ -668,6 +761,44 @@ pub fn decode_downlink_esm(msg: &[u8]) -> Result<DownlinkEsm, NasDecodeError> {
             cause: r.u8()?,
         },
         esm_type::ESM_INFORMATION_REQUEST => DownlinkEsm::EsmInformationRequest { pti },
+        esm_type::ACTIVATE_DEDICATED_REQUEST => {
+            // Linked EPS bearer identity in bits 4-1, spare half octet in 8-5
+            let linked_ebi = r.u8()? & 0x0F;
+            let qos = r.lv()?;
+            let qci = *qos.first().ok_or(NasDecodeError::Invalid("EPS QoS"))?;
+            let tft = r.lv()?.to_vec();
+            // TV IEs: 32 Negotiated LLC SAPI (2). Type 1: 8- radio priority,
+            // C- WLAN offload acceptability.
+            let _ = r.optional_ies(&[(0x32, 2)])?;
+            DownlinkEsm::ActivateDedicatedBearerRequest(ActivateDedicatedBearerRequest {
+                ebi,
+                pti,
+                linked_ebi,
+                qci,
+                tft,
+            })
+        }
+        esm_type::MODIFY_REQUEST => {
+            let mut req = ModifyBearerRequest {
+                ebi,
+                pti,
+                qci: None,
+                tft: None,
+            };
+            for (iei, v) in r.optional_ies(&[(0x32, 2)])? {
+                match iei {
+                    0x5B => req.qci = v.first().copied(),
+                    0x36 => req.tft = Some(v.to_vec()),
+                    _ => {}
+                }
+            }
+            DownlinkEsm::ModifyBearerRequest(req)
+        }
+        esm_type::DEACTIVATE_REQUEST => DownlinkEsm::DeactivateBearerRequest {
+            ebi,
+            pti,
+            cause: r.u8()?,
+        },
         other => DownlinkEsm::Other(ebi, pti, other),
     })
 }

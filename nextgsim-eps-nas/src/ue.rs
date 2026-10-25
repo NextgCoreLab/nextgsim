@@ -87,6 +87,8 @@ pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
 
 /// ESM cause #81 "invalid PTI value" (§9.9.4.4).
 const ESM_INVALID_PTI: u8 = 81;
+/// ESM cause #43 invalid EPS bearer identity.
+const ESM_INVALID_EPS_BEARER_IDENTITY: u8 = 43;
 /// ESM cause #95 "semantically incorrect message".
 const ESM_SEMANTICALLY_INCORRECT: u8 = 95;
 /// ESM cause #96 "invalid mandatory information" (TS 24.301 §9.9.4.4).
@@ -157,6 +159,19 @@ pub struct DefaultBearer {
     pub dns_ipv4: Vec<std::net::Ipv4Addr>,
 }
 
+/// A dedicated EPS bearer context (TS 24.301 §6.4.2, #283).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedicatedBearer {
+    /// EPS bearer identity.
+    pub ebi: u8,
+    /// The default bearer of its PDN connection.
+    pub linked_ebi: u8,
+    /// QCI.
+    pub qci: u8,
+    /// The packet filters of its TFT.
+    pub filters: Vec<crate::tft::PacketFilter>,
+}
+
 /// What a NAS event asks of the layers below.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NasOutput {
@@ -195,6 +210,11 @@ pub struct EpsNasUe {
     next_pti: u8,
     attach_pti: Option<u8>,
     bearer: Option<DefaultBearer>,
+    /// The packet filters of the default bearer's TFT, when a MODIFY gave it
+    /// one; empty is match-all (§6.4.3.4 a) 3)).
+    default_filters: Vec<crate::tft::PacketFilter>,
+    /// Dedicated EPS bearer contexts (#283).
+    dedicated: Vec<DedicatedBearer>,
     /// The RAND of the last successful challenge with its RES and `K_ASME`,
     /// kept so a retransmitted AUTHENTICATION REQUEST is answered without
     /// the USIM (§5.4.2.3), and the T3416 deadline that bounds it.
@@ -268,6 +288,8 @@ impl EpsNasUe {
             next_pti: 1,
             attach_pti: None,
             bearer: None,
+            default_filters: Vec::new(),
+            dedicated: Vec::new(),
             stored_auth: None,
             secure_exchange: false,
             uplink_pending: false,
@@ -385,7 +407,7 @@ impl EpsNasUe {
     /// EMM-DEREGISTERED after a UE-initiated detach: the EPS bearer contexts are
     /// deactivated locally (§5.5.2.2.2) and no attach follows.
     fn enter_detached(&mut self) {
-        self.bearer = None;
+        self.clear_bearers();
         self.uplink_pending = false;
         self.paging_response_pending = false;
         self.detach_pending = None;
@@ -458,6 +480,36 @@ impl EpsNasUe {
     /// The default EPS bearer, once activated.
     pub fn default_bearer(&self) -> Option<&DefaultBearer> {
         self.bearer.as_ref()
+    }
+
+    /// The active dedicated EPS bearers (#283).
+    pub fn dedicated_bearers(&self) -> &[DedicatedBearer] {
+        &self.dedicated
+    }
+
+    /// The EPS bearer an uplink IP packet goes on (TS 23.401 §5.4.1 / TS 24.301
+    /// §6.4.2.1, #283): the dedicated bearer whose uplink packet filter matches,
+    /// lowest evaluation precedence first, else the default bearer. `None`
+    /// with no default bearer.
+    pub fn uplink_bearer_for(&self, packet: &[u8]) -> Option<u8> {
+        let default = self.bearer.as_ref()?.ebi;
+        let Some(key) = crate::tft::PacketKey::parse(packet) else {
+            return Some(default);
+        };
+        self.dedicated
+            .iter()
+            .flat_map(|b| b.filters.iter().map(move |f| (f, b.ebi)))
+            .filter(|(f, _)| f.matches_uplink(&key))
+            .min_by_key(|(f, _)| f.precedence)
+            .map(|(_, ebi)| ebi)
+            .or(Some(default))
+    }
+
+    /// Drop every EPS bearer context, default and dedicated.
+    fn clear_bearers(&mut self) {
+        self.bearer = None;
+        self.default_filters.clear();
+        self.dedicated.clear();
     }
 
     /// The GUTI, once assigned.
@@ -919,19 +971,29 @@ impl EpsNasUe {
     }
 
     /// The ESM answer to an ESM message with a mandatory-IE error (TS 24.301
-    /// §7.5.1, §7.5.3): ACTIVATE DEFAULT EPS BEARER CONTEXT REJECT #96 for an
-    /// ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST (§7.5.3 a)), ESM STATUS #96
-    /// otherwise. The EBI and PTI are read from the header octets when they are
-    /// there. (§7.5.3 b)-d) name messages this UE does not implement; they are
-    /// answered with ESM STATUS #97 before any IE is read, §7.4.)
-    fn esm_invalid_mandatory_reply(esm: &[u8]) -> Vec<u8> {
+    /// §7.5.1, §7.5.3): the REJECT #96 of an ACTIVATE DEFAULT / ACTIVATE
+    /// DEDICATED / MODIFY EPS BEARER CONTEXT REQUEST (§7.5.3 a)-c)); for a
+    /// DEACTIVATE EPS BEARER CONTEXT REQUEST, the bearer is released and the
+    /// ACCEPT returned (d), #283); ESM STATUS #96 otherwise. The EBI and PTI
+    /// are read from the header octets when they are there.
+    fn esm_invalid_mandatory_reply(&mut self, esm: &[u8]) -> Vec<u8> {
+        use msg::esm_type;
         let ebi = esm.first().map_or(0, |b| b >> 4);
         let pti = esm.get(1).copied().unwrap_or(0);
+        let cause = ESM_INVALID_MANDATORY_INFORMATION;
         match esm.get(2).copied() {
-            Some(msg::esm_type::ACTIVATE_DEFAULT_REQUEST) => {
-                msg::encode_activate_default_reject(ebi, pti, ESM_INVALID_MANDATORY_INFORMATION)
+            Some(esm_type::ACTIVATE_DEFAULT_REQUEST) => {
+                msg::encode_activate_default_reject(ebi, pti, cause)
             }
-            _ => msg::encode_esm_status(ebi, pti, ESM_INVALID_MANDATORY_INFORMATION),
+            Some(esm_type::ACTIVATE_DEDICATED_REQUEST) => {
+                msg::encode_activate_dedicated_reject(ebi, pti, cause)
+            }
+            Some(esm_type::MODIFY_REQUEST) => msg::encode_modify_reject(ebi, pti, cause),
+            Some(esm_type::DEACTIVATE_REQUEST) => {
+                self.on_deactivate_bearer(ebi, cause);
+                msg::encode_deactivate_accept(ebi, pti)
+            }
+            _ => msg::encode_esm_status(ebi, pti, cause),
         }
     }
 
@@ -1249,7 +1311,7 @@ impl EpsNasUe {
                 // undecodable ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST is
                 // rejected with #96 in ATTACH COMPLETE (#382)
                 log::warn!("ESM: undecodable ESM container: {e}; #96 (§7.5.3 a))");
-                Self::esm_invalid_mandatory_reply(&a.esm_message)
+                self.esm_invalid_mandatory_reply(&a.esm_message)
             }
         };
         self.state = EmmState::Registered;
@@ -1332,7 +1394,7 @@ impl EpsNasUe {
             | emm_cause::ILLEGAL_ME
             | emm_cause::EPS_SERVICES_NOT_ALLOWED
             | emm_cause::EPS_AND_NON_EPS_NOT_ALLOWED => {
-                self.bearer = None;
+                self.clear_bearers();
                 self.invalidate(r.cause);
                 self.t3440 = Some(now + T3440);
             }
@@ -1362,7 +1424,7 @@ impl EpsNasUe {
             | emm_cause::NO_SUITABLE_CELLS_IN_TA
             | emm_cause::NOT_AUTHORIZED_FOR_CSG
             | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN => {
-                self.bearer = None;
+                self.clear_bearers();
                 self.guti = None;
                 self.ctx = None;
                 self.state = EmmState::NoService(r.cause);
@@ -1414,7 +1476,7 @@ impl EpsNasUe {
                 | emm_cause::EPS_SERVICES_NOT_ALLOWED
                 | emm_cause::EPS_AND_NON_EPS_NOT_ALLOWED),
             ) => {
-                self.bearer = None;
+                self.clear_bearers();
                 self.invalidate(c);
             }
             Some(
@@ -1426,7 +1488,7 @@ impl EpsNasUe {
                 | emm_cause::NOT_AUTHORIZED_FOR_CSG
                 | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN),
             ) => {
-                self.bearer = None;
+                self.clear_bearers();
                 self.guti = None;
                 self.ctx = None;
                 self.state = EmmState::NoService(c);
@@ -1443,7 +1505,7 @@ impl EpsNasUe {
     /// Deactivate the EPS bearer contexts locally and enter
     /// EMM-DEREGISTERED.NORMAL-SERVICE, so an attach is due.
     fn local_detach(&mut self) {
-        self.bearer = None;
+        self.clear_bearers();
         self.uplink_pending = false;
         self.state = EmmState::Deregistered;
         self.attempts = 0;
@@ -1472,6 +1534,18 @@ impl EpsNasUe {
                     ESM_INVALID_PTI,
                 ))
             }
+            Ok(DownlinkEsm::ActivateDedicatedBearerRequest(req)) => {
+                let reply = self.on_activate_dedicated(req);
+                self.send_emm(reply)
+            }
+            Ok(DownlinkEsm::ModifyBearerRequest(req)) => {
+                let reply = self.on_modify_bearer(req);
+                self.send_emm(reply)
+            }
+            Ok(DownlinkEsm::DeactivateBearerRequest { ebi, pti, cause }) => {
+                self.on_deactivate_bearer(ebi, cause);
+                self.send_emm(msg::encode_deactivate_accept(ebi, pti))
+            }
             Ok(DownlinkEsm::Other(ebi, pti, ty)) => {
                 log::warn!("ESM: message type 0x{ty:02x} not implemented; ESM STATUS #97");
                 self.send_emm(msg::encode_esm_status(
@@ -1483,8 +1557,145 @@ impl EpsNasUe {
             Err(e) => {
                 // §7.5.1 / §7.5.3 (#382)
                 log::warn!("ESM: undecodable message: {e}; #96 (§7.5.3)");
-                self.send_emm(Self::esm_invalid_mandatory_reply(plain))
+                let reply = self.esm_invalid_mandatory_reply(plain);
+                self.send_emm(reply)
             }
+        }
+    }
+}
+
+impl EpsNasUe {
+    /// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.2.3-5):
+    /// the ACCEPT or REJECT to send.
+    fn on_activate_dedicated(&mut self, req: msg::ActivateDedicatedBearerRequest) -> Vec<u8> {
+        use crate::tft::{Tft, TftError, TftOperation};
+        let reject = |cause: u8| {
+            log::warn!(
+                "ESM: dedicated bearer {} (linked {}) rejected, #{cause}",
+                req.ebi,
+                req.linked_ebi
+            );
+            msg::encode_activate_dedicated_reject(req.ebi, req.pti, cause)
+        };
+        // §6.4.2.5 c): no default bearer with the linked EBI
+        if self.bearer.as_ref().map(|b| b.ebi) != Some(req.linked_ebi) {
+            return reject(ESM_INVALID_EPS_BEARER_IDENTITY);
+        }
+        // §6.4.2.4 a)-d)
+        let tft = match Tft::decode(&req.tft) {
+            Ok(t) if t.operation != TftOperation::CreateNew => {
+                return reject(TftError::SemanticOperation.esm_cause())
+            }
+            Ok(t) => t,
+            Err(e) => return reject(e.esm_cause()),
+        };
+        if !tft.filters.iter().any(|f| f.direction.applies_uplink()) {
+            return reject(TftError::SemanticFilter.esm_cause());
+        }
+        // §6.4.2.5 a): the EBI of the active default bearer deactivates it and
+        // its dedicated bearers locally, and the activation proceeds; b): that
+        // of a dedicated one deactivates that one.
+        if self.bearer.as_ref().map(|b| b.ebi) == Some(req.ebi) {
+            log::warn!(
+                "ESM: dedicated bearer request with the default bearer's EBI {}: the \
+                 default bearer and its dedicated bearers are deactivated locally",
+                req.ebi
+            );
+            self.clear_bearers();
+        }
+        self.dedicated.retain(|b| b.ebi != req.ebi);
+        // §6.4.2.4 d) 2): an old filter of another dedicated bearer with the
+        // same precedence is deleted
+        for b in &mut self.dedicated {
+            b.filters
+                .retain(|old| !tft.filters.iter().any(|f| f.precedence == old.precedence));
+        }
+        log::info!(
+            "ESM: dedicated EPS bearer {} activated (linked {}), QCI {}, {} packet filter(s)",
+            req.ebi,
+            req.linked_ebi,
+            req.qci,
+            tft.filters.len()
+        );
+        self.dedicated.push(DedicatedBearer {
+            ebi: req.ebi,
+            linked_ebi: req.linked_ebi,
+            qci: req.qci,
+            filters: tft.filters,
+        });
+        msg::encode_activate_dedicated_accept(req.ebi, req.pti)
+    }
+
+    /// MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.3.3-4): the ACCEPT or
+    /// REJECT to send.
+    fn on_modify_bearer(&mut self, req: msg::ModifyBearerRequest) -> Vec<u8> {
+        use crate::tft::{apply_operation, Tft};
+        let reject = |cause: u8| {
+            log::warn!(
+                "ESM: modification of EPS bearer {} rejected, #{cause}",
+                req.ebi
+            );
+            msg::encode_modify_reject(req.ebi, req.pti, cause)
+        };
+        let is_default = self.bearer.as_ref().map(|b| b.ebi) == Some(req.ebi);
+        let dedicated_idx = self.dedicated.iter().position(|b| b.ebi == req.ebi);
+        if !is_default && dedicated_idx.is_none() {
+            return reject(ESM_INVALID_EPS_BEARER_IDENTITY);
+        }
+        let new_filters = match &req.tft {
+            None => None,
+            Some(v) => {
+                let tft = match Tft::decode(v) {
+                    Ok(t) => t,
+                    Err(e) => return reject(e.esm_cause()),
+                };
+                let current = match dedicated_idx {
+                    Some(i) => &self.dedicated[i].filters,
+                    None => &self.default_filters,
+                };
+                match apply_operation(current, &tft, dedicated_idx.is_some()) {
+                    Ok(f) => Some(f),
+                    Err(e) => return reject(e.esm_cause()),
+                }
+            }
+        };
+        match dedicated_idx {
+            Some(i) => {
+                let b = &mut self.dedicated[i];
+                if let Some(q) = req.qci {
+                    b.qci = q;
+                }
+                if let Some(f) = new_filters {
+                    b.filters = f;
+                }
+            }
+            None => {
+                if let (Some(q), Some(b)) = (req.qci, self.bearer.as_mut()) {
+                    b.qci = q;
+                }
+                if let Some(f) = new_filters {
+                    self.default_filters = f;
+                }
+            }
+        }
+        log::info!("ESM: EPS bearer {} modified", req.ebi);
+        msg::encode_modify_accept(req.ebi, req.pti)
+    }
+
+    /// DEACTIVATE EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.4.3): a dedicated
+    /// bearer goes; the default bearer takes its PDN connection, dedicated
+    /// bearers included, with it. An EBI that is not active is accepted too.
+    fn on_deactivate_bearer(&mut self, ebi: u8, cause: u8) {
+        if self.bearer.as_ref().map(|b| b.ebi) == Some(ebi) {
+            log::info!(
+                "ESM: default EPS bearer {ebi} deactivated (#{cause}), with its PDN connection"
+            );
+            self.clear_bearers();
+        } else if self.dedicated.iter().any(|b| b.ebi == ebi) {
+            log::info!("ESM: dedicated EPS bearer {ebi} deactivated (#{cause})");
+            self.dedicated.retain(|b| b.ebi != ebi);
+        } else {
+            log::info!("ESM: deactivation of EPS bearer {ebi}, which is not active; accepted");
         }
     }
 }

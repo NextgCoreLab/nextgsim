@@ -1020,3 +1020,222 @@ fn a_plain_message_on_a_secure_exchange_is_discarded() {
         "the AUTHENTICATION REJECT was not processed"
     );
 }
+
+// ============================================================================
+// Dedicated EPS bearers (TS 24.301 §6.4.2-6.4.4, nextgsim #283)
+// ============================================================================
+
+/// The TFT of a SIP-like dedicated bearer: one uplink filter, precedence
+/// 0x10, UDP to 10.45.0.1/32 port 5060 (TS 24.008 Table 10.5.162).
+fn sip_tft() -> Vec<u8> {
+    vec![
+        0x21, 0x21, 0x10, 0x0E, 0x10, 0x0A, 0x2D, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x30, 0x11,
+        0x50, 0x13, 0xC4,
+    ]
+}
+
+/// ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST (Table 8.3.3.1), hand-built:
+/// EBI, PTI 0, C5, linked EBI (bits 4-1), LV EPS QoS (QCI 1), LV TFT.
+fn activate_dedicated(ebi: u8, linked: u8, tft: &[u8]) -> Vec<u8> {
+    let mut m = vec![(ebi << 4) | 0x02, 0x00, 0xC5, linked & 0x0F, 0x01, 0x01];
+    m.push(tft.len() as u8);
+    m.extend_from_slice(tft);
+    m
+}
+
+fn udp4(dst: [u8; 4], dport: u16) -> Vec<u8> {
+    let mut p = vec![
+        0x45, 0x00, 0x00, 0x1C, 0, 0, 0, 0, 64, 17, 0, 0, 10, 45, 0, 2,
+    ];
+    p.extend_from_slice(&dst);
+    p.extend_from_slice(&40000u16.to_be_bytes());
+    p.extend_from_slice(&dport.to_be_bytes());
+    p.extend_from_slice(&[0, 8, 0, 0]);
+    p
+}
+
+/// The UE's (unprotected) reply to a protected ESM request from the MME.
+fn esm_reply(ue: &mut EpsNasUe, mme: &mut Mme, esm: &[u8]) -> Vec<u8> {
+    let out = ue.on_downlink(&mme.protect(esm, 2), Instant::now());
+    assert_eq!(out.uplink.len(), 1, "one reply");
+    mme.unprotect(&out.uplink[0])
+}
+
+/// #283, §6.4.2.3: the UE accepts a dedicated bearer linked to its default
+/// bearer, keeps its TFT, and classifies uplink by it: a packet that matches
+/// the uplink filter goes on the dedicated bearer, anything else on the
+/// default one.
+#[test]
+fn a_dedicated_bearer_is_accepted_and_classifies_uplink_by_its_tft() {
+    let (mut ue, mut mme, _) = attach();
+    let reply = esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    assert_eq!(reply, vec![0x62, 0x00, 0xC6], "ACCEPT, EBI 6, PTI 0");
+    let b = &ue.dedicated_bearers()[0];
+    assert_eq!((b.ebi, b.linked_ebi, b.qci, b.filters.len()), (6, 5, 1, 1));
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 5060)), Some(6));
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 80)), Some(5));
+    assert_eq!(ue.uplink_bearer_for(&[0x00, 0x01]), Some(5), "not IP");
+}
+
+/// #283 with #382, §7.5.3 b)-d): a dedicated activation or a modification
+/// whose mandatory part does not decode is rejected with #96; a deactivation
+/// releases the bearer and is accepted.
+#[test]
+fn dedicated_bearer_messages_with_a_bad_mandatory_ie_follow_7_5_3() {
+    let (mut ue, mut mme, _) = attach();
+    // ACTIVATE DEDICATED, EBI 6, linked 5, without its EPS QoS and TFT
+    let reply = esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xC5, 0x05]);
+    assert_eq!(reply, vec![0x62, 0x00, 0xC7, 0x60]);
+    assert!(ue.dedicated_bearers().is_empty());
+
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    // MODIFY with a TFT IE whose length runs past the message
+    let reply = esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xC9, 0x36, 0x05, 0x21]);
+    assert_eq!(reply, vec![0x62, 0x00, 0xCB, 0x60]);
+    assert_eq!(ue.dedicated_bearers().len(), 1, "kept");
+    // DEACTIVATE without its ESM cause
+    let reply = esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xCD]);
+    assert_eq!(reply, vec![0x62, 0x00, 0xCE]);
+    assert!(ue.dedicated_bearers().is_empty(), "released");
+    assert_eq!(ue.default_bearer().unwrap().ebi, 5);
+}
+
+/// TS 23.401 §5.3.3 / TS 24.008 §10.5.6.12: among the uplink filters that
+/// match, the lowest precedence value picks the bearer, across bearers.
+#[test]
+fn the_matching_filter_with_the_lowest_precedence_value_wins() {
+    let (mut ue, mut mme, _) = attach();
+    // EBI 7 first: any UDP, precedence 0x20.
+    let udp = [0x21, 0x21, 0x20, 0x02, 0x30, 0x11];
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(7, 5, &udp));
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 5060)), Some(6));
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 53)), Some(7));
+}
+
+/// #283, §6.4.2.4 / §6.4.2.5 c): REJECT with the causes the spec names.
+#[test]
+fn a_dedicated_bearer_request_is_rejected_per_6_4_2_4() {
+    let (mut ue, mut mme, _) = attach();
+    // c) no default bearer with the linked EBI: #43
+    let reply = esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 9, &sip_tft()));
+    assert_eq!(reply, vec![0x62, 0x00, 0xC7, 43]);
+    // a) an operation other than "create new TFT": #41
+    let mut add = sip_tft();
+    add[0] = 0x61;
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &add))[3],
+        41
+    );
+    // b) create with an empty packet filter list: #42
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &[0x20]))[3],
+        42
+    );
+    // c) 2) no uplink filter: #44
+    let mut down = sip_tft();
+    down[1] = 0x11;
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &down))[3],
+        44
+    );
+    // d) 3) a reserved component type: #45
+    let bad = [0x21, 0x21, 0x00, 0x02, 0x99, 0x00];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &bad))[3],
+        45
+    );
+    assert!(ue.dedicated_bearers().is_empty());
+}
+
+/// #283, §6.4.2.5 b): a request for the EBI of an active dedicated bearer
+/// replaces it; §6.4.2.4 d) 2): a filter of another dedicated bearer with the
+/// same precedence is deleted.
+#[test]
+fn a_reused_dedicated_ebi_replaces_the_bearer() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    // EBI 7 with the same precedence 0x10, TCP
+    let tcp = [0x21, 0x21, 0x10, 0x02, 0x30, 0x06];
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(7, 5, &tcp));
+    assert!(
+        ue.dedicated_bearers()[0].filters.is_empty(),
+        "EBI 6's filter with precedence 0x10 is deleted"
+    );
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(7, 5, &sip_tft()));
+    assert_eq!(ue.dedicated_bearers().len(), 2);
+    let seven = ue.dedicated_bearers().iter().find(|b| b.ebi == 7).unwrap();
+    assert_eq!(
+        seven.filters,
+        crate::tft::Tft::decode(&sip_tft()).unwrap().filters
+    );
+}
+
+/// #283, §6.4.3: MODIFY EPS BEARER CONTEXT REQUEST updates the QoS and the TFT
+/// and is accepted (CA); an unknown EBI is rejected #43 (CB); a TFT operation
+/// §6.4.3.4 refuses is rejected with its cause.
+#[test]
+fn a_bearer_modification_follows_6_4_3() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    // New EPS QoS (5B) QCI 2, TFT (36): add filter 2, uplink, TCP to port 80
+    let add = [0x61, 0x22, 0x20, 0x05, 0x30, 0x06, 0x50, 0x00, 0x50];
+    let mut modify = vec![0x62, 0x00, 0xC9, 0x5B, 0x01, 0x02, 0x36, add.len() as u8];
+    modify.extend_from_slice(&add);
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &modify),
+        vec![0x62, 0x00, 0xCA]
+    );
+    let b = &ue.dedicated_bearers()[0];
+    assert_eq!((b.qci, b.filters.len()), (2, 2));
+    let mut tcp80 = udp4([1, 1, 1, 1], 80);
+    tcp80[9] = 6;
+    assert_eq!(ue.uplink_bearer_for(&tcp80), Some(6));
+
+    // Delete existing TFT on a dedicated bearer: #41
+    let modify = [0x62, 0x00, 0xC9, 0x36, 0x01, 0x40];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &modify),
+        vec![0x62, 0x00, 0xCB, 41]
+    );
+    // An EBI that is not active: #43
+    let modify = [0x82, 0x00, 0xC9];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &modify),
+        vec![0x82, 0x00, 0xCB, 43]
+    );
+}
+
+/// #283, §6.4.4.3: DEACTIVATE EPS BEARER CONTEXT REQUEST of a dedicated bearer
+/// removes it and is accepted (CE); uplink falls back to the default bearer.
+/// Deactivating the default bearer takes its dedicated bearers with it, and
+/// an EBI that is not active is accepted as well.
+#[test]
+fn a_bearer_deactivation_follows_6_4_4() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xCD, 36]),
+        vec![0x62, 0x00, 0xCE]
+    );
+    assert!(ue.dedicated_bearers().is_empty());
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 5060)), Some(5));
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &[0x92, 0x00, 0xCD, 36]),
+        vec![0x92, 0x00, 0xCE],
+        "not active: accepted"
+    );
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    esm_reply(&mut ue, &mut mme, &[0x52, 0x00, 0xCD, 36]);
+    assert_eq!(ue.default_bearer(), None);
+    assert!(ue.dedicated_bearers().is_empty(), "with its PDN connection");
+}
+
+/// #283: losing the registration drops the dedicated bearers too.
+#[test]
+fn a_detach_drops_the_dedicated_bearers() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    ue.on_downlink(&mme.protect(&detach_request(1, None), 2), Instant::now());
+    assert!(ue.dedicated_bearers().is_empty());
+}
