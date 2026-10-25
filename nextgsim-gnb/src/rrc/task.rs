@@ -102,7 +102,7 @@ use super::sidelink::{
     sl_rnti_for_ue, LocalRemoteUeIdAllocator, DEFAULT_SRAP_BEARER, SL_T400_MS,
 };
 use super::system_info::{
-    encode_cell_mib, encode_cell_sib1, encode_cell_system_information,
+    encode_cell_mib_barred, encode_cell_sib1, encode_cell_system_information,
     release_cell_reselection_priorities, sib19_params,
 };
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
@@ -460,6 +460,14 @@ impl RrcTask {
     pub fn handle_radio_power_on(&mut self) {
         info!("Radio power on - cell is now active");
         self.connection_manager.set_barred(false);
+    }
+
+    /// Handles `RrcMessage::RadioPowerOff`: no AMF can serve the cell any more,
+    /// so it is barred -- on the air (MIB `cellBarred`) and for new RRC
+    /// connections -- until the next `RadioPowerOn` (#336).
+    pub fn handle_radio_power_off(&mut self) {
+        warn!("Radio power off - no AMF is ready; the cell is barred");
+        self.connection_manager.set_barred(true);
     }
 
     fn handle_signal_detected(&mut self, ue_id: i32) {
@@ -2525,7 +2533,9 @@ impl RrcTask {
     /// SIB19 would pass whether or not `self.ntn_config` was ever read, which is the
     /// defect the issue is about.
     pub async fn broadcast_system_information(&mut self, with_sib1: bool) {
-        match encode_cell_mib() {
+        // `cellBarred` follows the cell's admission state (#336): barred until NG
+        // Setup completes and again whenever no AMF is ready.
+        match encode_cell_mib_barred(self.connection_manager.is_barred()) {
             Ok(mib) => {
                 self.broadcast_rrc_message(RrcChannel::BcchBch, OctetString::from_slice(&mib))
                     .await;
@@ -2963,6 +2973,7 @@ impl Task for RrcTask {
                     match msg {
                         TaskMessage::Message(rrc_msg) => match rrc_msg {
                             RrcMessage::RadioPowerOn => self.handle_radio_power_on(),
+                            RrcMessage::RadioPowerOff => self.handle_radio_power_off(),
                             RrcMessage::SignalDetected { ue_id } => self.handle_signal_detected(ue_id),
                             RrcMessage::UplinkRrc { ue_id, rrc_channel, data, c_rnti } => {
                                 self.handle_uplink_rrc_with_c_rnti(ue_id, rrc_channel, data, c_rnti)
@@ -3539,6 +3550,47 @@ mod tests {
         assert!(task.connection_manager.is_barred());
         task.handle_radio_power_on();
         assert!(!task.connection_manager.is_barred());
+    }
+
+    /// #336: with no AMF ready the cell is barred ON THE AIR -- the broadcast MIB
+    /// says `cellBarred` -- not only for the RRC setups it would silently ignore;
+    /// powering on unbars it again.
+    #[test]
+    fn a_cell_with_no_amf_broadcasts_barred() {
+        use nextgsim_rrc::procedures::system_information::{decode_mib, CellBarredStatus};
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        let mib_barred = |rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>| {
+            let mut last = None;
+            while let Ok(TaskMessage::Message(RlsMessage::BroadcastRrc {
+                rrc_channel: RrcChannel::BcchBch,
+                data,
+                ..
+            })) = rx.try_recv()
+            {
+                last = Some(decode_mib(data.data()).expect("MIB").cell_barred);
+            }
+            last.expect("a MIB was broadcast")
+        };
+        run_async(async {
+            task.broadcast_system_information(false).await;
+            assert_eq!(
+                mib_barred(&mut rls_rx),
+                CellBarredStatus::Barred,
+                "before NG Setup"
+            );
+            task.handle_radio_power_on();
+            task.broadcast_system_information(false).await;
+            assert_eq!(mib_barred(&mut rls_rx), CellBarredStatus::NotBarred);
+            task.handle_radio_power_off();
+            task.broadcast_system_information(false).await;
+            assert_eq!(
+                mib_barred(&mut rls_rx),
+                CellBarredStatus::Barred,
+                "no AMF ready"
+            );
+        });
     }
 
     #[test]

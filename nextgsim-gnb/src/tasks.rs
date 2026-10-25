@@ -526,6 +526,9 @@ pub struct GutiMobileIdentity {
 pub enum RrcMessage {
     /// Radio power on (from NGAP after NG Setup)
     RadioPowerOn,
+    /// Radio power off (from NGAP when no AMF is ready any more): the cell is
+    /// barred until the next `RadioPowerOn` (#336).
+    RadioPowerOff,
     /// Signal detected from UE (from RLS)
     SignalDetected {
         /// UE ID

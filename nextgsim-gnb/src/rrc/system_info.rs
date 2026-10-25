@@ -76,6 +76,13 @@ const Q_RX_LEV_MIN: i8 = -70;
 /// in a 6-bit field would make a decoder that trusts the field wrong about a real
 /// network.
 pub fn mib_params() -> MibParams {
+    mib_params_barred(false)
+}
+
+/// The MIB with `cellBarred` set as the cell's admission state says (#336): a cell
+/// with no AMF to serve it is barred on the air, so idle UEs do not try to connect
+/// (TS 38.304 §5.3.1).
+pub fn mib_params_barred(barred: bool) -> MibParams {
     MibParams {
         system_frame_number: frame_clock::sfn_msb6(frame_clock::current_sfn()),
         sub_carrier_spacing_common: SubCarrierSpacingCommon::Scs30Or120,
@@ -85,7 +92,11 @@ pub fn mib_params() -> MibParams {
             coreset_zero: CORESET_ZERO,
             search_space_zero: SEARCH_SPACE_ZERO,
         },
-        cell_barred: CellBarredStatus::NotBarred,
+        cell_barred: if barred {
+            CellBarredStatus::Barred
+        } else {
+            CellBarredStatus::NotBarred
+        },
         intra_freq_reselection: IntraFreqReselection::Allowed,
     }
 }
@@ -138,6 +149,11 @@ pub fn sib1_params(config: &GnbConfig) -> Sib1Params {
 /// The encoded MIB (`BCCH-BCH-Message`) broadcast by this cell.
 pub fn encode_cell_mib() -> Result<Vec<u8>, SystemInformationError> {
     encode_mib(&mib_params())
+}
+
+/// [`encode_cell_mib`] with `cellBarred` from the cell's admission state (#336).
+pub fn encode_cell_mib_barred(barred: bool) -> Result<Vec<u8>, SystemInformationError> {
+    encode_mib(&mib_params_barred(barred))
 }
 
 /// The encoded SIB1 (`BCCH-DL-SCH-Message`) for this cell.
