@@ -35,21 +35,19 @@
 //!
 //! # Units
 //!
-//! The two quantities are signalled in DIFFERENT units, which is the whole reason
-//! [`a3_offset_signalled`] and [`hysteresis_signalled`] are named functions rather
-//! than arithmetic at each site:
+//! Both quantities are signalled in units of **0.5 dB** (TS 38.331 §6.3.2):
 //!
-//! * `a3-Offset` is a `MeasTriggerQuantityOffset`, `INTEGER (-30..30)` in units of
-//!   **1 dB** ("Values in the unit of 'dB'", TS 38.331 §6.3.2).
-//! * `hysteresis` is `INTEGER (0..30)` in units of **0.5 dB** ("The actual value
-//!   is field value * 0.5 dB", §6.3.2).
+//! * `a3-Offset` is a `MeasTriggerQuantityOffset`, `INTEGER (-30..30)`:
+//!   "Offset value(s) to be used in NR measurement report triggering condition for
+//!   event a3/a6. The actual value is field value * 0.5 dB" (EventTriggerConfig
+//!   field descriptions), so the range is -15..15 dB. Before #359 it was signalled
+//!   in whole dB: a 3 dB offset went out as 3, which a conformant UE reads as
+//!   1.5 dB.
+//! * `hysteresis` is `INTEGER (0..30)`: "The actual value is field value * 0.5 dB".
 //!
-//! Those are exactly the units the UE's own measurement runtime works in
-//! (`ReportTriggerConfig.a3_offset` is whole dB; `.hysteresis` is 0.5 dB units),
-//! which is why a received configuration installs with **no** further conversion —
-//! and why the conditional-handover path, whose container carries half-dB for
-//! both, converts through these same two functions rather than inlining a second
-//! copy of the arithmetic.
+//! The UE's measurement runtime works in the same 0.5 dB units
+//! (`ReportTriggerConfig.a3_offset` and `.hysteresis`), so a received configuration
+//! installs with **no** further conversion.
 
 use crate::codec::generated::*;
 use thiserror::Error;
@@ -70,20 +68,18 @@ const MAX_REPORT_CELLS_RANGE: std::ops::RangeInclusive<u8> = 1..=8;
 
 /// `a3-Offset` as the wire integer, from a value in dB.
 ///
-/// `MeasTriggerQuantityOffset ::= CHOICE { rsrp INTEGER (-30..30), … }` in units of
-/// **1 dB**, so a fractional dB cannot be signalled and rounds to the grid.
-///
-/// Not fused with [`hysteresis_signalled`]: the two IEs are in different units, and
-/// a single "to signalled units" helper would make one of the two call sites wrong
-/// by a factor of two with nothing at the site to show it.
+/// `MeasTriggerQuantityOffset ::= CHOICE { rsrp INTEGER (-30..30), … }`, and "the
+/// actual value is field value * 0.5 dB" (TS 38.331 §6.3.2), so the dB value
+/// doubles, a value off the half-dB grid rounds to it, and -15..15 dB is the range.
 pub fn a3_offset_signalled(db: f64) -> Result<i8, MeasConfigError> {
-    let rounded = db.round();
-    if !(-30.0..=30.0).contains(&rounded) {
+    let half_db = (db * 2.0).round();
+    if !(-30.0..=30.0).contains(&half_db) {
         return Err(MeasConfigError::InvalidFieldValue(format!(
-            "a3-Offset {db} dB is outside MeasTriggerQuantityOffset's INTEGER (-30..30)"
+            "a3-Offset {db} dB is {half_db} in 0.5 dB units, outside \
+             MeasTriggerQuantityOffset's INTEGER (-30..30)"
         )));
     }
-    Ok(rounded as i8)
+    Ok(half_db as i8)
 }
 
 /// `hysteresis` as the wire integer, from a value in dB.
@@ -134,9 +130,9 @@ pub struct A3MeasConfigParams {
 /// What a received `measConfig`'s A3 `measId` says, in the signalled units.
 ///
 /// Deliberately the WIRE units rather than dB: the UE's measurement runtime works
-/// in whole-dB offsets and 0.5 dB hysteresis, which is what the two IEs already
-/// carry, so a `measConfig` installs with no conversion and no rounding. A dB
-/// round trip here would introduce one.
+/// in 0.5 dB units for both, which is what the two IEs carry, so a `measConfig`
+/// installs with no conversion and no rounding. A dB round trip here would
+/// introduce one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct A3MeasConfigRead {
     /// `measId` this binding is under.
@@ -145,8 +141,8 @@ pub struct A3MeasConfigRead {
     pub meas_object_id: u8,
     /// `reportConfigId` the binding names.
     pub report_config_id: u8,
-    /// `a3-Offset` in whole dB, as signalled.
-    pub a3_offset_db: i8,
+    /// `a3-Offset` in 0.5 dB units, as signalled (TS 38.331 §6.3.2).
+    pub a3_offset_half_db: i8,
     /// `hysteresis` in 0.5 dB units, as signalled.
     pub hysteresis_half_db: u8,
     /// `timeToTrigger` in ms.
@@ -540,7 +536,7 @@ pub fn read_a3_meas_configs(config: &MeasConfig) -> Vec<A3MeasConfigRead> {
                 meas_id: binding.meas_id.0,
                 meas_object_id: object_id,
                 report_config_id: report_id,
-                a3_offset_db: offset.0,
+                a3_offset_half_db: offset.0,
                 hysteresis_half_db: a3.hysteresis.0,
                 time_to_trigger_ms: time_to_trigger_ms(a3.time_to_trigger.0)?,
                 report_interval_ms: report_interval_ms(event.report_interval.0)?,
@@ -580,15 +576,17 @@ mod tests {
     // rather than against each other.
     // ====================================================================
 
-    /// `a3-Offset` is whole dB: 3 dB is the integer 3, NOT 6.
+    /// `a3-Offset` is 0.5 dB units (TS 38.331 §6.3.2, EventTriggerConfig: "The
+    /// actual value is field value * 0.5 dB"): 3 dB is the integer 6, NOT 3 (#359).
     #[test]
-    fn the_a3_offset_is_signalled_in_whole_db() {
-        assert_eq!(a3_offset_signalled(3.0), Ok(3));
-        assert_eq!(a3_offset_signalled(-30.0), Ok(-30), "lower bound");
-        assert_eq!(a3_offset_signalled(30.0), Ok(30), "upper bound");
-        // Off the 1 dB grid: rounds, because there is no fractional dB to signal.
-        assert_eq!(a3_offset_signalled(3.4), Ok(3));
-        assert_eq!(a3_offset_signalled(3.6), Ok(4));
+    fn the_a3_offset_is_signalled_in_half_db_units() {
+        assert_eq!(a3_offset_signalled(3.0), Ok(6));
+        assert_eq!(a3_offset_signalled(1.5), Ok(3), "the grid step is 0.5 dB");
+        assert_eq!(a3_offset_signalled(-15.0), Ok(-30), "lower bound, -15 dB");
+        assert_eq!(a3_offset_signalled(15.0), Ok(30), "upper bound, 15 dB");
+        // Off the 0.5 dB grid: rounds to it.
+        assert_eq!(a3_offset_signalled(3.2), Ok(6));
+        assert_eq!(a3_offset_signalled(3.3), Ok(7));
     }
 
     /// `hysteresis` is 0.5 dB units: 1 dB is the integer 2, NOT 1.
@@ -608,8 +606,10 @@ mod tests {
     /// Past the ends of either INTEGER is refused rather than clamped or wrapped.
     #[test]
     fn an_out_of_range_offset_or_hysteresis_is_refused() {
-        assert!(a3_offset_signalled(31.0).is_err());
-        assert!(a3_offset_signalled(-31.0).is_err());
+        // 15.5 dB is 31 in half-dB units, one past `INTEGER (-30..30)`.
+        assert!(a3_offset_signalled(15.5).is_err());
+        assert!(a3_offset_signalled(-15.5).is_err());
+        assert!(a3_offset_signalled(30.0).is_err(), "the old whole-dB bound");
         // 15.5 dB is 31 in half-dB units, one past `INTEGER (0..30)`.
         assert!(hysteresis_signalled(15.5).is_err());
         assert!(hysteresis_signalled(-0.5).is_err());
@@ -648,7 +648,7 @@ mod tests {
                 report_config_id: 1,
                 ssb_frequency_arfcn: 0,
                 ssb_subcarrier_spacing_khz: 15,
-                a3_offset_db: -30.0,
+                a3_offset_db: -15.0,
                 hysteresis_db: 0.0,
                 time_to_trigger_ms: 0,
                 report_interval_ms: 120,
@@ -662,7 +662,7 @@ mod tests {
                 report_config_id: 64,
                 ssb_frequency_arfcn: ARFCN_VALUE_NR_MAX,
                 ssb_subcarrier_spacing_khz: 240,
-                a3_offset_db: 30.0,
+                a3_offset_db: 15.0,
                 hysteresis_db: 15.0,
                 time_to_trigger_ms: 5120,
                 report_interval_ms: 1_800_000,
@@ -714,7 +714,7 @@ mod tests {
     // units the UE installs them in.
     // ====================================================================
 
-    /// A gNB's 3 dB / 1 dB reaches the reader as 3 whole dB and 2 half-dB units.
+    /// A gNB's 3 dB / 1 dB reaches the reader as 6 and 2 half-dB units.
     #[test]
     fn the_configured_margin_survives_the_wire() {
         let config = build_a3_meas_config(&default_params()).expect("build");
@@ -729,7 +729,7 @@ mod tests {
                 meas_id: 1,
                 meas_object_id: 1,
                 report_config_id: 1,
-                a3_offset_db: 3,
+                a3_offset_half_db: 6,
                 hysteresis_half_db: 2,
                 time_to_trigger_ms: 640,
                 report_interval_ms: 480,
@@ -766,13 +766,73 @@ mod tests {
                 meas_id: 5,
                 meas_object_id: 3,
                 report_config_id: 4,
-                a3_offset_db: 7,
+                a3_offset_half_db: 14,
                 hysteresis_half_db: 5,
                 time_to_trigger_ms: 256,
                 report_interval_ms: 1024,
                 report_amount: Some(2),
                 max_report_cells: 6,
             }]
+        );
+    }
+
+    /// #359: the `a3-Offset` field on the wire is the spec's value, not just a
+    /// value this codec agrees with itself on. 3 dB is field value 6 (TS 38.331
+    /// §6.3.2: "field value * 0.5 dB"): the structure the builder emits carries
+    /// `MeasTriggerQuantityOffset::Rsrp(6)`, and a measConfig a conformant gNB
+    /// built with field value 3 reads back as 1.5 dB (3 half-dB units).
+    #[test]
+    fn the_a3_offset_field_carries_the_spec_value() {
+        let config = build_a3_meas_config(&default_params()).expect("build");
+        let field = |config: &MeasConfig| {
+            let report = &config
+                .report_config_to_add_mod_list
+                .as_ref()
+                .expect("report")
+                .0[0];
+            let ReportConfigToAddModReportConfig::ReportConfigNR(nr) = &report.report_config else {
+                panic!("NR report config");
+            };
+            let ReportConfigNRReportType::EventTriggered(event) = &nr.report_type else {
+                panic!("event triggered");
+            };
+            let EventTriggerConfigEventId::EventA3(a3) = &event.event_id else {
+                panic!("event A3");
+            };
+            let MeasTriggerQuantityOffset::Rsrp(offset) = &a3.a3_offset else {
+                panic!("RSRP");
+            };
+            offset.0
+        };
+        let bytes = encode_rrc(&config).expect("encode");
+        let decoded: MeasConfig = decode_rrc(&bytes).expect("decode");
+        assert_eq!(field(&decoded), 6, "3 dB on the wire is field value 6");
+
+        // A peer's field value 3 is 1.5 dB.
+        let mut peer = decoded;
+        {
+            let report = &mut peer
+                .report_config_to_add_mod_list
+                .as_mut()
+                .expect("report")
+                .0[0];
+            let ReportConfigToAddModReportConfig::ReportConfigNR(nr) = &mut report.report_config
+            else {
+                panic!("NR report config");
+            };
+            let ReportConfigNRReportType::EventTriggered(event) = &mut nr.report_type else {
+                panic!("event triggered");
+            };
+            let EventTriggerConfigEventId::EventA3(a3) = &mut event.event_id else {
+                panic!("event A3");
+            };
+            a3.a3_offset = MeasTriggerQuantityOffset::Rsrp(MeasTriggerQuantityOffset_rsrp(3));
+        }
+        let peer = decode_rrc::<MeasConfig>(&encode_rrc(&peer).expect("encode")).expect("decode");
+        assert_eq!(
+            read_a3_meas_configs(&peer)[0].a3_offset_half_db,
+            3,
+            "1.5 dB"
         );
     }
 

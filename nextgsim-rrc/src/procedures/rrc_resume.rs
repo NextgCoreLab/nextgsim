@@ -671,7 +671,7 @@ mod tests {
         );
         let read = read_a3_meas_configs(&data.meas_config.expect("carried"));
         assert_eq!(read.len(), 1);
-        assert_eq!(read[0].a3_offset_db, 5, "5 dB, in whole dB");
+        assert_eq!(read[0].a3_offset_half_db, 10, "5 dB, in 0.5 dB units");
         assert_eq!(read[0].hysteresis_half_db, 4, "2 dB, in 0.5 dB units");
         assert_eq!(read[0].time_to_trigger_ms, 320);
     }

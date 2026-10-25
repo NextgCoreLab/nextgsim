@@ -1740,7 +1740,7 @@ mod tests {
             .expect("a fullConfig resume must carry a measConfig or the UE measures nothing");
         let read = nextgsim_rrc::procedures::meas_config::read_a3_meas_configs(&signalled);
         assert_eq!(read.len(), 1, "one A3 reporting binding");
-        assert_eq!(read[0].a3_offset_db, 9, "9 dB, in whole dB");
+        assert_eq!(read[0].a3_offset_half_db, 18, "9 dB, in 0.5 dB units");
         assert_eq!(read[0].hysteresis_half_db, 9, "4.5 dB, in 0.5 dB units");
     }
 

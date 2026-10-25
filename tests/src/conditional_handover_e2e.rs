@@ -231,9 +231,9 @@ async fn the_gnbs_configured_margin_governs_the_ues_a3_reporting() {
 
     assert_eq!(
         h.ue.a3_margin(1),
-        Some((3, 2)),
+        Some((6, 2)),
         "precondition: before the measConfig the UE is on its OWN default (3 dB / 1 dB \
-         = 2 half-dB), which is NOT the gNB's 9 dB / 3.5 dB"
+         = 6 / 2 half-dB), which is NOT the gNB's 9 dB / 3.5 dB"
     );
 
     // The gNB's live DRB reconfiguration, built from its own configuration by the same
@@ -262,7 +262,7 @@ async fn the_gnbs_configured_margin_governs_the_ues_a3_reporting() {
     assert_eq!(
         h.ue.a3_margin(1),
         Some((
-            config.cho_a3_offset_db as i32,
+            (config.cho_a3_offset_db * 2.0) as i32,
             (config.cho_hysteresis_db * 2.0) as i32
         )),
         "the UE's A3 REPORTING margin must equal the gNB's configured margin -- the \

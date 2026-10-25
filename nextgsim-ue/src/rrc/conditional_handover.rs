@@ -301,7 +301,8 @@ fn map_condition(condition: &ChoCondition) -> Option<(MeasEventType, ReportTrigg
                 threshold: None,
                 threshold1: None,
                 threshold2: None,
-                a3_offset: Some(a3.a3_offset.0.round() as i32),
+                // 0.5 dB units, like the hysteresis below (#359)
+                a3_offset: Some((a3.a3_offset.0 * 2.0).round() as i32),
                 a6_offset: None,
                 hysteresis: (a3.hysteresis.0 * 2.0).round() as i32,
                 time_to_trigger: u64::from(a3.time_to_trigger.to_ms()),

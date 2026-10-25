@@ -7006,7 +7006,10 @@ mod tests {
             read[0].meas_id, 1,
             "measId 1, which REPLACES the UE's pre-signalling default"
         );
-        assert_eq!(read[0].a3_offset_db, 11, "the gNB's configured 11 dB");
+        assert_eq!(
+            read[0].a3_offset_half_db, 22,
+            "the gNB's configured 11 dB, in 0.5 dB units"
+        );
         assert_eq!(
             read[0].hysteresis_half_db, 7,
             "the gNB's configured 3.5 dB, in 0.5 dB units"

@@ -132,7 +132,7 @@ si_broadcast_period_ms: 80
 | `dl_arfcn` | u32 | 632448 | Downlink ARFCN of this cell, bound into the KgNB* derivation of a handover and an RRC re-establishment; every gNB and UE must hold the same value (RLS carries no carrier frequency) |
 | `scell_phys_cell_id` | u16 | none | `physCellId` of a secondary cell to configure on each UE (event A6) |
 | `conditional_handover` | bool | false | Nominate the configured intra-frequency neighbours as conditional-handover candidates |
-| `cho_a3_offset_db` | f64 | 3.0 | `a3-Offset` in dB: of the UE's A3 measurement configuration, the CHO execution condition, and the gNB's handover decision on a MeasurementReport |
+| `cho_a3_offset_db` | f64 | 3.0 | `a3-Offset` in dB: of the UE's A3 measurement configuration, the CHO execution condition, and the gNB's handover decision on a MeasurementReport. Signalled in 0.5 dB units (TS 38.331 §6.3.2): -15..15 dB in 0.5 dB steps |
 | `cho_hysteresis_db` | f64 | 1.0 | Hysteresis in dB, for the same three |
 | `sim_position` | `{x, y, z}` (metres, i32) | origin | Where the gNB stands. Each UE's received level is -1 dBm per metre of distance to its own `sim_position`; levels above -31 dBm all report as -31 (RSRP-Range), and a cell below -120 dBm is not heard |
 | `handover_neighbours` | list of `{nci, tac, gnb_id_length?}` | `[]` | Other gNBs' cells a measurement-triggered handover may target. A reported `physCellId` (`nci % 1008`) is matched against them; the match names the target gNB ID (top `gnb_id_length` bits of `nci`, default this gNB's) and TAC for HANDOVER REQUIRED. A PCI matching none is not handed over to |
