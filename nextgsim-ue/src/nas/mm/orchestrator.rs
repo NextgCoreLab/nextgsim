@@ -2497,7 +2497,10 @@ impl MmOrchestrator {
         if self.pending_is_registration_update() {
             return self.abnormal_registration_update_failure();
         }
-        self.registration_attempt_counter += 1;
+        // §5.5.1.2.7: "incremented, unless it was already set to 5"
+        if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
+            self.registration_attempt_counter += 1;
+        }
         if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
             info!(
                 "Registration attempt {} of {} failed; starting T3511",
@@ -2506,21 +2509,40 @@ impl MmOrchestrator {
             self.state
                 .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
             self.timers.start(TIMER_T3511, true);
+            Vec::new()
         } else {
             warn!(
-                "Registration attempt counter reached {}; starting T3502",
+                "Registration attempt counter reached {}; deleting the registration context, \
+                 starting T3502",
                 MAX_REGISTRATION_ATTEMPTS
             );
+            // §5.5.1.2.7, counter equal to 5: delete the TAI list and the last
+            // visited registered TAI and, for a UE not registered over both
+            // accesses (this one is single access), the 5G-GUTI, the ngKSI and
+            // the list of equivalent PLMNs (#343). Kept, the T3502 retry
+            // presented the identity the network had failed on five times.
+            // `delete_registration_context` also removes the stored copy
+            // (Annex C.1).
+            self.delete_registration_context();
+            self.current_tai = None;
             self.state.switch_update_status(UpdateStatus::NotUpdated);
             self.state
                 .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
+            // A network T3502 of zero starts a zero-length timer, which expires
+            // on the next tick: "the actions defined for the expiry of the
+            // timer T3502".
             if let Some(timer3) = self.t3502_value {
                 self.timers.start_with_timer3(TIMER_T3502, timer3, true);
             } else {
                 self.timers.start(TIMER_T3502, true);
             }
+            if self.equivalent_plmns.is_empty() {
+                Vec::new()
+            } else {
+                self.equivalent_plmns.clear();
+                vec![MmOutput::EquivalentPlmnsUpdated(Vec::new())]
+            }
         }
-        Vec::new()
     }
 
     /// Abnormal failure of a mobility or periodic registration update
@@ -5918,6 +5940,79 @@ mod tests {
         let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3502, true, 1));
         assert!(!outs.is_empty());
         assert_eq!(orch.registration_attempt_counter(), 0);
+    }
+
+    /// #343, TS 24.501 §5.5.1.2.7: the fifth failed initial registration
+    /// deletes the TAI list, the last visited registered TAI, the 5G-GUTI, the
+    /// ngKSI and the equivalent PLMNs (and the stored copy), so the T3502 retry
+    /// registers with the SUCI and no stale context. The first four keep them.
+    #[test]
+    fn the_fifth_failed_initial_registration_deletes_the_registration_context() {
+        let (_, path) = state_file_config("fifth-failure");
+        let mut orch = establish_security_context();
+        orch.state_file = Some(path.clone());
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.persist_state();
+        assert!(path.exists(), "precondition: state persisted");
+        orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+        assert!(orch.stored_guti().is_some() && orch.tai_list.is_some());
+        assert!(orch.current_tai.is_some());
+
+        // Network de-registration, then initial registrations the network
+        // never answers
+        orch.state_mut()
+            .switch_mm_state(MmSubState::DeregisteredNormalService);
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let mut last = Vec::new();
+        for i in 1..=MAX_REGISTRATION_ATTEMPTS {
+            // The network never answers: T3510 expires (§5.5.1.2.7 c))
+            last = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+            if i < MAX_REGISTRATION_ATTEMPTS {
+                assert!(orch.stored_guti().is_some(), "attempt {i}: kept");
+                assert!(orch.sec.is_active(), "attempt {i}: ngKSI kept");
+                orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, i));
+            }
+        }
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
+        assert!(orch.timers().t3502.is_running());
+        assert!(orch.stored_guti().is_none(), "5G-GUTI deleted");
+        assert!(orch.tai_list.is_none(), "TAI list deleted");
+        assert!(
+            orch.current_tai.is_none(),
+            "last visited registered TAI deleted"
+        );
+        assert!(!orch.sec.is_active(), "ngKSI deleted");
+        assert!(orch.equivalent_plmns.is_empty());
+        assert!(
+            last.contains(&MmOutput::EquivalentPlmnsUpdated(Vec::new())),
+            "{last:?}"
+        );
+        assert!(!path.exists(), "the stored copy goes too");
+
+        // The T3502 retry registers with the SUCI and no last visited TAI
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3502, true, 1));
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.mobile_identity.identity_type, MobileIdentityType::Suci);
+        assert_eq!(full.last_visited_tai, None);
+    }
+
+    /// #343, §5.5.1.2.7: the counter is not incremented past 5.
+    #[test]
+    fn the_registration_attempt_counter_stops_at_five() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        for _ in 0..MAX_REGISTRATION_ATTEMPTS + 2 {
+            let pdu = build_registration_reject_pdu(MmCause::ProtocolErrorUnspecified, None);
+            orch.handle_downlink(&pdu);
+        }
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
     }
 
     /// The TAI the test registration accept's TAI list holds: PLMN 999/70, TAC 1.
