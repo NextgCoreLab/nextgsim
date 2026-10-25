@@ -735,6 +735,11 @@ pub struct MmOrchestrator {
     /// update once the N1 NAS signalling connection is released (TS 24.501
     /// §5.6.1.5 #28, #313).
     mobility_registration_on_release: bool,
+    /// The lower layers reported a radio link failure ("RRC Connection
+    /// failure") and no registration has run since (#372): the next cell change
+    /// recovers the NAS signalling connection with a mobility update, whatever
+    /// its TA (TS 24.501 §5.5.1.3.2 f)).
+    connection_recovery_pending: bool,
 
     // -- SUCI freshness (TS 24.501 §5.4.3.3 / §5.5.1.2.2) --
     /// The last SUCI sent to the network. Reused while T3519 is running instead
@@ -835,6 +840,7 @@ impl MmOrchestrator {
             dereg_pdu: None,
             reregistration_on_release: false,
             mobility_registration_on_release: false,
+            connection_recovery_pending: false,
             stored_suci: None,
             ue_policy_sections: HashMap::new(),
             updp_pti: 0,
@@ -1408,7 +1414,17 @@ impl MmOrchestrator {
     ///   TAI differs from the one the failed update was sent in. A re-camp in
     ///   the same TA must not bypass the retry timer (#275); a move to another TA
     ///   must not wait it out (§5.2.3.2.3 d), up to 12 minutes of T3502).
-    /// - Otherwise: yes, as before.
+    /// - Otherwise, only when an update is due (#372):
+    ///   - §5.5.1.3.2 a): the serving TAI is not in the TAI list (or either is
+    ///     unknown, so nothing shows the UE is inside its registration area);
+    ///   - §5.5.1.3.2 f): the lower layers reported an RRC connection failure
+    ///     since the last registration (`on_radio_link_failure`), so the
+    ///     connection is recovered with an update in any TA;
+    ///   - the update status is 5U2 NOT UPDATED, or the UE is in
+    ///     ATTEMPTING-REGISTRATION-UPDATE: the last update did not complete.
+    ///
+    ///   A change to a cell in the TAI list starts nothing. Before #372 every
+    ///   cell change ran an update.
     pub fn registration_update_on_cell_change(&self) -> bool {
         if !self.state.is_registered() {
             return false;
@@ -1426,7 +1442,21 @@ impl MmOrchestrator {
                 _ => false,
             };
         }
-        true
+        !self.serving_tai_in_tai_list()
+            || self.connection_recovery_pending
+            || self.state.update_status() == UpdateStatus::NotUpdated
+            || self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
+    }
+
+    /// The lower layers reported a radio link failure (#372). The NAS
+    /// signalling connection is gone, and §5.5.1.3.2 f) recovers it with a
+    /// mobility registration update once the UE camps again, in the same TA or
+    /// another.
+    pub fn on_radio_link_failure(&mut self) -> Vec<MmOutput> {
+        if self.state.is_registered() {
+            self.connection_recovery_pending = true;
+        }
+        self.on_nas_signalling_connection_released()
     }
 
     /// Whether the serving cell's TAI is in the stored TAI list. False when
@@ -1756,6 +1786,8 @@ impl MmOrchestrator {
 
     /// Build, record and emit a Registration Request; arms T3510.
     fn build_and_send_registration(&mut self, reg_type: RegistrationType) -> Vec<MmOutput> {
+        // Any registration recovers the connection (§5.5.1.3.2 f), #372)
+        self.connection_recovery_pending = false;
         if matches!(
             reg_type,
             RegistrationType::MobilityRegistrationUpdating
@@ -5941,6 +5973,84 @@ mod tests {
         orch.state_mut()
             .switch_mm_state(MmSubState::RegisteredNormalService);
         assert!(orch.uplink_user_plane_ready());
+    }
+
+    /// A registered UE, 5U1 UPDATED, in 5GMM-IDLE, whose TAI list holds
+    /// TAI_IN_LIST (#372).
+    fn registered_idle_updated() -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert_eq!(orch.state().update_status(), UpdateStatus::Updated);
+        assert_eq!(
+            orch.state().mm_substate(),
+            MmSubState::RegisteredNormalService
+        );
+        orch
+    }
+
+    /// #372, TS 24.501 §5.5.1.3.2 a): a cell change inside the TAI list starts
+    /// no update; one into a TA outside the list does, and so does one with no
+    /// TAI list or no serving TAI known.
+    #[test]
+    fn only_a_cell_change_out_of_the_tai_list_starts_an_update() {
+        let mut orch = registered_idle_updated();
+        orch.set_serving_tai(TAI_IN_LIST);
+        assert!(
+            !orch.registration_update_on_cell_change(),
+            "inside the TAI list"
+        );
+        orch.set_serving_tai(TAI_NOT_IN_LIST);
+        assert!(orch.registration_update_on_cell_change(), "a new TA");
+
+        let mut orch = registered_idle_updated();
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "serving TAI unknown"
+        );
+        orch.set_serving_tai(TAI_IN_LIST);
+        orch.tai_list = None;
+        assert!(
+            orch.registration_update_on_cell_change(),
+            "TAI list unknown"
+        );
+    }
+
+    /// #372, §5.5.1.3.2 f): after a radio link failure the next camp recovers
+    /// the connection with an update even inside the TAI list (the #264 / #337
+    /// recovery). A plain RRC release does not, and the registration clears it.
+    #[test]
+    fn a_radio_link_failure_recovers_with_an_update_in_the_same_ta() {
+        let mut orch = registered_idle_updated();
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.set_serving_tai(TAI_IN_LIST);
+        orch.on_nas_signalling_connection_released();
+        assert!(
+            !orch.registration_update_on_cell_change(),
+            "a plain release"
+        );
+
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.on_radio_link_failure();
+        assert!(orch.state().is_idle());
+        assert!(orch.registration_update_on_cell_change(), "after an RLF");
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        assert!(!outs.is_empty());
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 2);
+        orch.handle_downlink(&acc);
+        assert!(!orch.registration_update_on_cell_change(), "recovered");
+    }
+
+    /// #372: an update that did not complete (5U2 NOT UPDATED) is still due on
+    /// a cell change inside the TAI list.
+    #[test]
+    fn a_not_updated_ue_updates_on_any_cell_change() {
+        let mut orch = registered_idle_updated();
+        orch.set_serving_tai(TAI_IN_LIST);
+        orch.state_mut()
+            .switch_update_status(UpdateStatus::NotUpdated);
+        assert!(orch.registration_update_on_cell_change());
     }
 
     /// A UE that is not registered never starts an update on a cell change.
