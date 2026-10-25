@@ -3838,6 +3838,8 @@ impl RrcTask {
         // A suspension for a re-establishment does not outlive the connection it
         // was for: the next connection's SRB1 starts afresh (#348 run).
         self.srb1_suspended_for_reestablishment = false;
+        // Nor does a handover's source snapshot (#415 review).
+        self.handover_source = None;
 
         info!("RRC connection released");
 
@@ -4445,13 +4447,24 @@ impl RrcTask {
         // than after the sync, so a UE that reaches the target already holds the right
         // keys (issue #39).
         // §5.3.5.8.3: T304 expiry reverts to the source PCell's configuration,
-        // so it is kept before the target's replaces it (#399).
-        self.handover_source = Some(HandoverSourceSecurity {
-            as_security: self.as_security.clone(),
-            as_ncc: self.as_ncc,
-            nh_chain: self.nh_chain,
-            rekeyed: key_update.is_some(),
-        });
+        // so it is kept before the target's replaces it (#399). A second
+        // command while the first is still synchronising keeps the snapshot:
+        // the source PCell's is the configuration to revert to, not the first
+        // target's (#415 review).
+        match self.handover_source.as_mut() {
+            None => {
+                self.handover_source = Some(HandoverSourceSecurity {
+                    as_security: self.as_security.clone(),
+                    as_ncc: self.as_ncc,
+                    nh_chain: self.nh_chain,
+                    rekeyed: key_update.is_some(),
+                });
+            }
+            Some(source) => source.rekeyed |= key_update.is_some(),
+        }
+        // §5.3.5.5.2: a reconfigurationWithSync stops T310; while T304 runs the
+        // source's radio link is not monitored (§5.3.10.3, #415 review).
+        self.rlf_detector.reset();
         if let Some(update) = key_update {
             self.apply_master_key_update(update, target_pci);
             // The DRBs this UE keeps run on the target's K_UP keys (#325)
@@ -5039,6 +5052,8 @@ impl RrcTask {
         // was for: the next connection's SRB1 starts afresh (#348 run).
         self.srb1_suspended_for_reestablishment = false;
         self.reestablishment_awaiting_sib1 = None;
+        // A source snapshot does not outlive the connection (#415 review).
+        self.handover_source = None;
         self.serving_cell_id = None;
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
@@ -5062,6 +5077,18 @@ impl RrcTask {
     /// (`RrcMessage::RadioLinkFailure`) also driven directly by the in-process
     /// gNB<->UE harness (`tests/src/rrc_handshake.rs`, #264).
     pub async fn handle_radio_link_failure(&mut self, cause: RlfCause) {
+        if self.handover_manager.is_in_progress() {
+            // TS 38.331 §5.3.10.3: no radio link failure of the source is
+            // declared while T304 runs; T304 decides the handover, and its
+            // expiry re-establishes from the source keys (§5.3.5.8.3). Taken
+            // here, the re-establishment would be keyed from the target's
+            // KgNB* (#415 review).
+            warn!(
+                "Radio link failure ({cause:?}) while T304 runs: ignored, the handover's \
+                 T304 governs (TS 38.331 §5.3.10.3)"
+            );
+            return;
+        }
         warn!("Radio link failure: {:?}", cause);
 
         // Map RLF cause to re-establishment trigger
@@ -5078,6 +5105,10 @@ impl RrcTask {
     /// §5.3.7.2), or, with no AS security to re-establish under, goes to
     /// RRC_IDLE. Shared by a radio link failure and a T304 expiry (#399).
     async fn initiate_reestablishment(&mut self, trigger: ReestablishmentTrigger) {
+        // A re-establishment always keys from the source PCell's configuration
+        // when a handover command replaced it (§5.3.5.8.3, §5.3.7.4); a no-op
+        // when none did, or when the T304 path already reverted.
+        self.revert_to_source_security().await;
         // Per TS 38.331 §5.3.7.2 re-establishment is only initiated when AS
         // security has been activated; otherwise the UE goes to RRC_IDLE.
         let security = if self.state_machine.state().has_connection_context()
@@ -10989,6 +11020,99 @@ mod tests {
                 );
             });
         }
+    }
+
+    /// #415 review, TS 38.331 §5.3.10.3: a radio link failure reported while
+    /// T304 runs (the source fading during the synchronisation) is not
+    /// declared; T304 decides. Its expiry then re-establishes with the SOURCE
+    /// keys, so the RRCReestablishmentRequest's shortMAC-I is the one the
+    /// source gNB verifies. Before, the failure re-established at once from
+    /// the target's KgNB*.
+    #[test]
+    fn a_radio_link_failure_during_t304_does_not_re_establish_with_the_target_keys() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let source = task.as_security.clone().expect("keyed");
+            let source_pci = task
+                .cell_selector
+                .get_cell(1)
+                .map(|c| phys_cell_id_from_nci(c.sib1.nci as u64))
+                .unwrap();
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            let target = task.as_security.clone().expect("keyed");
+            assert!(task.handover_manager.is_in_progress());
+
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            assert!(
+                !task.reestablishment_proc.is_in_progress(),
+                "no re-establishment while T304 runs"
+            );
+            assert!(
+                task.handover_manager.is_in_progress(),
+                "the handover goes on"
+            );
+            while nas_rx.try_recv().is_ok() {}
+
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_signal_changed(1, i32::MIN).await;
+            task.handle_signal_changed(2, -60).await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            let (_, bytes) = next_uplink_rrc(&mut rls_rx);
+            let req = decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+            assert_eq!(
+                req.ue_identity.short_mac_i,
+                compute_short_mac_i(&source, source_pci, 0x20).unwrap(),
+                "source-keyed"
+            );
+            assert_ne!(
+                req.ue_identity.short_mac_i,
+                compute_short_mac_i(&target, source_pci, 0x20).unwrap()
+            );
+        });
+    }
+
+    /// #415 review: a second handover command while the first synchronises
+    /// keeps the SOURCE snapshot, so T304 reverts to the source PCell's keys,
+    /// not the first target's; a release drops the snapshot.
+    #[test]
+    fn a_second_handover_command_keeps_the_source_snapshot() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let source = task.as_security.clone().expect("keyed").kgnb;
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+            assert_eq!(task.as_security.as_ref().unwrap().kgnb, source);
+
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            assert!(task.handover_source.is_some());
+            task.handle_rrc_release().await;
+            assert!(
+                task.handover_source.is_none(),
+                "released with the connection"
+            );
+        });
     }
 
     /// #399: a handover that completes keeps the target's keys; the source
