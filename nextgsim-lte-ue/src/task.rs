@@ -176,6 +176,12 @@ async fn run_inner(
             r = socket.recv_from(&mut buf) => {
                 let (n, from) = r?;
                 match rls_codec::decode(&buf[..n]) {
+                    // #345: an ack from outside the eNB search list is
+                    // unsolicited and creates no cell
+                    Ok(RlsMessage::HeartbeatAck(_)) if !cells.admits(&from) => {
+                        log::debug!("HeartbeatAck from {from} (not in the eNB search list) dropped");
+                        Vec::new()
+                    }
                     Ok(RlsMessage::HeartbeatAck(ack)) => {
                         cells.process_heartbeat_ack(ack.sti, from, &ack);
                         cell_addr.insert(ack.sti, from);
