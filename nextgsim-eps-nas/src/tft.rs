@@ -574,11 +574,16 @@ pub fn apply_operation(
         // a) 4)
         TftOperation::DeleteExisting if dedicated => return Err(TftError::SemanticOperation),
         TftOperation::DeleteExisting => out.clear(),
+        // d) 1) / d) 2): an old filter with a new one's identifier, or with
+        // its precedence (the clash "among all TFTs" includes this one), is
+        // deleted
         TftOperation::AddFilters | TftOperation::ReplaceFilters => {
-            for f in &tft.filters {
-                out.retain(|x| x.id != f.id);
-                out.push(f.clone());
-            }
+            out.retain(|x| {
+                !tft.filters
+                    .iter()
+                    .any(|f| f.id == x.id || f.precedence == x.precedence)
+            });
+            out.extend(tft.filters.iter().cloned());
         }
         TftOperation::DeleteFilters => {
             out.retain(|x| !tft.deleted_ids.contains(&x.id));
@@ -780,6 +785,24 @@ mod tests {
         .unwrap();
         assert_eq!(replaced.len(), 2);
         assert_eq!(replaced[1].components, vec![FilterComponent::Protocol(17)]);
+        // Add with the precedence of one of this TFT's own filters: the old
+        // one is deleted (d) 2), "among all TFTs")
+        let same_precedence = PacketFilter {
+            precedence: 0x10,
+            ..filter(3, 6)
+        };
+        assert_eq!(
+            apply_operation(
+                &replaced,
+                &op(TftOperation::AddFilters, vec![same_precedence], vec![]),
+                true
+            )
+            .unwrap()
+            .iter()
+            .map(|f| (f.id, f.precedence))
+            .collect::<Vec<_>>(),
+            vec![(2, 0x22), (3, 0x10)]
+        );
         // Replace of a filter that does not exist adds it (b) 3))
         assert_eq!(
             apply_operation(
