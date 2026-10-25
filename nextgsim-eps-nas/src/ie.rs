@@ -359,6 +359,61 @@ pub fn gprs_timer_seconds(octet: u8) -> Option<u64> {
     }
 }
 
+/// A GPRS timer 3 value (TS 24.008 §10.5.7.4a) in seconds, as the T3412
+/// extended value IE (§9.9.3.16B) of an integrity-protected message reads it:
+/// unit 110 is 320 hours (NOTE 1). `None` when deactivated; unit 111 is not
+/// applicable to T3412 and makes the IE count as absent (NOTE 2), which the
+/// caller decides.
+pub fn gprs_timer3_seconds(octet: u8) -> Option<u64> {
+    let value = u64::from(octet & 0x1F);
+    match octet >> 5 {
+        0 => Some(value * 600),
+        1 => Some(value * 3600),
+        2 => Some(value * 36_000),
+        3 => Some(value * 2),
+        4 => Some(value * 30),
+        5 => Some(value * 60),
+        6 => Some(value * 320 * 3600),
+        _ => None,
+    }
+}
+
+/// EPS bearer context status (§9.9.2.1): bit `n` is EBI(n), "not BEARER
+/// CONTEXT-INACTIVE" when set. Octet 3 carries EBI(7)..EBI(0) in bits 8..1,
+/// octet 4 EBI(15)..EBI(8); EBI(0) is spare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EpsBearerContextStatus(u16);
+
+impl EpsBearerContextStatus {
+    /// The status with `ebis` active (EBIs outside 1..=15 are ignored).
+    pub fn from_ebis(ebis: impl IntoIterator<Item = u8>) -> Self {
+        Self(
+            ebis.into_iter()
+                .filter(|e| (1..=15).contains(e))
+                .fold(0, |acc, e| acc | 1 << e),
+        )
+    }
+
+    /// Whether EBI `ebi` is not BEARER CONTEXT-INACTIVE.
+    pub fn is_active(self, ebi: u8) -> bool {
+        (1..=15).contains(&ebi) && self.0 & (1 << ebi) != 0
+    }
+
+    /// The value part: octets 3 and 4.
+    pub fn encode(self) -> [u8; 2] {
+        [(self.0 & 0xFF) as u8, (self.0 >> 8) as u8]
+    }
+
+    /// Decode the value part. Octets past 4 are ignored, as a longer IE from a
+    /// later release would be; the spare EBI(0) bit is not read.
+    pub fn decode(v: &[u8]) -> Result<Self, NasDecodeError> {
+        let [lo, hi, ..] = v else {
+            return Err(NasDecodeError::Invalid("EPS bearer context status length"));
+        };
+        Ok(Self(u16::from_le_bytes([*lo, *hi]) & !1))
+    }
+}
+
 /// A tracking area identity (§9.9.3.32).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tai {
@@ -584,5 +639,40 @@ mod tests {
                 (0x78, &b[9..11]),
             ]
         );
+    }
+
+    /// #356, §9.9.2.1: EBI(n) is bit n of the two octets, EBI(7)..EBI(0) in
+    /// octet 3 and EBI(15)..EBI(8) in octet 4.
+    #[test]
+    fn eps_bearer_context_status_matches_its_9_9_2_1_layout() {
+        assert_eq!(EpsBearerContextStatus::from_ebis([5]).encode(), [0x20, 0x00]);
+        assert_eq!(EpsBearerContextStatus::from_ebis([9]).encode(), [0x00, 0x02]);
+        assert_eq!(
+            EpsBearerContextStatus::from_ebis([5, 6, 15]).encode(),
+            [0x60, 0x80]
+        );
+        assert_eq!(
+            EpsBearerContextStatus::from_ebis([0, 16]).encode(),
+            [0, 0],
+            "EBI(0) is spare; 16 is no EBI"
+        );
+        let s = EpsBearerContextStatus::decode(&[0x21, 0x02]).unwrap();
+        assert!(s.is_active(5) && s.is_active(9));
+        assert!(!s.is_active(6) && !s.is_active(0), "the spare bit is not read");
+        assert!(EpsBearerContextStatus::decode(&[0x20]).is_err());
+    }
+
+    /// TS 24.008 §10.5.7.4a: GPRS timer 3 units, 320 hours for 110 in a
+    /// protected message (NOTE 1).
+    #[test]
+    fn gprs_timer_3_units() {
+        assert_eq!(gprs_timer3_seconds(0b000_00011), Some(1800));
+        assert_eq!(gprs_timer3_seconds(0b001_00010), Some(7200));
+        assert_eq!(gprs_timer3_seconds(0b010_00001), Some(36_000));
+        assert_eq!(gprs_timer3_seconds(0b011_00101), Some(10));
+        assert_eq!(gprs_timer3_seconds(0b100_00010), Some(60));
+        assert_eq!(gprs_timer3_seconds(0b101_00011), Some(180));
+        assert_eq!(gprs_timer3_seconds(0b110_00001), Some(320 * 3600));
+        assert_eq!(gprs_timer3_seconds(0b111_00001), None);
     }
 }

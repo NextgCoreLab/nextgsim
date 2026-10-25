@@ -482,22 +482,38 @@ async fn authenticate_and_secure(h: &mut Harness) -> MmeNas {
 }
 
 fn attach_accept(mme: &mut MmeNas) -> Vec<u8> {
+    attach_accept_with(mme, 0x49, &[])
+}
+
+/// ATTACH ACCEPT (TS 24.301 §8.2.1) with T3412 octet `t3412` (§9.9.3.16) and
+/// the optional IEs `ies` after the ESM container.
+fn attach_accept_with(mme: &mut MmeNas, t3412: u8, ies: &[u8]) -> Vec<u8> {
     let mut esm = vec![0x52, 0x01, 0xC1, 0x01, 0x09];
     let apn = b"\x08internet";
     esm.push(apn.len() as u8);
     esm.extend_from_slice(apn);
     esm.extend_from_slice(&[0x05, 0x01, 10, 45, 0, 2]);
     let mut m = vec![
-        0x07, 0x42, 0x01, 0x49, 0x06, 0x00, 0x99, 0xF9, 0x07, 0x00, 0x01,
+        0x07, 0x42, 0x01, t3412, 0x06, 0x00, 0x99, 0xF9, 0x07, 0x00, 0x01,
     ];
     m.extend_from_slice(&(esm.len() as u16).to_be_bytes());
     m.extend_from_slice(&esm);
+    m.extend_from_slice(ies);
     mme.protect(&m, 2)
 }
 
 /// Run the attach to ATTACH COMPLETE with the SGW's S1-U address `sgw`;
 /// returns the eNB's S1-U TEID for E-RAB 5 and the MME's NAS context.
 async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> (u32, MmeNas) {
+    attach_with(h, sgw, attach_accept).await
+}
+
+/// [`attach`] with the ATTACH ACCEPT `accept` builds.
+async fn attach_with(
+    h: &mut Harness,
+    sgw: Ipv4Addr,
+    accept: impl FnOnce(&mut MmeNas) -> Vec<u8>,
+) -> (u32, MmeNas) {
     wait_state(&mut h.state_rx, |s| {
         matches!(s, UeRrcState::Connected { .. })
     })
@@ -506,7 +522,7 @@ async fn attach(h: &mut Harness, sgw: Ipv4Addr) -> (u32, MmeNas) {
 
     // TS 33.401 §7.2.6.2: K_eNB from K_ASME and the SMC complete's UL COUNT 0.
     let kenb = derive_kenb(&mme.kasme, 0);
-    let accept = attach_accept(&mut mme);
+    let accept = accept(&mut mme);
     h.to_enb
         .send(initial_context_setup(
             4242,
@@ -1096,4 +1112,47 @@ async fn a_dedicated_bearer_carries_the_uplink_its_tft_matches() {
     g.extend_from_slice(&[0x45, 0, 0, 4]);
     sgw.send_to(&g, h.enb_s1u).await.unwrap();
     downlink_on(&mut h, &sgw, default_teid, 3).await;
+}
+
+/// #356: the periodic tracking area update end to end. The ATTACH ACCEPT
+/// sets T3412 to 2 s and a GUTI; released to RRC_IDLE, the UE's NAS starts
+/// T3412 (TS 24.301 §5.3.5), and on expiry RRC establishes a connection for a
+/// TRACKING AREA UPDATE REQUEST it built itself: integrity protected, not
+/// ciphered, "periodic updating", the Old GUTI, the last visited TAI and the
+/// EPS bearer context status of bearer 5 (`20 00`). The TAU ACCEPT with a new
+/// GUTI is acknowledged with TRACKING AREA UPDATE COMPLETE, ciphered.
+#[tokio::test]
+async fn t3412_expiry_sends_a_periodic_tracking_area_update() {
+    // GUTI (IEI 50): 999/70, MME group 0x0002, MME code 0x01, M-TMSI 0xC0000001.
+    const GUTI: [u8; 13] = [
+        0x50, 0x0B, 0xF6, 0x99, 0xF9, 0x07, 0x00, 0x02, 0x01, 0xC0, 0x00, 0x00, 0x01,
+    ];
+    let mut h = start().await;
+    // T3412 0x01: unit 000 (2 seconds) x 1.
+    let (_, mut mme) = attach_with(&mut h, Ipv4Addr::new(127, 0, 0, 2), |m| {
+        attach_accept_with(m, 0x01, &GUTI)
+    })
+    .await;
+    h.to_enb.send(release_command(4242, h.enb_ue_id)).unwrap();
+    expect_release_complete(&mut h.mme_rx).await;
+
+    let (enb_ue_id, tau) = initial_ue_message(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(tau[0], 0x17, "integrity protected, not ciphered (§4.4.5)");
+    let plain = mme.unprotect(&tau);
+    let mut expect = vec![0x07, 0x48, 0x03];
+    expect.extend_from_slice(&GUTI[1..]);
+    expect.extend_from_slice(&[0x52, 0x99, 0xF9, 0x07, 0x00, 0x01]);
+    expect.extend_from_slice(&[0x57, 0x02, 0x20, 0x00, 0xE0]);
+    assert_eq!(plain, expect, "KSI 0, periodic updating, Old GUTI, TAI, EBCS");
+
+    // TRACKING AREA UPDATE ACCEPT, "TA updated", new GUTI M-TMSI 0xC0000002.
+    let mut accept = vec![0x07, 0x49, 0x00];
+    accept.extend_from_slice(&GUTI[..12]);
+    accept.push(0x02);
+    let accept = mme.protect(&accept, 2);
+    h.to_enb.send(dl_nas(6262, enb_ue_id, &accept)).unwrap();
+    let (mme_id, complete) = uplink_nas(next_s1(&mut h.mme_rx).await.1);
+    assert_eq!(mme_id, 6262);
+    assert_eq!(complete[0] >> 4, 2, "integrity protected and ciphered");
+    assert_eq!(mme.unprotect(&complete), vec![0x07, 0x4A]);
 }

@@ -133,7 +133,7 @@ fn start_mmed_with(dir: &std::path::Path, s1ap_port: u16, epc: bool) -> Mmed {
         r#"logger:
   file:
     path: {log}
-  level: info
+  level: {level}
 mme:
 {peers}  s1ap:
     server:
@@ -155,7 +155,10 @@ mme:
     ciphering_order: [EEA0, EEA1, EEA2]
   mme_name: nextgcore-mme0
 "#,
-        log = dir.join("mme.log").display()
+        log = dir.join("mme.log").display(),
+        // NEXTGCORE_MMED_LOG_LEVEL: mmed logs some procedures (the tracking
+        // area update among them) at debug only.
+        level = std::env::var("NEXTGCORE_MMED_LOG_LEVEL").unwrap_or_else(|_| "info".into()),
     );
     let path = dir.join("mme.yaml");
     std::fs::write(&path, cfg).unwrap();
@@ -566,4 +569,83 @@ async fn lte_ue_pings_through_the_nextgcore_epc_with_no_loss() {
             "echo {seq} of {count} lost: the loss must be 0%"
         );
     }
+}
+
+/// #356's real-binary run: the periodic tracking area update through the
+/// nextgcore EPC. After the attach the eNB's user-inactivity release returns
+/// the UE to RRC_IDLE; T3412 -- from the subscription (`subscribed_rau_tau_timer`
+/// in minutes; `bring-up.sh` provisions 12, set 1 for a short run) -- expires
+/// and the UE's TRACKING AREA UPDATE REQUEST, with the EPS bearer context
+/// status of its default bearer, reaches mmed, which answers TAU ACCEPT with
+/// its own status (nextgcore #1166, #961). The UE must come out of it
+/// EMM-REGISTERED with the same default bearer and without a new attach: a
+/// byte-swapped status in either direction would deactivate it (§5.5.3.2.4).
+/// `NEXTGSIM_TAU_WAIT_S` bounds the wait for the update (default 800 s).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs NEXTGCORE_MMED, kernel SCTP and the EPC of tests/epc/bring-up.sh"]
+async fn lte_ue_updates_its_tracking_area_through_the_nextgcore_epc() {
+    assert!(
+        std::env::var("NEXTGCORE_EPC").is_ok(),
+        "start the EPC with tests/epc/bring-up.sh and set NEXTGCORE_EPC=1"
+    );
+    init_logging();
+    let wait = Duration::from_secs(
+        std::env::var("NEXTGSIM_TAU_WAIT_S")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(800),
+    );
+    let port = 36412;
+    let mut mmed = start_mmed_with(&tmpdir("epc-tau"), port, true);
+    let mut cfg = enb_config(port, Plmn::new(999, 70, false));
+    cfg.mme_configs[0].address = IpAddr::V4(MME_ADDR);
+    cfg.radio.rls_port = 0;
+    cfg.inactivity_timer_secs = Some(3);
+    let remote = SocketAddr::new(IpAddr::V4(MME_ADDR), port);
+    let (mut state_rx, status, _stop, _ip) = enb_and_ue(cfg, remote).await;
+    let s = wait_nas(&status, Duration::from_secs(40), |s| {
+        s.state == EmmState::Registered && s.bearer.is_some()
+    })
+    .await;
+    let bearer = s.bearer.unwrap();
+
+    // RRC_IDLE, then a new connection for the update, then RRC_IDLE again.
+    async fn rrc(
+        rx: &mut tokio::sync::watch::Receiver<UeRrcState>,
+        within: Duration,
+        what: &str,
+        f: impl Fn(UeRrcState) -> bool,
+    ) {
+        tokio::time::timeout(within, async {
+            while !f(*rx.borrow_and_update()) {
+                rx.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("the UE did not reach {what}"));
+    }
+    let camped = |s| matches!(s, UeRrcState::Camped { .. });
+    let connected = |s| matches!(s, UeRrcState::Connected { .. });
+    rrc(&mut state_rx, Duration::from_secs(20), "RRC_IDLE after the attach", camped).await;
+    rrc(&mut state_rx, wait, "a connection for the update (T3412)", connected).await;
+    rrc(&mut state_rx, Duration::from_secs(30), "RRC_IDLE after the update", camped).await;
+    assert!(
+        mmed.wait_for("Tracking area update accept", Duration::from_secs(10)),
+        "mmed did not accept a tracking area update (set NEXTGCORE_MMED_LOG_LEVEL=debug)"
+    );
+    let after = wait_nas(&status, Duration::from_secs(10), |s| {
+        s.state == EmmState::Registered
+    })
+    .await;
+    assert_eq!(
+        after.bearer.as_ref().map(|b| b.ebi),
+        Some(bearer.ebi),
+        "the default bearer survived the update's EPS bearer context status"
+    );
+    let attaches = mmed
+        .seen
+        .iter()
+        .filter(|l| l.contains("Attach Request: IMSI[999700000000001]"))
+        .count();
+    assert_eq!(attaches, 1, "no new attach after the update");
 }

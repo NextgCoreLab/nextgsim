@@ -1,15 +1,15 @@
-//! The EPS NAS messages of attach, identification, authentication, security
-//! mode control and default EPS bearer activation (TS 24.301 §8.2, §8.3), as a
-//! UE sends and receives them.
+//! The EPS NAS messages of attach, tracking area update, identification,
+//! authentication, security mode control and EPS bearer context management
+//! (TS 24.301 §8.2, §8.3), as a UE sends and receives them.
 //!
 //! Uplink messages are built from values; downlink messages are parsed into
 //! values. The plain message is what these functions see -- security
 //! protection (§9.3, the 6-octet security header) is [`crate::security`]'s.
 
 use crate::ie::{
-    decode_apn, decode_pdn_address, decode_tai_list, encode_apn, gprs_timer_seconds, put_lv,
-    put_lv_e, put_tlv, EpsMobileIdentity, Guti, MobileIdentity, NasDecodeError, NasKsi, PdnAddress,
-    PdnType, Reader, Tai, UeNetworkCapability,
+    decode_apn, decode_pdn_address, decode_tai_list, encode_apn, gprs_timer3_seconds,
+    gprs_timer_seconds, put_lv, put_lv_e, put_tlv, EpsBearerContextStatus, EpsMobileIdentity, Guti,
+    MobileIdentity, NasDecodeError, NasKsi, PdnAddress, PdnType, Reader, Tai, UeNetworkCapability,
 };
 
 /// EPS mobility management protocol discriminator (TS 24.007 §11.2.3.1.1).
@@ -31,8 +31,18 @@ pub mod emm_type {
     pub const DETACH_REQUEST: u8 = 0x45;
     /// DETACH ACCEPT.
     pub const DETACH_ACCEPT: u8 = 0x46;
+    /// TRACKING AREA UPDATE REQUEST.
+    pub const TAU_REQUEST: u8 = 0x48;
+    /// TRACKING AREA UPDATE ACCEPT.
+    pub const TAU_ACCEPT: u8 = 0x49;
+    /// TRACKING AREA UPDATE COMPLETE.
+    pub const TAU_COMPLETE: u8 = 0x4A;
+    /// TRACKING AREA UPDATE REJECT.
+    pub const TAU_REJECT: u8 = 0x4B;
     /// SERVICE REJECT.
     pub const SERVICE_REJECT: u8 = 0x4E;
+    /// GUTI REALLOCATION COMMAND.
+    pub const GUTI_REALLOCATION_COMMAND: u8 = 0x50;
     /// AUTHENTICATION REQUEST.
     pub const AUTHENTICATION_REQUEST: u8 = 0x52;
     /// AUTHENTICATION RESPONSE.
@@ -198,6 +208,69 @@ impl AttachRequest {
         }
         out
     }
+}
+
+/// The EPS update type value (§9.9.3.14, bits 3-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpsUpdateType {
+    /// TA updating (000).
+    TaUpdating,
+    /// Periodic updating (011).
+    Periodic,
+}
+
+/// TRACKING AREA UPDATE REQUEST (§8.2.29), the IEs this UE sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingAreaUpdateRequest {
+    /// EPS update type.
+    pub update_type: EpsUpdateType,
+    /// The "active" flag (§9.9.3.14 bit 4): bearer establishment requested.
+    pub active: bool,
+    /// NAS key set identifier.
+    pub ksi: NasKsi,
+    /// Old GUTI (§5.5.3.2.2: the valid native GUTI).
+    pub old_guti: Guti,
+    /// UE network capability (IEI 58); §8.2.29.7: not on a periodic update.
+    pub ue_network_capability: Option<UeNetworkCapability>,
+    /// Last visited registered TAI (IEI 52).
+    pub last_visited_tai: Option<Tai>,
+    /// EPS bearer context status (IEI 57).
+    pub eps_bearer_context_status: Option<EpsBearerContextStatus>,
+}
+
+impl TrackingAreaUpdateRequest {
+    /// Encode the plain message. Optional IEs go in Table 8.2.29.1 order; the
+    /// Old GUTI type (IEI E-, §9.9.3.45: "native GUTI") is always included
+    /// (§8.2.29.20).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = vec![PD_EMM, emm_type::TAU_REQUEST];
+        let update_type = match self.update_type {
+            EpsUpdateType::TaUpdating => 0b000,
+            EpsUpdateType::Periodic => 0b011,
+        };
+        // NAS key set identifier in bits 8-5; the EPS update type, the first
+        // half-octet IE, in bits 4-1 with the "active" flag in bit 4.
+        out.push((self.ksi.nibble() << 4) | (u8::from(self.active) << 3) | update_type);
+        put_lv(&mut out, &EpsMobileIdentity::Guti(self.old_guti).encode());
+        if let Some(c) = &self.ue_network_capability {
+            put_tlv(&mut out, 0x58, &c.encode());
+        }
+        if let Some(tai) = self.last_visited_tai {
+            out.push(0x52);
+            out.extend_from_slice(&tai.plmn.encode());
+            out.extend_from_slice(&tai.tac.to_be_bytes());
+        }
+        if let Some(s) = self.eps_bearer_context_status {
+            put_tlv(&mut out, 0x57, &s.encode());
+        }
+        out.push(0xE0);
+        out
+    }
+}
+
+/// TRACKING AREA UPDATE COMPLETE (§8.2.27).
+pub fn encode_tau_complete() -> Vec<u8> {
+    vec![PD_EMM, emm_type::TAU_COMPLETE]
 }
 
 /// ATTACH COMPLETE (§8.2.2).
@@ -460,6 +533,37 @@ pub struct AttachAccept {
     pub t3402_s: Option<u64>,
 }
 
+/// TRACKING AREA UPDATE ACCEPT (§8.2.26), the IEs this UE acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrackingAreaUpdateAccept {
+    /// EPS update result (§9.9.3.13, bits 3-1).
+    pub result: u8,
+    /// T3412 value (IEI 5A): `Some(None)` = deactivated.
+    pub t3412_s: Option<Option<u64>>,
+    /// T3412 extended value (IEI 5E, GPRS timer 3): `Some(None)` =
+    /// deactivated; unit 111 leaves it `None` (TS 24.008 §10.5.7.4a NOTE 2).
+    pub t3412_extended_s: Option<Option<u64>>,
+    /// GUTI (IEI 50).
+    pub guti: Option<Guti>,
+    /// TAI list (IEI 54).
+    pub tai_list: Option<Vec<Tai>>,
+    /// EPS bearer context status (IEI 57).
+    pub eps_bearer_context_status: Option<EpsBearerContextStatus>,
+    /// EMM cause (IEI 53).
+    pub emm_cause: Option<u8>,
+    /// T3402 value (IEI 17), seconds.
+    pub t3402_s: Option<u64>,
+}
+
+/// TRACKING AREA UPDATE REJECT (§8.2.28).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackingAreaUpdateReject {
+    /// EMM cause.
+    pub cause: u8,
+    /// T3346 value (IEI 5F, GPRS timer 2): `Some(None)` = deactivated.
+    pub t3346_s: Option<Option<u64>>,
+}
+
 /// ATTACH REJECT (§8.2.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachReject {
@@ -507,6 +611,10 @@ pub enum DownlinkEmm {
     AttachReject(AttachReject),
     /// SERVICE REJECT.
     ServiceReject(ServiceReject),
+    /// TRACKING AREA UPDATE ACCEPT.
+    TauAccept(TrackingAreaUpdateAccept),
+    /// TRACKING AREA UPDATE REJECT.
+    TauReject(TrackingAreaUpdateReject),
     /// DETACH ACCEPT, network to UE (§8.2.10.2): the answer to a UE-initiated
     /// detach (#365).
     DetachAccept,
@@ -613,6 +721,52 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                 }
             }
             DownlinkEmm::ServiceReject(rej)
+        }
+        emm_type::TAU_ACCEPT => {
+            let mut a = TrackingAreaUpdateAccept {
+                result: r.u8()? & 0x07,
+                ..TrackingAreaUpdateAccept::default()
+            };
+            for (iei, v) in r.optional_ies(&[
+                (0x5A, 2),
+                (0x13, 6),
+                (0x53, 2),
+                (0x17, 2),
+                (0x59, 2),
+            ])? {
+                match iei {
+                    0x5A => a.t3412_s = v.first().map(|o| gprs_timer_seconds(*o)),
+                    0x50 => match EpsMobileIdentity::decode(v)? {
+                        EpsMobileIdentity::Guti(g) => a.guti = Some(g),
+                        _ => return Err(NasDecodeError::Invalid("GUTI IE")),
+                    },
+                    0x54 => a.tai_list = Some(decode_tai_list(v)?),
+                    0x57 => a.eps_bearer_context_status = Some(EpsBearerContextStatus::decode(v)?),
+                    0x53 => a.emm_cause = v.first().copied(),
+                    0x17 => a.t3402_s = timer2(v),
+                    0x5E => {
+                        a.t3412_extended_s = v
+                            .first()
+                            .filter(|o| *o >> 5 != 0b111)
+                            .map(|o| gprs_timer3_seconds(*o))
+                    }
+                    _ => {}
+                }
+            }
+            DownlinkEmm::TauAccept(a)
+        }
+        emm_type::TAU_REJECT => {
+            let cause = r.u8()?;
+            let mut rej = TrackingAreaUpdateReject {
+                cause,
+                t3346_s: None,
+            };
+            for (iei, v) in r.optional_ies(&[])? {
+                if iei == 0x5F {
+                    rej.t3346_s = v.first().map(|o| gprs_timer_seconds(*o));
+                }
+            }
+            DownlinkEmm::TauReject(rej)
         }
         emm_type::DETACH_ACCEPT => DownlinkEmm::DetachAccept,
         emm_type::DETACH_REQUEST => {

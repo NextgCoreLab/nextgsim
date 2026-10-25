@@ -165,6 +165,8 @@ pub struct UeRrc {
     plmn: PlmnId,
     cells: HashMap<u64, CellView>,
     camped: Option<u64>,
+    /// The tracking area code last reported to NAS (#356).
+    reported_tac: Option<u16>,
     state: State,
     /// T302 (§5.3.3.8): no new establishment until this instant.
     barred_until: Option<Instant>,
@@ -193,6 +195,7 @@ impl UeRrc {
             },
             cells: HashMap::new(),
             camped: None,
+            reported_tac: None,
             state: State::Idle,
             barred_until: None,
             nas,
@@ -277,6 +280,18 @@ impl UeRrc {
                 None => log::info!("no suitable cell"),
             }
             self.camped = best;
+        }
+        // TS 36.304 §5.2.3: camped, NAS learns the cell's tracking area (SIB1
+        // trackingAreaCode) and may owe a tracking area update for it
+        // (TS 24.301 §5.5.3.2.2 a), #356).
+        let tac = self
+            .camped
+            .and_then(|c| self.cells.get(&c))
+            .and_then(|v| v.sib1.as_ref())
+            .map(|s| s.tac);
+        if let Some(tac) = tac.filter(|t| Some(*t) != self.reported_tac) {
+            self.reported_tac = Some(tac);
+            self.nas.on_serving_cell(tac);
         }
         self.try_establish(now)
     }
