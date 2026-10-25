@@ -158,6 +158,10 @@ pub struct RrcTask {
     /// the NGAP task before this task has any context for the UE at all -- the
     /// arriving UE's first message to the target IS the RRCReconfigurationComplete.
     pending_handover_arrivals: std::collections::HashMap<i32, u16>,
+    /// The SRB keys of each pending handover arrival (#325): with
+    /// `as_security_enabled` the arriving RRCReconfigurationComplete is verified
+    /// with them at UL COUNT 0, and SRB1 protection then runs on them.
+    pending_handover_security: std::collections::HashMap<i32, ReestablishmentSecurity>,
     /// The local Remote UE IDs assigned per relay UE, for L2 UE-to-Network relay
     /// (TS 38.300 §16.12.2.1; issue #190).
     ///
@@ -241,6 +245,7 @@ impl RrcTask {
             scell_configured_ues: std::collections::HashSet::new(),
             cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashMap::new(),
+            pending_handover_security: std::collections::HashMap::new(),
             relay_local_ue_ids: std::collections::HashMap::new(),
             handover_manager: {
                 // The decision margin is the one the UE's A3 measurement
@@ -525,8 +530,13 @@ impl RrcTask {
                 self.handle_ul_ccch_message(ue_id, &data).await;
             }
             RrcChannel::UlDcch => {
-                let ue_id = self.bind_handover_arrival(ue_id, c_rnti, data.data()).await;
-                self.handle_ul_dcch_message(ue_id, &data).await;
+                let (ue_id, verified) =
+                    self.bind_handover_arrival(ue_id, c_rnti, data.data()).await;
+                match verified {
+                    // A secured arrival was unprotected while binding (#325)
+                    Some(plain) => self.handle_ul_dcch_plain(ue_id, &plain).await,
+                    None => self.handle_ul_dcch_message(ue_id, &data).await,
+                }
             }
             _ => warn!("Unexpected uplink channel: {:?}", channel),
         }
@@ -682,8 +692,15 @@ impl RrcTask {
         let Some(data) = self.unprotect_ul_dcch(ue_id, data) else {
             return;
         };
-        let data = &data;
+        self.handle_ul_dcch_plain(ue_id, &data).await;
+    }
 
+    /// Dispatches an UL-DCCH PDU that is already PDCP-unprotected.
+    async fn handle_ul_dcch_plain(&mut self, ue_id: i32, data: &OctetString) {
+        if data.is_empty() {
+            // A discarded PDU (an arrival that failed integrity, #325)
+            return;
+        }
         let bytes = data.data();
 
         // ASN.1-first UL-DCCH dispatch (TS 38.331 §6.2.2, Wave-6 C3): a
@@ -1140,6 +1157,23 @@ impl RrcTask {
             ue_id, c_rnti
         );
         self.pending_handover_arrivals.insert(ue_id, c_rnti);
+        self.pending_handover_security.remove(&ue_id);
+    }
+
+    /// [`Self::handle_expect_handover_arrival`] with the SRB keys the target
+    /// derived from `KgNB*` at admission (#325, TS 38.331 §5.3.5.8.3). With
+    /// `as_security_enabled` the arrival is bound only by an
+    /// RRCReconfigurationComplete that verifies with them at UL COUNT 0.
+    pub fn handle_expect_secured_handover_arrival(
+        &mut self,
+        ue_id: i32,
+        c_rnti: u16,
+        security: Option<ReestablishmentSecurity>,
+    ) {
+        self.handle_expect_handover_arrival(ue_id, c_rnti);
+        if let Some(security) = security {
+            self.pending_handover_security.insert(ue_id, security);
+        }
     }
 
     /// The source side of an N2 handover (#324): send the target's
@@ -1167,14 +1201,26 @@ impl RrcTask {
     /// and the PDU is handled under it. Anything else is left alone, never guessed:
     /// two concurrent arrivals must not be able to take each other's NGAP context,
     /// sessions and tunnels.
-    async fn bind_handover_arrival(&mut self, ue_id: i32, c_rnti: Option<u16>, data: &[u8]) -> i32 {
+    ///
+    /// Under `as_security_enabled` with keys from the admission (#325), the
+    /// RRCReconfigurationComplete is the first protected UL PDU on this cell
+    /// (TS 38.331 §5.3.5.8.3): SRB1's PDCP was re-established, so it is
+    /// verified and deciphered with the `KgNB*` keys at UL COUNT 0 before it may
+    /// bind, and SRB1 protection is then active on those keys with the COUNTs
+    /// restarted. Returns the bound id and, for such an arrival, the plaintext.
+    async fn bind_handover_arrival(
+        &mut self,
+        ue_id: i32,
+        c_rnti: Option<u16>,
+        data: &[u8],
+    ) -> (i32, Option<OctetString>) {
         if self.ue_manager.try_find_ue(ue_id).is_some()
             || self.pending_handover_arrivals.contains_key(&ue_id)
         {
-            return ue_id;
+            return (ue_id, None);
         }
         let Some(c_rnti) = c_rnti else {
-            return ue_id;
+            return (ue_id, None);
         };
         let Some(admitted) = self
             .pending_handover_arrivals
@@ -1183,17 +1229,48 @@ impl RrcTask {
             .map(|(id, _)| *id)
         else {
             debug!("UE[{ue_id}] presents C-RNTI {c_rnti:#06x}, which no pending handover-in holds");
-            return ue_id;
+            return (ue_id, None);
+        };
+        let secured = if self.task_base.config.as_security_enabled {
+            self.pending_handover_security.get(&admitted).cloned()
+        } else {
+            None
+        };
+        let plain = match &secured {
+            Some(security) => {
+                let Some(sec) = SrbSecurity::new(
+                    security.k_rrc_enc,
+                    security.k_rrc_int,
+                    security.ciphering_alg_id,
+                    security.integrity_alg_id,
+                )
+                .ok() else {
+                    error!("UE[{ue_id}]: the handover-in's AS security state is unusable");
+                    return (ue_id, None);
+                };
+                match sec.unprotect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, data) {
+                    Ok(plain) => plain,
+                    Err(e) => {
+                        warn!(
+                            "UE[{ue_id}] with handover C-RNTI {c_rnti:#06x}: UL-DCCH PDU fails \
+                             integrity with the KgNB* keys ({e}); discarded, not bound \
+                             (TS 33.501 §6.5)"
+                        );
+                        return (ue_id, Some(OctetString::from_slice(&[])));
+                    }
+                }
+            }
+            None => data.to_vec(),
         };
         if !matches!(
-            dispatch_ul_dcch(data),
+            dispatch_ul_dcch(&plain),
             Ok(UlDcchMessage::RrcReconfigurationComplete(_))
         ) {
             debug!(
                 "UE[{ue_id}] with handover C-RNTI {c_rnti:#06x}: not an \
                  RRCReconfigurationComplete, not bound yet"
             );
-            return ue_id;
+            return (ue_id, None);
         }
         info!(
             "UE[{ue_id}] arrives with C-RNTI {c_rnti:#06x}: the handover admission UE[{admitted}]"
@@ -1208,11 +1285,28 @@ impl RrcTask {
             .await
         {
             error!("Failed to rebind UE[{ue_id}] as UE[{admitted}]: {e}");
-            return ue_id;
+            return (ue_id, None);
         }
         let ctx = self.ue_manager.find_or_create_ue(admitted);
         ctx.on_setup_complete();
-        admitted
+        match secured {
+            Some(security) => {
+                self.pending_handover_security.remove(&admitted);
+                // TS 38.331 §5.3.5.8.3 / TS 33.501 §6.9.2.3: SRB1 runs on the
+                // KgNB* keys from now on, both COUNTs restarted at 0, and UL COUNT 0
+                // is spent on this Complete.
+                ctx.set_reestablishment_security(security);
+                ctx.on_as_security_activated();
+                ctx.reestablish_srb1_pdcp();
+                let _ = ctx.next_ul_pdcp_count();
+                info!(
+                    "UE[{admitted}]: handover arrival verified with KgNB*; SRB1 integrity \
+                     protection and ciphering active on this cell"
+                );
+                (admitted, Some(OctetString::from_slice(&plain)))
+            }
+            None => (admitted, None),
+        }
     }
 
     /// Whether a handover arrival is still expected for `ue_id`.
@@ -1929,10 +2023,17 @@ impl RrcTask {
     /// its ARFCN-DL (Annex A.11). The NGAP task's AS context is told, so a later
     /// handover chains from the key the UE now holds.
     async fn rekey_for_reestablishment(&mut self, ue_id: i32) {
+        let pci = phys_cell_id_from_nci(self.task_base.config.nci);
+        self.rekey_srb1(ue_id, pci, "re-establishment").await;
+    }
+
+    /// Re-keys SRB1 horizontally to KgNB* = KDF(KgNB, `pci`, ARFCN-DL)
+    /// (TS 33.501 Annex A.11) and tells the NGAP task, which re-keys the AS
+    /// context and the DRBs (#325).
+    async fn rekey_srb1(&mut self, ue_id: i32, pci: u16, why: &str) {
         use nextgsim_crypto::kdf::{
             derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
         };
-        let pci = phys_cell_id_from_nci(self.task_base.config.nci);
         let arfcn = self.task_base.config.dl_arfcn;
         let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
             return;
@@ -1954,8 +2055,8 @@ impl RrcTask {
         );
         sec.phys_cell_id = pci;
         info!(
-            "UE[{ue_id}]: re-establishment re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL \
-             {arfcn}, NCC {}, horizontal)",
+            "UE[{ue_id}]: {why} re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL {arfcn}, NCC \
+             {}, horizontal)",
             sec.next_hop_chaining_count
         );
         let _ = self
@@ -2882,13 +2983,21 @@ impl RrcTask {
             || target_cell == own_cell;
 
         if is_own_cell {
-            let Some(command) =
+            let Some(mut command) =
                 self.handover_manager
                     .initiate_handover(ue_id, own_cell, target_cell)
             else {
                 warn!("RRC: the handover manager declined to prepare UE {ue_id}");
                 return;
             };
+            // A horizontal re-key signals the UE's current NCC (#325)
+            let secured = self
+                .ue_manager
+                .try_find_ue(ue_id)
+                .filter(|c| c.as_security_active())
+                .and_then(|c| c.reestablishment_security.as_ref())
+                .map(|s| s.next_hop_chaining_count);
+            command.next_hop_chaining_count = secured.unwrap_or(0);
             let Some(pdu) = command.build_rrc_pdu() else {
                 warn!("RRC: could not encode the handover command for UE {ue_id}");
                 return;
@@ -2897,6 +3006,17 @@ impl RrcTask {
             // the UE (TS 38.331 §5.3.5.5.2). The old code emitted nothing at all.
             self.send_rrc_message(ue_id, RrcChannel::DlDcch, OctetString::from_slice(&pdu))
                 .await;
+            // The command went out on the old keys. The UE re-keys to KgNB* for the
+            // target PCI and re-establishes SRB1 PDCP (TS 38.331 §5.3.5.7,
+            // §5.3.5.8.3), so this gNB does too, or it cannot read the
+            // RRCReconfigurationComplete (#325).
+            if secured.is_some() {
+                let pci = (command.target_pci % 1008) as u16;
+                self.rekey_srb1(ue_id, pci, "intra-gNB handover").await;
+                if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+                    ctx.reestablish_srb1_pdcp();
+                }
+            }
             self.handover_manager.mark_executing(ue_id);
             info!("RRC: sent an intra-gNB handover command to UE {ue_id} for cell {target_cell}");
             return;
@@ -3077,8 +3197,12 @@ impl Task for RrcTask {
                                 self.send_conditional_handover_configuration(ue_id)
                                     .await;
                             }
-                            RrcMessage::ExpectHandoverArrival { ue_id, c_rnti } => {
-                                self.handle_expect_handover_arrival(ue_id, c_rnti);
+                            RrcMessage::ExpectHandoverArrival { ue_id, c_rnti, security } => {
+                                self.handle_expect_secured_handover_arrival(
+                                    ue_id,
+                                    c_rnti,
+                                    security.map(|s| *s),
+                                );
                             }
                             RrcMessage::SendHandoverCommand { ue_id, pdu } => {
                                 self.handle_send_handover_command(ue_id, pdu).await;
@@ -5589,6 +5713,249 @@ mod tests {
             })
             .expect("encode RRCReconfigurationComplete"),
         )
+    }
+
+    /// SRB keys a handover-in derived from `KgNB*` (#325), NEA2 / NIA2.
+    fn arrival_security() -> ReestablishmentSecurity {
+        ReestablishmentSecurity {
+            k_rrc_int: [0x51; 16],
+            k_rrc_enc: [0x52; 16],
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: 0x03E8,
+            phys_cell_id: 1,
+            next_hop_chaining_count: 1,
+            kgnb: [0x53; 32],
+        }
+    }
+
+    fn arrival_srb(sec: &ReestablishmentSecurity) -> SrbSecurity {
+        SrbSecurity::new(
+            sec.k_rrc_enc,
+            sec.k_rrc_int,
+            sec.ciphering_alg_id,
+            sec.integrity_alg_id,
+        )
+        .expect("legal ids")
+    }
+
+    /// #325, TS 38.331 §5.3.5.8.3: under AS security the arriving
+    /// RRCReconfigurationComplete is the first protected UL PDU on the target. It
+    /// is verified and deciphered with the KgNB* keys at UL COUNT 0, the arrival is
+    /// bound and reported, and SRB1 then runs protected on those keys with the
+    /// COUNTs restarted: the next DL PDU goes out at DL COUNT 0, the next UL PDU
+    /// is expected at UL COUNT 1. Before, the target held no keys and could read
+    /// none of it.
+    #[test]
+    fn a_secured_handover_arrival_is_verified_with_the_kgnb_star_keys() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(
+                GnbConfig {
+                    as_security_enabled: true,
+                    ..test_config()
+                },
+                16,
+            );
+        let mut task = RrcTask::new(task_base);
+        let sec = arrival_security();
+        let ue_side = arrival_srb(&sec);
+        run_async(async {
+            task.handle_expect_secured_handover_arrival(1000, 0x03E8, Some(sec.clone()));
+            let protected = ue_side.protect(
+                0,
+                SRB1_PDCP_BEARER,
+                PDCP_DIRECTION_UPLINK,
+                reconfiguration_complete().data(),
+            );
+            task.handle_uplink_rrc_with_c_rnti(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&protected),
+                Some(0x03E8),
+            )
+            .await;
+        });
+        assert_eq!(rebinds(&mut rls_rx), vec![(7, 1000)]);
+        assert_eq!(notified(&mut ngap_rx), vec![1000]);
+        let ctx = task.ue_manager.try_find_ue(1000).expect("bound");
+        assert!(ctx.as_security_active());
+        assert_eq!(
+            ctx.pdcp_counts(),
+            (0, 1),
+            "SRB1 PDCP re-established; UL COUNT 0 was spent on the Complete"
+        );
+
+        // The next downlink PDU is protected at DL COUNT 0 with the KgNB* keys
+        let nas = [0x7E, 0x02, 0x11, 0x22];
+        run_async(task.handle_nas_delivery(1000, OctetString::from_slice(&nas)));
+        let dl = loop {
+            match rls_rx.try_recv() {
+                Ok(TaskMessage::Message(crate::tasks::RlsMessage::DownlinkRrc {
+                    ue_id: 1000,
+                    data,
+                    ..
+                })) => break data,
+                Ok(_) => continue,
+                Err(e) => panic!("no downlink PDU: {e}"),
+            }
+        };
+        assert!(
+            ue_side
+                .unprotect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, dl.data())
+                .is_ok(),
+            "the first DL PDU on the target verifies at DL COUNT 0 with the KgNB* keys"
+        );
+    }
+
+    /// #325: an arrival whose Complete fails integrity with the KgNB* keys (here,
+    /// protected with other keys) is discarded and not bound: no rebind, no
+    /// HANDOVER NOTIFY, the admission still pending.
+    #[test]
+    fn a_secured_arrival_that_fails_integrity_is_not_bound() {
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(
+                GnbConfig {
+                    as_security_enabled: true,
+                    ..test_config()
+                },
+                16,
+            );
+        let mut task = RrcTask::new(task_base);
+        let sec = arrival_security();
+        let wrong = arrival_srb(&ReestablishmentSecurity {
+            k_rrc_int: [0x99; 16],
+            ..arrival_security()
+        });
+        run_async(async {
+            task.handle_expect_secured_handover_arrival(1000, 0x03E8, Some(sec));
+            let protected = wrong.protect(
+                0,
+                SRB1_PDCP_BEARER,
+                PDCP_DIRECTION_UPLINK,
+                reconfiguration_complete().data(),
+            );
+            task.handle_uplink_rrc_with_c_rnti(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&protected),
+                Some(0x03E8),
+            )
+            .await;
+        });
+        assert!(rebinds(&mut rls_rx).is_empty());
+        assert!(notified(&mut ngap_rx).is_empty());
+        assert!(task.expects_handover_arrival(1000));
+        assert!(task.ue_manager.try_find_ue(1000).is_none());
+    }
+
+    /// #325: an intra-gNB handover under AS security signals the UE's current
+    /// NCC in the masterKeyUpdate (a horizontal re-key keeps it, TS 33.501
+    /// §6.9.2.3.2), and this gNB re-keys SRB1 to KgNB* for the target PCI with the
+    /// COUNTs restarted, as the UE does (TS 38.331 §5.3.5.7, §5.3.5.8.3). The NCC
+    /// used to be a fixed 0, and the gNB kept the source keys.
+    #[test]
+    fn an_intra_gnb_handover_signals_the_current_ncc_and_re_keys_srb1() {
+        use nextgsim_crypto::kdf::{
+            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
+        };
+        use nextgsim_rrc::procedures::rrc_reconfiguration::decode_handover_command;
+        const SCELL_PCI: u16 = 21;
+        let config = GnbConfig {
+            as_security_enabled: true,
+            scell_phys_cell_id: Some(SCELL_PCI),
+            ..test_config()
+        };
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config.clone(), 16);
+        let mut task = RrcTask::new(task_base);
+        let sec = ReestablishmentSecurity {
+            next_hop_chaining_count: 2,
+            ..arrival_security()
+        };
+        {
+            let ctx = task.ue_manager.find_or_create_ue(5);
+            ctx.on_setup_complete();
+            ctx.set_reestablishment_security(sec.clone());
+            ctx.on_as_security_activated();
+        }
+        run_async(task.execute_handover(5, i32::from(SCELL_PCI)));
+        let dl = loop {
+            match rls_rx.try_recv() {
+                Ok(TaskMessage::Message(crate::tasks::RlsMessage::DownlinkRrc {
+                    ue_id: 5,
+                    data,
+                    ..
+                })) => break data,
+                Ok(_) => continue,
+                Err(e) => panic!("no handover command: {e}"),
+            }
+        };
+        // Sent on the SOURCE keys
+        let plain = arrival_srb(&sec)
+            .unprotect(1, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, dl.data())
+            .expect("the command is protected with the source keys");
+        let command = decode_handover_command(&plain).expect("a handover command");
+        assert_eq!(
+            command.master_key_update.map(|m| m.next_hop_chaining_count),
+            Some(2),
+            "the UE's current NCC, so it keys horizontally"
+        );
+        let kgnb_star = derive_kgnb_star(&sec.kgnb, SCELL_PCI, config.dl_arfcn);
+        let ctx = task.ue_manager.try_find_ue(5).expect("ctx");
+        let now = ctx.reestablishment_security.as_ref().expect("keys");
+        assert_eq!(now.kgnb, kgnb_star);
+        assert_eq!(
+            now.k_rrc_int,
+            derive_rrc_up_key(&kgnb_star, AlgorithmTypeDistinguisher::RrcInt, 2)
+        );
+        assert_eq!(ctx.pdcp_counts(), (0, 0), "SRB1 PDCP re-established");
+    }
+
+    /// #396 review: under a secured expectation, a PLAINTEXT UL-DCCH PDU from the
+    /// expected C-RNTI (here an ULInformationTransfer carrying NAS) fails the
+    /// KgNB* integrity check and is discarded outright: it is neither bound nor
+    /// dispatched, so no NAS reaches NGAP and no HANDOVER NOTIFY goes out.
+    #[test]
+    fn a_plaintext_pdu_under_a_secured_expectation_is_discarded() {
+        use nextgsim_rrc::procedures::information_transfer::{
+            encode_ul_information_transfer, UlInformationTransferParams,
+        };
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(
+                GnbConfig {
+                    as_security_enabled: true,
+                    ..test_config()
+                },
+                16,
+            );
+        let mut task = RrcTask::new(task_base);
+        let plain = encode_ul_information_transfer(&UlInformationTransferParams {
+            dedicated_nas_message: Some(vec![0x7E, 0x00, 0x67, 0x01]),
+        })
+        .expect("encode ULInformationTransfer");
+        run_async(async {
+            task.handle_expect_secured_handover_arrival(1000, 0x03E8, Some(arrival_security()));
+            task.handle_uplink_rrc_with_c_rnti(
+                7,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&plain),
+                Some(0x03E8),
+            )
+            .await;
+        });
+        assert!(rebinds(&mut rls_rx).is_empty());
+        let mut nas = 0;
+        let mut notify = 0;
+        while let Ok(msg) = ngap_rx.try_recv() {
+            match msg {
+                TaskMessage::Message(NgapMessage::UplinkNasDelivery { .. })
+                | TaskMessage::Message(NgapMessage::InitialNasDelivery { .. }) => nas += 1,
+                TaskMessage::Message(NgapMessage::HandoverAccessCompleted { .. }) => notify += 1,
+                _ => {}
+            }
+        }
+        assert_eq!((nas, notify), (0, 0), "discarded, not dispatched");
+        assert!(task.expects_handover_arrival(1000));
     }
 
     /// #324, #355 review: two concurrent handovers into one target. Each arriving

@@ -263,6 +263,8 @@ impl GnbHandoverManager {
             target_pci: target_cell_id as u32, // Simplified: PCI = cell_id
             new_ue_id: None,                   // Same UE ID for intra-gNB handover
             transaction_id,
+            // The caller sets the UE's current NCC (#325)
+            next_hop_chaining_count: HORIZONTAL_NCC,
         })
     }
 
@@ -801,6 +803,12 @@ pub struct HandoverCommand {
     pub new_ue_id: Option<i32>,
     /// Transaction ID
     pub transaction_id: u8,
+    /// The NCC of the UE's current KgNB (#325). A horizontal re-key signals
+    /// it unchanged (TS 33.501 §6.9.2.3.2): the UE compares it with its own and
+    /// keys horizontally only when they are equal, so a fixed 0 sent to a UE that
+    /// had moved on to NCC 1 made it key vertically from an NH the network never
+    /// used.
+    pub next_hop_chaining_count: u8,
 }
 
 impl HandoverCommand {
@@ -853,7 +861,7 @@ impl HandoverCommand {
             // source gNB holds — the forward-security loss this issue reports.
             master_key_update: Some(MasterKeyUpdateParams {
                 key_set_change_indicator: false,
-                next_hop_chaining_count: HORIZONTAL_NCC,
+                next_hop_chaining_count: self.next_hop_chaining_count,
             }),
         })
         .ok()
@@ -1071,6 +1079,7 @@ mod tests {
             target_pci: 16,
             new_ue_id: None,
             transaction_id: 5,
+            next_hop_chaining_count: 0,
         };
 
         let pdu = cmd

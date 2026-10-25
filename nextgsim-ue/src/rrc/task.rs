@@ -349,6 +349,24 @@ pub struct Srb1Config {
     pub cell_group_config: Option<CellGroupConfig>,
 }
 
+/// The UE's NH chain (TS 33.501 §6.9.2.1.1, Annex A.10; #325): the NH that
+/// belongs to `ncc`. At NCC 0 it is the KgNB of the AS SecurityModeCommand (the
+/// "virtual NH"), which is the SYNC-input of NH(1).
+#[derive(Clone, Copy)]
+struct NhChain {
+    nh: [u8; 32],
+    ncc: u8,
+}
+
+impl std::fmt::Debug for NhChain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print key material.
+        f.debug_struct("NhChain")
+            .field("ncc", &self.ncc)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The PDCP COUNTs of a protected SRB1 (#285).
 ///
 /// Reset to `{0, 0}` wherever TS 38.331 (re-)establishes PDCP for SRB1: RRC
@@ -487,6 +505,15 @@ pub struct RrcTask {
     /// last received in a reconfigurationWithSync or an RRCReestablishment
     /// (TS 38.331 §5.3.5.7, §5.3.7.5 "store the nextHopChainingCount value").
     as_ncc: u8,
+    /// K_AMF from the NAS plane (#325): the root of the NH chain (TS 33.501
+    /// §6.9.2.1.1, Annex A.10).
+    kamf: Option<[u8; 32]>,
+    /// The NH chain (#325): the KgNB of the AS SecurityModeCommand, which is
+    /// the SYNC-input of NH(1), and the NH at `as_ncc` once one was derived.
+    nh_chain: Option<NhChain>,
+    /// The DRBs keyed so far, as (PSI, DRB identity, integrity on), so a re-key
+    /// re-installs their user-plane keys (#325).
+    keyed_drbs: Vec<(i32, u8, bool)>,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -760,6 +787,9 @@ impl RrcTask {
             srb1_pdcp: None,
             srb1_suspended_for_reestablishment: false,
             as_ncc: 0,
+            kamf: None,
+            nh_chain: None,
+            keyed_drbs: Vec::new(),
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -805,6 +835,96 @@ impl RrcTask {
     /// derive the RRC keys (Wave-6 I5). Called via `RrcMessage::AsSecurityKey`.
     pub fn set_pending_kgnb(&mut self, kgnb: [u8; 32]) {
         self.pending_kgnb = Some(kgnb);
+    }
+
+    /// Installs K_AMF, the root of the NH chain (#325, TS 33.501 Annex A.10).
+    /// Called via `RrcMessage::AsSecurityKey` alongside the KgNB.
+    pub fn set_kamf(&mut self, kamf: [u8; 32]) {
+        self.kamf = Some(kamf);
+    }
+
+    /// `KgNB*` for a target that signals `ncc` (TS 33.501 §6.9.2.3.3, §6.11,
+    /// Annex A.10/A.11; #325).
+    ///
+    /// - The same NCC as the current KgNB's: **horizontal**, from the current
+    ///   KgNB (`current_kgnb`).
+    /// - Another NCC: **vertical**. The UE "shall firstly synchronize the locally
+    ///   kept NH parameter": it advances its NH chain, NH = KDF(K_AMF,
+    ///   SYNC-input) with the KgNB of the AS SecurityModeCommand as the first
+    ///   SYNC-input and the previous NH after that, until its NCC is the
+    ///   signalled one (NCC counts modulo 8), and keys `KgNB*` from that NH.
+    ///
+    /// Returns `KgNB*` and the chain to commit once the caller accepts it.
+    /// Refused when a vertical derivation has no K_AMF or chain to start from.
+    fn kgnb_star_for(
+        &self,
+        ncc: u8,
+        pci: u16,
+        current_kgnb: &[u8; 32],
+    ) -> Result<([u8; 32], Option<NhChain>), String> {
+        use nextgsim_crypto::kdf::{derive_kgnb_star, derive_nh};
+        let arfcn = self.task_base.config.dl_arfcn;
+        let ncc = ncc % 8;
+        if ncc == self.as_ncc {
+            return Ok((derive_kgnb_star(current_kgnb, pci, arfcn), None));
+        }
+        let Some(kamf) = self.kamf else {
+            return Err(format!(
+                "NCC {ncc} differs from this UE's NCC {}, and with no K_AMF the NH \
+                 chain cannot be synchronised",
+                self.as_ncc
+            ));
+        };
+        let Some(mut chain) = self.nh_chain else {
+            return Err("no NH chain: AS security was never activated".to_string());
+        };
+        while chain.ncc != ncc {
+            chain.nh = derive_nh(&kamf, &chain.nh);
+            chain.ncc = (chain.ncc + 1) % 8;
+        }
+        Ok((derive_kgnb_star(&chain.nh, pci, arfcn), Some(chain)))
+    }
+
+    /// Re-installs the user-plane keys of every DRB keyed so far, from the
+    /// current AS context (#325): a re-key changes K_UPenc / K_UPint, and a DRB
+    /// that survives it would otherwise keep the old keys while the network
+    /// uses the new ones.
+    #[allow(clippy::unused_async)]
+    async fn rekey_drbs(&mut self) {
+        #[cfg(feature = "up-security")]
+        {
+            use nextgsim_pdcp::{PdcpSecurity, UpSecurity, DIRECTION_UPLINK};
+            let Some(as_ctx) = self.as_security.clone() else {
+                return;
+            };
+            for (psi, drb_id, integrity) in self.keyed_drbs.clone() {
+                let security = match UpSecurity::new(
+                    as_ctx.k_up_enc,
+                    as_ctx.k_up_int,
+                    as_ctx.ciphering_algorithm.id(),
+                    integrity.then(|| as_ctx.integrity_algorithm.id()),
+                ) {
+                    Ok(sec) => sec,
+                    Err(e) => {
+                        error!("Refusing to re-key DRB {drb_id} (PSI {psi}): {e}");
+                        continue;
+                    }
+                };
+                info!("DRB {drb_id} (PSI {psi}): re-keyed with the new K_UPenc/K_UPint");
+                let msg = RlsMessage::InstallDrbSecurity {
+                    psi,
+                    drb_id: i32::from(drb_id),
+                    security: Some(Box::new(PdcpSecurity {
+                        security,
+                        bearer: drb_id.saturating_sub(1),
+                        tx_direction: DIRECTION_UPLINK,
+                    })),
+                };
+                if let Err(e) = self.task_base.rls_tx.send(msg).await {
+                    error!("Failed to re-key DRB {drb_id}: {e}");
+                }
+            }
+        }
     }
 
     /// Installs (or, with `None`, deletes) the 5G-S-TMSI the AS matches PCCH
@@ -877,8 +997,9 @@ impl RrcTask {
             AsSecurityContext::derive_from_kgnb(&kgnb, ciphering, integrity, AS_SECURITY_C_RNTI);
         // TS 33.501 §6.9.2.1.1: the KgNB of an initial AS security context "is then
         // considered to be associated with a virtual NH parameter with NCC value
-        // equal to zero".
+        // equal to zero". It is the SYNC-input of NH(1) (Annex A.10, #325).
         self.as_ncc = 0;
+        self.nh_chain = Some(NhChain { nh: kgnb, ncc: 0 });
 
         // TS 38.331 §5.3.4.2: verify the SecurityModeCommand's integrity with the
         // FRESHLY DERIVED K_RRCint before replying. On failure the UE continues
@@ -3090,6 +3211,7 @@ impl RrcTask {
         // L2 state an earlier connection left on the RLS task goes, so the DRBs
         // this connection sets up start at COUNT 0 like the gNB's (#315).
         self.send_rls(RlsMessage::ReleaseDrbs).await;
+        self.keyed_drbs.clear();
         // A new connection: SRB1 is unprotected until this connection's own
         // SecurityModeCommand (§5.3.3.4, #285).
         self.srb1_pdcp = None;
@@ -3691,6 +3813,7 @@ impl RrcTask {
         // §5.3.11: the release takes every radio bearer's PDCP and RLC entity
         // with it (#315).
         self.send_rls(RlsMessage::ReleaseDrbs).await;
+        self.keyed_drbs.clear();
         // SRB1 goes with the connection; a resume re-establishes it (#285).
         self.srb1_pdcp = None;
         // A suspension for a re-establishment does not outlive the connection it
@@ -3893,6 +4016,10 @@ impl RrcTask {
                     integrity,
                     as_ctx.ciphering_algorithm.id()
                 );
+                // Remembered, so a re-key re-installs this DRB's keys (#325)
+                self.keyed_drbs
+                    .retain(|(p, d, _)| (*p, *d) != (psi, drb_id));
+                self.keyed_drbs.push((psi, drb_id, integrity));
                 let msg = RlsMessage::InstallDrbSecurity {
                     psi,
                     // The DRB identity keys the RLS task's PDCP entity since issue #44,
@@ -4203,14 +4330,14 @@ impl RrcTask {
     /// declares handover failure with no indication that a key was the problem — which is
     /// why this logs both inputs.
     ///
-    /// **Horizontal only.** A vertical derivation chains from a fresh NH, and a UE never
-    /// receives an NH: TS 33.501 §6.9.2.3.1 has it derive vertically from the `KgNB` the
-    /// *NAS* layer refreshed, which this simulator does not do on handover. So a
-    /// `keySetChangeIndicator` of `true` is reported and treated as horizontal rather than
-    /// silently producing a key the network does not hold.
+    /// **Horizontal or vertical, by the NCC** (TS 33.501 §6.9.2.3.3; #325): the
+    /// signalled `nextHopChainingCount` equal to the UE's means horizontal, from the
+    /// current KgNB; a different one means vertical, from the NH the UE's chain
+    /// reaches at that NCC (see [`Self::kgnb_star_for`]). An N2 handover target keys
+    /// vertically from the AMF's {NH, NCC}, so a UE that derived horizontally there
+    /// failed every PDCP MAC on the target. `keySetChangeIndicator` (a KgNB from a
+    /// new K_AMF after a NAS key change) is not supported and is reported.
     fn apply_master_key_update(&mut self, update: KeyUpdate, target_pci: u32) {
-        use nextgsim_crypto::kdf::derive_kgnb_star;
-
         // The KgNB this handover chains from: the one the current AS security context was
         // derived with. Refused rather than substituted when there is none — a `KgNB*`
         // built on zeros would make every DRB and SRB on the target fail its MAC, with
@@ -4222,23 +4349,38 @@ impl RrcTask {
             );
             return;
         };
-        let kgnb = current.kgnb;
         if update.vertical {
             warn!(
-                "Handover asks for a VERTICAL key derivation (NCC {}), which needs an NH \
-                 this UE never receives; deriving horizontally instead \
-                 (TS 33.501 §6.9.2.3.1)",
-                update.next_hop_chaining_count
+                "Handover sets keySetChangeIndicator (a KgNB from a new K_AMF), which \
+                 this UE does not support; keying by the NCC instead (TS 38.331 §5.3.5.7)"
             );
         }
         let pci = (target_pci % 1008) as u16;
         let arfcn = self.task_base.config.dl_arfcn;
-        let kgnb_star = derive_kgnb_star(&kgnb, pci, arfcn);
+        let ncc = update.next_hop_chaining_count;
+        let chained = ncc % 8 != self.as_ncc;
+        let (kgnb_star, chain) = match self.kgnb_star_for(ncc, pci, &current.kgnb) {
+            Ok(derived) => derived,
+            Err(e) => {
+                warn!(
+                    "Handover: no KgNB* for NCC {ncc} ({e}); keeping the current keys, \
+                     so the target will not verify this UE (TS 33.501 §6.9.2.3.3)"
+                );
+                return;
+            }
+        };
         // TS 38.331 §5.3.5.7: "store the nextHopChainingCount value".
-        self.as_ncc = update.next_hop_chaining_count;
+        self.as_ncc = ncc % 8;
+        if let Some(chain) = chain {
+            self.nh_chain = Some(chain);
+        }
         info!(
-            "Handover: re-derived KgNB* for PCI {pci}, ARFCN-DL {arfcn} (NCC {})",
-            update.next_hop_chaining_count
+            "Handover: re-derived KgNB* {} for PCI {pci}, ARFCN-DL {arfcn} (NCC {ncc})",
+            if chained {
+                "VERTICALLY from NH"
+            } else {
+                "horizontally"
+            }
         );
         // The next handover chains from `KgNB*`, which is now this context's own `kgnb` —
         // so the chain advances rather than repeatedly re-deriving from the original.
@@ -4285,6 +4427,8 @@ impl RrcTask {
         // keys (issue #39).
         if let Some(update) = key_update {
             self.apply_master_key_update(update, target_pci);
+            // The DRBs this UE keeps run on the target's K_UP keys (#325)
+            self.rekey_drbs().await;
         }
 
         // TS 38.331 §5.3.5.8.3: T304 starts when the UE begins synchronising with the
@@ -4851,6 +4995,7 @@ impl RrcTask {
         let _ = self.state_machine.on_rrc_release();
         // Going to RRC_IDLE releases the radio bearers (§5.3.11, #315).
         self.send_rls(RlsMessage::ReleaseDrbs).await;
+        self.keyed_drbs.clear();
         self.srb1_pdcp = None;
         // A suspension for a re-establishment does not outlive the connection it
         // was for: the next connection's SRB1 starts afresh (#348 run).
@@ -5191,7 +5336,6 @@ impl RrcTask {
     /// Anything else is discarded: nothing else is expected, and nothing unverified
     /// is acted on.
     async fn handle_suspended_srb1_pdu(&mut self, cell_id: i32, pdu: &[u8]) {
-        use nextgsim_crypto::kdf::derive_kgnb_star;
         use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
 
         if pdu.len() <= MAC_I_LEN {
@@ -5217,28 +5361,29 @@ impl RrcTask {
         // TS 33.501 §6.11: "The UE shall firstly synchronize the locally kept NH
         // parameter as defined in Annex A.10 if the received NCC value is different
         // from the current NCC value in the UE itself", and Annex A.11 then keys
-        // KgNB* from that NH. This UE keeps no NH chain yet (#325), so it cannot
-        // derive the key the network holds for a different NCC. It refuses, rather
-        // than verify with a key that cannot match: the RRCReestablishment's
-        // integrity check would fail anyway, and this says why (#348 review).
-        if reestablishment.next_hop_chaining_count != self.as_ncc {
-            warn!(
-                "RRCReestablishment signals NCC {} but this UE's KgNB has NCC {}: a \
-                 vertical KgNB* needs the NH chain (TS 33.501 §6.11, Annex A.10/A.11), \
-                 which is not implemented (#325); going to RRC_IDLE",
-                reestablishment.next_hop_chaining_count, self.as_ncc
-            );
-            self.srb1_suspended_for_reestablishment = false;
-            self.enter_idle_after_radio_link_failure().await;
-            return;
-        }
+        // KgNB* from that NH (#325, see `kgnb_star_for`). With no K_AMF to advance
+        // the chain the UE refuses, rather than verify with a key that cannot match
+        // (#348 review).
+        //
         // ARFCN-DL of the selected cell (Annex A.11 P1). This simulator is
         // single-carrier: RLS carries no carrier frequency, so every cell is on the
         // UE's configured `dl_arfcn`, which must therefore equal each gNB's
         // `dl_arfcn` (docs/configuration.md). A gNB on another value derives a
         // different KgNB* and the re-establishment fails its integrity check.
         let arfcn = self.task_base.config.dl_arfcn;
-        let kgnb_star = derive_kgnb_star(&current.kgnb, pci, arfcn);
+        let ncc = reestablishment.next_hop_chaining_count;
+        let (kgnb_star, chain) = match self.kgnb_star_for(ncc, pci, &current.kgnb) {
+            Ok(derived) => derived,
+            Err(e) => {
+                warn!(
+                    "RRCReestablishment signals NCC {ncc}: no KgNB* for it ({e}) \
+                     (TS 33.501 §6.11, Annex A.10/A.11); going to RRC_IDLE"
+                );
+                self.srb1_suspended_for_reestablishment = false;
+                self.enter_idle_after_radio_link_failure().await;
+                return;
+            }
+        };
         let rekeyed = AsSecurityContext::derive_from_kgnb(
             &kgnb_star,
             current.ciphering_algorithm,
@@ -5267,11 +5412,18 @@ impl RrcTask {
             reestablishment.next_hop_chaining_count
         );
         self.as_security = Some(rekeyed);
+        // §5.3.7.5 "store the nextHopChainingCount value", and the NH reached
+        self.as_ncc = ncc % 8;
+        if let Some(chain) = chain {
+            self.nh_chain = Some(chain);
+        }
         self.srb1_suspended_for_reestablishment = false;
         self.srb1_pdcp = Some(Srb1Pdcp {
             tx_count: 0,
             rx_count: 1,
         });
+        // The DRBs that survive re-establishment run on the new K_UP keys (#325)
+        self.rekey_drbs().await;
         self.handle_rrc_reestablishment(cell_id, &reestablishment)
             .await;
     }
@@ -5459,9 +5611,12 @@ impl Task for RrcTask {
                                 // that just became forbidden (nextgsim #322).
                                 self.last_cell_selection = None;
                             }
-                            RrcMessage::AsSecurityKey { kgnb } => {
+                            RrcMessage::AsSecurityKey { kgnb, kamf } => {
                                 debug!("Received KgNB for AS security from NAS plane");
                                 self.set_pending_kgnb(kgnb);
+                                if let Some(kamf) = kamf {
+                                    self.set_kamf(kamf);
+                                }
                             }
                             #[cfg(feature = "sidelink")]
                             RrcMessage::SidelinkInterestChanged {
@@ -6081,6 +6236,179 @@ mod tests {
                 "no masterKeyUpdate means no re-key (TS 38.331 §5.3.5.5.2)"
             );
             assert_eq!(after.k_rrc_int, before.k_rrc_int);
+        });
+    }
+
+    /// The K_AMF the NH-chain tests root the chain on (#325).
+    const TEST_KAMF: [u8; 32] = [0x24; 32];
+
+    /// A handover command to PCI 407 with `masterKeyUpdate` NCC `ncc`.
+    fn keyed_handover_command(ncc: u8) -> HandoverCommand {
+        use nextgsim_rrc::procedures::rrc_reconfiguration::{
+            encode_handover_command, HandoverCommandParams, MasterKeyUpdateParams,
+        };
+        let pdu = encode_handover_command(&HandoverCommandParams {
+            rrc_transaction_id: 0,
+            target_phys_cell_id: 407,
+            new_ue_identity: 1,
+            t304_ms: 1000,
+            full_config: true,
+            master_key_update: Some(MasterKeyUpdateParams {
+                key_set_change_indicator: false,
+                next_hop_chaining_count: ncc,
+            }),
+        })
+        .expect("encode");
+        parse_handover_command(&pdu).expect("parse")
+    }
+
+    /// #325, TS 33.501 §6.9.2.3.3 / Annex A.10: a handover that signals a NEW
+    /// NCC keys vertically. The UE advances its NH chain from the KgNB of the AS
+    /// SecurityModeCommand (NH(1) = KDF(K_AMF, KgNB), then NH(n+1) = KDF(K_AMF,
+    /// NH(n))) to the signalled NCC and derives KgNB* from that NH, which is the
+    /// key an N2 target holds from the AMF's {NH, NCC}. Two handovers, NCC 1 then
+    /// NCC 3, so the chain is shown to continue from where it stopped.
+    #[test]
+    fn a_new_ncc_keys_the_handover_vertically_from_the_nh_chain() {
+        use nextgsim_crypto::kdf::{derive_kgnb_star, derive_nh};
+        let config = test_config();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(config.clone(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.set_kamf(TEST_KAMF);
+            task.nh_chain = Some(NhChain {
+                nh: [0x5A; 32],
+                ncc: 0,
+            });
+
+            task.handle_handover_command(1, keyed_handover_command(1))
+                .await;
+            let nh1 = derive_nh(&TEST_KAMF, &[0x5A; 32]);
+            assert_eq!(
+                task.as_security.as_ref().expect("keyed").kgnb,
+                derive_kgnb_star(&nh1, 407, config.dl_arfcn),
+                "KgNB* from NH(1)"
+            );
+            assert_eq!(task.as_ncc, 1);
+
+            task.handle_handover_command(1, keyed_handover_command(3))
+                .await;
+            let nh3 = derive_nh(&TEST_KAMF, &derive_nh(&TEST_KAMF, &nh1));
+            assert_eq!(
+                task.as_security.as_ref().expect("keyed").kgnb,
+                derive_kgnb_star(&nh3, 407, config.dl_arfcn),
+                "KgNB* from NH(3), chained on from NH(1)"
+            );
+            assert_eq!(task.as_ncc, 3);
+
+            // NCC 0 again: five more steps (4, 5, 6, 7, 0) from NH(3), not the KgNB
+            // the chain started from
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            let mut nh8 = nh3;
+            for _ in 0..5 {
+                nh8 = derive_nh(&TEST_KAMF, &nh8);
+            }
+            assert_eq!(
+                task.as_security.as_ref().expect("keyed").kgnb,
+                derive_kgnb_star(&nh8, 407, config.dl_arfcn),
+                "the chain continues past NCC 7"
+            );
+        });
+    }
+
+    /// #325: NCC counts modulo 8 (it is 3 bits, TS 38.331 NextHopChainingCount):
+    /// from NCC 6 a handover to NCC 1 takes three NH steps (7, 0, 1).
+    #[test]
+    fn the_nh_chain_wraps_its_ncc_modulo_8() {
+        use nextgsim_crypto::kdf::{derive_kgnb_star, derive_nh};
+        let config = test_config();
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(config.clone(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.set_kamf(TEST_KAMF);
+            let nh6 = [0x66; 32];
+            task.nh_chain = Some(NhChain { nh: nh6, ncc: 6 });
+            task.as_ncc = 6;
+            task.handle_handover_command(1, keyed_handover_command(1))
+                .await;
+            let nh1 = derive_nh(
+                &TEST_KAMF,
+                &derive_nh(&TEST_KAMF, &derive_nh(&TEST_KAMF, &nh6)),
+            );
+            assert_eq!(
+                task.as_security.as_ref().expect("keyed").kgnb,
+                derive_kgnb_star(&nh1, 407, config.dl_arfcn)
+            );
+            assert_eq!(task.as_ncc, 1);
+        });
+    }
+
+    /// #325: a new NCC with no K_AMF cannot be keyed; the UE keeps its keys and
+    /// says so rather than deriving horizontally into a key the target does not
+    /// hold.
+    #[test]
+    fn a_new_ncc_without_k_amf_keeps_the_keys() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.nh_chain = Some(NhChain {
+                nh: [0x5A; 32],
+                ncc: 0,
+            });
+            let before = task.as_security.as_ref().expect("keyed").kgnb;
+            task.handle_handover_command(1, keyed_handover_command(1))
+                .await;
+            assert_eq!(task.as_security.as_ref().expect("keyed").kgnb, before);
+            assert_eq!(task.as_ncc, 0);
+        });
+    }
+
+    /// #325: a handover that re-keys re-installs the user-plane keys of the DRBs
+    /// the UE keeps, from the new K_UPenc / K_UPint.
+    #[cfg(feature = "up-security")]
+    #[test]
+    fn a_handover_re_key_re_installs_the_drb_keys() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.keyed_drbs = vec![(1, 1, true), (2, 2, false)];
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            let after = task.as_security.clone().expect("keyed");
+            let mut rekeyed = Vec::new();
+            while let Ok(msg) = rls_rx.try_recv() {
+                if let TaskMessage::Message(RlsMessage::InstallDrbSecurity {
+                    psi,
+                    drb_id,
+                    security,
+                }) = msg
+                {
+                    let security = security.expect("a binding");
+                    let expected = nextgsim_pdcp::UpSecurity::new(
+                        after.k_up_enc,
+                        after.k_up_int,
+                        after.ciphering_algorithm.id(),
+                        (drb_id == 1).then(|| after.integrity_algorithm.id()),
+                    )
+                    .expect("legal");
+                    let (hdr, data) = ([0x80, 0x00], b"payload");
+                    assert_eq!(
+                        security.security.protect(0, 0, 0, &hdr, data),
+                        expected.protect(0, 0, 0, &hdr, data),
+                        "DRB {drb_id} runs on the new K_UP keys"
+                    );
+                    rekeyed.push((psi, drb_id));
+                }
+            }
+            assert_eq!(rekeyed, vec![(1, 1), (2, 2)]);
         });
     }
 

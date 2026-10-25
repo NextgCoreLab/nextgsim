@@ -249,6 +249,12 @@ impl RrcUeContext {
         .ok()
     }
 
+    /// The (DL, UL) SRB1 PDCP COUNTs next to be used (test hook, #325).
+    #[cfg(test)]
+    pub(crate) fn pdcp_counts(&self) -> (u32, u32) {
+        (self.dl_pdcp_count, self.ul_pdcp_count)
+    }
+
     /// Takes the next downlink PDCP COUNT.
     pub fn next_dl_pdcp_count(&mut self) -> u32 {
         let c = self.dl_pdcp_count;

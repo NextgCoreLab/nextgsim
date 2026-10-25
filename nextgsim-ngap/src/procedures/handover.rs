@@ -678,6 +678,11 @@ pub struct HandoverRequestData {
     /// present and the Source to Target container carries no radio capabilities, the
     /// target requests the mapping from the AMF if it holds none for the ID.
     pub ue_radio_capability_id: Option<Vec<u8>>,
+    /// UE Security Capabilities (TS 38.413 §9.2.3.4): the algorithms the target
+    /// may select for this UE's AS security (TS 33.501 §6.7.3.1, #325). `None`
+    /// when a peer omitted the (mandatory) IE.
+    pub ue_security_capabilities:
+        Option<crate::procedures::initial_context_setup::UeSecurityCapabilitiesValue>,
 }
 
 /// Parse a Handover Request from an NGAP PDU
@@ -710,6 +715,7 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
     let mut security_context: Option<HandoverSecurityContext> = None;
 
     let mut ue_radio_capability_id = None;
+    let mut ue_security_capabilities = None;
     for ie in &request.protocol_i_es.0 {
         match &ie.value {
             HandoverRequestProtocolIEs_EntryValue::Id_AMF_UE_NGAP_ID(id) => {
@@ -735,6 +741,11 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
             HandoverRequestProtocolIEs_EntryValue::Id_UERadioCapabilityID(id) => {
                 ue_radio_capability_id = Some(id.0.clone());
             }
+            HandoverRequestProtocolIEs_EntryValue::Id_UESecurityCapabilities(caps) => {
+                ue_security_capabilities = Some(
+                    crate::procedures::initial_context_setup::parse_ue_security_capabilities(caps),
+                );
+            }
             _ => {}
         }
     }
@@ -751,6 +762,7 @@ pub fn parse_handover_request(pdu: &NGAP_PDU) -> Result<HandoverRequestData, Han
         pdu_sessions,
         security_context,
         ue_radio_capability_id,
+        ue_security_capabilities,
     })
 }
 
@@ -941,6 +953,10 @@ pub struct HandoverRequestParams {
     pub pdu_sessions: Vec<HandoverRequestSetupItem>,
     /// The AS security context to chain from
     pub security_context: Option<HandoverSecurityContext>,
+    /// The UE Security Capabilities (TS 38.413 §9.2.3.4, mandatory): the target
+    /// selects its AS algorithms from them (#325)
+    pub ue_security_capabilities:
+        Option<crate::procedures::initial_context_setup::UeSecurityCapabilitiesValue>,
 }
 
 /// Build a Handover Request (AMF → target gNB, TS 38.413 §8.4.2.1).
@@ -998,6 +1014,16 @@ pub fn build_handover_request(params: &HandoverRequestParams) -> Result<NGAP_PDU
             criticality: Criticality(Criticality::REJECT),
             value: HandoverRequestProtocolIEs_EntryValue::Id_PDUSessionResourceSetupListHOReq(
                 PDUSessionResourceSetupListHOReq(items),
+            ),
+        });
+    }
+
+    if let Some(caps) = &params.ue_security_capabilities {
+        protocol_ies.push(HandoverRequestProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_UE_SECURITY_CAPABILITIES),
+            criticality: Criticality(Criticality::REJECT),
+            value: HandoverRequestProtocolIEs_EntryValue::Id_UESecurityCapabilities(
+                crate::procedures::initial_context_setup::build_ue_security_capabilities(caps),
             ),
         });
     }
@@ -2391,7 +2417,34 @@ mod tests {
                 next_hop_chaining_count: 3,
                 next_hop_nh: [0xA5; 32],
             }),
+            ue_security_capabilities: Some(
+                crate::procedures::initial_context_setup::UeSecurityCapabilitiesValue {
+                    nr_encryption_algorithms: 0x6000,
+                    nr_integrity_algorithms: 0x2000,
+                    eutra_encryption_algorithms: Some(0),
+                    eutra_integrity_algorithms: Some(0),
+                },
+            ),
         }
+    }
+
+    /// #325: the UE Security Capabilities (TS 38.413 §9.2.3.4) reach the parsed
+    /// Handover Request, bit for bit, and a request without them parses to
+    /// `None` rather than invented capabilities.
+    #[test]
+    fn the_ue_security_capabilities_reach_the_parsed_handover_request() {
+        let params = ho_request_params();
+        let data = parse_handover_request(&build_handover_request(&params).expect("build"))
+            .expect("parse");
+        assert_eq!(
+            data.ue_security_capabilities,
+            params.ue_security_capabilities
+        );
+        let mut without = ho_request_params();
+        without.ue_security_capabilities = None;
+        let data = parse_handover_request(&build_handover_request(&without).expect("build"))
+            .expect("parse");
+        assert_eq!(data.ue_security_capabilities, None);
     }
 
     /// #39, criterion 1: the requested PDU Session Resource Setup List reaches the

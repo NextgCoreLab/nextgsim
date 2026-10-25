@@ -640,6 +640,12 @@ pub enum RrcMessage {
         /// The C-RNTI the admission allocated (`newUE-Identity`), by which the
         /// arriving UE is recognised (#355 review).
         c_rnti: u16,
+        /// The SRB keys this target derived from `KgNB*` at admission (#325). With
+        /// `as_security_enabled` the arriving RRCReconfigurationComplete is the
+        /// first protected UL PDU on this cell (TS 38.331 §5.3.5.8.3); it is
+        /// verified with these keys at UL COUNT 0, and SRB1 protection then runs
+        /// on them. `None` when the admission derived no `KgNB*`.
+        security: Option<Box<crate::rrc::ue_context::ReestablishmentSecurity>>,
     },
     /// AN release request (from NGAP)
     AnRelease {
