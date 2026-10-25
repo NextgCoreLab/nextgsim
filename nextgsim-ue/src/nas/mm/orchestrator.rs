@@ -42,10 +42,11 @@ use nextgsim_nas::messages::mm::ue_policy::{
 };
 use nextgsim_nas::messages::mm::{
     AuthenticationFailure, AuthenticationRequest, AuthenticationResponse,
-    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, Ie5gsMobileIdentity,
-    MmCause, MobileIdentityType, RegistrationAccept, RegistrationComplete, RegistrationReject,
-    RegistrationRequest, SecurityModeCommand, SecurityModeComplete, SecurityModeReject,
-    ServiceAccept, ServiceReject, ServiceRequest,
+    DeregistrationRequestUeOriginating, DeregistrationRequestUeTerminated, DlNasTransport,
+    FiveGMmStatus, IdentityRequest, Ie5gsMobileIdentity, MmCause, MobileIdentityType,
+    RegistrationAccept, RegistrationComplete, RegistrationReject, RegistrationRequest,
+    SecurityModeCommand, SecurityModeComplete, SecurityModeReject, ServiceAccept, ServiceReject,
+    ServiceRequest,
 };
 use nextgsim_nas::security::{
     compute_nas_mac, nas_cipher, verify_nas_mac, CipheringAlgorithm, IntegrityAlgorithm, NasCount,
@@ -662,6 +663,11 @@ pub struct MmOrchestrator {
     /// [`SR_ATTEMPT_LIMIT`] T3525 starts. Reset by a completed or rejected
     /// service request, a completed registration, and 5GMM-DEREGISTERED.
     sr_attempt_counter: u32,
+    /// The PDU sessions that are not inactive in the UE, as a PDU session
+    /// status bitmap (TS 24.501 §9.11.3.44, bit n = PSI n). Kept from the SM
+    /// layer's established / released events (#334) for the PDU session status
+    /// IE of a registration update from 5GMM-IDLE (§5.5.1.3.2).
+    active_pdu_sessions: u16,
     /// The Uplink data status the last registration update carried (#313 review):
     /// the sessions whose user plane the Registration Accept is to bring back.
     registration_uplink_data_status: Option<u16>,
@@ -819,6 +825,7 @@ impl MmOrchestrator {
             pending_service_type: None,
             sr_from_idle: false,
             sr_attempt_counter: 0,
+            active_pdu_sessions: 0,
             registration_uplink_data_status: None,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
@@ -1928,6 +1935,20 @@ impl MmOrchestrator {
             mobile_identity.clone(),
         );
         req.uplink_data_status = uplink_data_status;
+        // TS 24.501 §5.5.1.3.2: a mobility or periodic update initiated in
+        // 5GMM-IDLE "may include a PDU session status IE ... indicating which
+        // ... PDU sessions ... are not inactive in the UE", so the AMF releases
+        // the ones the UE no longer has (§5.5.1.3.4). An all-zero value is
+        // meaningful too: the UE holds none. NON-CLEARTEXT (§4.4.6): set on
+        // `req` only, which travels in the NAS message container (#334).
+        if matches!(
+            reg_type,
+            RegistrationType::MobilityRegistrationUpdating
+                | RegistrationType::PeriodicRegistrationUpdating
+        ) && self.state.is_idle()
+        {
+            req.pdu_session_status = Some(self.active_pdu_sessions);
+        }
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
@@ -2139,7 +2160,7 @@ impl MmOrchestrator {
             Ok(acc) => acc,
             Err(e) => {
                 warn!("Failed to decode Registration Accept: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -2347,11 +2368,23 @@ impl MmOrchestrator {
         outs
     }
 
+    /// PDU session `psi` is now active (#334): a registration update from
+    /// 5GMM-IDLE names it in the PDU session status IE (TS 24.501 §5.5.1.3.2).
+    pub fn on_pdu_session_established(&mut self, psi: u8) {
+        self.active_pdu_sessions |= uplink_data_status_bit(psi);
+    }
+
+    /// The PDU session status bitmap the UE would report (#334).
+    pub fn active_pdu_sessions(&self) -> u16 {
+        self.active_pdu_sessions
+    }
+
     /// PDU session `psi` was released (#313 re-review): it has no uplink data
     /// pending any more, so its bit leaves the held Uplink data status
     /// (§5.6.1.2 names only sessions with pending data).
     pub fn on_pdu_session_released(&mut self, psi: u8) {
         let bit = uplink_data_status_bit(psi);
+        self.active_pdu_sessions &= !bit;
         if let Some(status) = self.held_uplink_data_status.as_mut() {
             *status &= !bit;
             if *status == 0 {
@@ -2367,7 +2400,7 @@ impl MmOrchestrator {
             Ok(rej) => rej,
             Err(e) => {
                 warn!("Failed to decode Registration Reject: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
         let cause = rej.mm_cause.value;
@@ -2580,7 +2613,10 @@ impl MmOrchestrator {
         if self.pending_is_registration_update() {
             return self.abnormal_registration_update_failure();
         }
-        self.registration_attempt_counter += 1;
+        // §5.5.1.2.7: "incremented, unless it was already set to 5"
+        if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
+            self.registration_attempt_counter += 1;
+        }
         if self.registration_attempt_counter < MAX_REGISTRATION_ATTEMPTS {
             info!(
                 "Registration attempt {} of {} failed; starting T3511",
@@ -2589,21 +2625,40 @@ impl MmOrchestrator {
             self.state
                 .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
             self.timers.start(TIMER_T3511, true);
+            Vec::new()
         } else {
             warn!(
-                "Registration attempt counter reached {}; starting T3502",
+                "Registration attempt counter reached {}; deleting the registration context, \
+                 starting T3502",
                 MAX_REGISTRATION_ATTEMPTS
             );
+            // §5.5.1.2.7, counter equal to 5: delete the TAI list and the last
+            // visited registered TAI and, for a UE not registered over both
+            // accesses (this one is single access), the 5G-GUTI, the ngKSI and
+            // the list of equivalent PLMNs (#343). Kept, the T3502 retry
+            // presented the identity the network had failed on five times.
+            // `delete_registration_context` also removes the stored copy
+            // (Annex C.1).
+            self.delete_registration_context();
+            self.current_tai = None;
             self.state.switch_update_status(UpdateStatus::NotUpdated);
             self.state
                 .switch_mm_state(MmSubState::DeregisteredAttemptingRegistration);
+            // A network T3502 of zero starts a zero-length timer, which expires
+            // on the next tick: "the actions defined for the expiry of the
+            // timer T3502".
             if let Some(timer3) = self.t3502_value {
                 self.timers.start_with_timer3(TIMER_T3502, timer3, true);
             } else {
                 self.timers.start(TIMER_T3502, true);
             }
+            if self.equivalent_plmns.is_empty() {
+                Vec::new()
+            } else {
+                self.equivalent_plmns.clear();
+                vec![MmOutput::EquivalentPlmnsUpdated(Vec::new())]
+            }
         }
-        Vec::new()
     }
 
     /// Abnormal failure of a mobility or periodic registration update
@@ -2695,7 +2750,7 @@ impl MmOrchestrator {
             Ok(req) => req,
             Err(e) => {
                 warn!("Failed to decode Authentication Request: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -3039,8 +3094,11 @@ impl MmOrchestrator {
         let smc = match SecurityModeCommand::decode(&mut &payload[3..]) {
             Ok(smc) => smc,
             Err(e) => {
+                // TS 24.501 §7.5.1 (§7.5.2: no 5GMM exception): a mandatory-IE error is
+                // answered with 5GMM STATUS #96. SECURITY MODE REJECT is for a command
+                // the UE decoded and cannot accept (§5.4.2.5) (#384 review).
                 warn!("Failed to decode Security Mode Command: {e:?}");
-                return self.send_security_mode_reject(MmCause::InvalidMandatoryInformation);
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -3612,7 +3670,7 @@ impl MmOrchestrator {
             Ok(rej) => rej,
             Err(e) => {
                 warn!("Failed to decode Service Reject: {e:?}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
         // The cause octet as sent: #78 has no MmCause variant, so the decoded
@@ -4000,7 +4058,7 @@ impl MmOrchestrator {
             Ok(m) => m,
             Err(e) => {
                 warn!("Malformed network DEREGISTRATION REQUEST: {e}");
-                return Vec::new();
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -4289,8 +4347,36 @@ impl MmOrchestrator {
                 warn!("Security Mode Command without integrity protection: discarded");
                 Vec::new()
             }
+            // Owned by the caller, but their mandatory IEs are checked here so an
+            // undecodable one is answered with 5GMM STATUS #96 like the rest
+            // (TS 24.501 §7.5.1).
+            MmMessageType::IdentityRequest
+                if IdentityRequest::decode(&mut plain.as_slice()).is_err() =>
+            {
+                warn!("Failed to decode Identity Request");
+                self.send_invalid_mandatory_information_status()
+            }
+            MmMessageType::DlNasTransport if DlNasTransport::decode(&mut &plain[3..]).is_err() => {
+                warn!("Failed to decode DL NAS Transport");
+                self.send_invalid_mandatory_information_status()
+            }
             _ => vec![MmOutput::NotHandled(plain)],
         }
+    }
+
+    /// 5GMM STATUS with cause #96 "invalid mandatory information" (TS 24.501
+    /// §7.5.1, §8.2.29), the UE's answer to a 5GMM message with an imperative
+    /// part error, a missing or syntactically incorrect mandatory IE, or an
+    /// unknown "comprehension required" IE. §7.5.2 lists no 5GMM exception, so
+    /// the procedure the message belonged to is otherwise left as it was: its
+    /// timer keeps running and its retransmission decides what happens next.
+    /// Before #932 (nextgcore) the UE logged the failure and sent nothing.
+    fn send_invalid_mandatory_information_status(&mut self) -> Vec<MmOutput> {
+        let mut pdu = Vec::new();
+        FiveGMmStatus::new(MmCause::InvalidMandatoryInformation).encode(&mut pdu);
+        info!("Sending 5GMM STATUS (cause #96, invalid mandatory information)");
+        let pdu = self.protect_if_active(pdu);
+        vec![MmOutput::SendNasPdu(pdu)]
     }
 
     /// TS 24.501 4.4.4.2 allow-list: messages the UE may process when received
@@ -5993,6 +6079,79 @@ mod tests {
         assert_eq!(orch.registration_attempt_counter(), 0);
     }
 
+    /// #343, TS 24.501 §5.5.1.2.7: the fifth failed initial registration
+    /// deletes the TAI list, the last visited registered TAI, the 5G-GUTI, the
+    /// ngKSI and the equivalent PLMNs (and the stored copy), so the T3502 retry
+    /// registers with the SUCI and no stale context. The first four keep them.
+    #[test]
+    fn the_fifth_failed_initial_registration_deletes_the_registration_context() {
+        let (_, path) = state_file_config("fifth-failure");
+        let mut orch = establish_security_context();
+        orch.state_file = Some(path.clone());
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.persist_state();
+        assert!(path.exists(), "precondition: state persisted");
+        orch.equivalent_plmns = vec![[0x00, 0xF1, 0x10]];
+        assert!(orch.stored_guti().is_some() && orch.tai_list.is_some());
+        assert!(orch.current_tai.is_some());
+
+        // Network de-registration, then initial registrations the network
+        // never answers
+        orch.state_mut()
+            .switch_mm_state(MmSubState::DeregisteredNormalService);
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let mut last = Vec::new();
+        for i in 1..=MAX_REGISTRATION_ATTEMPTS {
+            // The network never answers: T3510 expires (§5.5.1.2.7 c))
+            last = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3510, true, 1));
+            if i < MAX_REGISTRATION_ATTEMPTS {
+                assert!(orch.stored_guti().is_some(), "attempt {i}: kept");
+                assert!(orch.sec.is_active(), "attempt {i}: ngKSI kept");
+                orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3511, true, i));
+            }
+        }
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
+        assert!(orch.timers().t3502.is_running());
+        assert!(orch.stored_guti().is_none(), "5G-GUTI deleted");
+        assert!(orch.tai_list.is_none(), "TAI list deleted");
+        assert!(
+            orch.current_tai.is_none(),
+            "last visited registered TAI deleted"
+        );
+        assert!(!orch.sec.is_active(), "ngKSI deleted");
+        assert!(orch.equivalent_plmns.is_empty());
+        assert!(
+            last.contains(&MmOutput::EquivalentPlmnsUpdated(Vec::new())),
+            "{last:?}"
+        );
+        assert!(!path.exists(), "the stored copy goes too");
+
+        // The T3502 retry registers with the SUCI and no last visited TAI
+        let outs = orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3502, true, 1));
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.mobile_identity.identity_type, MobileIdentityType::Suci);
+        assert_eq!(full.last_visited_tai, None);
+    }
+
+    /// #343, §5.5.1.2.7: the counter is not incremented past 5.
+    #[test]
+    fn the_registration_attempt_counter_stops_at_five() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        for _ in 0..MAX_REGISTRATION_ATTEMPTS + 2 {
+            let pdu = build_registration_reject_pdu(MmCause::ProtocolErrorUnspecified, None);
+            orch.handle_downlink(&pdu);
+        }
+        assert_eq!(
+            orch.registration_attempt_counter(),
+            MAX_REGISTRATION_ATTEMPTS
+        );
+    }
+
     /// The TAI the test registration accept's TAI list holds: PLMN 999/70, TAC 1.
     const TAI_IN_LIST: [u8; 6] = [0x99, 0xF9, 0x07, 0x00, 0x00, 0x01];
     /// A TAI the list does not hold: same PLMN, TAC 2.
@@ -6911,6 +7070,115 @@ mod tests {
         assert!(outs.is_empty());
     }
 
+    // ========================================================================
+    // Mandatory-IE errors: 5GMM STATUS #96 (TS 24.501 §7.5.1, nextgcore #932)
+    // ========================================================================
+
+    /// The plain 5GMM message inside an uplink PDU the UE sent: as is when it
+    /// went out unprotected, deciphered with the uplink COUNT it used otherwise.
+    fn open_uplink(orch: &MmOrchestrator, pdu: &[u8]) -> Vec<u8> {
+        if pdu[1] == 0x00 {
+            return pdu.to_vec();
+        }
+        let sec = orch.security_context();
+        let count = NasCount::new(0, sec.uplink_count().sqn.wrapping_sub(1));
+        let mut payload = pdu[7..].to_vec();
+        if pdu[1] == 0x02 {
+            nas_cipher(
+                sec.ciphering_algorithm(),
+                sec.keys().knas_enc().unwrap(),
+                &count,
+                NAS_BEARER,
+                NasDirection::Uplink,
+                &mut payload,
+            );
+        }
+        payload
+    }
+
+    /// The exact 5GMM STATUS #96 octets (TS 24.501 §8.2.29): EPD 0x7E, plain
+    /// security header, message type 0x64, 5GMM cause 96.
+    const STATUS_96: [u8; 4] = [0x7E, 0x00, 0x64, 96];
+
+    /// Every UE-owned downlink 5GMM message whose mandatory part does not decode
+    /// is answered with 5GMM STATUS #96, protected like any other uplink.
+    #[test]
+    fn a_protected_message_with_a_bad_mandatory_ie_is_answered_with_status_96() {
+        let cases: &[(&str, Vec<u8>)] = &[
+            // 5GS registration result (LV) missing.
+            ("REGISTRATION ACCEPT", vec![0x7E, 0x00, 0x42]),
+            // 5GMM cause missing.
+            ("REGISTRATION REJECT", vec![0x7E, 0x00, 0x44]),
+            ("SERVICE REJECT", vec![0x7E, 0x00, 0x4D]),
+            // De-registration type + ngKSI octet missing.
+            ("DEREGISTRATION REQUEST", vec![0x7E, 0x00, 0x47]),
+            // ngKSI octet present, ABBA (LV) missing.
+            ("AUTHENTICATION REQUEST", vec![0x7E, 0x00, 0x56, 0x00]),
+            // 5GS identity type missing.
+            ("IDENTITY REQUEST", vec![0x7E, 0x00, 0x5B]),
+            // Payload container type present, payload container (LV-E) missing.
+            ("DL NAS TRANSPORT", vec![0x7E, 0x00, 0x68, 0x01]),
+        ];
+        for (name, inner) in cases {
+            let mut orch = establish_security_context();
+            let protected = protect_downlink(&orch, inner, 1);
+            let outs = orch.handle_downlink(&protected);
+            assert_eq!(outs.len(), 1, "{name}: one uplink, nothing else: {outs:?}");
+            let sent = first_sent_pdu(&outs).to_vec();
+            assert_eq!(sent[1], 0x02, "{name}: the STATUS goes out protected");
+            assert_eq!(open_uplink(&orch, &sent), STATUS_96, "{name}");
+        }
+    }
+
+    /// Before security is established, a message on the TS 24.501 §4.4.4.2
+    /// allow-list with a bad mandatory IE gets a plain STATUS #96.
+    #[test]
+    fn a_plain_allowed_message_with_a_bad_mandatory_ie_is_answered_with_status_96() {
+        for inner in [
+            vec![0x7E, 0x00, 0x56, 0x00],
+            vec![0x7E, 0x00, 0x44],
+            vec![0x7E, 0x00, 0x4D],
+        ] {
+            let mut orch = new_orch();
+            orch.start_registration(RegistrationType::InitialRegistration);
+            let outs = orch.handle_downlink(&inner);
+            assert_eq!(first_sent_pdu(&outs), STATUS_96, "{inner:02x?}");
+            // The procedure is otherwise untouched: T3510 still runs.
+            assert!(orch.timers().t3510.is_running());
+            assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
+        }
+    }
+
+    /// #384 review: an undecodable SECURITY MODE COMMAND (new-context header) is a
+    /// §7.5.1 mandatory-IE error too, so it gets 5GMM STATUS #96, not SECURITY MODE
+    /// REJECT. No context is active yet, so the STATUS goes out plain.
+    #[test]
+    fn an_undecodable_security_mode_command_is_answered_with_status_96() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        let _ = orch.handle_downlink(&auth);
+        // SHT 3 (integrity, new context), MAC, SQN 0, then an SMC that stops after
+        // its message type: the selected NAS security algorithms are missing.
+        let smc = [0x7E, 0x03, 0, 0, 0, 0, 0, 0x7E, 0x00, 0x5D];
+        let outs = orch.handle_downlink(&smc);
+        assert_eq!(outs.len(), 1, "{outs:?}");
+        assert_eq!(first_sent_pdu(&outs), STATUS_96);
+        assert!(!orch.security_context().is_active());
+    }
+
+    /// A well-formed DL NAS TRANSPORT still goes to the caller, not to STATUS.
+    #[test]
+    fn a_decodable_dl_nas_transport_is_not_answered_with_status() {
+        let mut orch = establish_security_context();
+        let inner = vec![0x7E, 0x00, 0x68, 0x01, 0x00, 0x01, 0xAA];
+        let protected = protect_downlink(&orch, &inner, 1);
+        assert_eq!(
+            orch.handle_downlink(&protected),
+            vec![MmOutput::NotHandled(inner)]
+        );
+    }
+
     #[test]
     fn test_unhandled_protected_message_is_deciphered_and_forwarded() {
         let mut orch = establish_security_context();
@@ -7024,6 +7292,72 @@ mod tests {
         let mut plain_full = Vec::new();
         full.encode(&mut plain_full);
         assert_ne!(container, &plain_full);
+    }
+
+    /// #334, TS 24.501 §5.5.1.3.2: a mobility or periodic update from
+    /// 5GMM-IDLE names the UE's PDU sessions in the PDU session status IE, in
+    /// the ciphered container only (§4.4.6); a released session leaves it.
+    #[test]
+    fn an_idle_registration_update_carries_the_pdu_session_status() {
+        for reg_type in [
+            RegistrationType::MobilityRegistrationUpdating,
+            RegistrationType::PeriodicRegistrationUpdating,
+        ] {
+            let mut orch = establish_security_context();
+            let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+            orch.handle_downlink(&acc);
+            orch.on_pdu_session_established(1);
+            orch.on_pdu_session_established(5);
+            orch.on_pdu_session_established(7);
+            orch.on_pdu_session_released(7);
+            orch.on_nas_signalling_connection_released();
+
+            let outs = orch.start_registration(reg_type);
+            let pdu = first_sent_pdu(&outs).to_vec();
+            let (outer, full) = open_registration_request(&orch, &pdu);
+            assert_eq!(
+                outer.pdu_session_status, None,
+                "{reg_type:?}: not in the clear"
+            );
+            assert_eq!(
+                full.pdu_session_status,
+                Some((1 << 1) | (1 << 5)),
+                "{reg_type:?}: PSIs 1 and 5"
+            );
+        }
+    }
+
+    /// #334: with no PDU session the idle update says so (an all-zero status),
+    /// and an initial registration or an update from 5GMM-CONNECTED carries no
+    /// PDU session status IE.
+    #[test]
+    fn the_pdu_session_status_ie_is_only_for_idle_updates() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.pdu_session_status, Some(0));
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_pdu_session_established(1);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.pdu_session_status, None, "from 5GMM-CONNECTED");
+
+        // An initial registration from 5GMM-IDLE with a security context (so
+        // the full request rides the container)
+        let mut orch = establish_security_context();
+        orch.on_pdu_session_established(1);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        let outs = orch.build_and_send_registration(RegistrationType::InitialRegistration);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert!(full.requested_nssai.is_some(), "the full request");
+        assert_eq!(full.pdu_session_status, None, "initial registration");
     }
 
     /// From 5GMM-CONNECTED a REGISTRATION REQUEST rides the existing NAS
@@ -8438,6 +8772,152 @@ mod tests {
         orch.tick();
         assert_eq!(orch.service_request_attempt_counter(), 0);
         assert!(!orch.timers().t3525.is_running());
+    }
+
+    /// A configured PDU session rejected #26 with no back-off, its UE wait
+    /// over: a re-attempt is due (#379).
+    fn sm_with_due_retry() -> crate::nas::sm::SmOrchestrator {
+        use crate::nas::sm::{SmOrchestrator, SmOutput, SmSessionParams};
+        use nextgsim_nas::ies::ie1::PayloadContainerType;
+        use nextgsim_nas::messages::mm::DlNasTransport;
+        use nextgsim_nas::messages::sm::{
+            PduSessionEstablishmentReject, PduSessionTypeValue, SmCause, SscModeValue,
+        };
+        let mut sm = SmOrchestrator::new();
+        let outs = sm.establish_default_sessions(&[SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: Some("internet".to_string()),
+            s_nssai: Some(vec![0x01]),
+            emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
+        }]);
+        let Some(SmOutput::SendNasPdu(ul)) = outs.first() else {
+            panic!("an establishment request: {outs:?}");
+        };
+        let t = nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &ul[3..]).unwrap();
+        let (psi, pti) = (t.payload_container[1], t.payload_container[2]);
+        let mut rej = Vec::new();
+        PduSessionEstablishmentReject::new(psi, pti, SmCause::InsufficientResources)
+            .encode(&mut rej);
+        let mut dl = DlNasTransport::new(PayloadContainerType::N1SmInformation, rej);
+        dl.pdu_session_id = Some(psi);
+        sm.handle_dl_nas_transport(&dl);
+        sm.end_retry_waits_for_test();
+        assert!(sm.has_due_retry());
+        sm
+    }
+
+    /// Whether `outs` carries a PDU SESSION ESTABLISHMENT REQUEST.
+    fn carries_establishment_request(outs: &[crate::nas::sm::SmOutput]) -> bool {
+        outs.iter().any(|o| match o {
+            crate::nas::sm::SmOutput::SendNasPdu(ul) => {
+                nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &ul[3..])
+                    .is_ok_and(|t| t.payload_container.get(3) == Some(&0xC1))
+            }
+            _ => false,
+        })
+    }
+
+    /// #379: a due re-attempt goes out at once on a NAS signalling connection;
+    /// from 5GMM-IDLE the UE first sends a SERVICE REQUEST for signalling
+    /// (TS 24.501 §5.6.1.2) and asks once the Service Accept brings it up.
+    #[test]
+    fn a_due_session_re_attempt_rides_a_signalling_connection() {
+        use crate::nas::drive_session_retries;
+
+        // Connected: straight out
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty(), "{mm_outs:?}");
+        assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
+        assert!(!sm.has_pending_retry());
+
+        // Idle: a signalling Service Request first, once
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(sm_outs.is_empty(), "{sm_outs:?}");
+        assert!(mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))));
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Signalling));
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(
+            mm_outs.is_empty() && sm_outs.is_empty(),
+            "one request in flight"
+        );
+
+        // Service Accept: the session request goes out
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty(), "{mm_outs:?}");
+        assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
+    }
+
+    /// #379, TS 24.501 §5.6.1.5 #22 / §5.6.1.7: a SERVICE REJECT #22 with T3346
+    /// holds the re-attempt's signalling Service Request back until T3346
+    /// expires; then the UE asks again.
+    #[test]
+    fn t3346_holds_a_session_re_attempt_until_it_expires() {
+        use crate::nas::drive_session_retries;
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, _) = drive_session_retries(&mut orch, &mut sm);
+        assert!(!mm_outs.is_empty());
+        reject_service_request(&mut orch, MmCause::Congestion, Some(0x05), 2);
+        orch.on_nas_signalling_connection_released();
+        assert!(orch.timers().t3346.is_running());
+        for _ in 0..3 {
+            let (mm_outs, sm_outs) = drive_session_retries(&mut orch, &mut sm);
+            assert!(
+                mm_outs.is_empty() && sm_outs.is_empty(),
+                "barred under T3346"
+            );
+        }
+
+        orch.timers.stop(TIMER_T3346, true);
+        orch.handle_timer_expiry(TimerExpiryEvent::new(TIMER_T3346, true, 1));
+        let (mm_outs, _) = drive_session_retries(&mut orch, &mut sm);
+        assert!(
+            mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "T3346 over: the Service Request goes out: {mm_outs:?}"
+        );
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Signalling));
+    }
+
+    /// #379: nothing is re-attempted while the UE is not in
+    /// 5GMM-REGISTERED.NORMAL-SERVICE: deregistered, or connected with a
+    /// registration update in progress.
+    #[test]
+    fn no_session_re_attempt_outside_normal_service() {
+        let mut orch = new_orch();
+        let mut sm = sm_with_due_retry();
+        let (mm_outs, sm_outs) = crate::nas::drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty());
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredInitiated);
+        let (mm_outs, sm_outs) = crate::nas::drive_session_retries(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty(), "{sm_outs:?}");
+        assert!(sm.has_due_retry(), "still due for later");
     }
 
     /// The complement: with no uplink held (the rejected request was signalling),
