@@ -487,22 +487,30 @@ impl EpsNasUe {
         &self.dedicated
     }
 
-    /// The EPS bearer an uplink IP packet goes on (TS 23.401 §5.4.1 / TS 24.301
-    /// §6.4.2.1, #283): the dedicated bearer whose uplink packet filter matches,
-    /// lowest evaluation precedence first, else the default bearer. `None`
-    /// with no default bearer.
+    /// The EPS bearer an uplink IP packet goes on (TS 23.401 §5.4.1, #283):
+    /// the bearer of the matching uplink packet filter with the lowest
+    /// evaluation precedence among all TFTs, the default bearer's included;
+    /// with no match, the bearer that has no uplink packet filter. `None`
+    /// when every bearer has one -- the packet is discarded -- or there is no
+    /// default bearer.
     pub fn uplink_bearer_for(&self, packet: &[u8]) -> Option<u8> {
         let default = self.bearer.as_ref()?.ebi;
-        let Some(key) = crate::tft::PacketKey::parse(packet) else {
-            return Some(default);
+        let tfts = || {
+            std::iter::once((default, &self.default_filters))
+                .chain(self.dedicated.iter().map(|b| (b.ebi, &b.filters)))
         };
-        self.dedicated
-            .iter()
-            .flat_map(|b| b.filters.iter().map(move |f| (f, b.ebi)))
-            .filter(|(f, _)| f.matches_uplink(&key))
-            .min_by_key(|(f, _)| f.precedence)
-            .map(|(_, ebi)| ebi)
-            .or(Some(default))
+        let matched = crate::tft::PacketKey::parse(packet).and_then(|key| {
+            tfts()
+                .flat_map(|(ebi, fs)| fs.iter().map(move |f| (f, ebi)))
+                .filter(|(f, _)| f.matches_uplink(&key))
+                .min_by_key(|(f, _)| f.precedence)
+                .map(|(_, ebi)| ebi)
+        });
+        matched.or_else(|| {
+            tfts()
+                .find(|(_, fs)| !fs.iter().any(|f| f.direction.applies_uplink()))
+                .map(|(ebi, _)| ebi)
+        })
     }
 
     /// Drop every EPS bearer context, default and dedicated.
@@ -1604,12 +1612,7 @@ impl EpsNasUe {
             self.clear_bearers();
         }
         self.dedicated.retain(|b| b.ebi != req.ebi);
-        // §6.4.2.4 d) 2): an old filter of another dedicated bearer with the
-        // same precedence is deleted
-        for b in &mut self.dedicated {
-            b.filters
-                .retain(|old| !tft.filters.iter().any(|f| f.precedence == old.precedence));
-        }
+        self.drop_precedence_clashes(req.ebi, &tft.filters);
         log::info!(
             "ESM: dedicated EPS bearer {} activated (linked {}), QCI {}, {} packet filter(s)",
             req.ebi,
@@ -1624,6 +1627,28 @@ impl EpsNasUe {
             filters: tft.filters,
         });
         msg::encode_activate_dedicated_accept(req.ebi, req.pti)
+    }
+
+    /// TS 24.301 §6.4.2.4 d) 2) / §6.4.3.4 d) 2): an old packet filter of
+    /// another dedicated bearer with the precedence of one in `filters`, the
+    /// TFT bearer `ebi` gets, is deleted. Not done: the UE-requested bearer
+    /// resource modification that should tell the network, and the release of
+    /// the PDN connection when the old filter is the default bearer's (it is
+    /// kept, and only logged): #408.
+    fn drop_precedence_clashes(&mut self, ebi: u8, filters: &[crate::tft::PacketFilter]) {
+        let clashes =
+            |old: &crate::tft::PacketFilter| filters.iter().any(|f| f.precedence == old.precedence);
+        let default = self.bearer.as_ref().map(|b| b.ebi);
+        if default != Some(ebi) && self.default_filters.iter().any(clashes) {
+            log::warn!(
+                "ESM: EPS bearer {ebi}'s TFT reuses a precedence of the default bearer's; \
+                 the PDN connection release §6.4.2.4 d) 2) asks for is not implemented"
+            );
+        }
+        // `ebi`'s own old filters are replaced by `filters` anyway
+        for b in &mut self.dedicated {
+            b.filters.retain(|old| !clashes(old));
+        }
     }
 
     /// MODIFY EPS BEARER CONTEXT REQUEST (TS 24.301 §6.4.3.3-4): the ACCEPT or
@@ -1659,6 +1684,9 @@ impl EpsNasUe {
                 }
             }
         };
+        if let Some(f) = &new_filters {
+            self.drop_precedence_clashes(req.ebi, f);
+        }
         match dedicated_idx {
             Some(i) => {
                 let b = &mut self.dedicated[i];

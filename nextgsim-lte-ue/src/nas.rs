@@ -81,9 +81,9 @@ pub trait NasLayer: Send {
     fn default_bearer_ebi(&self) -> Option<u8> {
         None
     }
-    /// The EPS bearer an uplink IP packet goes on: a dedicated bearer whose
-    /// TFT uplink packet filter matches it, else the default bearer (TS 23.401
-    /// §5.4.1, TS 24.301 §6.4.2; #283).
+    /// The EPS bearer an uplink IP packet goes on, by the TFTs' uplink packet
+    /// filters (TS 23.401 §5.4.1, TS 24.301 §6.4.2; #283); `None` to discard
+    /// it while a default bearer exists.
     fn uplink_bearer_for(&self, _packet: &[u8]) -> Option<u8> {
         self.default_bearer_ebi()
     }

@@ -1100,6 +1100,64 @@ fn dedicated_bearer_messages_with_a_bad_mandatory_ie_follow_7_5_3() {
     assert_eq!(ue.default_bearer().unwrap().ebi, 5);
 }
 
+fn modify_tft(ebi: u8, tft: &[u8]) -> Vec<u8> {
+    let mut m = vec![(ebi << 4) | 0x02, 0x00, 0xC9, 0x36, tft.len() as u8];
+    m.extend_from_slice(tft);
+    m
+}
+
+/// #407 review, TS 23.401 §5.4.1: the default bearer's uplink filters take
+/// part in the precedence order like any other; with no match the packet
+/// goes on the bearer without uplink filters, and with none such it is
+/// discarded.
+#[test]
+fn every_tft_counts_and_an_unmatched_packet_needs_a_bearer_without_filters() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    let icmp = [
+        0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0, 10, 45, 0, 2, 8, 8, 8, 8,
+    ];
+    assert_eq!(
+        ue.uplink_bearer_for(&icmp),
+        Some(5),
+        "the default has no filter"
+    );
+    // The default bearer gets an uplink UDP filter at precedence 1.
+    let udp = [0x21, 0x21, 0x01, 0x02, 0x30, 0x11];
+    let reply = esm_reply(&mut ue, &mut mme, &modify_tft(5, &udp));
+    assert_eq!(reply, vec![0x52, 0x00, 0xCA]);
+    assert_eq!(ue.uplink_bearer_for(&udp4([10, 45, 0, 1], 5060)), Some(5));
+    assert_eq!(
+        ue.uplink_bearer_for(&icmp),
+        None,
+        "every bearer filters: discarded"
+    );
+    assert_eq!(ue.uplink_bearer_for(&[0x00, 0x01]), None, "not IP");
+}
+
+/// #407 review, §6.4.3.4 d) 2): a modification that gives a dedicated bearer
+/// the precedence of another dedicated bearer's filter deletes that filter.
+#[test]
+fn a_modification_deletes_the_filters_whose_precedence_it_takes() {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    let tcp = [0x21, 0x21, 0x20, 0x02, 0x30, 0x06];
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(7, 5, &tcp));
+    // Add to EBI 7 a filter (id 2) at EBI 6's precedence 0x10.
+    let add = [0x61, 0x22, 0x10, 0x02, 0x30, 0x11];
+    let reply = esm_reply(&mut ue, &mut mme, &modify_tft(7, &add));
+    assert_eq!(reply, vec![0x72, 0x00, 0xCA]);
+    let b = |e| {
+        ue.dedicated_bearers()
+            .iter()
+            .find(|b| b.ebi == e)
+            .unwrap()
+            .filters
+            .len()
+    };
+    assert_eq!((b(6), b(7)), (0, 2));
+}
+
 /// TS 23.401 §5.3.3 / TS 24.008 §10.5.6.12: among the uplink filters that
 /// match, the lowest precedence value picks the bearer, across bearers.
 #[test]

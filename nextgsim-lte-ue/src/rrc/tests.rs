@@ -28,6 +28,9 @@ struct Scripted {
     paged: Option<(msg::PagedUeIdentity, Vec<u8>)>,
     /// The EPS bearer this NAS's TFTs put UDP packets on (#283).
     udp_bearer: Option<u8>,
+    /// This NAS's default bearer, which takes ICMP; with one, the TFTs
+    /// discard anything else (#283).
+    default_ebi: Option<u8>,
 }
 
 /// The DETACH REQUEST the scripted NAS produces (#365).
@@ -69,8 +72,15 @@ impl NasLayer for Scripted {
             crate::nas::NasTimerOutcome::default()
         }
     }
+    fn default_bearer_ebi(&self) -> Option<u8> {
+        self.default_ebi
+    }
     fn uplink_bearer_for(&self, packet: &[u8]) -> Option<u8> {
-        self.udp_bearer.filter(|_| packet.get(9) == Some(&17))
+        match packet.get(9) {
+            Some(17) => self.udp_bearer,
+            Some(1) => self.default_ebi,
+            _ => None,
+        }
     }
     fn on_paging(&mut self, identity: &msg::PagedUeIdentity) -> bool {
         self.seen.lock().unwrap().paged += 1;
@@ -98,6 +108,7 @@ fn ue(initial: Option<&[u8]>) -> (UeRrc, Arc<Mutex<Seen>>) {
         on_pending: None,
         paged: None,
         udp_bearer: None,
+        default_ebi: None,
     };
     (
         UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A)),
@@ -538,6 +549,7 @@ fn an_idle_uplink_packet_makes_nas_request_a_connection() {
         on_pending: Some(vec![0xC7, 0x02, 0xAB, 0xCD]),
         paged: None,
         udp_bearer: None,
+        default_ebi: None,
     };
     let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
     assert!(acquire(&mut u, cell_info(), true, now).is_empty());
@@ -584,6 +596,7 @@ fn paged_ue(seen: &Arc<Mutex<Seen>>) -> UeRrc {
             vec![0xC7, 0x02, 0xAB, 0xCD],
         )),
         udp_bearer: None,
+        default_ebi: None,
     };
     UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A))
 }
@@ -699,9 +712,10 @@ fn an_idle_detach_requests_a_connection() {
 }
 
 /// #283: a second DRB for a dedicated bearer. The TFT's pick (here: UDP on
-/// EPS bearer 6) chooses the DRB an uplink packet goes on, anything else
-/// rides the default bearer's; drb-ToReleaseList (TS 36.331 §5.3.10.2) then
-/// removes the DRB and its traffic falls back.
+/// EPS bearer 6, ICMP on the default bearer 5) chooses the DRB an uplink
+/// packet goes on; a packet the TFTs discard, or whose bearer has no DRB, is
+/// not sent at all. drb-ToReleaseList (TS 36.331 §5.3.10.2) removes the
+/// DRB.
 #[test]
 fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
     let now = Instant::now();
@@ -714,6 +728,7 @@ fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
         on_pending: None,
         paged: None,
         udp_bearer: Some(6),
+        default_ebi: Some(5),
     };
     let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
     acquire(&mut u, cell_info(), true, now);
@@ -761,14 +776,17 @@ fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
     };
     let udp = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0];
     let icmp = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0];
+    let tcp = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 6, 0, 0];
 
     reconfigure(&mut u, 2, &[drb(5, 1)], &[]);
-    // No DRB for bearer 6 yet: the UDP packet takes the default's.
-    assert_eq!(lcid_of(&mut u, &udp), 3);
+    // No DRB for bearer 6 yet: the UDP packet is not put on another
+    // bearer's DRB against its TFT.
+    assert!(u.send_ip(&udp, now).is_empty());
     reconfigure(&mut u, 3, &[drb(6, 2)], &[]);
     assert_eq!(u.drbs(), vec![drb(5, 1), drb(6, 2)]);
     assert_eq!(lcid_of(&mut u, &udp), 4, "on the dedicated bearer's DRB");
     assert_eq!(lcid_of(&mut u, &icmp), 3);
+    assert!(u.send_ip(&tcp, now).is_empty(), "discarded by the TFTs");
 
     reconfigure(&mut u, 0, &[], &[2, 7]);
     assert_eq!(
@@ -776,5 +794,6 @@ fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
         vec![drb(5, 1)],
         "DRB 2 released, unknown DRB 7 ignored"
     );
-    assert_eq!(lcid_of(&mut u, &udp), 3);
+    assert!(u.send_ip(&udp, now).is_empty());
+    assert_eq!(lcid_of(&mut u, &icmp), 3);
 }

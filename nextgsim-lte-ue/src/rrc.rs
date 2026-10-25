@@ -915,17 +915,23 @@ impl UeRrc {
             self.nas.on_uplink_pending();
             return self.try_establish(now);
         }
-        // The bearer the TFTs pick (#283), else the default bearer's DRB
+        // The DRB of the bearer the TFTs pick (TS 23.401 §5.4.1, #283). With
+        // a default bearer, no pick means the packet is discarded; so does a
+        // pick whose DRB is not set up -- another bearer's DRB would carry it
+        // against its TFT. Without one (a NAS that keeps no bearers), the
+        // lowest DRB.
         let ebi = self.nas.uplink_bearer_for(packet);
-        let default = self.nas.default_bearer_ebi();
+        let has_default = self.nas.default_bearer_ebi().is_some();
         let State::Connected { cell, user, .. } = &mut self.state else {
             return vec![];
         };
-        let lcid_of = |e: Option<u8>| user.iter().find(|(_, d)| Some(d.ebi) == e).map(|(l, _)| *l);
-        let lcid = lcid_of(ebi)
-            .or_else(|| lcid_of(default))
-            .or_else(|| user.keys().min().copied());
+        let lcid = match ebi {
+            Some(e) => user.iter().find(|(_, d)| d.ebi == e).map(|(l, _)| *l),
+            None if has_default => None,
+            None => user.keys().min().copied(),
+        };
         let Some(lcid) = lcid else {
+            log::debug!("uplink packet discarded: no DRB for EPS bearer {ebi:?}");
             return vec![];
         };
         let d = user.get_mut(&lcid).expect("found above");

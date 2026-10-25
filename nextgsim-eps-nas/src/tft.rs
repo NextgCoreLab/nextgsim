@@ -310,6 +310,11 @@ impl Tft {
                     return Err(TftError::SyntacticalOperation);
                 }
                 for _ in 0..n {
+                    // §6.4.2.4 b) 2), §6.4.3.4 b) 6): fewer packet filters
+                    // than the number announced, #42
+                    if rest.is_empty() {
+                        return Err(TftError::SyntacticalOperation);
+                    }
                     if rest.len() < 3 {
                         return Err(TftError::SyntacticalFilter);
                     }
@@ -352,8 +357,12 @@ impl Tft {
                 }
             }
         }
-        // The parameters list (E bit) is accepted and not acted on.
-        let _ = (e_bit, rest);
+        // The parameters list (E bit) is accepted and not acted on. Without
+        // the E bit, octets after the announced packet filters mean more
+        // filters than announced: §6.4.2.4 b) 2), §6.4.3.4 b) 6), #42.
+        if !e_bit && !rest.is_empty() {
+            return Err(TftError::SyntacticalOperation);
+        }
         Ok(Self {
             operation,
             filters,
@@ -687,6 +696,23 @@ mod tests {
             Tft::decode(&[0x21, 0x21, 0x00, 0x04, 0x30, 0x11, 0x30, 0x06]),
             Err(TftError::SyntacticalFilter)
         );
+        // Two filters announced, one present; one announced, two present
+        // without the E bit (§6.4.2.4 b) 2), §6.4.3.4 b) 6)); a parameters
+        // list after the filters with the E bit set is accepted
+        assert_eq!(
+            Tft::decode(&[0x22, 0x21, 0x00, 0x02, 0x30, 0x11]),
+            Err(TftError::SyntacticalOperation)
+        );
+        assert_eq!(
+            Tft::decode(&[0x21, 0x21, 0x00, 0x02, 0x30, 0x11, 0x22, 0x01, 0x02, 0x30, 0x06]),
+            Err(TftError::SyntacticalOperation)
+        );
+        assert_eq!(
+            Tft::decode(&[0x51, 0x01, 0x02]),
+            Err(TftError::SyntacticalOperation),
+            "delete filters: more ids than announced"
+        );
+        assert!(Tft::decode(&[0x31, 0x21, 0x00, 0x02, 0x30, 0x11, 0x01, 0x01, 0x00]).is_ok());
         // Two filters with one identifier (§6.4.2.4 d) 1))
         assert_eq!(
             Tft::decode(&[0x22, 0x21, 0x00, 0x02, 0x30, 0x11, 0x21, 0x01, 0x02, 0x30, 0x06]),
