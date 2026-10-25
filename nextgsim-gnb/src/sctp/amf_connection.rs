@@ -95,6 +95,18 @@ impl AssociationKind {
         }
     }
 
+    /// Whether the userspace association closed under the poll: lost after
+    /// Association.Max.Retrans, or ABORTed by the peer (#338). Kernel SCTP
+    /// reports a closed association through recv instead.
+    fn is_closed(&self) -> bool {
+        match self {
+            Self::Single(a) => a.is_closed(),
+            Self::Multihome(a) => a.is_closed(),
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(_) => false,
+        }
+    }
+
     fn local_addr(&self) -> SocketAddr {
         match self {
             Self::Single(a) => a.local_addr(),
@@ -384,6 +396,20 @@ impl AmfConnection {
         if let Some(ref mut kind) = self.association {
             // Drive the state machine with any pending UDP datagrams.
             kind.poll().await?;
+            // A loss the poll detected (Association.Max.Retrans exceeded, or
+            // an ABORT) is reported here. Before #338 it was swallowed: the
+            // poll path returned "no message" for a closed association
+            // forever, so the reconnect (#289) and release (#310) never ran.
+            if kind.is_closed() {
+                warn!(
+                    "SCTP association to AMF {} lost (client_id: {})",
+                    self.remote_address, self.client_id
+                );
+                self.state = AmfConnectionState::Closed;
+                return Ok(Some(AmfConnectionEvent::AssociationDown {
+                    client_id: self.client_id,
+                }));
+            }
 
             match kind.try_recv() {
                 Ok(Some(msg)) => {
