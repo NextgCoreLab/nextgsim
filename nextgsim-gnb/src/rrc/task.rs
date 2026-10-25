@@ -129,8 +129,11 @@ use nextgsim_rrc::procedures::system_information::Sib19Params;
 pub type NtnRrcConfig = Sib19Params;
 
 /// How long a re-establishment heard under a new RLS id waits for its
-/// RRCReestablishmentComplete before the pending binding is dropped (#406):
-/// the longest T301 a UE runs (TS 38.331 §7.1.1, ms2000).
+/// RRCReestablishmentComplete before the pending binding is dropped (#406).
+/// The UE sends the Complete as soon as the RRCReestablishment arrives
+/// (TS 38.331 §5.3.7.5), so the wait is one round trip, which no timer of
+/// the UE bounds once T301 has stopped. This is a gNB choice: 2 s, the
+/// longest T301 (§7.1.1, ms2000), is ample for that round trip.
 pub const REESTABLISHMENT_BIND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(2000);
 
@@ -1213,6 +1216,8 @@ impl RrcTask {
 
     /// The UL-DCCH PDU of an RLS id with a pending re-establishment binding
     /// (#406): `None` when there is none, so the PDU takes the usual path.
+    /// A binding that has expired, or whose RLS id has a context of its own
+    /// again (a fresh RRCSetup there), is dropped with `None` too.
     /// Otherwise the PDU is checked against the context's re-derived SRB1 keys
     /// at the context's next UL COUNT, without spending it unless it verifies.
     /// Only a verified RRCReestablishmentComplete binds: RLS is told to rebind
@@ -1225,13 +1230,24 @@ impl RrcTask {
         data: &[u8],
     ) -> Option<Option<(i32, OctetString)>> {
         let (context, since) = *self.pending_reestablishment_binds.get(&rls_id)?;
+        if self.ue_manager.try_find_ue(rls_id).is_some() {
+            // The UE gave up the re-establishment and set up afresh on this id
+            // (an RRCSetupRequest made a context here): its UL-DCCH is that
+            // context's (#412 review).
+            self.pending_reestablishment_binds.remove(&rls_id);
+            debug!(
+                "UE[{rls_id}]: a context of its own replaces the pending \
+                 re-establishment of UE[{context}]"
+            );
+            return None;
+        }
         if since.elapsed() > REESTABLISHMENT_BIND_TIMEOUT {
             self.pending_reestablishment_binds.remove(&rls_id);
             info!(
                 "UE[{rls_id}]: the re-establishment of UE[{context}] was not completed in \
                  {REESTABLISHMENT_BIND_TIMEOUT:?}; the pending binding is dropped"
             );
-            return Some(None);
+            return None;
         }
         let secured = self.task_base.config.as_security_enabled;
         let Some(ctx) = self.ue_manager.try_find_ue_mut(context) else {
@@ -4880,6 +4896,53 @@ mod tests {
             .await;
             assert!(task.pending_reestablishment_binds.is_empty());
             assert!(rls_trace(&mut rls_rx).is_empty());
+        });
+    }
+
+    /// #412 review: a UE that gives up its re-establishment on a new RLS id and
+    /// sets up afresh there within the bind timeout is not swallowed. The
+    /// RRCSetup made a context on the id, so its RRCSetupComplete reaches NGAP
+    /// as an Initial UE Message and the pending binding goes.
+    #[test]
+    fn a_fresh_setup_on_the_pending_rls_id_is_not_swallowed() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_complete, RrcSetupCompleteParams,
+        };
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert!(task.pending_reestablishment_binds.contains_key(&5));
+            while ngap_rx.try_recv().is_ok() {}
+
+            establish_pending_setup(&mut task, 5).await;
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            let complete = encode_rrc_setup_complete(&RrcSetupCompleteParams {
+                registered_amf: None,
+                rrc_transaction_id: 0,
+                selected_plmn_identity: 1,
+                guami_type: None,
+                s_nssai_list: None,
+                dedicated_nas_message: nas.clone(),
+                ng_5g_s_tmsi_value: None,
+            })
+            .expect("encode RRCSetupComplete");
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+            let (ue_id, pdu) =
+                try_take_initial_nas(&mut ngap_rx).expect("the RRCSetupComplete reaches NGAP");
+            assert_eq!(ue_id, 5);
+            assert_eq!(pdu.data(), &nas[..]);
+            assert!(task.pending_reestablishment_binds.is_empty());
         });
     }
 
