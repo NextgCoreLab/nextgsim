@@ -533,6 +533,10 @@ pub enum RrcMessage {
     AsSecurityKey {
         /// 256-bit KgNB derived from KAMF and the uplink NAS COUNT.
         kgnb: [u8; 32],
+        /// K_AMF the KgNB came from (#325): the UE's NH chain is derived from it
+        /// (TS 33.501 §6.9.2.1.1, Annex A.10), for the vertical `KgNB*` of a
+        /// handover or re-establishment that signals a new NCC.
+        kamf: Option<[u8; 32]>,
     },
     /// The paging identity the AS shall match PCCH `PagingRecord`s against
     /// (from NAS).

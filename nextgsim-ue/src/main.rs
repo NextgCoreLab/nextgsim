@@ -1621,7 +1621,11 @@ async fn process_mm_outputs(
                 // derivation on the next AS SecurityModeCommand (TS 33.501 §6.7).
                 let _ = task_base
                     .rrc_tx
-                    .send(RrcMessage::AsSecurityKey { kgnb })
+                    .send(RrcMessage::AsSecurityKey {
+                        kgnb,
+                        // The NH chain's root (#325, TS 33.501 Annex A.10)
+                        kamf: orch.security_context().keys().kamf().copied(),
+                    })
                     .await;
             }
             MmOutput::NetworkPduSessionStatus(status) => {
