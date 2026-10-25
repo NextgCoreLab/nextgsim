@@ -524,6 +524,31 @@ impl SmOrchestrator {
         self.retries.iter().any(|r| self.retry_is_due(r))
     }
 
+    /// Test hook: make every running back-off timer expire on the next tick.
+    #[cfg(test)]
+    pub(crate) fn expire_backoffs_for_test(&mut self) {
+        for entry in self.backoff.values_mut() {
+            if let Some(timer) = entry.timer.as_mut() {
+                let mut zero = UeTimer::new(timer.code(), false, 0);
+                zero.start(true);
+                *timer = zero;
+            }
+        }
+    }
+
+    /// Test hook: make every running procedure timer (T3580/T3581/T3582)
+    /// expire on the next tick, as its first expiry.
+    #[cfg(test)]
+    pub(crate) fn expire_procedure_timers_for_test(&mut self) {
+        for pti in self.pt.pending_ptis() {
+            if let Some(timer) = self.pt.get_mut(pti).and_then(|t| t.timer_mut()) {
+                let mut zero = UeTimer::new(timer.code(), false, 0);
+                zero.start(true);
+                *timer = zero;
+            }
+        }
+    }
+
     /// Test hook: end every queued re-attempt's own wait now.
     #[cfg(test)]
     pub(crate) fn end_retry_waits_for_test(&mut self) {
