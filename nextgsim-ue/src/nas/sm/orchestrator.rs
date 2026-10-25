@@ -1067,7 +1067,14 @@ impl SmOrchestrator {
                 );
                 self.pt.abort(pti);
                 self.pending.remove(&pti);
-                return self.send_release_request(psi, SmCause::InvalidMandatoryInformation);
+                // The attempt has failed for the layers above (#386 review); the
+                // release request then ends the session the network holds.
+                let mut outs = vec![SmOutput::SessionEstablishmentFailed {
+                    psi,
+                    cause: SmCause::InvalidMandatoryInformation,
+                }];
+                outs.extend(self.send_release_request(psi, SmCause::InvalidMandatoryInformation));
+                return outs;
             }
         };
 
@@ -1688,7 +1695,15 @@ mod tests {
     /// STATUS. The establishment PTI is released, and the session is INACTIVE PENDING
     /// under T3582.
     fn assert_release_request_96(orch: &SmOrchestrator, outs: &[SmOutput], psi: u8, pti: u8) {
-        assert_eq!(outs.len(), 1, "{outs:?}");
+        assert_eq!(outs.len(), 2, "{outs:?}");
+        assert_eq!(
+            outs[0],
+            SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::InvalidMandatoryInformation
+            },
+            "the attempt is reported failed"
+        );
         let (t, inner) = unwrap_ul(first_sent_pdu(outs));
         assert_eq!(t.pdu_session_id, Some(psi));
         assert_eq!(
