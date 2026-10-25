@@ -329,6 +329,8 @@ fn pending_uplink_data_starts_a_service_request() {
     ue.on_uplink_data_pending();
     let sr = ue.initial_message(now).expect("SERVICE REQUEST");
     let count = mme.verify_service_request(&sr);
+    // EMM-CONNECTED stops T3412 (§5.3.5, #356).
+    ue.on_connected();
     assert_eq!(ue.state(), EmmState::ServiceRequestInitiated);
     assert_eq!(ue.next_deadline(), Some(now + T3417));
     assert_eq!(ue.k_enb(), Some(derive_kenb(&mme.kasme, count)));
@@ -425,9 +427,14 @@ fn a_release_during_the_service_request_aborts_it() {
     let (mut ue, mut mme, now) = registered_idle();
     ue.on_uplink_data_pending();
     mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_connected();
     ue.on_released(now);
     assert_eq!(ue.state(), EmmState::Registered);
-    assert_eq!(ue.next_deadline(), None);
+    assert_eq!(
+        ue.next_deadline(),
+        Some(now + ue.t3412().unwrap()),
+        "only T3412, restarted in EMM-IDLE (#356)"
+    );
 }
 
 /// §5.6.1.5 #22 with T3346: no new SERVICE REQUEST until T3346 expires.

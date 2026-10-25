@@ -12,6 +12,8 @@ struct Seen {
     uplink_pending: usize,
     /// Paging records RRC handed to NAS (#351 review).
     paged: usize,
+    /// The tracking area codes RRC reported (#356).
+    serving: Vec<u16>,
 }
 
 /// A NAS that requests a connection with a fixed message, echoes a fixed
@@ -54,6 +56,9 @@ impl NasLayer for Scripted {
     }
     fn k_enb(&mut self) -> Option<[u8; 32]> {
         self.k_enb
+    }
+    fn on_serving_cell(&mut self, tac: u16) {
+        self.seen.lock().unwrap().serving.push(tac);
     }
     fn on_uplink_pending(&mut self) {
         self.seen.lock().unwrap().uplink_pending += 1;
@@ -796,4 +801,34 @@ fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
     );
     assert!(u.send_ip(&udp, now).is_empty());
     assert_eq!(lcid_of(&mut u, &icmp), 3);
+}
+
+/// #356: camped, RRC tells NAS the cell's tracking area (SIB1
+/// trackingAreaCode) -- once, and again only when a reselection changes it.
+#[test]
+fn the_camped_cells_tracking_area_reaches_nas() {
+    let now = Instant::now();
+    let (mut u, seen) = ue(None);
+    acquire(&mut u, cell_info(), true, now);
+    u.on_cell_measurement(CELL, 0, now);
+    assert_eq!(seen.lock().unwrap().serving, vec![1]);
+    // A stronger cell of TA 7.
+    let other = 0x19B02;
+    u.on_cell_measurement(other, 10, now);
+    u.on_downlink(other, RrcChannel::BcchBch, 0, &mib(), now);
+    let sib1 = CellInfo {
+        tac: 7,
+        cell_identity: 0x19B02,
+        ..cell_info()
+    };
+    u.on_downlink(
+        other,
+        RrcChannel::BcchDlSch,
+        0,
+        &msg::encode_sib1(&sib1).unwrap(),
+        now,
+    );
+    u.on_cell_measurement(other, 10, now);
+    assert_eq!(u.state(), UeRrcState::Camped { cell: other });
+    assert_eq!(seen.lock().unwrap().serving, vec![1, 7]);
 }

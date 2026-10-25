@@ -71,6 +71,10 @@ pub trait NasLayer: Send {
     /// An uplink IP packet found no DRB because the UE is in RRC_IDLE: NAS
     /// may want a connection for it (TS 24.301 §5.6.1.1 b).
     fn on_uplink_pending(&mut self) {}
+    /// RRC camps on a cell of tracking area `tac` of the selected PLMN
+    /// (SIB1 `trackingAreaCode`): NAS compares its TAI with the TAI list
+    /// (TS 24.301 §5.5.3.2.2 a), #356).
+    fn on_serving_cell(&mut self, _tac: u16) {}
     /// `K_eNB` for the AS Security Mode Command, when NAS has a security
     /// context (TS 33.401 §7.2.6.2).
     fn k_enb(&mut self) -> Option<[u8; 32]> {
@@ -133,6 +137,11 @@ pub struct EpsNasStatus {
     pub state: EmmState,
     /// The default EPS bearer, once activated.
     pub bearer: Option<DefaultBearer>,
+    /// The tracking area updating attempt counter (TS 24.301 §5.5.3.1, #356):
+    /// 0 after a TRACKING AREA UPDATE ACCEPT.
+    pub tau_attempts: u8,
+    /// The M-TMSI of the GUTI, once assigned.
+    pub m_tmsi: Option<u32>,
 }
 
 /// TS 24.301 EPS NAS for the RRC: [`EpsNasUe`] behind the [`NasLayer`] seam.
@@ -149,6 +158,8 @@ impl EpsNas {
         let status = Arc::new(Mutex::new(EpsNasStatus {
             state: ue.state(),
             bearer: None,
+            tau_attempts: 0,
+            m_tmsi: None,
         }));
         Self { ue, status }
     }
@@ -167,6 +178,8 @@ impl EpsNas {
         if let Ok(mut s) = self.status.lock() {
             s.state = self.ue.state();
             s.bearer = self.ue.default_bearer().cloned();
+            s.tau_attempts = self.ue.tau_attempts();
+            s.m_tmsi = self.ue.guti().map(|g| g.m_tmsi);
         }
     }
 }
@@ -176,8 +189,9 @@ impl NasLayer for EpsNas {
         let nas = self.ue.initial_message(Instant::now());
         self.publish();
         let nas = nas?;
-        // TS 24.301 Annex D Table D.1.1: attach is "mo-Signalling"; a service
-        // request for uplink user data is "mo-Data".
+        // TS 24.301 Annex D Table D.1.1: attach and tracking area update are
+        // "mo-Signalling"; a service request for uplink user data is
+        // "mo-Data".
         // A service request answering a paging is "mt-Access" (#351).
         let cause = if self.ue.service_request_answers_paging() {
             EstablishmentCauseValue::MtAccess
@@ -214,6 +228,11 @@ impl NasLayer for EpsNas {
 
     fn on_uplink_pending(&mut self) {
         self.ue.on_uplink_data_pending();
+    }
+
+    fn on_serving_cell(&mut self, tac: u16) {
+        self.ue.on_serving_cell(tac);
+        self.publish();
     }
 
     fn on_paging(&mut self, identity: &PagedUeIdentity) -> bool {
@@ -300,6 +319,8 @@ mod tests {
             status: Arc::new(Mutex::new(EpsNasStatus {
                 state: ue.state(),
                 bearer: None,
+                tau_attempts: 0,
+                m_tmsi: None,
             })),
             ue,
         };

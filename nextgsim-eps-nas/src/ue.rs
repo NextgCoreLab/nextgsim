@@ -1,7 +1,7 @@
-//! The UE's EMM and ESM entities for attach (TS 24.301 §5.5.1), the common
-//! procedures attach runs -- identification (§5.4.4), authentication (§5.4.2)
-//! and security mode control (§5.4.3) -- and the default EPS bearer it sets up
-//! (§6.4.1).
+//! The UE's EMM and ESM entities for attach (TS 24.301 §5.5.1) and tracking
+//! area updating (§5.5.3), the common procedures they run -- identification
+//! (§5.4.4), authentication (§5.4.2) and security mode control (§5.4.3) --
+//! and the EPS bearer contexts (§6.4).
 //!
 //! Pure: downlink NAS PDUs, lower-layer indications and the clock in; uplink
 //! NAS PDUs and a "release the connection" flag out. The LTE UE's RRC owns the
@@ -40,10 +40,18 @@
 //!   ACCEPT, a lost connection or the fifth expiry leave the UE
 //!   EMM-DEREGISTERED with no further attach.
 //!
-//! Tracking area update is not implemented. A network
-//! message of a procedure this UE does not implement is answered with EMM
-//! STATUS #97 (§7.4), which is what the clause asks of a UE that does not
-//! implement a message type.
+//! - **Tracking area updating** (§5.5.3.2, #356, in `ue/tau.rs`): periodic on
+//!   T3412 (§5.3.5) and normal on entering a TA outside the TAI list, with the
+//!   EPS bearer context status IE and the "active" flag for pending uplink
+//!   data or a paging; TRACKING AREA UPDATE ACCEPT (TAI list, GUTI with TAU
+//!   COMPLETE, T3412, bearer reconciliation), REJECT per cause (§5.5.3.2.5) and
+//!   the abnormal cases of §5.5.3.2.6 with T3430, T3411, T3402 and the
+//!   tracking area updating attempt counter. Combined (EPS/IMSI) updating is
+//!   not: this UE attaches for EPS services only.
+//!
+//! A network message of a procedure this UE does not implement is answered
+//! with EMM STATUS #97 (§7.4), which is what the clause asks of a UE that does
+//! not implement a message type.
 
 use std::time::{Duration, Instant};
 
@@ -84,6 +92,10 @@ pub const MAX_DETACH_RETRANSMISSIONS: u8 = 4;
 const NETWORK_DETACH_TYPE_IMSI: u8 = 0b011;
 /// Attach attempt counter limit (§5.5.1.2.6: "equal to 5").
 pub const MAX_ATTACH_ATTEMPTS: u8 = 5;
+/// T3430: tracking area update supervision (§10.2, Table 10.2.1).
+pub const T3430: Duration = Duration::from_secs(15);
+/// Tracking area updating attempt counter limit (§5.5.3.2.6: "equal to 5").
+pub const MAX_TAU_ATTEMPTS: u8 = 5;
 
 /// ESM cause #81 "invalid PTI value" (§9.9.4.4).
 const ESM_INVALID_PTI: u8 = 81;
@@ -152,6 +164,17 @@ pub enum EmmState {
     /// EMM-DEREGISTERED after a UE-initiated detach (§5.5.2.2.2): the EPS
     /// bearer contexts are gone and no attach follows until asked for.
     Detached,
+    /// EMM-TRACKING-AREA-UPDATING-INITIATED: TRACKING AREA UPDATE REQUEST
+    /// sent, T3430 running (§5.5.3.2.2, #356).
+    TrackingAreaUpdatingInitiated,
+    /// EMM-REGISTERED.ATTEMPTING-TO-UPDATE (§5.2.3.2.2): a tracking area
+    /// update failed; no user data; the update is tried again on T3411, T3402
+    /// or T3346 expiry, or in a new TA.
+    AttemptingToUpdate,
+    /// EMM-REGISTERED.LIMITED-SERVICE or .PLMN-SEARCH after TRACKING AREA
+    /// UPDATE REJECT #13, #15 (§5.5.3.2.5): the bearer contexts stay, the TA is
+    /// forbidden, and a TA that is not starts a tracking area update.
+    RegisteredLimited(u8),
 }
 
 /// The default EPS bearer context (§6.4.1.3).
@@ -282,6 +305,39 @@ pub struct EpsNasUe {
     /// retransmitted (§5.5.2.2.4 c), for T3421.
     detach_request: Option<(Vec<u8>, u8)>,
     t3421: Option<Instant>,
+    /// T3412 as the network last set it (§5.3.5); `None` is deactivated.
+    t3412_value: Option<Duration>,
+    /// The running T3412 (#356).
+    t3412: Option<Instant>,
+    /// T3430, while a TRACKING AREA UPDATE REQUEST is unanswered.
+    t3430: Option<Instant>,
+    /// T3411 or T3402 before the next tracking area update attempt
+    /// (§5.5.3.2.6).
+    tau_retry_at: Option<Instant>,
+    /// The tracking area updating attempt counter (§5.5.3.1).
+    tau_attempts: u8,
+    /// T3412 expired: a periodic update is owed (§5.3.5: delayed until
+    /// EMM-REGISTERED.NORMAL-SERVICE).
+    tau_periodic_due: bool,
+    /// A normal ("TA updating") update is owed: a TA outside the TAI list
+    /// (§5.5.3.2.2 a), or the retry of one that failed.
+    tau_ta_due: bool,
+    /// The TRACKING AREA UPDATE REQUEST in progress: its update type and
+    /// "active" flag.
+    tau_in_progress: Option<(msg::EpsUpdateType, bool)>,
+    /// EPS update status EU1 UPDATED (§5.1.3.3); false is EU2 NOT UPDATED or
+    /// EU3 ROAMING NOT ALLOWED.
+    updated: bool,
+    /// The TAI of the cell the UE camps on, as the lower layers report it.
+    current_tai: Option<Tai>,
+    /// The last visited registered TAI (§5.5.3.2.2, IEI 52).
+    last_visited_tai: Option<Tai>,
+    /// The lists of forbidden tracking areas "for roaming" and "for regional
+    /// provision of service" (§5.5.3.2.5), merged: this UE treats both alike.
+    forbidden_tais: Vec<Tai>,
+    /// A UE-initiated detach (not switch-off) asked for during a tracking area
+    /// update, sent once it completes (§5.5.3.2.6 m).
+    detach_after_tau: bool,
     /// The detach in progress is the "detach and re-attach" of §6.4.2.4 d) 2)
     /// (#408): it ends in EMM-DEREGISTERED.NORMAL-SERVICE, with an attach due.
     reattach_after_detach: bool,
@@ -343,6 +399,19 @@ impl EpsNasUe {
             detach_pending: None,
             detach_request: None,
             t3421: None,
+            t3412_value: None,
+            t3412: None,
+            t3430: None,
+            tau_retry_at: None,
+            tau_attempts: 0,
+            tau_periodic_due: false,
+            tau_ta_due: false,
+            tau_in_progress: None,
+            updated: false,
+            current_tai: None,
+            last_visited_tai: None,
+            forbidden_tais: Vec::new(),
+            detach_after_tau: false,
             reattach_after_detach: false,
             bearer_resource_modifications: Vec::new(),
         }
@@ -366,7 +435,27 @@ impl EpsNasUe {
     /// its bearer contexts and is EMM-DEREGISTERED as soon as the request is out.
     pub fn detach(&mut self, switch_off: bool, connected: bool, now: Instant) -> NasOutput {
         match self.state {
-            EmmState::Registered | EmmState::ServiceRequestInitiated => {}
+            EmmState::Registered
+            | EmmState::ServiceRequestInitiated
+            | EmmState::AttemptingToUpdate
+            | EmmState::RegisteredLimited(_) => {}
+            EmmState::TrackingAreaUpdatingInitiated if switch_off => {
+                // §5.5.3.2.6 m): "Detach due to ... switch off: The tracking
+                // area updating procedure shall be aborted, and the UE
+                // initiated detach procedure shall be performed", with the
+                // GUTI the TRACKING AREA UPDATE REQUEST carried.
+                log::info!("EMM: switch-off detach during a tracking area update; TAU aborted");
+                self.t3430 = None;
+                self.tau_in_progress = None;
+            }
+            EmmState::TrackingAreaUpdatingInitiated => {
+                // §5.5.3.2.6 m): any other detach "shall be initiated after
+                // successful completion of the tracking area updating
+                // procedure".
+                log::info!("EMM: detach requested during a tracking area update; after it");
+                self.detach_after_tau = true;
+                return NasOutput::default();
+            }
             EmmState::RegisteredInitiated if connected => {
                 // §5.5.2.2.1: the DETACH REQUEST goes, with T3421, "in the state
                 // EMM-REGISTERED or EMM-REGISTERED-INITIATED". The attach is
@@ -471,6 +560,7 @@ impl EpsNasUe {
     /// deactivated locally (§5.5.2.2.2) and no attach follows.
     fn enter_detached(&mut self) {
         self.clear_bearers();
+        self.stop_tau();
         self.uplink_pending = false;
         self.paging_response_pending = false;
         self.detach_pending = None;
@@ -505,6 +595,19 @@ impl EpsNasUe {
     ///   is.
     pub fn on_paging(&mut self, with: PagedWith) -> bool {
         match with {
+            PagedWith::STmsi if self.state == EmmState::AttemptingToUpdate => {
+                // §5.5.3.2.2 r): "upon reception of a paging indication using
+                // S-TMSI and the UE is in state
+                // EMM-REGISTERED.ATTEMPTING-TO-UPDATE" a tracking area update,
+                // with the "active" flag set.
+                log::info!(
+                    "EMM: paged with the S-TMSI in ATTEMPTING-TO-UPDATE; TAU (§5.5.3.2.2 r)"
+                );
+                self.t3346 = None;
+                self.paging_response_pending = true;
+                self.tau_ta_due = true;
+                true
+            }
             PagedWith::STmsi => {
                 if self.state != EmmState::Registered {
                     log::info!(
@@ -702,6 +805,9 @@ impl EpsNasUe {
                 .into_iter()
                 .next();
         }
+        if let Some(tau) = self.tau_request(now) {
+            return Some(tau);
+        }
         if self.state == EmmState::Registered {
             return self.service_request(now);
         }
@@ -726,7 +832,10 @@ impl EpsNasUe {
             Some(g) => EpsMobileIdentity::Guti(g),
             None => EpsMobileIdentity::Imsi(self.cfg.imsi.clone()),
         };
-        let last_visited_tai = self.guti.and_then(|_| self.tai_list.first().copied());
+        let last_visited_tai = self.guti.and_then(|_| {
+            self.last_visited_tai
+                .or_else(|| self.tai_list.first().copied())
+        });
         let req = AttachRequest {
             ksi: self
                 .ctx
@@ -762,6 +871,9 @@ impl EpsNasUe {
             self.t3440,
             self.t3346,
             self.t3421,
+            self.t3412,
+            self.t3430,
+            self.tau_retry_at,
             self.retry_at,
             self.bearer_resource_modifications
                 .iter()
@@ -841,6 +953,18 @@ impl EpsNasUe {
                 release: true,
             };
         }
+        if self.t3430.is_some_and(|t| now >= t) {
+            // §5.5.3.2.6 c): "The UE shall abort the procedure. The NAS
+            // signalling connection, if any, shall be released locally."
+            log::warn!("EMM: T3430 expired; tracking area update aborted (§5.5.3.2.6 c)");
+            self.tau_failed(now, false);
+            self.secure_exchange = false;
+            return NasOutput {
+                uplink: vec![],
+                release: true,
+            };
+        }
+        self.on_tau_timers(now);
         if self.t3346.is_some_and(|t| now >= t) {
             self.t3346 = None;
         }
@@ -880,8 +1004,10 @@ impl EpsNasUe {
         log::info!("EMM: next attach attempt in {} s", t.as_secs());
     }
 
-    /// The RRC connection is up.
-    pub fn on_connected(&mut self) {}
+    /// The RRC connection is up: EMM-CONNECTED, so T3412 stops (§5.3.5).
+    pub fn on_connected(&mut self) {
+        self.t3412 = None;
+    }
 
     /// The RRC connection was released or failed. Before ATTACH ACCEPT or
     /// REJECT this aborts the attach (§5.5.1.2.6 a).
@@ -898,6 +1024,15 @@ impl EpsNasUe {
             // EMM-DEREGISTERED.
             log::warn!("EMM: NAS signalling connection lost before DETACH ACCEPT; EMM-DEREGISTERED (§5.5.2.2.4 b)");
             self.enter_detached();
+        }
+        if self.state == EmmState::TrackingAreaUpdatingInitiated {
+            // §5.5.3.2.6 b): lower layer failure, or release of the NAS
+            // signalling connection, before TRACKING AREA UPDATE ACCEPT or
+            // REJECT aborts the procedure.
+            log::warn!(
+                "EMM: NAS signalling connection lost during a tracking area update (§5.5.3.2.6 b)"
+            );
+            self.tau_failed(now, false);
         }
         if self.state == EmmState::ServiceRequestInitiated {
             // §5.6.1.6 a): lower layer failure or release before the user
@@ -921,6 +1056,9 @@ impl EpsNasUe {
         // §4.4.5: ciphering lasts "until the NAS signalling connection is
         // released"; the next connection needs its own SMC.
         self.secure_exchange = false;
+        // §5.3.5: "Timer T3412 is reset and started with its initial value,
+        // when the UE changes from EMM-CONNECTED ... to EMM-IDLE mode."
+        self.start_t3412(now);
     }
 
     /// Wrap an uplink EMM message: protected with the current context when
@@ -1008,6 +1146,7 @@ impl EpsNasUe {
                             | msg::emm_type::AUTHENTICATION_REQUEST
                             | msg::emm_type::AUTHENTICATION_REJECT
                             | msg::emm_type::ATTACH_REJECT
+                            | msg::emm_type::TAU_REJECT
                             | msg::emm_type::SERVICE_REJECT
                     )
                 );
@@ -1026,6 +1165,12 @@ impl EpsNasUe {
             | DownlinkEmm::AuthenticationReject
             | DownlinkEmm::AttachReject(_)
             | DownlinkEmm::ServiceReject(_) => self.on_emm(m, now),
+            // §4.4.4.2: "TRACKING AREA UPDATE REJECT (if the EMM cause is not
+            // #25 or #78)"; §5.5.3.2.5: one with #25 or #78 "received without
+            // integrity protection" is discarded.
+            DownlinkEmm::TauReject(r) if !matches!(r.cause, 25 | 78) => {
+                self.on_tau_reject(r, false, now)
+            }
             other => {
                 log::warn!("EMM: unprotected {other:?} discarded (§4.4.4.2)");
                 NasOutput::default()
@@ -1128,6 +1273,15 @@ impl EpsNasUe {
             }
             DownlinkEmm::ServiceReject(r) => {
                 self.on_service_reject(r, now);
+                NasOutput::default()
+            }
+            DownlinkEmm::TauAccept(a) => self.on_tau_accept(a, now),
+            DownlinkEmm::TauReject(r) => self.on_tau_reject(r, true, now),
+            DownlinkEmm::Other(msg::emm_type::GUTI_REALLOCATION_COMMAND)
+                if self.state == EmmState::TrackingAreaUpdatingInitiated =>
+            {
+                // §5.5.3.2.6 g): ignored, the tracking area update progresses.
+                log::info!("EMM: GUTI REALLOCATION COMMAND during a tracking area update; ignored");
                 NasOutput::default()
             }
             DownlinkEmm::DetachAccept => {
@@ -1367,6 +1521,10 @@ impl EpsNasUe {
         if let Some(s) = a.t3402_s {
             self.t3402 = Duration::from_secs(s);
         }
+        // §5.3.5: T3412 from ATTACH ACCEPT; deactivated or zero, no periodic
+        // update.
+        self.t3412_value = a.t3412_s.filter(|s| *s > 0).map(Duration::from_secs);
+        self.registered_in_current_ta();
         // §5.5.1.2.4 / §6.4.1.3: the ESM container carries ACTIVATE DEFAULT EPS
         // BEARER CONTEXT REQUEST; its accept or reject goes in ATTACH COMPLETE.
         let esm_reply = match msg::decode_downlink_esm(&a.esm_message) {
@@ -1423,6 +1581,7 @@ impl EpsNasUe {
     }
 
     fn invalidate(&mut self, cause: u8) {
+        self.stop_tau();
         self.stored_auth = None;
         self.guti = None;
         self.tai_list.clear();
@@ -1520,6 +1679,7 @@ impl EpsNasUe {
             | emm_cause::NOT_AUTHORIZED_FOR_CSG
             | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN => {
                 self.clear_bearers();
+                self.stop_tau();
                 self.guti = None;
                 self.ctx = None;
                 self.state = EmmState::NoService(r.cause);
@@ -1540,6 +1700,12 @@ impl EpsNasUe {
     fn on_detach_request(&mut self, detach_type: u8, cause: Option<u8>, now: Instant) -> NasOutput {
         const REATTACH_REQUIRED: u8 = 1;
         const IMSI_DETACH: u8 = 3;
+        if detach_type == IMSI_DETACH && self.state == EmmState::TrackingAreaUpdatingInitiated {
+            // §5.5.3.2.6 f): "the DETACH REQUEST message shall be ignored and
+            // tracking area updating procedure shall be progressed".
+            log::info!("EMM: IMSI DETACH REQUEST during a tracking area update; ignored");
+            return NasOutput::default();
+        }
         if detach_type == IMSI_DETACH {
             // Non-EPS services only; this UE attaches for EPS services alone,
             // so its EPS state is untouched.
@@ -1552,9 +1718,12 @@ impl EpsNasUe {
             self.state
         );
         // §5.5.2.3.4 e): a detach colliding with the UE's own attach or
-        // service request is progressed; those procedures are aborted.
+        // service request is progressed; those procedures are aborted, and so
+        // is a tracking area update (§5.5.3.2.6 f).
         self.t3410 = None;
         self.t3417 = None;
+        self.t3430 = None;
+        self.tau_in_progress = None;
         // DETACH ACCEPT goes out under the context the request came with,
         // before a cause below deletes that context.
         let out = self.send_emm(msg::encode_detach_accept());
@@ -1584,6 +1753,7 @@ impl EpsNasUe {
                 | emm_cause::SERVICE_OPTION_NOT_AUTHORIZED_IN_PLMN),
             ) => {
                 self.clear_bearers();
+                self.stop_tau();
                 self.guti = None;
                 self.ctx = None;
                 self.state = EmmState::NoService(c);
@@ -1601,6 +1771,7 @@ impl EpsNasUe {
     /// EMM-DEREGISTERED.NORMAL-SERVICE, so an attach is due.
     fn local_detach(&mut self) {
         self.clear_bearers();
+        self.stop_tau();
         self.uplink_pending = false;
         self.state = EmmState::Deregistered;
         self.attempts = 0;
@@ -2100,6 +2271,8 @@ fn imei_of(imeisv: &str) -> String {
     s.push(char::from_digit(check, 10).unwrap_or('0'));
     s
 }
+
+mod tau;
 
 #[cfg(test)]
 mod tests;
