@@ -1162,6 +1162,12 @@ pub fn decode_dl_dcch(bytes: &[u8]) -> Result<DlDcch, RrcMsgError> {
                     .as_ref()
                     .and_then(|d| d.srb_to_add_mod_list.as_ref())
                     .is_some_and(|l| l.0.iter().any(|s| s.srb_identity.0 == 2)),
+                drbs_released: r8
+                    .radio_resource_config_dedicated
+                    .as_ref()
+                    .and_then(|d| d.drb_to_release_list.as_ref())
+                    .map(|l| l.0.iter().map(|i| i.0).collect())
+                    .unwrap_or_default(),
                 drbs: r8
                     .radio_resource_config_dedicated
                     .and_then(|d| d.drb_to_add_mod_list)
@@ -1310,6 +1316,8 @@ pub struct Reconfiguration {
     pub srb2: bool,
     /// DRBs to add (`drb-ToAddModList`).
     pub drbs: Vec<DrbConfig>,
+    /// DRB identities to release (`drb-ToReleaseList`, §5.3.10.2, #283).
+    pub drbs_released: Vec<u8>,
     /// `dedicatedInfoNASList`, in order.
     pub nas: Vec<Vec<u8>>,
     /// Whether `mobilityControlInfo` is present (a handover).
@@ -1430,7 +1438,25 @@ pub fn encode_rrc_connection_reconfiguration(
     drbs: &[DrbConfig],
     nas: &[Vec<u8>],
 ) -> Result<Vec<u8>, RrcMsgError> {
+    encode_rrc_connection_reconfiguration_with_release(transaction_id, add_srb2, drbs, &[], nas)
+}
+
+/// [`encode_rrc_connection_reconfiguration`] that also releases the DRBs
+/// `release` names, by DRB identity, in `drb-ToReleaseList` (§5.3.10.2,
+/// #283): the radio side of an E-RAB RELEASE.
+pub fn encode_rrc_connection_reconfiguration_with_release(
+    transaction_id: u8,
+    add_srb2: bool,
+    drbs: &[DrbConfig],
+    release: &[u8],
+    nas: &[Vec<u8>],
+) -> Result<Vec<u8>, RrcMsgError> {
     check_tid(transaction_id)?;
+    if release.len() > 11 || release.iter().any(|d| !(1..=32).contains(d)) {
+        return Err(RrcMsgError::Invalid(format!(
+            "drb-ToReleaseList {release:?}"
+        )));
+    }
     if drbs.len() > 11 || nas.len() > 11 {
         return Err(RrcMsgError::Invalid("more than maxDRB (11) entries".into()));
     }
@@ -1450,18 +1476,18 @@ pub fn encode_rrc_connection_reconfiguration(
                 nas.iter().map(|n| DedicatedInfoNAS(n.clone())).collect(),
             )
         }),
-        radio_resource_config_dedicated: (add_srb2 || !drbs.is_empty()).then(|| {
-            RadioResourceConfigDedicated {
+        radio_resource_config_dedicated: (add_srb2 || !drbs.is_empty() || !release.is_empty())
+            .then(|| RadioResourceConfigDedicated {
                 extensions: Default::default(),
                 srb_to_add_mod_list: add_srb2.then(|| SRB_ToAddModList(vec![srb2_to_add_mod()])),
                 drb_to_add_mod_list: (!drbs.is_empty())
                     .then(|| DRB_ToAddModList(drbs.iter().map(drb_to_add_mod).collect())),
-                drb_to_release_list: None,
+                drb_to_release_list: (!release.is_empty())
+                    .then(|| DRB_ToReleaseList(release.iter().map(|d| DRB_Identity(*d)).collect())),
                 mac_main_config: None,
                 sps_config: None,
                 physical_config_dedicated: None,
-            }
-        }),
+            }),
         security_config_ho: None,
         non_critical_extension: None,
     };

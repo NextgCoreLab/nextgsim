@@ -325,6 +325,7 @@ fn reconfiguration_carries_the_drb_and_the_nas_in_order() {
             transaction_id: 1,
             srb2: true,
             drbs: vec![drb],
+            drbs_released: vec![],
             nas,
             mobility_control: false,
         })
@@ -390,4 +391,22 @@ fn paging_records_round_trip_and_bounds_are_enforced() {
         cn_domain: PagingCnDomain::Ps,
     }])
     .is_err());
+}
+
+/// #283, TS 36.331 §6.3.2: `drb-ToReleaseList` is encoded and decoded back
+/// (an E-RAB RELEASE's reconfiguration), with the NAS PDU it carries.
+#[test]
+fn reconfiguration_releases_drbs() {
+    let nas = vec![vec![0x27, 1, 2, 3, 4, 5, 0x62, 0x00, 0xCD]];
+    let b =
+        encode_rrc_connection_reconfiguration_with_release(2, false, &[], &[2, 3], &nas).unwrap();
+    match decode_dl_dcch(&b).unwrap() {
+        DlDcch::ConnectionReconfiguration(r) => {
+            assert_eq!(r.drbs_released, vec![2, 3]);
+            assert!(r.drbs.is_empty());
+            assert_eq!(r.nas, nas);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(encode_rrc_connection_reconfiguration_with_release(2, false, &[], &[0], &[]).is_err());
 }
