@@ -10331,6 +10331,7 @@ mod tests {
             .map(|c| c.ran_ue_ngap_id)
             .expect("ue context") as u32;
 
+        let before = Instant::now();
         task.send_handover_required(
             1,
             4242,
@@ -10356,8 +10357,19 @@ mod tests {
         // Drain the Handover Required so the assertion below is about the cancel.
         while sctp_rx.try_recv().is_ok() {}
 
+        let after = Instant::now();
         let prep = Duration::from_secs(test_config().ngap_tngreloc_prep_secs);
-        let base = Instant::now();
+        // Timing from the timer's own deadline, not a later `Instant::now()`
+        // (see `an_unanswered_ng_setup_is_reinitiated`).
+        let deadline = task
+            .guard_timers
+            .deadline(GuardTimer::HandoverPreparation { ue_id: 13 })
+            .expect("TNGRELOCprep is armed");
+        assert!(
+            deadline >= before + prep && deadline <= after + prep,
+            "armed for TNGRELOCprep"
+        );
+        let base = deadline - prep;
         task.process_expired_guard_timers(base + prep - Duration::from_millis(1))
             .await;
         assert!(
@@ -10630,7 +10642,9 @@ mod tests {
         let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
         let mut expected = NG_SETUP_BACKOFF_BASE;
         for attempt in 1..=8u32 {
+            let before = Instant::now();
             assert!(task.handle_ng_setup_failure(1, &ng_setup_failure_bytes(None)));
+            let after = Instant::now();
             assert_eq!(
                 task.find_amf_context(1).map(|c| c.state),
                 Some(AmfState::Connected),
@@ -10645,7 +10659,18 @@ mod tests {
                     .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }),
                 "the answer stops the response timer"
             );
-            let base = Instant::now();
+            // Timing from the retry timer's own deadline (see
+            // `an_unanswered_ng_setup_is_reinitiated`), checked against the window
+            // the failure was handled in.
+            let deadline = task
+                .guard_timers
+                .deadline(GuardTimer::NgSetupRetry { amf_id: 1 })
+                .expect("the retry is armed");
+            assert!(
+                deadline >= before + expected && deadline <= after + expected,
+                "attempt {attempt}: armed for the {expected:?} backoff"
+            );
+            let base = deadline - expected;
             task.process_expired_guard_timers(base + expected - Duration::from_millis(1))
                 .await;
             assert_eq!(
@@ -10677,11 +10702,23 @@ mod tests {
     /// this; the identical re-send follows §8.7.2.4's for RAN Configuration Update.
     #[tokio::test]
     async fn an_unanswered_ng_setup_is_reinitiated() {
+        let before = Instant::now();
         let (mut task, mut sctp_rx) = task_with_ng_setup_in_flight().await;
-        assert!(task
+        let after = Instant::now();
+        // The timer was armed between `before` and `after`. Timing is taken from
+        // its own deadline, not from a later `Instant::now()`: under CPU load the
+        // gap between arming and the probe below exceeded the 1 ms margin and the
+        // "not before" probe fired the timer (flaky in CI).
+        let deadline = task
             .guard_timers
-            .is_pending(GuardTimer::NgSetupResponse { amf_id: 1 }));
-        let base = Instant::now();
+            .deadline(GuardTimer::NgSetupResponse { amf_id: 1 })
+            .expect("the response timer is armed");
+        assert!(
+            deadline >= before + NG_SETUP_RESPONSE_TIMEOUT
+                && deadline <= after + NG_SETUP_RESPONSE_TIMEOUT,
+            "armed for NG_SETUP_RESPONSE_TIMEOUT"
+        );
+        let base = deadline - NG_SETUP_RESPONSE_TIMEOUT;
         task.process_expired_guard_timers(
             base + NG_SETUP_RESPONSE_TIMEOUT - Duration::from_millis(1),
         )
