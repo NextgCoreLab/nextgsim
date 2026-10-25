@@ -106,7 +106,9 @@ use super::system_info::{
     release_cell_reselection_priorities, sib19_params,
 };
 use super::transaction::{RrcProcedure, TidVerification, C5_TYPED_DCCH_DISPATCH};
-use super::ue_context::{ReestablishmentSecurity, RrcUeContextManager, SuspendedIdentity};
+use super::ue_context::{
+    PendingReestablishment, ReestablishmentSecurity, RrcUeContextManager, SuspendedIdentity,
+};
 use nextgsim_pdcp::srb_security::{SrbSecurity, MAC_I_LEN as SRB_MAC_I_LEN};
 use nextgsim_rrc::procedures::system_information::Sib19Params;
 
@@ -136,6 +138,35 @@ pub type NtnRrcConfig = Sib19Params;
 /// longest T301 (§7.1.1, ms2000), is ample for that round trip.
 pub const REESTABLISHMENT_BIND_TIMEOUT: std::time::Duration =
     std::time::Duration::from_millis(2000);
+
+/// `sec` re-keyed horizontally for the cell `pci`: KgNB* = KDF(KgNB, PCI,
+/// ARFCN-DL) (TS 33.501 Annex A.11) and new K_RRCint / K_RRCenc from it with
+/// the same algorithms (§6.11: "derive new RRC keys ... based on the K_(gNB)
+/// and the AS algorithms used in source cell"). This gNB holds no unused
+/// {NH, NCC}, so it signals the current NCC and the derivation is horizontal.
+fn rekeyed_security(
+    sec: &ReestablishmentSecurity,
+    pci: u16,
+    arfcn: u32,
+) -> ReestablishmentSecurity {
+    use nextgsim_crypto::kdf::{derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher};
+    let kgnb_star = derive_kgnb_star(&sec.kgnb, pci, arfcn);
+    ReestablishmentSecurity {
+        kgnb: kgnb_star,
+        k_rrc_int: derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcInt,
+            sec.integrity_alg_id,
+        ),
+        k_rrc_enc: derive_rrc_up_key(
+            &kgnb_star,
+            AlgorithmTypeDistinguisher::RrcEnc,
+            sec.ciphering_alg_id,
+        ),
+        phys_cell_id: pci,
+        ..sec.clone()
+    }
+}
 
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
@@ -551,6 +582,16 @@ impl RrcTask {
                 self.handle_ul_ccch_message(ue_id, &data).await;
             }
             RrcChannel::UlDcch => {
+                // A re-establishment of this very context waits for its Complete
+                // (#414): a PDU that verifies as one under the re-derived keys
+                // completes it; anything else is the context's own traffic under
+                // its current keys.
+                if let Some(plain) = self.complete_reestablishment(ue_id, data.data()).await {
+                    self.pending_reestablishment_binds
+                        .retain(|_, (context, _)| *context != ue_id);
+                    self.handle_ul_dcch_plain(ue_id, &plain).await;
+                    return;
+                }
                 if let Some(bound) = self.bind_reestablishment(ue_id, data.data()).await {
                     if let Some((context, plain)) = bound {
                         self.handle_ul_dcch_plain(context, &plain).await;
@@ -1249,41 +1290,21 @@ impl RrcTask {
             );
             return None;
         }
-        let secured = self.task_base.config.as_security_enabled;
-        let Some(ctx) = self.ue_manager.try_find_ue_mut(context) else {
+        if self.ue_manager.try_find_ue(context).is_none() {
             self.pending_reestablishment_binds.remove(&rls_id);
             return Some(None);
-        };
-        let plain = if secured && ctx.as_security_active() {
-            let Some(sec) = ctx.srb_security() else {
-                return Some(None);
-            };
-            let count = ctx.peek_ul_pdcp_count();
-            match sec.unprotect(count, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, data) {
-                Ok(plain) => plain,
-                Err(e) => {
-                    warn!(
-                        "UE[{rls_id}]: UL-DCCH PDU fails integrity with UE[{context}]'s \
-                         re-established keys ({e}); discarded, not bound (TS 33.501 §6.5)"
-                    );
-                    return Some(None);
-                }
-            }
-        } else {
-            data.to_vec()
-        };
-        if !matches!(
-            dispatch_ul_dcch(&plain),
-            Ok(UlDcchMessage::RrcReestablishmentComplete(_))
-        ) {
-            debug!("UE[{rls_id}]: not an RRCReestablishmentComplete; not bound, discarded");
+        }
+        let Some(plain) = self.complete_reestablishment(context, data).await else {
+            debug!(
+                "UE[{rls_id}]: not a verified RRCReestablishmentComplete of UE[{context}]; \
+                 not bound, discarded"
+            );
             return Some(None);
-        }
-        if secured && ctx.as_security_active() {
-            // The verified Complete spends this UL COUNT
-            let _ = ctx.next_ul_pdcp_count();
-        }
-        self.pending_reestablishment_binds.remove(&rls_id);
+        };
+        // Every binding of the context goes: the one that completed is rebound,
+        // and the others were replays or abandoned attempts (#414).
+        self.pending_reestablishment_binds
+            .retain(|_, (c, _)| *c != context);
         info!("UE[{rls_id}]: RRCReestablishmentComplete verified; rebinding to UE[{context}]");
         if let Err(e) = self
             .task_base
@@ -1296,7 +1317,77 @@ impl RrcTask {
         {
             error!("Failed to rebind UE[{rls_id}] as UE[{context}]: {e}");
         }
-        Some(Some((context, OctetString::from_slice(&plain))))
+        Some(Some((context, plain)))
+    }
+
+    /// The RRCReestablishmentComplete of `context`'s pending re-establishment
+    /// (#414), if `data` is one: the plaintext, with the re-establishment
+    /// committed. `None` when there is no pending re-establishment (or it has
+    /// expired, which drops it), or `data` is not a Complete that verifies under
+    /// the re-derived keys at UL COUNT 0; nothing changes then.
+    ///
+    /// TS 38.331 §5.3.7.5: the Complete is the first message protected with the
+    /// keys re-derived from KgNB*, so only it proves the UE (TS 33.501 §6.11).
+    /// Committing takes the re-derived keys into use, re-establishes SRB1's
+    /// PDCP with the RRCReestablishment's DL COUNT 0 and the Complete's UL
+    /// COUNT 0 spent, and tells the NGAP task (the AS context and the DRBs).
+    async fn complete_reestablishment(&mut self, context: i32, data: &[u8]) -> Option<OctetString> {
+        let secured = self.task_base.config.as_security_enabled;
+        let ctx = self.ue_manager.try_find_ue_mut(context)?;
+        let pending = ctx.pending_reestablishment.as_ref()?;
+        if pending.since.elapsed() > REESTABLISHMENT_BIND_TIMEOUT {
+            info!(
+                "UE[{context}]: the re-establishment was not completed in \
+                 {REESTABLISHMENT_BIND_TIMEOUT:?}; its re-derived keys are dropped"
+            );
+            ctx.pending_reestablishment = None;
+            return None;
+        }
+        let plain = match (&pending.security, secured) {
+            (Some(sec), true) => {
+                let srb = nextgsim_pdcp::SrbSecurity::new(
+                    sec.k_rrc_enc,
+                    sec.k_rrc_int,
+                    sec.ciphering_alg_id,
+                    sec.integrity_alg_id,
+                )
+                .ok()?;
+                srb.unprotect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, data)
+                    .ok()?
+            }
+            _ => data.to_vec(),
+        };
+        if !matches!(
+            dispatch_ul_dcch(&plain),
+            Ok(UlDcchMessage::RrcReestablishmentComplete(_))
+        ) {
+            return None;
+        }
+        let pending = ctx.pending_reestablishment.take()?;
+        let rekeyed = pending.security.map(|sec| {
+            let kgnb = sec.kgnb;
+            ctx.set_reestablishment_security(sec);
+            // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established; the
+            // RRCReestablishment spent DL COUNT 0 and the Complete UL COUNT 0.
+            ctx.reestablish_srb1_pdcp();
+            let _ = ctx.next_dl_pdcp_count();
+            let _ = ctx.next_ul_pdcp_count();
+            kgnb
+        });
+        info!(
+            "UE[{context}]: RRCReestablishmentComplete verified; the re-establishment is committed"
+        );
+        if let Some(kgnb) = rekeyed {
+            let _ = self
+                .task_base
+                .ngap_tx
+                .send(NgapMessage::AsKeyRefreshed {
+                    ue_id: context,
+                    kgnb,
+                })
+                .await;
+        }
+        Some(OctetString::from_slice(&plain))
     }
 
     /// Binds an N2 handover arrival to its admission (#324, #355 review).
@@ -2029,10 +2120,9 @@ impl RrcTask {
                 // rebinds the new id to the context's (the #324 mechanism).
                 // Answering on the old id sent the RRCReestablishment to an
                 // address the UE no longer had (#285 run).
-                // A newer request for the context replaces any binding an
-                // earlier one left pending (#406).
-                self.pending_reestablishment_binds
-                    .retain(|_, (context, _)| *context != result.ue_id);
+                // Bindings an earlier request left pending stay: one of them may
+                // be the genuine UE's, and a replay must not displace it. The
+                // first id whose Complete verifies wins (#414).
                 let reply_to = if result.ue_id != ue_id {
                     info!(
                         "RRC Reestablishment of UE[{}] heard under RLS UE[{}]: answered there, \
@@ -2048,30 +2138,68 @@ impl RrcTask {
                 } else {
                     result.ue_id
                 };
-                // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established (COUNTs 0) and the
-                // RRCReestablishment is integrity protected, not ciphered (#285).
-                // The shortMAC-I was verified above with the OLD K_RRCint; the
-                // RRCReestablishment and everything after use the re-keyed SRB1.
-                let secured = self
-                    .ue_manager
-                    .try_find_ue(result.ue_id)
-                    .is_some_and(|c| c.as_security_active());
-                if secured {
-                    self.rekey_for_reestablishment(result.ue_id).await;
+                // #414: nothing of the context changes on the request. The keys
+                // are re-derived into a pending slot (the same ones again for a
+                // later request: the derivation is from the unchanged KgNB);
+                // the context's keys, SRB1 COUNTs and state wait for a Complete
+                // that verifies under them (TS 38.331 §5.3.7.5, TS 33.501 §6.11).
+                let pci = phys_cell_id_from_nci(self.task_base.config.nci);
+                let arfcn = self.task_base.config.dl_arfcn;
+                let Some(ctx) = self.ue_manager.try_find_ue_mut(result.ue_id) else {
+                    return;
+                };
+                let fresh = ctx
+                    .pending_reestablishment
+                    .as_ref()
+                    .is_none_or(|p| p.since.elapsed() > REESTABLISHMENT_BIND_TIMEOUT);
+                if fresh {
+                    let security = ctx
+                        .reestablishment_security
+                        .as_ref()
+                        .filter(|_| ctx.as_security_active())
+                        .map(|sec| rekeyed_security(sec, pci, arfcn));
+                    ctx.pending_reestablishment = Some(PendingReestablishment {
+                        security,
+                        transaction_id: result.transaction_id,
+                        since: std::time::Instant::now(),
+                    });
                 }
-                if let Some(ctx) = self.ue_manager.try_find_ue_mut(result.ue_id) {
-                    if ctx.as_security_active() {
-                        ctx.reestablish_srb1_pdcp();
-                        ctx.dl_next_integrity_only = true;
+                // §5.3.7.5: the RRCReestablishment is integrity protected with the
+                // re-derived K_RRCint at the re-established SRB1's DL COUNT 0, and
+                // NOT ciphered (#285).
+                let pdu = match ctx
+                    .pending_reestablishment
+                    .as_ref()
+                    .and_then(|p| p.security.as_ref())
+                    .filter(|_| self.task_base.config.as_security_enabled)
+                {
+                    Some(sec) => {
+                        let Ok(srb) = nextgsim_pdcp::SrbSecurity::new(
+                            sec.k_rrc_enc,
+                            sec.k_rrc_int,
+                            sec.ciphering_alg_id,
+                            sec.integrity_alg_id,
+                        ) else {
+                            error!(
+                                "RRCReestablishment for UE[{}] not sent: its re-derived \
+                                 security state is unusable",
+                                result.ue_id
+                            );
+                            return;
+                        };
+                        let body = result.rrc_reestablishment_pdu.data();
+                        let mut out = body.to_vec();
+                        out.extend_from_slice(&srb.compute_mac_i(
+                            0,
+                            SRB1_PDCP_BEARER,
+                            PDCP_DIRECTION_DOWNLINK,
+                            body,
+                        ));
+                        OctetString::from_slice(&out)
                     }
-                }
-                self.send_rrc_message_to(
-                    result.ue_id,
-                    reply_to,
-                    result.channel,
-                    result.rrc_reestablishment_pdu,
-                )
-                .await;
+                    None => result.rrc_reestablishment_pdu,
+                };
+                self.send_rrc_pdu(reply_to, result.channel, pdu).await;
             }
             Err(rejection) if rejection.falls_back_to_setup() => {
                 // §5.3.3.1: the network falls back to RRCSetup. The transport-level
@@ -2154,29 +2282,10 @@ impl RrcTask {
         }
     }
 
-    /// Re-key a UE's AS security at RRC re-establishment (#285 review). TS 38.331
-    /// §5.3.7.5 has the UE "update the K_(gNB) key based on the current K_(gNB) key
-    /// or the NH, using the received nextHopChainingCount value". On the network
-    /// side, TS 33.501 §6.11: the gNB "shall use the K_(NG-RAN)* corresponding to the
-    /// selected cell as K_(gNB) and derive new RRC keys (new K_(RRCint) and new
-    /// K_(RRCenc)) based on the K_(gNB) and the AS algorithms used in source cell".
-    ///
-    /// This gNB holds no unused {NH, NCC}, so it signals the current NCC and the
-    /// derivation is horizontal: `KgNB*` from the current `KgNB`, this cell's PCI and
-    /// its ARFCN-DL (Annex A.11). The NGAP task's AS context is told, so a later
-    /// handover chains from the key the UE now holds.
-    async fn rekey_for_reestablishment(&mut self, ue_id: i32) {
-        let pci = phys_cell_id_from_nci(self.task_base.config.nci);
-        self.rekey_srb1(ue_id, pci, "re-establishment").await;
-    }
-
     /// Re-keys SRB1 horizontally to KgNB* = KDF(KgNB, `pci`, ARFCN-DL)
     /// (TS 33.501 Annex A.11) and tells the NGAP task, which re-keys the AS
     /// context and the DRBs (#325).
     async fn rekey_srb1(&mut self, ue_id: i32, pci: u16, why: &str) {
-        use nextgsim_crypto::kdf::{
-            derive_kgnb_star, derive_rrc_up_key, AlgorithmTypeDistinguisher,
-        };
         let arfcn = self.task_base.config.dl_arfcn;
         let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) else {
             return;
@@ -2184,19 +2293,8 @@ impl RrcTask {
         let Some(sec) = ctx.reestablishment_security.as_mut() else {
             return;
         };
-        let kgnb_star = derive_kgnb_star(&sec.kgnb, pci, arfcn);
-        sec.kgnb = kgnb_star;
-        sec.k_rrc_int = derive_rrc_up_key(
-            &kgnb_star,
-            AlgorithmTypeDistinguisher::RrcInt,
-            sec.integrity_alg_id,
-        );
-        sec.k_rrc_enc = derive_rrc_up_key(
-            &kgnb_star,
-            AlgorithmTypeDistinguisher::RrcEnc,
-            sec.ciphering_alg_id,
-        );
-        sec.phys_cell_id = pci;
+        *sec = rekeyed_security(sec, pci, arfcn);
+        let kgnb_star = sec.kgnb;
         info!(
             "UE[{ue_id}]: {why} re-keyed SRB1 from KgNB* (PCI {pci}, ARFCN-DL {arfcn}, NCC \
              {}, horizontal)",
@@ -2786,6 +2884,12 @@ impl RrcTask {
             // security regression besides.
             None => return,
         };
+        self.send_rrc_pdu(rls_id, channel, data).await;
+    }
+
+    /// Sends an RRC PDU, protected already where it has to be, to RLS id
+    /// `rls_id`.
+    async fn send_rrc_pdu(&mut self, rls_id: i32, channel: RrcChannel, data: OctetString) {
         let pdu_id = self.next_pdu_id();
         let msg = RlsMessage::DownlinkRrc {
             ue_id: rls_id,
@@ -4741,6 +4845,23 @@ mod tests {
         });
     }
 
+    /// The SRB1 security of `context`'s pending re-establishment (#414).
+    fn pending_srb(task: &RrcTask, context: i32) -> nextgsim_pdcp::SrbSecurity {
+        let sec = task
+            .ue_manager
+            .try_find_ue(context)
+            .and_then(|c| c.pending_reestablishment.as_ref())
+            .and_then(|p| p.security.as_ref())
+            .expect("re-derived keys pending");
+        nextgsim_pdcp::SrbSecurity::new(
+            sec.k_rrc_enc,
+            sec.k_rrc_int,
+            sec.ciphering_alg_id,
+            sec.integrity_alg_id,
+        )
+        .expect("legal algorithms")
+    }
+
     /// The secured context of UE 1 (AS security active), keyed so that
     /// `reestablishment_request_pdu(.., &[0xA1; 16], ..)` verifies.
     fn secured_context(task: &mut RrcTask) {
@@ -4762,6 +4883,158 @@ mod tests {
             kgnb: [0x11; 32],
         });
         ctx.on_as_security_activated();
+    }
+
+    /// The NGAP messages an RRC task under test sent: (uplink NAS PDUs, AS key
+    /// refreshes).
+    fn ngap_trace(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> (Vec<Vec<u8>>, usize) {
+        let (mut nas, mut refreshed) = (Vec::new(), 0);
+        while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
+            match msg {
+                NgapMessage::UplinkNasDelivery { pdu, .. } => nas.push(pdu.data().to_vec()),
+                NgapMessage::AsKeyRefreshed { .. } => refreshed += 1,
+                _ => {}
+            }
+        }
+        (nas, refreshed)
+    }
+
+    /// #414: a replayed RRCReestablishmentRequest changes nothing of a
+    /// connected UE's context: its keys, SRB1 COUNTs and state stay, NGAP is
+    /// not told of a re-key, and the UE's next SRB1 PDU, under its current keys
+    /// at its next UL COUNT, still verifies and is handled.
+    #[test]
+    fn a_replayed_request_leaves_a_connected_ues_keys_counts_and_state() {
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            let ctx = task.ue_manager.try_find_ue(1).unwrap();
+            let keys = ctx.srb_security().unwrap();
+            let counts = ctx.pdcp_counts();
+            let probe = keys.protect(7, 0, 1, b"probe");
+
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert_eq!(rls_trace(&mut rls_rx), vec!["DlDcch to 9".to_string()]);
+            let ctx = task.ue_manager.try_find_ue(1).unwrap();
+            assert!(ctx.is_connected(), "the state is untouched");
+            assert_eq!(ctx.pdcp_counts(), counts, "the SRB1 COUNTs are untouched");
+            assert_eq!(
+                ctx.srb_security().unwrap().protect(7, 0, 1, b"probe"),
+                probe,
+                "the keys are untouched"
+            );
+            assert_eq!(ngap_trace(&mut ngap_rx).1, 0, "no re-key reaches NGAP");
+
+            let nas = vec![0x7E, 0x00, 0x67];
+            let pdu = encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(nas.clone()),
+            })
+            .expect("encode ULInformationTransfer");
+            let pdu = keys.protect(counts.1, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &pdu);
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+            assert_eq!(
+                ngap_trace(&mut ngap_rx).0,
+                vec![nas],
+                "the UE's next SRB1 PDU still verifies"
+            );
+        });
+    }
+
+    /// #414: a replay landing in the middle of a genuine re-establishment does
+    /// not break it. The replayer is answered with the same transaction id and
+    /// the same re-derived keys; the genuine RRCReestablishment was integrity
+    /// protected (not ciphered) with them at DL COUNT 0; the genuine Complete
+    /// still verifies and is bound, and only then are the keys taken into use
+    /// and NGAP told.
+    #[test]
+    fn a_replay_during_a_genuine_reestablishment_does_not_break_it() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            let downlinks = |rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>| {
+                let mut out = Vec::new();
+                while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
+                    if let RlsMessage::DownlinkRrc { ue_id, data, .. } = msg {
+                        out.push((ue_id, data.data().to_vec()));
+                    }
+                }
+                out
+            };
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            let genuine = downlinks(&mut rls_rx);
+            let new = pending_srb(&task, 1);
+            let (body, mac) = genuine[0].1.split_at(genuine[0].1.len() - SRB_MAC_I_LEN);
+            let tid = decode_rrc_reestablishment(body)
+                .expect("an RRCReestablishment, not ciphered")
+                .rrc_transaction_id;
+            assert_eq!(
+                mac,
+                &new.compute_mac_i(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, body)[..],
+                "MAC-I under the re-derived K_RRCint at DL COUNT 0"
+            );
+
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            let replayed = downlinks(&mut rls_rx);
+            assert_eq!(replayed, vec![(9, genuine[0].1.clone())], "the same answer");
+
+            let complete = reestablishment_complete_pdu(tid);
+            let real = new.protect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &complete);
+            assert_eq!(
+                ngap_trace(&mut ngap_rx).1,
+                0,
+                "no re-key before the Complete"
+            );
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&real))
+                .await;
+            assert_eq!(rebinds(&mut rls_rx), vec![(5, 1)]);
+            assert!(task.pending_reestablishment_binds.is_empty());
+            let ctx = task.ue_manager.try_find_ue(1).unwrap();
+            assert!(ctx.is_connected());
+            assert!(ctx.pending_reestablishment.is_none());
+            assert_eq!(
+                ctx.srb_security().unwrap().protect(1, 0, 0, b"x"),
+                new.protect(1, 0, 0, b"x"),
+                "the re-derived keys are in use"
+            );
+            assert_eq!(
+                ngap_trace(&mut ngap_rx).1,
+                1,
+                "NGAP told once, on the Complete"
+            );
+        });
     }
 
     /// #406, under AS security: only an RRCReestablishmentComplete protected
@@ -4793,12 +5066,7 @@ mod tests {
             )
             .await;
             assert_eq!(rls_trace(&mut rls_rx), vec!["DlDcch to 5".to_string()]);
-            let new = task
-                .ue_manager
-                .try_find_ue(1)
-                .unwrap()
-                .srb_security()
-                .unwrap();
+            let new = pending_srb(&task, 1);
             let tid = task
                 .ue_manager
                 .try_find_ue(1)
@@ -4842,9 +5110,9 @@ mod tests {
                 .await;
             assert_eq!(rls_trace(&mut rls_rx), vec!["rebind 5->1".to_string()]);
             assert_eq!(
-                task.ue_manager.try_find_ue(1).unwrap().pdcp_counts().1,
-                1,
-                "the verified Complete spent UL COUNT 0"
+                task.ue_manager.try_find_ue(1).unwrap().pdcp_counts(),
+                (1, 1),
+                "the RRCReestablishment spent DL COUNT 0 and the Complete UL COUNT 0"
             );
         });
     }
@@ -4946,10 +5214,12 @@ mod tests {
         });
     }
 
-    /// #406: another request for the same context replaces the pending
-    /// binding, so a Complete on the first RLS id binds nothing.
+    /// #406 / #414: another request for the same context leaves the earlier
+    /// binding pending, so a replay cannot displace the genuine UE's. The first
+    /// id whose Complete verifies is bound, and every binding of the context
+    /// goes with it; the context's release takes them too.
     #[test]
-    fn another_request_drops_the_pending_binding() {
+    fn another_request_keeps_the_pending_binding_until_one_completes() {
         let config = test_config();
         let nci = config.nci;
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
@@ -4965,23 +5235,35 @@ mod tests {
                 )
                 .await;
             }
-            assert_eq!(
-                task.pending_reestablishment_binds
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>(),
-                vec![5]
-            );
+            let mut pending: Vec<i32> =
+                task.pending_reestablishment_binds.keys().copied().collect();
+            pending.sort_unstable();
+            assert_eq!(pending, vec![5, 9]);
+            let tid = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .pending_reestablishment
+                .as_ref()
+                .expect("pending")
+                .transaction_id;
             while rls_rx.try_recv().is_ok() {}
             task.handle_uplink_rrc(
                 9,
                 RrcChannel::UlDcch,
-                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+                OctetString::from_slice(&reestablishment_complete_pdu(tid)),
             )
             .await;
-            assert!(rebinds(&mut rls_rx).is_empty());
+            assert_eq!(rebinds(&mut rls_rx), vec![(9, 1)]);
+            assert!(task.pending_reestablishment_binds.is_empty());
 
             // The context's release takes its pending binding with it
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
             assert!(!task.pending_reestablishment_binds.is_empty());
             task.handle_an_release(1).await;
             assert!(task.pending_reestablishment_binds.is_empty());
