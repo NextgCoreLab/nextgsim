@@ -786,7 +786,7 @@ mod tests {
         assert_eq!(e.rx_deliv(), 2100);
         assert_eq!(e.tx_count_for_next_sdu(), 2100);
         // A gap, so one SDU is held for reordering.
-        // SN 2101: COUNT 2101 is still below the 12-bit SN modulus (4096)
+        // SN 2101: SN == COUNT here because COUNT < 4096
         e.receive_pdu(&pdu(PdcpSnSize::Sn12, 2101, &[9]), 0)
             .unwrap();
         assert_eq!(e.buffered_count(), 1);
