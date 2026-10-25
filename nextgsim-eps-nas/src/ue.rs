@@ -842,6 +842,16 @@ impl EpsNasUe {
     }
 
     fn on_plain_emm(&mut self, pdu: &[u8], now: Instant) -> NasOutput {
+        // §4.4.4.2: "Once the secure exchange of NAS messages has been
+        // established, the receiving EMM or ESM entity in the UE shall not
+        // process any NAS signalling messages unless they have been
+        // successfully integrity checked". The allow-list below is for a
+        // connection without one; on a secure exchange a plain message is
+        // discarded unread, and is not answered either (#400 review).
+        if self.secure_exchange {
+            log::warn!("EMM: plain message on a secure exchange; discarded (§4.4.4.2)");
+            return NasOutput::default();
+        }
         let m = match msg::decode_downlink_emm(pdu) {
             Ok(m) => m,
             Err(e) => {

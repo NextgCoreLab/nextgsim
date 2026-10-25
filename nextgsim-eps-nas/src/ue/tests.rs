@@ -132,8 +132,11 @@ fn the_stored_pair_is_deleted_on_security_mode_command() {
     let (mut ue, mut mme, now) = first_challenge();
     let complete = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
     mme.unprotect(&complete.uplink[0]);
-    // Answered inside the new security context, so unprotect before reading.
-    let out = ue.on_downlink(&mme.authentication_request(), now);
+    // On the secure exchange the challenge must be integrity protected
+    // (§4.4.4.2: a plain one is discarded, #400 review), and it is answered
+    // inside the new security context, so unprotect before reading.
+    let challenge = mme.authentication_request();
+    let out = ue.on_downlink(&mme.protect(&challenge, 2), now);
     let plain = mme.unprotect(&out.uplink[0]);
     assert_eq!(&plain[..3], &[0x07, 0x5C, 21], "the RAND went to the USIM");
 }
@@ -999,4 +1002,21 @@ fn an_attach_accept_with_an_undecodable_default_bearer_request_rejects_it_with_9
     assert_eq!(&complete[..2], &[0x07, 0x43], "ATTACH COMPLETE");
     assert_eq!(&complete[2..], &[0x00, 0x04, 0x52, pti, 0xC3, 0x60]);
     assert!(ue.default_bearer().is_none());
+}
+
+/// #400 review, §4.4.4.2: once the secure exchange is established, a plain
+/// message is discarded unread -- neither answered with EMM STATUS #96 when it
+/// does not decode, nor processed when it does (an AUTHENTICATION REJECT here,
+/// which would otherwise invalidate the USIM).
+#[test]
+fn a_plain_message_on_a_secure_exchange_is_discarded() {
+    let (mut ue, _mme, _) = attach();
+    let now = Instant::now();
+    assert_eq!(ue.on_downlink(&[0x07, 0x55], now), NasOutput::default());
+    assert_eq!(ue.on_downlink(&[0x07, 0x54], now), NasOutput::default());
+    assert_eq!(
+        ue.state(),
+        EmmState::Registered,
+        "the AUTHENTICATION REJECT was not processed"
+    );
 }
