@@ -1133,27 +1133,58 @@ mod tests {
         assert_eq!(manager.triggered_cells(1), vec![TriggeringCell::Nr(2)]);
     }
 
-    /// #359: the A3 offset is in the signalled 0.5 dB units and is evaluated
-    /// without rounding. Serving -90 dBm, neighbour -88 dBm, no hysteresis: a
-    /// 1.5 dB offset (field 3) triggers, a 2.5 dB one (field 5) does not.
+    /// #359: A3 and A6 offsets and the hysteresis are in the signalled 0.5 dB
+    /// units and are evaluated exactly, in half-dB arithmetic
+    /// (`2*Mn > 2*Mp + Off + Hys`), not truncated to whole dB. The cases are the
+    /// ones whole-dB arithmetic gets wrong: a 0.5 dB offset plus a 0.5 dB
+    /// hysteresis against a 1 dB lead (exactly at the bar: not entered), and a
+    /// -0.5 dB offset with equal levels (entered).
+    const HALF_DB_CASES: [(i32, i32, i32, bool); 6] = [
+        // (neighbour lead over the reference in dB, offset, hysteresis, enters)
+        (2, 3, 0, true),   // 2 dB > 1.5 dB
+        (2, 4, 0, false),  // 2 dB = 2 dB: not strictly above
+        (2, 5, 0, false),  // 2 dB < 2.5 dB
+        (1, 1, 1, false),  // 1 dB = 0.5 + 0.5 dB
+        (0, -1, 0, true),  // 0 dB > -0.5 dB
+        (0, -1, 1, false), // 0 dB = -0.5 + 0.5 dB
+    ];
+
     #[test]
     fn a_half_db_a3_offset_is_evaluated_exactly() {
-        for (offset_half_db, triggers) in [(3, true), (4, false), (5, false)] {
+        for (lead, offset_half_db, hys_half_db, enters) in HALF_DB_CASES {
             let mut manager = MeasurementManager::new();
             manager.set_serving_cell(Some(1));
             manager.update_measurement(1, -90);
-            manager.update_measurement(2, -88);
+            manager.update_measurement(2, -90 + lead);
             let mut config = MeasConfig::default();
             config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A3);
             config.trigger_config.a3_offset = Some(offset_half_db);
-            config.trigger_config.hysteresis = 0;
+            config.trigger_config.hysteresis = hys_half_db;
             config.trigger_config.time_to_trigger = 0;
             manager.add_config(config);
             manager.evaluate_events();
             assert_eq!(
                 !manager.triggered_cells(1).is_empty(),
-                triggers,
-                "offset {offset_half_db} half-dB"
+                enters,
+                "A3: lead {lead} dB, offset {offset_half_db} / hysteresis {hys_half_db} half-dB"
+            );
+        }
+    }
+
+    #[test]
+    fn a_half_db_a6_offset_is_evaluated_exactly() {
+        for (lead, offset_half_db, hys_half_db, enters) in HALF_DB_CASES {
+            let mut manager = manager_with_scell(); // SCell at -95 dBm
+            manager.update_measurement(3, -95 + lead);
+            let mut config = a6_config(0);
+            config.trigger_config.a6_offset = Some(offset_half_db);
+            config.trigger_config.hysteresis = hys_half_db;
+            manager.add_config(config);
+            manager.evaluate_events();
+            assert_eq!(
+                manager.triggered_cells(6).contains(&TriggeringCell::Nr(3)),
+                enters,
+                "A6: lead {lead} dB, offset {offset_half_db} / hysteresis {hys_half_db} half-dB"
             );
         }
     }
