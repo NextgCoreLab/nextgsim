@@ -950,7 +950,13 @@ impl UeApp {
                             // CM-IDLE, plus any registration that had to wait for
                             // the NAS signalling connection to go (TS 24.501
                             // §5.5.2.3.2, issue #265).
-                            let outs = orch.on_nas_signalling_connection_released();
+                            // A radio link failure also arms the §5.5.1.3.2 f)
+                            // recovery update on the next camp (#372).
+                            let outs = if matches!(msg, NasMessage::RadioLinkFailure) {
+                                orch.on_radio_link_failure()
+                            } else {
+                                orch.on_nas_signalling_connection_released()
+                            };
                             process_mm_outputs(
                                 outs,
                                 &mut orch,
