@@ -2924,8 +2924,11 @@ impl MmOrchestrator {
         let smc = match SecurityModeCommand::decode(&mut &payload[3..]) {
             Ok(smc) => smc,
             Err(e) => {
+                // TS 24.501 §7.5.1 (§7.5.2: no 5GMM exception): a mandatory-IE error is
+                // answered with 5GMM STATUS #96. SECURITY MODE REJECT is for a command
+                // the UE decoded and cannot accept (§5.4.2.5) (#384 review).
                 warn!("Failed to decode Security Mode Command: {e:?}");
-                return self.send_security_mode_reject(MmCause::InvalidMandatoryInformation);
+                return self.send_invalid_mandatory_information_status();
             }
         };
 
@@ -6880,6 +6883,24 @@ mod tests {
             assert!(orch.timers().t3510.is_running());
             assert_eq!(orch.state().mm_substate(), MmSubState::RegisteredInitiated);
         }
+    }
+
+    /// #384 review: an undecodable SECURITY MODE COMMAND (new-context header) is a
+    /// §7.5.1 mandatory-IE error too, so it gets 5GMM STATUS #96, not SECURITY MODE
+    /// REJECT. No context is active yet, so the STATUS goes out plain.
+    #[test]
+    fn an_undecodable_security_mode_command_is_answered_with_status_96() {
+        let mut orch = new_orch();
+        orch.start_registration(RegistrationType::InitialRegistration);
+        let auth = build_auth_request_pdu([0, 0, 0, 0, 0, 1], [0x80, 0x00]);
+        let _ = orch.handle_downlink(&auth);
+        // SHT 3 (integrity, new context), MAC, SQN 0, then an SMC that stops after
+        // its message type: the selected NAS security algorithms are missing.
+        let smc = [0x7E, 0x03, 0, 0, 0, 0, 0, 0x7E, 0x00, 0x5D];
+        let outs = orch.handle_downlink(&smc);
+        assert_eq!(outs.len(), 1, "{outs:?}");
+        assert_eq!(first_sent_pdu(&outs), STATUS_96);
+        assert!(!orch.security_context().is_active());
     }
 
     /// A well-formed DL NAS TRANSPORT still goes to the caller, not to STATUS.
