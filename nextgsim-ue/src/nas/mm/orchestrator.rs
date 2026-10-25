@@ -598,6 +598,15 @@ pub const SERVICE_REJECT_BACKOFF_BASE: std::time::Duration = std::time::Duration
 /// Ceiling of the Service Reject backoff.
 pub const SERVICE_REJECT_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(80);
 
+/// First wait before a data SERVICE REQUEST that a release or a lower-layer
+/// failure aborted is retried for the uplink still held (#344, TS 24.501
+/// §5.6.1.7 l)). Doubled per consecutive abort.
+pub const SR_ABORT_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How many times in a row an aborted data SERVICE REQUEST is retried before
+/// the held uplink waits for a new packet (#344). §5.6.1.7 l) bounds its own
+/// retry case at "maximum re-attempts 5".
+pub const SR_ABORT_RETRY_MAX: u32 = 5;
 /// Service request attempt counter value at which T3525 starts (TS 24.501
 /// §5.6.1.7 a): "greater than or equal to 5").
 pub const SR_ATTEMPT_LIMIT: u32 = 5;
@@ -654,6 +663,12 @@ pub struct MmOrchestrator {
     held_uplink_data_status: Option<u16>,
     /// Service type of the last SERVICE REQUEST sent (§5.6.1.5 #28 depends on it).
     pending_service_type: Option<ServiceType>,
+    /// Consecutive data SERVICE REQUESTs a release or lower-layer failure
+    /// aborted (#344). Cleared by SERVICE ACCEPT and by a registration that
+    /// brought the user plane back.
+    sr_abort_retries: u32,
+    /// When the next retry of an aborted data SERVICE REQUEST is due (#344).
+    sr_abort_retry_at: Option<std::time::Instant>,
     /// Whether the last SERVICE REQUEST was sent from 5GMM-IDLE (#323): T3517
     /// expiry then counts the attempt and releases the connection locally
     /// (TS 24.501 §5.6.1.7 a)).
@@ -828,6 +843,8 @@ impl MmOrchestrator {
             sr_backoff_until: None,
             held_uplink_data_status: None,
             pending_service_type: None,
+            sr_abort_retries: 0,
+            sr_abort_retry_at: None,
             sr_from_idle: false,
             sr_attempt_counter: 0,
             active_pdu_sessions: 0,
@@ -1628,6 +1645,16 @@ impl MmOrchestrator {
             self.sr_backoff_until = None;
             outs.extend(self.retry_held_uplink_service_request("Service Reject backoff over"));
         }
+        // The retry of a data Service Request a release aborted (#344)
+        if self
+            .sr_abort_retry_at
+            .is_some_and(|at| std::time::Instant::now() >= at)
+        {
+            self.sr_abort_retry_at = None;
+            outs.extend(
+                self.retry_held_uplink_service_request("retry after an aborted Service Request"),
+            );
+        }
         outs
     }
 
@@ -2233,6 +2260,8 @@ impl MmOrchestrator {
                 info!("Registration Accept re-established the user plane for held uplink");
                 self.up_reactivation_pending = false;
                 self.held_uplink_data_status = None;
+                self.sr_abort_retries = 0;
+                self.sr_abort_retry_at = None;
                 self.stop_t3525("user-plane resources established");
             } else {
                 warn!(
@@ -3654,6 +3683,8 @@ impl MmOrchestrator {
         self.held_uplink_data_status = None;
         self.sr_reject_count = 0;
         self.sr_backoff_until = None;
+        self.sr_abort_retries = 0;
+        self.sr_abort_retry_at = None;
         self.timers.stop(TIMER_T3517, true);
         self.timers.stop(TIMER_T3516, true);
         self.res_star = None;
@@ -4179,7 +4210,37 @@ impl MmOrchestrator {
     /// is aborted: T3517 stopped, 5GMM-REGISTERED (TS 24.501 §5.6.1.7 l), #316).
     /// A registration in progress is left to T3510.
     pub fn on_rrc_establishment_failure(&mut self) {
-        self.abort_service_request("RRC connection establishment failed");
+        if self.abort_service_request("RRC connection establishment failed") {
+            self.schedule_aborted_service_request_retry();
+        }
+    }
+
+    /// A SERVICE REQUEST was aborted by a release or a lower-layer failure
+    /// (§5.6.1.7 l)) while uplink is held. The spec does not ask for a retry, but the
+    /// uplink that triggered it is still held, and a one-shot sender (a single
+    /// DNS query) sends nothing more that would trigger one (#344). So it is
+    /// retried, after a doubling wait, at most [`SR_ABORT_RETRY_MAX`] times in
+    /// a row; after that the held uplink waits for a new packet.
+    fn schedule_aborted_service_request_retry(&mut self) {
+        if self.held_uplink_data_status.is_none() {
+            return;
+        }
+        if self.sr_abort_retries >= SR_ABORT_RETRY_MAX {
+            info!(
+                "Aborted Service Request not retried: {} retries in a row; held uplink waits \
+                 for a new packet",
+                self.sr_abort_retries
+            );
+            return;
+        }
+        let wait = SR_ABORT_RETRY_BASE.saturating_mul(1u32 << self.sr_abort_retries.min(16));
+        self.sr_abort_retries += 1;
+        info!(
+            "Aborted Service Request retried in {wait:?} for held uplink (retry {} of \
+             {SR_ABORT_RETRY_MAX})",
+            self.sr_abort_retries
+        );
+        self.sr_abort_retry_at = Some(std::time::Instant::now() + wait);
     }
 
     /// The NAS signalling connection was released (RRC release or radio link
@@ -4193,7 +4254,9 @@ impl MmOrchestrator {
         // and enters 5GMM-REGISTERED. Left running, T3517 kept the uplink held
         // and refused a new Service Request for up to 15 s after the connection
         // it belonged to was gone (#316).
-        self.abort_service_request("NAS signalling connection released");
+        if self.abort_service_request("NAS signalling connection released") {
+            self.schedule_aborted_service_request_retry();
+        }
         // A secure exchange belongs to one connection (§4.4.4.2).
         self.secure_exchange = false;
         // So do the user-plane resources (#288).
@@ -9074,6 +9137,144 @@ mod tests {
         ServiceAccept::new().encode(&mut plain);
         orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
         assert!(orch.held_uplink_data_status.is_none());
+    }
+
+    /// A registered UE in 5GMM-IDLE that sent a data SERVICE REQUEST for
+    /// held uplink on PSI 1 (#344).
+    fn idle_with_data_service_request_in_flight() -> MmOrchestrator {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let outs = orch.start_service_request(ServiceType::Data, uplink_data_status(&[1]));
+        assert!(outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))));
+        orch
+    }
+
+    fn sends_data_service_request(orch: &MmOrchestrator, outs: &[MmOutput]) -> bool {
+        outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_)))
+            && orch.pending_service_type == Some(ServiceType::Data)
+            && orch.timers().t3517.is_running()
+    }
+
+    /// #344, §5.6.1.7 l): a data SERVICE REQUEST aborted by a release or by
+    /// an RRC establishment failure is retried for the held uplink once the
+    /// wait is over, with no new packet.
+    #[test]
+    fn an_aborted_data_service_request_is_retried_for_held_uplink() {
+        for rrc_failure in [false, true] {
+            let mut orch = idle_with_data_service_request_in_flight();
+            if rrc_failure {
+                orch.on_rrc_establishment_failure();
+            } else {
+                orch.state_mut().switch_cm_state(CmState::Connected);
+                orch.on_nas_signalling_connection_released();
+            }
+            assert!(
+                !orch.service_request_in_progress(),
+                "rrc_failure={rrc_failure}"
+            );
+            let at = orch.sr_abort_retry_at.expect("a retry is scheduled");
+            let wait = at.saturating_duration_since(std::time::Instant::now());
+            assert!(wait <= SR_ABORT_RETRY_BASE, "{wait:?}");
+            let early = orch.tick();
+            assert!(
+                !early.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+                "rrc_failure={rrc_failure}: not before the wait"
+            );
+            orch.sr_abort_retry_at = Some(std::time::Instant::now());
+            let outs = orch.tick();
+            assert!(
+                sends_data_service_request(&orch, &outs),
+                "rrc_failure={rrc_failure}: {outs:?}"
+            );
+            assert_eq!(orch.held_uplink_data_status, uplink_data_status(&[1]));
+        }
+    }
+
+    /// #344: the retries are bounded and their wait doubles; a SERVICE ACCEPT
+    /// starts the count again.
+    #[test]
+    fn aborted_service_request_retries_are_bounded() {
+        let mut orch = idle_with_data_service_request_in_flight();
+        for n in 0..SR_ABORT_RETRY_MAX {
+            orch.on_rrc_establishment_failure();
+            let at = orch.sr_abort_retry_at.expect("scheduled");
+            let wait = at.saturating_duration_since(std::time::Instant::now());
+            let expected = SR_ABORT_RETRY_BASE * (1 << n);
+            assert!(
+                wait <= expected && wait + std::time::Duration::from_millis(500) > expected,
+                "retry {n}: {wait:?}"
+            );
+            orch.sr_abort_retry_at = Some(std::time::Instant::now());
+            let outs = orch.tick();
+            assert!(sends_data_service_request(&orch, &outs), "retry {n}");
+        }
+        orch.on_rrc_establishment_failure();
+        assert!(
+            orch.sr_abort_retry_at.is_none(),
+            "bounded at {SR_ABORT_RETRY_MAX}"
+        );
+
+        // A new packet asks again; this time the network answers
+        assert!(!orch
+            .start_service_request(ServiceType::Data, uplink_data_status(&[1]))
+            .is_empty());
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        assert_eq!(orch.sr_abort_retries, 0);
+    }
+
+    /// #388 review: a Registration Accept that brings the held uplink's user
+    /// plane back ends the abort retries; one that does not leaves them.
+    #[test]
+    fn a_registration_accept_restoring_the_user_plane_ends_the_abort_retries() {
+        for (failed, ended) in [(Some(0x0000), true), (Some(0x0002), false)] {
+            let mut orch = idle_with_data_service_request_in_flight();
+            orch.on_rrc_establishment_failure();
+            assert_eq!(orch.sr_abort_retries, 1);
+            assert!(orch.sr_abort_retry_at.is_some());
+            orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+            assert_eq!(
+                orch.registration_uplink_data_status,
+                uplink_data_status(&[1])
+            );
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            acc.pdu_session_reactivation_result = failed;
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+            assert_eq!(orch.sr_abort_retries == 0, ended, "failed={failed:?}");
+            assert_eq!(orch.sr_abort_retry_at.is_none(), ended, "failed={failed:?}");
+        }
+    }
+
+    /// #344: nothing is retried for a signalling request (no uplink held), or
+    /// when the abort was a registration starting (its REGISTRATION REQUEST
+    /// carries the Uplink data status itself, §5.5.1.3.2).
+    #[test]
+    fn no_abort_retry_without_held_uplink_or_for_a_registration() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        assert!(!orch
+            .start_service_request(ServiceType::Signalling, None)
+            .is_empty());
+        orch.on_rrc_establishment_failure();
+        assert!(orch.sr_abort_retry_at.is_none(), "signalling");
+
+        let mut orch = idle_with_data_service_request_in_flight();
+        orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        assert!(!orch.service_request_in_progress());
+        assert!(orch.sr_abort_retry_at.is_none(), "registration");
     }
 
     /// #313, §5.6.1.5 #28: restricted service area. The UE enters
