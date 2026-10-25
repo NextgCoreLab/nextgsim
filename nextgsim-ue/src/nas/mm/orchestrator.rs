@@ -9080,17 +9080,25 @@ mod tests {
             "one request in flight"
         );
 
+        // RRC is up, but the Service Request is unanswered: not yet
         orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(crate::nas::flush_held_sm(&orch, &mut sm).is_empty());
+        let (_, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(
+            sm_outs.is_empty(),
+            "not before the Service Accept: {sm_outs:?}"
+        );
+        // The Service Accept: out at once, not on the next tick
         let mut plain = Vec::new();
         ServiceAccept::new().encode(&mut plain);
         orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
-        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
-        assert!(mm_outs.is_empty(), "{mm_outs:?}");
         assert_eq!(
-            sm_outs,
+            crate::nas::flush_held_sm(&orch, &mut sm),
             vec![SmOutput::SendNasPdu(request)],
-            "the retransmission"
+            "the retransmission, on the Service Accept"
         );
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty(), "once");
     }
 
     /// #379, TS 24.501 §5.6.1.5 #22 / §5.6.1.7: a SERVICE REJECT #22 with T3346

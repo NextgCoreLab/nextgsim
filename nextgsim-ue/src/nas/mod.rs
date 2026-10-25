@@ -38,7 +38,7 @@ pub fn drive_sm_timers(
     use nextgsim_nas::ies::ie1::ServiceType;
 
     let connected = mm.state().is_connected();
-    let sm_outs = sm.tick_with_connection(connected);
+    let sm_outs = sm.tick_with_connection(sm_transport_ready(mm));
     let mm_outs = if !connected
         && sm.has_held_retransmission()
         && mm.state().mm_substate() == mm::MmSubState::RegisteredNormalService
@@ -48,6 +48,24 @@ pub fn drive_sm_timers(
         Vec::new()
     };
     (mm_outs, sm_outs)
+}
+
+/// Whether a 5GSM message can go now: a NAS signalling connection in
+/// 5GMM-REGISTERED.NORMAL-SERVICE, so not while the SERVICE REQUEST that
+/// asked for the connection is still unanswered (#420 review).
+fn sm_transport_ready(mm: &mm::MmOrchestrator) -> bool {
+    mm.state().is_connected() && mm.state().mm_substate() == mm::MmSubState::RegisteredNormalService
+}
+
+/// The held 5GSM retransmissions, once the connection a SERVICE REQUEST asked
+/// for is up (#420 review): call after each downlink NAS message, so they go
+/// on the Service Accept rather than on the next tick.
+pub fn flush_held_sm(mm: &mm::MmOrchestrator, sm: &mut sm::SmOrchestrator) -> Vec<sm::SmOutput> {
+    if sm_transport_ready(mm) && sm.has_held_retransmission() {
+        sm.take_held_retransmissions()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Drive the re-attempt of configured PDU sessions whose establishment failed

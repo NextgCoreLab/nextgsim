@@ -531,6 +531,26 @@ impl SmOrchestrator {
         self.retries.iter().any(|r| self.retry_is_due(r))
     }
 
+    /// The held retransmissions whose procedures are still pending, to send
+    /// now that a NAS signalling connection is up; each one's timer starts
+    /// again, keeping its expiry count (TS 24.501 §6.4.1.6 a): "reset and
+    /// start timer T3580"). Called on the transition to 5GMM-CONNECTED and on
+    /// the tick (#420 review).
+    pub fn take_held_retransmissions(&mut self) -> Vec<SmOutput> {
+        let mut outs = Vec::new();
+        for pti in std::mem::take(&mut self.held_retransmissions) {
+            let Some(pending) = self.pending.get(&pti) else {
+                continue;
+            };
+            info!("Held 5GSM retransmission sent on the connection (PTI={pti})");
+            outs.push(SmOutput::SendNasPdu(pending.ul_pdu.clone()));
+            if let Some(timer) = self.pt.get_mut(pti).and_then(|t| t.timer_mut()) {
+                timer.start(false);
+            }
+        }
+        outs
+    }
+
     /// Whether a procedure timer's retransmission waits for a NAS signalling
     /// connection (#409 follow-up).
     pub fn has_held_retransmission(&self) -> bool {
@@ -1110,12 +1130,7 @@ impl SmOrchestrator {
         let mut outs = Vec::new();
 
         if connected {
-            for pti in std::mem::take(&mut self.held_retransmissions) {
-                if let Some(pending) = self.pending.get(&pti) {
-                    info!("Held 5GSM retransmission sent on the connection (PTI={pti})");
-                    outs.push(SmOutput::SendNasPdu(pending.ul_pdu.clone()));
-                }
-            }
+            outs.extend(self.take_held_retransmissions());
         }
 
         // Procedure timers (T3580 / T3581 / T3582)
@@ -1123,10 +1138,17 @@ impl SmOrchestrator {
             for out in self.handle_procedure_timer_expiry(pti) {
                 match out {
                     SmOutput::SendNasPdu(_) if !connected => {
+                        // §6.4.1.6 a): the timer supervises a retransmission
+                        // that has not been sent; it stops until the flush,
+                        // so idle time does not use up the four retransmissions
+                        // (#420 review)
                         info!(
                             "5GSM retransmission (PTI={pti}) held: no NAS signalling connection \
-                             (TS 24.501 §5.6.1.1)"
+                             (TS 24.501 §5.6.1.1); its timer waits for it"
                         );
+                        if let Some(timer) = self.pt.get_mut(pti).and_then(|t| t.timer_mut()) {
+                            timer.stop(false);
+                        }
                         self.held_retransmissions.insert(pti);
                     }
                     out => outs.push(out),
@@ -2452,21 +2474,39 @@ mod tests {
     fn a_retransmission_without_a_connection_waits_for_one() {
         let (mut orch, psi, pti) = started_establishment();
         let original = orch.pending.get(&pti).unwrap().ul_pdu.clone();
+        let timer = |o: &SmOrchestrator| {
+            let t = o.pt.get(pti).unwrap().timer().unwrap();
+            (t.is_running(), t.expiry_count())
+        };
         orch.expire_procedure_timers_for_test();
         assert!(orch.tick_with_connection(false).is_empty(), "held");
         assert!(orch.has_held_retransmission());
+        assert_eq!(
+            timer(&orch),
+            (false, 1),
+            "T3580 waits with the retransmission"
+        );
+        assert!(
+            orch.tick_with_connection(false).is_empty(),
+            "no expiry while held"
+        );
         assert_eq!(
             orch.tick_with_connection(true),
             vec![SmOutput::SendNasPdu(original.clone())],
             "sent once the connection is up"
         );
+        assert_eq!(timer(&orch), (true, 1), "restarted with the retransmission");
         assert!(!orch.has_held_retransmission());
         assert!(orch.tick_with_connection(true).is_empty(), "once");
 
-        // Expiries 2-4 idle, then the fifth: aborted, nothing held left
-        for _ in 2..MAX_T3580_RETRIES {
+        // Four real retransmissions in all, then the fifth expiry aborts
+        for n in 2..MAX_T3580_RETRIES {
             orch.expire_procedure_timers_for_test();
-            assert!(orch.tick_with_connection(false).is_empty());
+            assert_eq!(
+                orch.tick_with_connection(true),
+                vec![SmOutput::SendNasPdu(original.clone())],
+                "retransmission {n}"
+            );
         }
         orch.expire_procedure_timers_for_test();
         assert_eq!(
