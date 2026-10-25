@@ -693,6 +693,14 @@ impl SctpAssociation {
         self.association.rtt()
     }
 
+    /// The number of outbound streams this endpoint may use: the configured
+    /// maximum, lowered to the peer's inbound-stream count (MIS) by the INIT /
+    /// INIT ACK exchange (RFC 9260 §5.1.1). A stream identifier at or above it
+    /// is invalid at the peer (§6.5). nextgsim #335.
+    pub fn outbound_streams(&self) -> u16 {
+        self.association.max_num_outbound_streams()
+    }
+
     /// Set the event sender for receiving association events
     pub fn set_event_sender(&mut self, tx: mpsc::UnboundedSender<SctpEvent>) {
         self.event_tx = Some(tx);
@@ -874,6 +882,12 @@ impl MultihomeSctpAssociation {
     }
 
     /// Get the active remote address.
+    /// The negotiated outbound stream count of the active association
+    /// (RFC 9260 §5.1.1, #335).
+    pub fn outbound_streams(&self) -> u16 {
+        self.active.outbound_streams()
+    }
+
     pub fn remote_addr(&self) -> SocketAddr {
         self.active.remote_addr()
     }

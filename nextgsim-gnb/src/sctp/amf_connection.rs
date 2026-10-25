@@ -69,6 +69,23 @@ impl AssociationKind {
         }
     }
 
+    /// The negotiated outbound stream count (RFC 9260 §5.1.1: bounded by the
+    /// AMF's MIS), or `None` when the transport cannot tell (#335).
+    fn outbound_streams(&self) -> Option<u16> {
+        match self {
+            Self::Single(a) => Some(a.outbound_streams()),
+            Self::Multihome(a) => Some(a.outbound_streams()),
+            #[cfg(all(target_os = "linux", feature = "kernel-sctp"))]
+            Self::Kernel(a) => match a.outbound_streams() {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    warn!("SCTP_STATUS failed ({e}): using the configured outbound stream count");
+                    None
+                }
+            },
+        }
+    }
+
     async fn poll(&mut self) -> Result<(), SctpError> {
         match self {
             Self::Single(a) => a.poll().await,
@@ -302,9 +319,15 @@ impl AmfConnection {
             AssociationKind::Multihome(association)
         };
 
-        // Use config values; sctp-proto doesn't expose negotiated counts directly.
+        // The inbound count stays the configured one. The outbound count is the
+        // negotiated one: RFC 9260 §5.1.1 bounds it by the AMF's MIS, and a
+        // UE-associated NGAP stream at or above it is invalid at the AMF (§6.5,
+        // #335). The configured count stands in only when the transport cannot
+        // report it.
         self.in_streams = config.sctp_config.max_inbound_streams;
-        self.out_streams = config.sctp_config.max_outbound_streams;
+        self.out_streams = kind
+            .outbound_streams()
+            .unwrap_or(config.sctp_config.max_outbound_streams);
         self.association_id = Some(self.client_id);
 
         self.association = Some(kind);
@@ -506,6 +529,58 @@ mod tests {
         assert_eq!(conn.client_id(), 1);
         assert_eq!(conn.state(), AmfConnectionState::Closed);
         assert!(!conn.is_connected());
+    }
+
+    /// #335, RFC 9260 §5.1.1: the AssociationUp the NGAP task allocates
+    /// UE-associated streams from carries the negotiated outbound count -- the
+    /// AMF's MIS (2) here, not the gNB's configured 8.
+    #[tokio::test]
+    async fn association_up_carries_the_negotiated_outbound_streams() {
+        use nextgsim_sctp::{SctpServer, SctpServerConfig};
+        let mut server = SctpServer::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            SctpServerConfig {
+                max_inbound_streams: 2,
+                max_outbound_streams: 16,
+                ..SctpServerConfig::default()
+            },
+        )
+        .await
+        .expect("bind AMF stand-in");
+        let amf = server.local_addr();
+        tokio::spawn(async move {
+            while server
+                .recv(std::time::Duration::from_millis(10))
+                .await
+                .is_ok()
+            {}
+        });
+        let config = AmfConnectionConfig {
+            local_address: "127.0.0.1:0".parse().expect("addr"),
+            remote_address: amf,
+            sctp_config: SctpConfig {
+                max_outbound_streams: 8,
+                max_inbound_streams: 8,
+                ..SctpConfig::default()
+            },
+            ..AmfConnectionConfig::default()
+        };
+        let mut conn = AmfConnection::new(1, config.clone());
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), conn.connect(&config))
+            .await
+            .expect("handshake within 5 s")
+            .expect("connect");
+        match event {
+            AmfConnectionEvent::AssociationUp {
+                in_streams,
+                out_streams,
+                ..
+            } => {
+                assert_eq!(out_streams, 2, "bounded by the AMF's MIS");
+                assert_eq!(in_streams, 8);
+            }
+            other => panic!("expected AssociationUp, got {other:?}"),
+        }
     }
 
     #[test]

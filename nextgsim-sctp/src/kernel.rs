@@ -131,6 +131,25 @@ const SOL_SCTP: c_int = 132;
 // `sctp_recvmsg()` does not read, which left the received PPID/stream zeroed.
 use libc::{SCTP_EVENTS, SCTP_INITMSG};
 
+/// `struct sctp_status` (`<linux/sctp.h>`, RFC 6458 §8.2.1); libc does not
+/// define it. The trailing `struct sctp_paddrinfo` (packed, aligned 4) is kept
+/// as opaque octets. Same layout as nextgcore-sctp's (nextgcore #813).
+#[repr(C)]
+struct SctpStatus {
+    sstat_assoc_id: i32,
+    sstat_state: i32,
+    sstat_rwnd: u32,
+    sstat_unackdata: u16,
+    sstat_penddata: u16,
+    sstat_instrms: u16,
+    sstat_outstrms: u16,
+    sstat_fragmentation_point: u32,
+    sstat_primary: [u8; 152],
+}
+
+// The kernel rejects a shorter option buffer with EINVAL, so the layout is pinned.
+const _: () = assert!(std::mem::size_of::<SctpStatus>() == 176);
+
 // libsctp helper functions. We link against `-lsctp` (libsctp-dev). These are
 // the classic one-to-one helpers that carry the PPID/stream out-of-band so we
 // do not have to assemble `cmsg` ancillary data by hand.
@@ -742,6 +761,29 @@ impl KernelSctpAssociation {
     /// Returns true while the association is up.
     pub fn is_established(&self) -> bool {
         self.established
+    }
+
+    /// The negotiated outbound stream count, read with `getsockopt(SCTP_STATUS)`
+    /// (RFC 6458 §8.2.1, `sstat_outstrms`): the requested count lowered to the
+    /// peer's MIS by the INIT / INIT ACK exchange (RFC 9260 §5.1.1, #335).
+    pub fn outbound_streams(&self) -> Result<u16> {
+        let mut status: SctpStatus = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<SctpStatus>() as socklen_t;
+        // SAFETY: `status` is a correctly sized, writable `struct sctp_status`
+        // and `len` holds its size; the kernel writes at most `len` octets.
+        let result = unsafe {
+            libc::getsockopt(
+                self.fd,
+                SOL_SCTP,
+                libc::SCTP_STATUS,
+                &mut status as *mut SctpStatus as *mut c_void,
+                &mut len,
+            )
+        };
+        if result < 0 {
+            return Err(SctpError::Io(io::Error::last_os_error()));
+        }
+        Ok(status.sstat_outstrms)
     }
 
     /// The PPID this association was opened to carry.
