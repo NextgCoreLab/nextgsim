@@ -168,6 +168,10 @@ fn rekeyed_security(
     }
 }
 
+/// How often expired pending re-establishments are swept, releasing the
+/// DL-DCCH messages they held (#421, #422 review).
+const REESTABLISHMENT_SWEEP_PERIOD: Duration = Duration::from_millis(100);
+
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
     task_base: GnbTaskBase,
@@ -2887,9 +2891,28 @@ impl RrcTask {
         // the UE re-establishing runs SRB1 on the re-derived keys, and the
         // context keeps its current ones until the Complete proves the UE, so
         // the DL-DCCH message is held until then (#414 review, below).
-        if channel == RrcChannel::DlDcch && self.hold_for_reestablishment(context, &data) {
-            return;
+        if channel == RrcChannel::DlDcch {
+            if self.hold_for_reestablishment(context, &data) {
+                return;
+            }
+            // Held messages of a re-establishment that has expired or
+            // completed go first, in order: this one must not overtake them
+            // (#422 review).
+            for (channel, held) in self.take_stale_held_downlink(context) {
+                self.send_rrc_now(context, context, channel, held).await;
+            }
         }
+        self.send_rrc_now(context, rls_id, channel, data).await;
+    }
+
+    /// Protects (DL-DCCH under AS security) and sends, with no hold.
+    async fn send_rrc_now(
+        &mut self,
+        context: i32,
+        rls_id: i32,
+        channel: RrcChannel,
+        data: OctetString,
+    ) {
         // SRB PDCP protection on DL-DCCH once AS security is active for this UE
         // (TS 38.323 §5.8/§5.9, issue #31). Applied here because this is the single
         // downlink send point, so nothing can bypass it by calling a sibling.
@@ -2957,8 +2980,33 @@ impl RrcTask {
             info!("UE[{context}]: {} held DL-DCCH message(s) sent", held.len());
         }
         for (channel, data) in held {
-            self.send_rrc_message(context, channel, data).await;
+            self.send_rrc_now(context, context, channel, data).await;
         }
+    }
+
+    /// The held DL-DCCH messages of `context` when no re-establishment is
+    /// pending any more (an expired one is dropped here), for sending before
+    /// anything newer (#422 review); empty while one still holds.
+    fn take_stale_held_downlink(&mut self, context: i32) -> Vec<(RrcChannel, OctetString)> {
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(context) else {
+            return Vec::new();
+        };
+        if ctx.held_downlink.is_empty() {
+            return Vec::new();
+        }
+        if ctx
+            .pending_reestablishment
+            .as_ref()
+            .is_some_and(|p| p.since.elapsed() <= REESTABLISHMENT_BIND_TIMEOUT)
+        {
+            return Vec::new();
+        }
+        ctx.pending_reestablishment = None;
+        info!(
+            "UE[{context}]: {} held DL-DCCH message(s) sent ahead of a newer one",
+            ctx.held_downlink.len()
+        );
+        std::mem::take(&mut ctx.held_downlink)
     }
 
     /// Drops every pending re-establishment past `REESTABLISHMENT_BIND_TIMEOUT`
@@ -3456,11 +3504,18 @@ impl Task for RrcTask {
         // cadence at multiples of the period.
         si_timer.tick().await;
         let mut si_ticks: u64 = 0;
+        // Expired re-establishments release what they held within this
+        // (#421, #422 review)
+        let mut reestablishment_timer = interval(REESTABLISHMENT_SWEEP_PERIOD);
 
         loop {
             tokio::select! {
-                _ = si_timer.tick() => {
+                _ = reestablishment_timer.tick() => {
+                    // Its own clock: the SI timer is parked for an hour when
+                    // the broadcast is off (#422 review)
                     self.expire_pending_reestablishments().await;
+                }
+                _ = si_timer.tick() => {
                     if si_period_ms > 0 {
                         si_ticks = si_ticks.wrapping_add(1);
                         self.on_system_information_period(si_ticks % 2 == 1).await;
@@ -5260,6 +5315,67 @@ mod tests {
             assert!(new
                 .unprotect(1, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, &sent[0].1)
                 .is_ok());
+        });
+    }
+
+    /// #422 review: once the re-establishment has expired, a new DL-DCCH
+    /// message does not overtake the held ones: they go first, in order,
+    /// whatever the SI broadcast period (here off, which parks the SI timer).
+    #[test]
+    fn a_new_downlink_after_the_expiry_goes_behind_the_held_ones() {
+        use nextgsim_rrc::procedures::information_transfer::decode_dl_information_transfer;
+        let config = GnbConfig {
+            as_security_enabled: true,
+            si_broadcast_period_ms: 0,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            let ctx = task.ue_manager.try_find_ue(1).unwrap();
+            let keys = ctx.srb_security().unwrap();
+            let dl_count = ctx.pdcp_counts().0;
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            dl_dcch_sent(&mut rls_rx);
+            task.handle_nas_delivery(1, OctetString::from_slice(&[0x7E, 0x00, 0x01]))
+                .await;
+            task.ue_manager
+                .try_find_ue_mut(1)
+                .unwrap()
+                .pending_reestablishment
+                .as_mut()
+                .unwrap()
+                .since -= REESTABLISHMENT_BIND_TIMEOUT + std::time::Duration::from_millis(1);
+            task.handle_nas_delivery(1, OctetString::from_slice(&[0x7E, 0x00, 0x02]))
+                .await;
+            task.expire_pending_reestablishments().await;
+            let order: Vec<u8> = dl_dcch_sent(&mut rls_rx)
+                .iter()
+                .enumerate()
+                .map(|(i, (_, pdu))| {
+                    let plain = keys
+                        .unprotect(
+                            dl_count + i as u32,
+                            SRB1_PDCP_BEARER,
+                            PDCP_DIRECTION_DOWNLINK,
+                            pdu,
+                        )
+                        .expect("in COUNT order under the current keys");
+                    decode_dl_information_transfer(&plain)
+                        .unwrap()
+                        .dedicated_nas_message
+                        .unwrap()[2]
+                })
+                .collect();
+            assert_eq!(order, vec![1, 2], "held first, then the new one");
         });
     }
 
