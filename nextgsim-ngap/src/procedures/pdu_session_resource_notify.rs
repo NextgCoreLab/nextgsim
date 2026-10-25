@@ -498,7 +498,7 @@ mod tests {
 
     fn params() -> PduSessionResourceNotifyParams {
         PduSessionResourceNotifyParams {
-            amf_ue_ngap_id: 0x0102_0304_05,
+            amf_ue_ngap_id: 0x0001_0203_0405,
             ran_ue_ngap_id: 7,
             notified_sessions: vec![NotifiedSession {
                 pdu_session_id: 5,
@@ -523,7 +523,7 @@ mod tests {
         let bytes = encode_pdu_session_resource_notify(&params()).expect("encodes");
         let decoded = decode_pdu_session_resource_notify(&bytes).expect("decodes");
 
-        assert_eq!(decoded.amf_ue_ngap_id, 0x0102_0304_05);
+        assert_eq!(decoded.amf_ue_ngap_id, 0x0001_0203_0405);
         assert_eq!(decoded.ran_ue_ngap_id, 7);
 
         assert_eq!(decoded.notified_sessions.len(), 1);

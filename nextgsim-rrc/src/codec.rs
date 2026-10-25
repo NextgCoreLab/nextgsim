@@ -70,17 +70,3 @@ pub fn decode_rrc<T: UperCodec<Output = T>>(bytes: &[u8]) -> Result<T, RrcCodecE
     let mut data = PerCodecData::from_slice_uper(bytes);
     T::uper_decode(&mut data).map_err(|e| RrcCodecError::DecodeError(format!("{e:?}")))
 }
-
-#[cfg(test)]
-mod tests {
-    // Note: Specific RRC message tests will be added once the generated types
-    // are available and we can identify commonly used message types.
-    // The generated code from rrc-19.3.0.asn1 includes all RRC message types.
-
-    #[test]
-    fn test_codec_module_compiles() {
-        // Basic test to ensure the module compiles with generated code
-        // More specific tests will be added for individual RRC messages
-        assert!(true);
-    }
-}

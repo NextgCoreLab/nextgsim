@@ -106,7 +106,7 @@ impl PagingCycleConfig {
         if !VALID_DRX_CYCLES.contains(&t) {
             return Err(PagingCycleError::InvalidDrxCycle(t));
         }
-        if n == 0 || n > t || t % n != 0 {
+        if n == 0 || n > t || !t.is_multiple_of(n) {
             return Err(PagingCycleError::InvalidN { t, n });
         }
         if !VALID_NS.contains(&ns) {
