@@ -143,6 +143,23 @@ jobs:
         # Gate on errors only; warnings are reported but don't fail CI
         # until the long tail is cleaned up incrementally.
         run: cargo clippy --workspace
+      - name: cargo clippy (warnings are errors in the crates that are clean)
+        # The ratchet for the step above: a crate listed here lints clean with
+        # `-D warnings` and CI keeps it that way. Add a crate once it is clean;
+        # still on the long tail: agent, ai, crypto, fl, gnb, nas, ngap, pdcp,
+        # rrc, ue.
+        # `--no-deps` lints the named crates only, so a dependency still on the
+        # long tail does not fail them. nextgsim-common is the shared config
+        # crate every binary links; a neg_cmp_op_on_partial_ord there went
+        # unnoticed because the step above does not fail on warnings.
+        run: |
+          cargo clippy --no-deps --all-targets \
+            -p nextgsim-cli -p nextgsim-common -p nextgsim-enb -p nextgsim-eps-nas \
+            -p nextgsim-gtp -p nextgsim-isac -p nextgsim-lte-rrc -p nextgsim-lte-ue \
+            -p nextgsim-nkef -p nextgsim-nwdaf -p nextgsim-rlc -p nextgsim-rls \
+            -p nextgsim-s1ap -p nextgsim-sctp -p nextgsim-semantic -p nextgsim-she \
+            -p nextgsim-integration-tests -- -D warnings
+          cargo clippy -p nextgsim-common --no-deps --all-targets --all-features -- -D warnings
 
   fmt:
     name: Format
