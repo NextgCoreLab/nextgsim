@@ -608,6 +608,7 @@ async fn lte_ue_updates_its_tracking_area_through_the_nextgcore_epc() {
     })
     .await;
     let bearer = s.bearer.unwrap();
+    let attach_m_tmsi = s.m_tmsi;
 
     // RRC_IDLE, then a new connection for the update, then RRC_IDLE again.
     async fn rrc(
@@ -626,17 +627,46 @@ async fn lte_ue_updates_its_tracking_area_through_the_nextgcore_epc() {
     }
     let camped = |s| matches!(s, UeRrcState::Camped { .. });
     let connected = |s| matches!(s, UeRrcState::Connected { .. });
-    rrc(&mut state_rx, Duration::from_secs(20), "RRC_IDLE after the attach", camped).await;
-    rrc(&mut state_rx, wait, "a connection for the update (T3412)", connected).await;
-    rrc(&mut state_rx, Duration::from_secs(30), "RRC_IDLE after the update", camped).await;
+    rrc(
+        &mut state_rx,
+        Duration::from_secs(20),
+        "RRC_IDLE after the attach",
+        camped,
+    )
+    .await;
+    rrc(
+        &mut state_rx,
+        wait,
+        "a connection for the update (T3412)",
+        connected,
+    )
+    .await;
+    rrc(
+        &mut state_rx,
+        Duration::from_secs(30),
+        "RRC_IDLE after the update",
+        camped,
+    )
+    .await;
     assert!(
-        mmed.wait_for("Tracking area update accept", Duration::from_secs(10)),
-        "mmed did not accept a tracking area update (set NEXTGCORE_MMED_LOG_LEVEL=debug)"
+        mmed.wait_for(
+            "TAU Request accepted (update_type=",
+            Duration::from_secs(10)
+        ),
+        "mmed did not accept a tracking area update"
     );
+    // The UE took a TRACKING AREA UPDATE ACCEPT: the attempt counter is
+    // reset (§5.5.3.2.4), not counting a T3430 expiry (§5.5.3.2.6 c), and the
+    // GUTI mmed reallocates in it was taken (TAU COMPLETE).
     let after = wait_nas(&status, Duration::from_secs(10), |s| {
         s.state == EmmState::Registered
     })
     .await;
+    assert_eq!(
+        after.tau_attempts, 0,
+        "the update was accepted, not timed out"
+    );
+    assert_ne!(after.m_tmsi, attach_m_tmsi, "the GUTI of the TAU ACCEPT");
     assert_eq!(
         after.bearer.as_ref().map(|b| b.ebi),
         Some(bearer.ebi),

@@ -529,7 +529,9 @@ impl EpsNasUe {
                 // S-TMSI and the UE is in state
                 // EMM-REGISTERED.ATTEMPTING-TO-UPDATE" a tracking area update,
                 // with the "active" flag set.
-                log::info!("EMM: paged with the S-TMSI in ATTEMPTING-TO-UPDATE; TAU (§5.5.3.2.2 r)");
+                log::info!(
+                    "EMM: paged with the S-TMSI in ATTEMPTING-TO-UPDATE; TAU (§5.5.3.2.2 r)"
+                );
                 self.t3346 = None;
                 self.paging_response_pending = true;
                 self.tau_ta_due = true;
@@ -758,9 +760,10 @@ impl EpsNasUe {
             Some(g) => EpsMobileIdentity::Guti(g),
             None => EpsMobileIdentity::Imsi(self.cfg.imsi.clone()),
         };
-        let last_visited_tai = self
-            .guti
-            .and_then(|_| self.last_visited_tai.or_else(|| self.tai_list.first().copied()));
+        let last_visited_tai = self.guti.and_then(|_| {
+            self.last_visited_tai
+                .or_else(|| self.tai_list.first().copied())
+        });
         let req = AttachRequest {
             ksi: self
                 .ctx

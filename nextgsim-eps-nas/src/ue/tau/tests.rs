@@ -35,8 +35,13 @@ fn idle_in_ta1() -> (EpsNasUe, Mme, Instant) {
 /// integrity protected and unciphered (§4.4.5), as the MME reads it; the
 /// connection then comes up.
 fn tau_request(ue: &mut EpsNasUe, mme: &mut Mme, now: Instant) -> Vec<u8> {
-    let pdu = ue.initial_message(now).expect("TRACKING AREA UPDATE REQUEST");
-    assert_eq!(pdu[0], 0x17, "security header type 1: integrity protected only");
+    let pdu = ue
+        .initial_message(now)
+        .expect("TRACKING AREA UPDATE REQUEST");
+    assert_eq!(
+        pdu[0], 0x17,
+        "security header type 1: integrity protected only"
+    );
     assert_eq!(ue.state(), EmmState::TrackingAreaUpdatingInitiated);
     assert_eq!(ue.next_deadline(), Some(now + T3430), "T3430");
     ue.on_connected();
@@ -101,7 +106,11 @@ fn a_new_ta_sends_a_ta_update_with_the_active_flag() {
     let req = tau_request(&mut ue, &mut mme, now);
     assert_eq!(req[2], 0x18, "KSI 1, active flag, TA updating (000)");
     assert_eq!(&req[3..15], &OLD_GUTI);
-    assert_eq!(&req[15..19], &[0x58, 0x02, 0xE0, 0xE0], "UE network capability");
+    assert_eq!(
+        &req[15..19],
+        &[0x58, 0x02, 0xE0, 0xE0],
+        "UE network capability"
+    );
     assert_eq!(&req[19..25], &LAST_VISITED_TA1);
 
     let mut ies = NEW_GUTI.to_vec();
@@ -111,8 +120,15 @@ fn a_new_ta_sends_a_ta_update_with_the_active_flag() {
     assert_eq!(out.uplink[0][0] >> 4, 2, "integrity protected and ciphered");
     assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x4A]);
     assert_eq!(ue.guti().unwrap().m_tmsi, 0xC000_0002);
-    assert_eq!(ue.tai_list().iter().map(|t| t.tac).collect::<Vec<_>>(), [1, 2]);
-    assert_eq!(ue.next_deadline(), None, "active flag: no T3440, no T3412 connected");
+    assert_eq!(
+        ue.tai_list().iter().map(|t| t.tac).collect::<Vec<_>>(),
+        [1, 2]
+    );
+    assert_eq!(
+        ue.next_deadline(),
+        None,
+        "active flag: no T3440, no T3412 connected"
+    );
 
     // The next update names TA 2 as the last visited registered TAI.
     ue.on_released(now);
@@ -141,9 +157,16 @@ fn the_accept_deactivates_the_bearers_the_mme_does_not_list() {
 
     let req = tau_request(&mut ue, &mut mme, now);
     let ebcs = req.windows(2).position(|w| w == [0x57, 0x02]).unwrap();
-    assert_eq!(&req[ebcs + 2..ebcs + 4], &[0x60, 0x00], "EBI 5 and 6 active");
+    assert_eq!(
+        &req[ebcs + 2..ebcs + 4],
+        &[0x60, 0x00],
+        "EBI 5 and 6 active"
+    );
     ue.on_downlink(&accept(&mut mme, &[0x57, 0x02, 0x20, 0x00]), now);
-    assert!(ue.dedicated_bearers().is_empty(), "EBI 6 deactivated locally");
+    assert!(
+        ue.dedicated_bearers().is_empty(),
+        "EBI 6 deactivated locally"
+    );
     assert_eq!(ue.default_bearer().unwrap().ebi, 5);
     assert_eq!(ue.state(), EmmState::Registered);
 }
@@ -355,7 +378,11 @@ fn plain_rejects_and_25_78() {
     ue.on_serving_cell(2);
     tau_request(&mut ue, &mut mme, now);
     ue.on_downlink(&[0x07, 0x4B, 12], now);
-    assert_eq!(ue.state(), EmmState::NoService(12), "plain #12 is processed");
+    assert_eq!(
+        ue.state(),
+        EmmState::NoService(12),
+        "plain #12 is processed"
+    );
 }
 
 /// #356, §5.5.3.2.6 c), d) and 3) to 5): T3430 expiry releases the
@@ -465,7 +492,11 @@ fn detach_and_guti_reallocation_during_the_update() {
     );
     assert_eq!(ue.state(), EmmState::TrackingAreaUpdatingInitiated);
     let out = ue.on_downlink(&mme.protect(&[0x07, 0x45, 0x01], 2), now);
-    assert_eq!(mme.unprotect(&out.uplink[0]), vec![0x07, 0x46], "DETACH ACCEPT");
+    assert_eq!(
+        mme.unprotect(&out.uplink[0]),
+        vec![0x07, 0x46],
+        "DETACH ACCEPT"
+    );
     assert_eq!(ue.state(), EmmState::Deregistered);
     assert_eq!(ue.next_deadline(), Some(now + T3440), "T3430 stopped");
 }

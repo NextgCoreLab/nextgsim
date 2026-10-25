@@ -137,6 +137,11 @@ pub struct EpsNasStatus {
     pub state: EmmState,
     /// The default EPS bearer, once activated.
     pub bearer: Option<DefaultBearer>,
+    /// The tracking area updating attempt counter (TS 24.301 §5.5.3.1, #356):
+    /// 0 after a TRACKING AREA UPDATE ACCEPT.
+    pub tau_attempts: u8,
+    /// The M-TMSI of the GUTI, once assigned.
+    pub m_tmsi: Option<u32>,
 }
 
 /// TS 24.301 EPS NAS for the RRC: [`EpsNasUe`] behind the [`NasLayer`] seam.
@@ -153,6 +158,8 @@ impl EpsNas {
         let status = Arc::new(Mutex::new(EpsNasStatus {
             state: ue.state(),
             bearer: None,
+            tau_attempts: 0,
+            m_tmsi: None,
         }));
         Self { ue, status }
     }
@@ -171,6 +178,8 @@ impl EpsNas {
         if let Ok(mut s) = self.status.lock() {
             s.state = self.ue.state();
             s.bearer = self.ue.default_bearer().cloned();
+            s.tau_attempts = self.ue.tau_attempts();
+            s.m_tmsi = self.ue.guti().map(|g| g.m_tmsi);
         }
     }
 }
@@ -310,6 +319,8 @@ mod tests {
             status: Arc::new(Mutex::new(EpsNasStatus {
                 state: ue.state(),
                 bearer: None,
+                tau_attempts: 0,
+                m_tmsi: None,
             })),
             ue,
         };

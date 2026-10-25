@@ -727,13 +727,9 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                 result: r.u8()? & 0x07,
                 ..TrackingAreaUpdateAccept::default()
             };
-            for (iei, v) in r.optional_ies(&[
-                (0x5A, 2),
-                (0x13, 6),
-                (0x53, 2),
-                (0x17, 2),
-                (0x59, 2),
-            ])? {
+            for (iei, v) in
+                r.optional_ies(&[(0x5A, 2), (0x13, 6), (0x53, 2), (0x17, 2), (0x59, 2)])?
+            {
                 match iei {
                     0x5A => a.t3412_s = v.first().map(|o| gprs_timer_seconds(*o)),
                     0x50 => match EpsMobileIdentity::decode(v)? {

@@ -1143,7 +1143,10 @@ async fn t3412_expiry_sends_a_periodic_tracking_area_update() {
     expect.extend_from_slice(&GUTI[1..]);
     expect.extend_from_slice(&[0x52, 0x99, 0xF9, 0x07, 0x00, 0x01]);
     expect.extend_from_slice(&[0x57, 0x02, 0x20, 0x00, 0xE0]);
-    assert_eq!(plain, expect, "KSI 0, periodic updating, Old GUTI, TAI, EBCS");
+    assert_eq!(
+        plain, expect,
+        "KSI 0, periodic updating, Old GUTI, TAI, EBCS"
+    );
 
     // TRACKING AREA UPDATE ACCEPT, "TA updated", new GUTI M-TMSI 0xC0000002.
     let mut accept = vec![0x07, 0x49, 0x00];

@@ -645,8 +645,14 @@ mod tests {
     /// octet 3 and EBI(15)..EBI(8) in octet 4.
     #[test]
     fn eps_bearer_context_status_matches_its_9_9_2_1_layout() {
-        assert_eq!(EpsBearerContextStatus::from_ebis([5]).encode(), [0x20, 0x00]);
-        assert_eq!(EpsBearerContextStatus::from_ebis([9]).encode(), [0x00, 0x02]);
+        assert_eq!(
+            EpsBearerContextStatus::from_ebis([5]).encode(),
+            [0x20, 0x00]
+        );
+        assert_eq!(
+            EpsBearerContextStatus::from_ebis([9]).encode(),
+            [0x00, 0x02]
+        );
         assert_eq!(
             EpsBearerContextStatus::from_ebis([5, 6, 15]).encode(),
             [0x60, 0x80]
@@ -658,7 +664,10 @@ mod tests {
         );
         let s = EpsBearerContextStatus::decode(&[0x21, 0x02]).unwrap();
         assert!(s.is_active(5) && s.is_active(9));
-        assert!(!s.is_active(6) && !s.is_active(0), "the spare bit is not read");
+        assert!(
+            !s.is_active(6) && !s.is_active(0),
+            "the spare bit is not read"
+        );
         assert!(EpsBearerContextStatus::decode(&[0x20]).is_err());
     }
 

@@ -265,9 +265,7 @@ impl EpsNasUe {
         } else if self.tau_attempts < MAX_TAU_ATTEMPTS {
             self.tau_attempts += 1;
         }
-        let in_tai_list = self
-            .current_tai
-            .is_none_or(|t| self.tai_list.contains(&t));
+        let in_tai_list = self.current_tai.is_none_or(|t| self.tai_list.contains(&t));
         if self.tau_attempts < MAX_TAU_ATTEMPTS {
             self.tau_retry_at = Some(now + T3411);
             if in_tai_list && self.updated {
@@ -302,9 +300,16 @@ impl EpsNasUe {
     }
 
     /// TRACKING AREA UPDATE ACCEPT (§5.5.3.2.4).
-    pub(super) fn on_tau_accept(&mut self, a: msg::TrackingAreaUpdateAccept, now: Instant) -> NasOutput {
+    pub(super) fn on_tau_accept(
+        &mut self,
+        a: msg::TrackingAreaUpdateAccept,
+        now: Instant,
+    ) -> NasOutput {
         if self.state != EmmState::TrackingAreaUpdatingInitiated {
-            log::warn!("EMM: TRACKING AREA UPDATE ACCEPT in {:?}; ignored", self.state);
+            log::warn!(
+                "EMM: TRACKING AREA UPDATE ACCEPT in {:?}; ignored",
+                self.state
+            );
             return NasOutput::default();
         }
         let (update_type, active) = self
