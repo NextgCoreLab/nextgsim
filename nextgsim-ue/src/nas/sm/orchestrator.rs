@@ -409,7 +409,11 @@ pub struct SmOrchestrator {
     /// message travels in UL NAS TRANSPORT, which 5GMM sends only in
     /// 5GMM-CONNECTED; from 5GMM-IDLE it first sends a SERVICE REQUEST for
     /// the pending uplink signalling (TS 24.501 §5.6.1.1).
-    held_retransmissions: std::collections::BTreeSet<u8>,
+    /// With each, the deadline after which the held procedure is aborted as
+    /// on its last expiry: the time its remaining retransmissions would have
+    /// taken, so a hold is bounded even when no connection comes (#424
+    /// review).
+    held_retransmissions: std::collections::BTreeMap<u8, std::time::Instant>,
 }
 
 impl Default for SmOrchestrator {
@@ -434,7 +438,7 @@ impl SmOrchestrator {
             type_override: HashMap::new(),
             wanted: Vec::new(),
             retries: Vec::new(),
-            held_retransmissions: std::collections::BTreeSet::new(),
+            held_retransmissions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -537,8 +541,46 @@ impl SmOrchestrator {
     /// start timer T3580"). Called on the transition to 5GMM-CONNECTED and on
     /// the tick (#420 review).
     pub fn take_held_retransmissions(&mut self) -> Vec<SmOutput> {
+        self.take_held(|_| true)
+    }
+
+    /// The held retransmissions of emergency PDU sessions only, which go on
+    /// any NAS signalling connection (#424 review).
+    pub fn take_held_emergency(&mut self) -> Vec<SmOutput> {
+        let emergency: Vec<u8> = self
+            .held_retransmissions
+            .keys()
+            .copied()
+            .filter(|pti| self.is_emergency_procedure(*pti))
+            .collect();
+        self.take_held(|pti| emergency.contains(&pti))
+    }
+
+    /// Whether PTI `pti`'s procedure is for an emergency PDU session.
+    fn is_emergency_procedure(&self, pti: u8) -> bool {
+        self.pt
+            .get(pti)
+            .and_then(|t| self.session(t.psi()))
+            .is_some_and(|s| s.params.emergency)
+    }
+
+    /// Whether a held retransmission is an emergency PDU session's.
+    pub fn has_held_emergency_retransmission(&self) -> bool {
+        self.held_retransmissions
+            .keys()
+            .any(|pti| self.pending.contains_key(pti) && self.is_emergency_procedure(*pti))
+    }
+
+    fn take_held(&mut self, which: impl Fn(u8) -> bool) -> Vec<SmOutput> {
         let mut outs = Vec::new();
-        for pti in std::mem::take(&mut self.held_retransmissions) {
+        let taken: Vec<u8> = self
+            .held_retransmissions
+            .keys()
+            .copied()
+            .filter(|pti| which(*pti))
+            .collect();
+        for pti in taken {
+            self.held_retransmissions.remove(&pti);
             let Some(pending) = self.pending.get(&pti) else {
                 continue;
             };
@@ -555,7 +597,7 @@ impl SmOrchestrator {
     /// connection (#409 follow-up).
     pub fn has_held_retransmission(&self) -> bool {
         self.held_retransmissions
-            .iter()
+            .keys()
             .any(|pti| self.pending.contains_key(pti))
     }
 
@@ -1127,17 +1169,46 @@ impl SmOrchestrator {
     /// restarts), and it goes on the first tick with one, if the procedure is
     /// still pending; the fifth expiry aborts as always (#409 follow-up).
     pub fn tick_with_connection(&mut self, connected: bool) -> Vec<SmOutput> {
+        self.tick_with_transport(connected, connected)
+    }
+
+    /// [`Self::tick_with_connection`] with the emergency case apart (#424
+    /// review): `connected`, a NAS signalling connection exists; `ready`, a
+    /// 5GSM message other than an emergency PDU session's can go on it (not
+    /// while the SERVICE REQUEST that asked for it is unanswered). An
+    /// emergency PDU session's retransmission goes on any connection,
+    /// including in 5GMM-REGISTERED.LIMITED-SERVICE (TS 24.501 §5.3.20,
+    /// §6.4.1.2), and is held only when there is none.
+    pub fn tick_with_transport(&mut self, connected: bool, ready: bool) -> Vec<SmOutput> {
         let mut outs = Vec::new();
 
-        if connected {
+        if ready {
             outs.extend(self.take_held_retransmissions());
+        } else if connected {
+            outs.extend(self.take_held_emergency());
+        }
+
+        // A hold is bounded: past its deadline the procedure is aborted as on
+        // its last expiry (§6.4.1.6 a), §6.4.2.6 a), §6.4.3.6 a)).
+        let now = std::time::Instant::now();
+        let overdue: Vec<u8> = self
+            .held_retransmissions
+            .iter()
+            .filter(|(_, deadline)| now >= **deadline)
+            .map(|(pti, _)| *pti)
+            .collect();
+        for pti in overdue {
+            warn!("5GSM retransmission (PTI={pti}) held past its timers' span; procedure aborted");
+            outs.extend(self.abort_procedure(pti));
         }
 
         // Procedure timers (T3580 / T3581 / T3582)
         for pti in self.pt.check_timers() {
             for out in self.handle_procedure_timer_expiry(pti) {
                 match out {
-                    SmOutput::SendNasPdu(_) if !connected => {
+                    SmOutput::SendNasPdu(_)
+                        if !(ready || (connected && self.is_emergency_procedure(pti))) =>
+                    {
                         // §6.4.1.6 a): the timer supervises a retransmission
                         // that has not been sent; it stops until the flush,
                         // so idle time does not use up the four retransmissions
@@ -1146,10 +1217,11 @@ impl SmOrchestrator {
                             "5GSM retransmission (PTI={pti}) held: no NAS signalling connection \
                              (TS 24.501 §5.6.1.1); its timer waits for it"
                         );
+                        let deadline = self.hold_deadline(pti);
                         if let Some(timer) = self.pt.get_mut(pti).and_then(|t| t.timer_mut()) {
                             timer.stop(false);
                         }
-                        self.held_retransmissions.insert(pti);
+                        self.held_retransmissions.insert(pti, deadline);
                     }
                     out => outs.push(out),
                 }
@@ -1214,6 +1286,46 @@ impl SmOrchestrator {
 
         // Exhaustion: abort with the per-procedure abnormal action
         warn!("T{timer_code} exhausted after {expiry_count} expiries: aborting {msg_type} (PSI={psi}, PTI={pti})");
+        self.abort_procedure(pti)
+    }
+
+    /// The (timer code, retransmission limit) of a procedure type.
+    fn procedure_timer_limits(msg_type: PtMessageType) -> (u16, u32) {
+        match msg_type {
+            PtMessageType::PduSessionEstablishmentRequest => (SM_TIMER_T3580, MAX_T3580_RETRIES),
+            PtMessageType::PduSessionModificationRequest => (SM_TIMER_T3581, MAX_T3581_RETRIES),
+            PtMessageType::PduSessionReleaseRequest => (SM_TIMER_T3582, MAX_T3582_RETRIES),
+        }
+    }
+
+    /// When a retransmission held now must have gone: the span its remaining
+    /// expiries would have taken (the one held plus those left), at the
+    /// timer's interval.
+    fn hold_deadline(&self, pti: u8) -> std::time::Instant {
+        let (interval, count, max) = self
+            .pt
+            .get(pti)
+            .and_then(|t| {
+                let timer = t.timer()?;
+                let (_, max) = Self::procedure_timer_limits(t.message_type()?);
+                Some((timer.interval(), timer.expiry_count(), max))
+            })
+            .unwrap_or((0, 0, 0));
+        let left = max.saturating_sub(count) + 1;
+        std::time::Instant::now()
+            + std::time::Duration::from_secs(u64::from(interval) * u64::from(left))
+    }
+
+    /// Abort PTI `pti`'s procedure with its abnormal-case action (§6.4.1.6 a),
+    /// §6.4.2.6 a), §6.4.3.6 a)): release the PTI and act per procedure.
+    fn abort_procedure(&mut self, pti: u8) -> Vec<SmOutput> {
+        let Some(pt) = self.pt.get(pti) else {
+            return Vec::new();
+        };
+        let Some(msg_type) = pt.message_type() else {
+            return Vec::new();
+        };
+        let psi = pt.psi();
         self.pt.abort(pti);
         self.pending.remove(&pti);
         self.held_retransmissions.remove(&pti);
@@ -2518,6 +2630,77 @@ mod tests {
         );
         assert!(!orch.has_held_retransmission());
         assert!(orch.tick_with_connection(true).is_empty(), "nothing held");
+    }
+
+    /// #424 review, TS 24.501 §6.4.1.2: an emergency PDU session's
+    /// retransmission goes on any NAS signalling connection, even one not
+    /// "ready" for other 5GSM (the SERVICE REQUEST unanswered); held only with
+    /// no connection at all. Another session's waits for readiness.
+    #[test]
+    fn an_emergency_retransmission_is_held_only_without_a_connection() {
+        let mut orch = new_orch();
+        let outs = orch.start_establishment(SmSessionParams {
+            emergency: true,
+            dnn: None,
+            ..test_params()
+        });
+        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
+        let pti = inner[2];
+        let original = orch.pending.get(&pti).unwrap().ul_pdu.clone();
+        orch.expire_procedure_timers_for_test();
+        assert_eq!(
+            orch.tick_with_transport(true, false),
+            vec![SmOutput::SendNasPdu(original.clone())],
+            "connected, not ready: an emergency one goes"
+        );
+        orch.expire_procedure_timers_for_test();
+        assert!(
+            orch.tick_with_transport(false, false).is_empty(),
+            "no connection: held"
+        );
+        assert!(orch.has_held_emergency_retransmission());
+        assert_eq!(
+            orch.take_held_emergency(),
+            vec![SmOutput::SendNasPdu(original)]
+        );
+
+        let (mut orch, _, _) = started_establishment();
+        orch.expire_procedure_timers_for_test();
+        assert!(
+            orch.tick_with_transport(true, false).is_empty(),
+            "not emergency: held"
+        );
+        assert!(!orch.has_held_emergency_retransmission());
+    }
+
+    /// #424 review: a hold is bounded. Past the span its remaining expiries
+    /// would have taken, the held procedure is aborted as on its last expiry,
+    /// though no connection came.
+    #[test]
+    fn a_held_retransmission_is_aborted_past_its_timers_span() {
+        let (mut orch, psi, pti) = started_establishment();
+        orch.expire_procedure_timers_for_test();
+        assert!(orch.tick_with_connection(false).is_empty(), "held");
+        let deadline = *orch.held_retransmissions.get(&pti).unwrap();
+        let span = deadline - std::time::Instant::now();
+        assert!(
+            span > std::time::Duration::from_secs(4 * 16 - 1),
+            "four more T3580 intervals and the one held: {span:?}"
+        );
+        assert!(orch.tick_with_connection(false).is_empty(), "within it");
+        *orch.held_retransmissions.get_mut(&pti).unwrap() = std::time::Instant::now();
+        assert_eq!(
+            orch.tick_with_connection(false),
+            vec![SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::ProtocolErrorUnspecified
+            }]
+        );
+        assert!(!orch.has_held_retransmission());
+        assert!(
+            orch.pt.get(pti).is_none_or(|t| !t.is_pending()),
+            "the PTI is released"
+        );
     }
 
     #[test]
