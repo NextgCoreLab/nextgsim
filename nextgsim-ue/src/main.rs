@@ -951,6 +951,11 @@ impl UeApp {
                                         &mut pdu_counter,
                                     )
                                     .await;
+                                    // A Service Accept brings the held 5GSM
+                                    // retransmissions out at once (#420 review)
+                                    let held = nextgsim_ue::nas::flush_held_sm(&orch, &mut sm_orch);
+                                    process_sm_outputs(held, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
+                                        .await;
                                 }
                             } else if pdu.len() >= 4 {
                                 warn!(
