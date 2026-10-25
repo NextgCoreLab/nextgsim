@@ -262,6 +262,11 @@ impl RrcUeContext {
         c
     }
 
+    /// The next expected uplink PDCP COUNT, without taking it (#406).
+    pub fn peek_ul_pdcp_count(&self) -> u32 {
+        self.ul_pdcp_count
+    }
+
     /// Takes the next expected uplink PDCP COUNT.
     pub fn next_ul_pdcp_count(&mut self) -> u32 {
         let c = self.ul_pdcp_count;

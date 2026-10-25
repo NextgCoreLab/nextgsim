@@ -73,14 +73,21 @@ pub fn decode_rrc<T: UperCodec<Output = T>>(bytes: &[u8]) -> Result<T, RrcCodecE
 
 #[cfg(test)]
 mod tests {
-    // Note: Specific RRC message tests will be added once the generated types
-    // are available and we can identify commonly used message types.
-    // The generated code from rrc-19.3.0.asn1 includes all RRC message types.
+    use super::*;
 
+    /// `PhysCellId ::= INTEGER (0..1007)` is a 10-bit constrained whole number
+    /// in UPER (X.691 §12.2.2): 1007 is `11 1110 1111`, padded to two octets.
     #[test]
-    fn test_codec_module_compiles() {
-        // Basic test to ensure the module compiles with generated code
-        // More specific tests will be added for individual RRC messages
-        assert!(true);
+    fn a_constrained_integer_round_trips_through_the_codec() {
+        let bytes = encode_rrc(&PhysCellId(PHYS_CELL_ID_MAX)).expect("encode");
+        assert_eq!(bytes, vec![0xFB, 0xC0]);
+        assert_eq!(
+            decode_rrc::<PhysCellId>(&bytes).expect("decode"),
+            PhysCellId(PHYS_CELL_ID_MAX)
+        );
+        assert!(matches!(
+            decode_rrc::<PhysCellId>(&[]),
+            Err(RrcCodecError::DecodeError(_))
+        ));
     }
 }

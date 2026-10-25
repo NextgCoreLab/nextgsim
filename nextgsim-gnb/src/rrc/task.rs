@@ -128,6 +128,15 @@ use nextgsim_rrc::procedures::system_information::Sib19Params;
 /// connected UE — so the broadcast and the dedicated update cannot disagree.
 pub type NtnRrcConfig = Sib19Params;
 
+/// How long a re-establishment heard under a new RLS id waits for its
+/// RRCReestablishmentComplete before the pending binding is dropped (#406).
+/// The UE sends the Complete as soon as the RRCReestablishment arrives
+/// (TS 38.331 §5.3.7.5), so the wait is one round trip, which no timer of
+/// the UE bounds once T301 has stopped. This is a gNB choice: 2 s, the
+/// longest T301 (§7.1.1, ms2000), is ample for that round trip.
+pub const REESTABLISHMENT_BIND_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(2000);
+
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
     task_base: GnbTaskBase,
@@ -162,6 +171,17 @@ pub struct RrcTask {
     /// `as_security_enabled` the arriving RRCReconfigurationComplete is verified
     /// with them at UL COUNT 0, and SRB1 protection then runs on them.
     pending_handover_security: std::collections::HashMap<i32, ReestablishmentSecurity>,
+    /// Re-establishments heard under an RLS id other than the context's (#397),
+    /// by that RLS id: the context's id and when the RRCReestablishment went
+    /// out (#406). The RRCReestablishmentRequest proves the UE only by its
+    /// shortMAC-I, which a replayed request carries too (TS 33.501 §6.11), so
+    /// the context's downlink is NOT moved on it. The RRCReestablishment goes
+    /// to the new id directly, and RLS rebinds the new id only once an
+    /// RRCReestablishmentComplete verifies on it, the first message protected
+    /// with the re-derived keys (TS 38.331 §5.3.7.5). Dropped on
+    /// [`REESTABLISHMENT_BIND_TIMEOUT`], on another request for the context,
+    /// and with the context.
+    pending_reestablishment_binds: std::collections::HashMap<i32, (i32, std::time::Instant)>,
     /// The local Remote UE IDs assigned per relay UE, for L2 UE-to-Network relay
     /// (TS 38.300 §16.12.2.1; issue #190).
     ///
@@ -246,6 +266,7 @@ impl RrcTask {
             cho_configured_ues: std::collections::HashSet::new(),
             pending_handover_arrivals: std::collections::HashMap::new(),
             pending_handover_security: std::collections::HashMap::new(),
+            pending_reestablishment_binds: std::collections::HashMap::new(),
             relay_local_ue_ids: std::collections::HashMap::new(),
             handover_manager: {
                 // The decision margin is the one the UE's A3 measurement
@@ -530,6 +551,12 @@ impl RrcTask {
                 self.handle_ul_ccch_message(ue_id, &data).await;
             }
             RrcChannel::UlDcch => {
+                if let Some(bound) = self.bind_reestablishment(ue_id, data.data()).await {
+                    if let Some((context, plain)) = bound {
+                        self.handle_ul_dcch_plain(context, &plain).await;
+                    }
+                    return;
+                }
                 let (ue_id, verified) =
                     self.bind_handover_arrival(ue_id, c_rnti, data.data()).await;
                 match verified {
@@ -1185,6 +1212,91 @@ impl RrcTask {
         );
         self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
         self.handover_manager.mark_executing(ue_id);
+    }
+
+    /// The UL-DCCH PDU of an RLS id with a pending re-establishment binding
+    /// (#406): `None` when there is none, so the PDU takes the usual path.
+    /// A binding that has expired, or whose RLS id has a context of its own
+    /// again (a fresh RRCSetup there), is dropped with `None` too.
+    /// Otherwise the PDU is checked against the context's re-derived SRB1 keys
+    /// at the context's next UL COUNT, without spending it unless it verifies.
+    /// Only a verified RRCReestablishmentComplete binds: RLS is told to rebind
+    /// the RLS id to the context, and `Some((context, plaintext))` is returned
+    /// for dispatch under the context. Anything else is discarded
+    /// (`Some(None)`), and the binding stays pending until it times out.
+    async fn bind_reestablishment(
+        &mut self,
+        rls_id: i32,
+        data: &[u8],
+    ) -> Option<Option<(i32, OctetString)>> {
+        let (context, since) = *self.pending_reestablishment_binds.get(&rls_id)?;
+        if self.ue_manager.try_find_ue(rls_id).is_some() {
+            // The UE gave up the re-establishment and set up afresh on this id
+            // (an RRCSetupRequest made a context here): its UL-DCCH is that
+            // context's (#412 review).
+            self.pending_reestablishment_binds.remove(&rls_id);
+            debug!(
+                "UE[{rls_id}]: a context of its own replaces the pending \
+                 re-establishment of UE[{context}]"
+            );
+            return None;
+        }
+        if since.elapsed() > REESTABLISHMENT_BIND_TIMEOUT {
+            self.pending_reestablishment_binds.remove(&rls_id);
+            info!(
+                "UE[{rls_id}]: the re-establishment of UE[{context}] was not completed in \
+                 {REESTABLISHMENT_BIND_TIMEOUT:?}; the pending binding is dropped"
+            );
+            return None;
+        }
+        let secured = self.task_base.config.as_security_enabled;
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(context) else {
+            self.pending_reestablishment_binds.remove(&rls_id);
+            return Some(None);
+        };
+        let plain = if secured && ctx.as_security_active() {
+            let Some(sec) = ctx.srb_security() else {
+                return Some(None);
+            };
+            let count = ctx.peek_ul_pdcp_count();
+            match sec.unprotect(count, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, data) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    warn!(
+                        "UE[{rls_id}]: UL-DCCH PDU fails integrity with UE[{context}]'s \
+                         re-established keys ({e}); discarded, not bound (TS 33.501 §6.5)"
+                    );
+                    return Some(None);
+                }
+            }
+        } else {
+            data.to_vec()
+        };
+        if !matches!(
+            dispatch_ul_dcch(&plain),
+            Ok(UlDcchMessage::RrcReestablishmentComplete(_))
+        ) {
+            debug!("UE[{rls_id}]: not an RRCReestablishmentComplete; not bound, discarded");
+            return Some(None);
+        }
+        if secured && ctx.as_security_active() {
+            // The verified Complete spends this UL COUNT
+            let _ = ctx.next_ul_pdcp_count();
+        }
+        self.pending_reestablishment_binds.remove(&rls_id);
+        info!("UE[{rls_id}]: RRCReestablishmentComplete verified; rebinding to UE[{context}]");
+        if let Err(e) = self
+            .task_base
+            .rls_tx
+            .send(RlsMessage::RebindUe {
+                from: rls_id,
+                to: context,
+            })
+            .await
+        {
+            error!("Failed to rebind UE[{rls_id}] as UE[{context}]: {e}");
+        }
+        Some(Some((context, OctetString::from_slice(&plain))))
     }
 
     /// Binds an N2 handover arrival to its admission (#324, #355 review).
@@ -1917,26 +2029,25 @@ impl RrcTask {
                 // rebinds the new id to the context's (the #324 mechanism).
                 // Answering on the old id sent the RRCReestablishment to an
                 // address the UE no longer had (#285 run).
-                if result.ue_id != ue_id {
+                // A newer request for the context replaces any binding an
+                // earlier one left pending (#406).
+                self.pending_reestablishment_binds
+                    .retain(|_, (context, _)| *context != result.ue_id);
+                let reply_to = if result.ue_id != ue_id {
                     info!(
-                        "RRC Reestablishment of UE[{}] heard under RLS UE[{}]: rebinding",
+                        "RRC Reestablishment of UE[{}] heard under RLS UE[{}]: answered there, \
+                         bound on a verified RRCReestablishmentComplete",
                         result.ue_id, ue_id
                     );
                     if self.ue_manager.delete_ue(ue_id).is_some() {
                         debug!("Discarded the transient context on UE[{ue_id}]");
                     }
-                    if let Err(e) = self
-                        .task_base
-                        .rls_tx
-                        .send(RlsMessage::RebindUe {
-                            from: ue_id,
-                            to: result.ue_id,
-                        })
-                        .await
-                    {
-                        error!("Failed to rebind UE[{ue_id}] as UE[{}]: {e}", result.ue_id);
-                    }
-                }
+                    self.pending_reestablishment_binds
+                        .insert(ue_id, (result.ue_id, std::time::Instant::now()));
+                    ue_id
+                } else {
+                    result.ue_id
+                };
                 // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established (COUNTs 0) and the
                 // RRCReestablishment is integrity protected, not ciphered (#285).
                 // The shortMAC-I was verified above with the OLD K_RRCint; the
@@ -1954,8 +2065,13 @@ impl RrcTask {
                         ctx.dl_next_integrity_only = true;
                     }
                 }
-                self.send_rrc_message(result.ue_id, result.channel, result.rrc_reestablishment_pdu)
-                    .await;
+                self.send_rrc_message_to(
+                    result.ue_id,
+                    reply_to,
+                    result.channel,
+                    result.rrc_reestablishment_pdu,
+                )
+                .await;
             }
             Err(rejection) if rejection.falls_back_to_setup() => {
                 // §5.3.3.1: the network falls back to RRCSetup. The transport-level
@@ -2317,6 +2433,8 @@ impl RrcTask {
                 .await;
         }
         self.ue_manager.delete_ue(ue_id);
+        self.pending_reestablishment_binds
+            .retain(|rls, (context, _)| *context != ue_id && *rls != ue_id);
         self.release_ue_drbs(ue_id).await;
     }
 
@@ -2644,10 +2762,23 @@ impl RrcTask {
     }
 
     async fn send_rrc_message(&mut self, ue_id: i32, channel: RrcChannel, data: OctetString) {
+        self.send_rrc_message_to(ue_id, ue_id, channel, data).await;
+    }
+
+    /// Sends an RRC message protected with `context`'s SRB keys and COUNTs to
+    /// the RLS id `rls_id`. They differ only for the RRCReestablishment to a UE
+    /// heard under a new RLS id that is not bound yet (#406).
+    async fn send_rrc_message_to(
+        &mut self,
+        context: i32,
+        rls_id: i32,
+        channel: RrcChannel,
+        data: OctetString,
+    ) {
         // SRB PDCP protection on DL-DCCH once AS security is active for this UE
         // (TS 38.323 §5.8/§5.9, issue #31). Applied here because this is the single
         // downlink send point, so nothing can bypass it by calling a sibling.
-        let data = match self.protect_dl_dcch(ue_id, channel, data) {
+        let data = match self.protect_dl_dcch(context, channel, data) {
             Some(protected) => protected,
             // The context vanished or the security state is unusable. Dropping is
             // the only safe answer: sending the PDU in the clear to a UE that is
@@ -2657,7 +2788,7 @@ impl RrcTask {
         };
         let pdu_id = self.next_pdu_id();
         let msg = RlsMessage::DownlinkRrc {
-            ue_id,
+            ue_id: rls_id,
             rrc_channel: channel,
             pdu_id,
             data,
@@ -4511,13 +4642,40 @@ mod tests {
         });
     }
 
-    /// A UE heard again under a new RLS id (it lost its RLS context during a
-    /// pause, #285 run) re-establishes the context of its old id. RLS is told to
-    /// rebind the new id to the context's BEFORE the RRCReestablishment goes out,
-    /// and the reply is addressed to the context's id, which RLS now routes to
-    /// the UE's current address. Before, the reply went to the old id's address.
+    /// The RLS messages an RRC task under test sent, as short labels.
+    fn rls_trace(rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>) -> Vec<String> {
+        let mut seen = Vec::new();
+        while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
+            match msg {
+                RlsMessage::RebindUe { from, to } => seen.push(format!("rebind {from}->{to}")),
+                RlsMessage::DownlinkRrc {
+                    ue_id, rrc_channel, ..
+                } => seen.push(format!("{rrc_channel:?} to {ue_id}")),
+                _ => {}
+            }
+        }
+        seen
+    }
+
+    /// An `RRCReestablishmentComplete` UL-DCCH PDU for `tid`, plain.
+    fn reestablishment_complete_pdu(tid: u8) -> Vec<u8> {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            encode_rrc_reestablishment_complete, RrcReestablishmentCompleteParams,
+        };
+        encode_rrc_reestablishment_complete(&RrcReestablishmentCompleteParams {
+            rrc_transaction_id: tid,
+        })
+        .expect("encode RRCReestablishmentComplete")
+    }
+
+    /// #397 / #406: a UE heard again under a new RLS id (it lost its RLS
+    /// context during a pause) re-establishes the context of its old id. The
+    /// RRCReestablishment goes to the new id directly, and the context's
+    /// downlink is NOT moved on the request: RLS rebinds the new id only once
+    /// the RRCReestablishmentComplete arrives on it. No context is left on the
+    /// new id, and the Complete is handled under the context.
     #[test]
-    fn a_reestablishment_under_a_new_rls_id_rebinds_it_to_the_context() {
+    fn a_reestablishment_under_a_new_rls_id_binds_on_the_complete() {
         use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
 
         let config = test_config();
@@ -4531,7 +4689,7 @@ mod tests {
             while rls_rx.try_recv().is_ok() {}
             // A transient context on the new id (left by, say, an RRCSetupRequest
             // the UE sent there before it tried to re-establish): it must not
-            // outlive the rebind, or two contexts would name one UE.
+            // outlive the re-establishment, or two contexts would name one UE.
             task.ue_manager.create_ue(5);
 
             task.handle_uplink_rrc(
@@ -4540,19 +4698,17 @@ mod tests {
                 reestablishment_request_pdu(nci, &[0xA1; 16], false),
             )
             .await;
-
+            let mut tid = None;
             let mut seen = Vec::new();
             while let Ok(TaskMessage::Message(msg)) = rls_rx.try_recv() {
                 match msg {
                     RlsMessage::RebindUe { from, to } => seen.push(format!("rebind {from}->{to}")),
-                    RlsMessage::DownlinkRrc {
-                        ue_id,
-                        rrc_channel,
-                        data,
-                        ..
-                    } => {
-                        assert_eq!(rrc_channel, RrcChannel::DlDcch);
-                        decode_rrc_reestablishment(data.data()).expect("an RRCReestablishment");
+                    RlsMessage::DownlinkRrc { ue_id, data, .. } => {
+                        tid = Some(
+                            decode_rrc_reestablishment(data.data())
+                                .expect("an RRCReestablishment")
+                                .rrc_transaction_id,
+                        );
                         seen.push(format!("reply to {ue_id}"));
                     }
                     _ => {}
@@ -4560,13 +4716,275 @@ mod tests {
             }
             assert_eq!(
                 seen,
-                vec!["rebind 5->1".to_string(), "reply to 1".to_string()]
+                vec!["reply to 5".to_string()],
+                "no rebind on the request"
             );
             assert!(
                 task.ue_manager.try_find_ue(5).is_none(),
-                "no context under the new id"
+                "no context on the new id"
             );
-            assert!(task.ue_manager.try_find_ue(1).is_some());
+
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(tid.expect("tid"))),
+            )
+            .await;
+            assert_eq!(rls_trace(&mut rls_rx), vec!["rebind 5->1".to_string()]);
+            assert!(task.pending_reestablishment_binds.is_empty());
+            assert!(
+                task.ue_manager
+                    .try_find_ue(1)
+                    .is_some_and(crate::RrcUeContext::is_connected),
+                "the Complete is handled under the context"
+            );
+        });
+    }
+
+    /// The secured context of UE 1 (AS security active), keyed so that
+    /// `reestablishment_request_pdu(.., &[0xA1; 16], ..)` verifies.
+    fn secured_context(task: &mut RrcTask) {
+        use nextgsim_rrc::procedures::rrc_reestablishment::{
+            phys_cell_id_from_nci, SIMULATED_C_RNTI,
+        };
+        task.handle_radio_power_on();
+        let pci = phys_cell_id_from_nci(task.task_base.config.nci);
+        let ctx = task.ue_manager.find_or_create_ue(1);
+        ctx.on_setup_complete();
+        ctx.set_reestablishment_security(ReestablishmentSecurity {
+            k_rrc_int: [0xA1; 16],
+            k_rrc_enc: [0x52; 16],
+            integrity_alg_id: 2,
+            ciphering_alg_id: 2,
+            c_rnti: SIMULATED_C_RNTI,
+            phys_cell_id: pci,
+            next_hop_chaining_count: 0,
+            kgnb: [0x11; 32],
+        });
+        ctx.on_as_security_activated();
+    }
+
+    /// #406, under AS security: only an RRCReestablishmentComplete protected
+    /// with the re-derived keys binds the new RLS id. A PDU that fails the
+    /// integrity check, here a Complete under the old keys, binds nothing and
+    /// spends no UL COUNT, so the real Complete still verifies after it.
+    #[test]
+    fn under_as_security_only_a_verified_complete_binds() {
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            let old = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .srb_security()
+                .unwrap();
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert_eq!(rls_trace(&mut rls_rx), vec!["DlDcch to 5".to_string()]);
+            let new = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .srb_security()
+                .unwrap();
+            let tid = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .transactions
+                .outstanding(RrcProcedure::Reestablishment)
+                .expect("an outstanding re-establishment");
+            let complete = reestablishment_complete_pdu(tid);
+
+            // A verified PDU that is not a Complete binds nothing either
+            let other = encode_ul_information_transfer(&UlInformationTransferParams {
+                dedicated_nas_message: Some(vec![0x7E, 0x00, 0x41]),
+            })
+            .expect("encode ULInformationTransfer");
+            let other = new.protect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &other);
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&other))
+                .await;
+            assert!(rls_trace(&mut rls_rx).is_empty(), "not a Complete");
+
+            let forged = old.protect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &complete);
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&forged))
+                .await;
+            assert!(
+                rls_trace(&mut rls_rx).is_empty(),
+                "the old keys bind nothing"
+            );
+            assert!(task.pending_reestablishment_binds.contains_key(&5));
+
+            let real = new.protect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &complete);
+            // The right keys with a broken MAC-I bind nothing either
+            let mut tampered = real.clone();
+            *tampered.last_mut().unwrap() ^= 0x01;
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&tampered))
+                .await;
+            assert!(
+                rls_trace(&mut rls_rx).is_empty(),
+                "a bad MAC-I binds nothing"
+            );
+
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&real))
+                .await;
+            assert_eq!(rls_trace(&mut rls_rx), vec!["rebind 5->1".to_string()]);
+            assert_eq!(
+                task.ue_manager.try_find_ue(1).unwrap().pdcp_counts().1,
+                1,
+                "the verified Complete spent UL COUNT 0"
+            );
+        });
+    }
+
+    /// #406, the replay: a captured RRCReestablishmentRequest replayed from a
+    /// second RLS id does not move the context's downlink. Its answer goes to
+    /// the replaying id, nothing is rebound without a verified Complete, and the
+    /// binding is dropped once it times out.
+    #[test]
+    fn a_replayed_request_from_another_rls_id_does_not_move_the_downlink() {
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert_eq!(
+                rls_trace(&mut rls_rx),
+                vec!["DlDcch to 9".to_string()],
+                "answered where the request came from, no rebind"
+            );
+            // The replayer cannot produce a Complete under the re-derived keys
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+            )
+            .await;
+            assert!(rls_trace(&mut rls_rx).is_empty(), "no rebind 9->1");
+
+            // Past the timeout the binding goes, whatever arrives
+            task.pending_reestablishment_binds.get_mut(&9).unwrap().1 -=
+                REESTABLISHMENT_BIND_TIMEOUT + std::time::Duration::from_millis(1);
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+            )
+            .await;
+            assert!(task.pending_reestablishment_binds.is_empty());
+            assert!(rls_trace(&mut rls_rx).is_empty());
+        });
+    }
+
+    /// #412 review: a UE that gives up its re-establishment on a new RLS id and
+    /// sets up afresh there within the bind timeout is not swallowed. The
+    /// RRCSetup made a context on the id, so its RRCSetupComplete reaches NGAP
+    /// as an Initial UE Message and the pending binding goes.
+    #[test]
+    fn a_fresh_setup_on_the_pending_rls_id_is_not_swallowed() {
+        use nextgsim_rrc::procedures::rrc_setup::{
+            encode_rrc_setup_complete, RrcSetupCompleteParams,
+        };
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert!(task.pending_reestablishment_binds.contains_key(&5));
+            while ngap_rx.try_recv().is_ok() {}
+
+            establish_pending_setup(&mut task, 5).await;
+            let nas: Vec<u8> = vec![0x7E, 0x00, 0x41, 0x79, 0x00, 0x0D];
+            let complete = encode_rrc_setup_complete(&RrcSetupCompleteParams {
+                registered_amf: None,
+                rrc_transaction_id: 0,
+                selected_plmn_identity: 1,
+                guami_type: None,
+                s_nssai_list: None,
+                dedicated_nas_message: nas.clone(),
+                ng_5g_s_tmsi_value: None,
+            })
+            .expect("encode RRCSetupComplete");
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&complete))
+                .await;
+            let (ue_id, pdu) =
+                try_take_initial_nas(&mut ngap_rx).expect("the RRCSetupComplete reaches NGAP");
+            assert_eq!(ue_id, 5);
+            assert_eq!(pdu.data(), &nas[..]);
+            assert!(task.pending_reestablishment_binds.is_empty());
+        });
+    }
+
+    /// #406: another request for the same context replaces the pending
+    /// binding, so a Complete on the first RLS id binds nothing.
+    #[test]
+    fn another_request_drops_the_pending_binding() {
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            for rls in [9, 5] {
+                task.handle_uplink_rrc(
+                    rls,
+                    RrcChannel::UlCcch,
+                    reestablishment_request_pdu(nci, &[0xA1; 16], false),
+                )
+                .await;
+            }
+            assert_eq!(
+                task.pending_reestablishment_binds
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![5]
+            );
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+            )
+            .await;
+            assert!(rebinds(&mut rls_rx).is_empty());
+
+            // The context's release takes its pending binding with it
+            assert!(!task.pending_reestablishment_binds.is_empty());
+            task.handle_an_release(1).await;
+            assert!(task.pending_reestablishment_binds.is_empty());
         });
     }
 

@@ -838,6 +838,17 @@ impl UeApp {
                         )
                         .await;
                     }
+                    // #409: the secondary subscriptions' SM timers and the
+                    // re-attempt of their configured sessions, on the shared
+                    // radio connection
+                    let sm_ticks = mint_secondary.tick_sessions(orch.state().is_connected());
+                    for (index, outs) in sm_ticks {
+                        process_secondary_sm_outputs(
+                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
+                            &mut pdu_counter,
+                        )
+                        .await;
+                    }
                 }
 
                 // UAV tracking report (Rel-18, TS 23.256): once the aerial UE

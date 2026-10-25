@@ -774,6 +774,39 @@ impl EnhancedMeasQuantities {
     }
 }
 
+/// Convert an E-UTRA RSRP measurement in dBm to `RSRP-RangeEUTRA`
+/// (`INTEGER (0..97)`, TS 36.133 §9.1.4).
+///
+/// The table is NOT the NR one: `RSRP_00` means "below -140 dBm", `RSRP_01` is
+/// `-140 <= RSRP < -139`, and so on to `RSRP_97` for "at or above -44 dBm". So the
+/// value is `1 + floor(dBm + 140)`, saturating at 97 — a different offset and a
+/// different ceiling from [`dbm_to_rsrp_range`], which is why reusing that one
+/// here would report an E-UTRA level roughly 16 ranges too high.
+///
+/// Note `nextgsim-ue`'s `nas::lpp::rsrp_report_value` computes the same TS 36.133
+/// table for the LPP E-CID report (issue #46). They are deliberately separate:
+/// that one lives in a UE-only NAS module behind an UNALIGNED PER codec and is not
+/// reachable from the gNB, while this one has to be, because the gNB inverts it
+/// with [`eutra_rsrp_range_to_dbm`] when it parses a B1/B2 report.
+pub fn dbm_to_eutra_rsrp_range(dbm: f64) -> u8 {
+    if dbm < -140.0 {
+        return 0;
+    }
+    let range = 1 + (dbm + 140.0).floor() as i32;
+    range.clamp(0, 97) as u8
+}
+
+/// The inverse of [`dbm_to_eutra_rsrp_range`], in dBm.
+///
+/// Range 0 has no single dBm value — it means "below -140 dBm" — so it maps to
+/// -141, the first level it covers, rather than to -140, which is range 1.
+pub fn eutra_rsrp_range_to_dbm(range: u8) -> f64 {
+    if range == 0 {
+        return -141.0;
+    }
+    -140.0 + f64::from(range - 1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1365,37 +1398,4 @@ mod tests {
 
         assert_eq!(decoded.eutra_neigh_results, cells);
     }
-}
-
-/// Convert an E-UTRA RSRP measurement in dBm to `RSRP-RangeEUTRA`
-/// (`INTEGER (0..97)`, TS 36.133 §9.1.4).
-///
-/// The table is NOT the NR one: `RSRP_00` means "below -140 dBm", `RSRP_01` is
-/// `-140 <= RSRP < -139`, and so on to `RSRP_97` for "at or above -44 dBm". So the
-/// value is `1 + floor(dBm + 140)`, saturating at 97 — a different offset and a
-/// different ceiling from [`dbm_to_rsrp_range`], which is why reusing that one
-/// here would report an E-UTRA level roughly 16 ranges too high.
-///
-/// Note `nextgsim-ue`'s `nas::lpp::rsrp_report_value` computes the same TS 36.133
-/// table for the LPP E-CID report (issue #46). They are deliberately separate:
-/// that one lives in a UE-only NAS module behind an UNALIGNED PER codec and is not
-/// reachable from the gNB, while this one has to be, because the gNB inverts it
-/// with [`eutra_rsrp_range_to_dbm`] when it parses a B1/B2 report.
-pub fn dbm_to_eutra_rsrp_range(dbm: f64) -> u8 {
-    if dbm < -140.0 {
-        return 0;
-    }
-    let range = 1 + (dbm + 140.0).floor() as i32;
-    range.clamp(0, 97) as u8
-}
-
-/// The inverse of [`dbm_to_eutra_rsrp_range`], in dBm.
-///
-/// Range 0 has no single dBm value — it means "below -140 dBm" — so it maps to
-/// -141, the first level it covers, rather than to -140, which is range 1.
-pub fn eutra_rsrp_range_to_dbm(range: u8) -> f64 {
-    if range == 0 {
-        return -141.0;
-    }
-    -140.0 + f64::from(range - 1)
 }
