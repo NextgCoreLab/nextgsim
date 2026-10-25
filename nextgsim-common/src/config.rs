@@ -153,6 +153,15 @@ pub struct GnbConfig {
     /// declared down (TS 23.007 §20.3.1 N3-REQUESTS). Default 3.
     #[serde(default = "default_gtpu_echo_max_misses")]
     pub gtpu_echo_max_misses: u32,
+    /// User-inactivity release (TS 23.502 §4.2.6, TS 38.413 §8.3.2): when no
+    /// user-plane packet has been forwarded for a UE with a PDU session, in
+    /// either direction, for this many seconds, the gNB sends UE CONTEXT RELEASE
+    /// REQUEST with cause "user-inactivity" (§9.3.1.2) and the UE goes to
+    /// CM-IDLE through the AMF's release. **Absent (the default) disables it**:
+    /// a UE then reaches CM-IDLE only through `ue-release` or a lost radio link,
+    /// as before #352.
+    #[serde(default)]
+    pub inactivity_timer_secs: Option<u64>,
     /// Period in milliseconds at which the gNB broadcasts system information on
     /// BCCH: the MIB every period and SIB1 every second period, matching the
     /// TS 38.331 §5.2.1 default cadence (MIB 80 ms, SIB1 160 ms).
@@ -568,6 +577,7 @@ impl Default for GnbConfig {
             upf_port: 2152,
             gtpu_echo_period_secs: 0,
             gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
+            inactivity_timer_secs: None,
             gtpu_restart_counter_path: None,
             paging_default_cycle_frames: default_paging_cycle_frames(),
             rlc_am_psis: Vec::new(),

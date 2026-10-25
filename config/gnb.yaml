@@ -68,6 +68,12 @@ ignore_stream_ids: false
 upf_addr: 172.23.0.7
 upf_port: 2152
 
+# User-inactivity release (TS 23.502 §4.2.6, TS 38.413 §8.3.2): after this many
+# seconds with no user-plane packet for a UE with a PDU session, the gNB sends UE
+# CONTEXT RELEASE REQUEST (cause user-inactivity) and the UE goes to CM-IDLE.
+# Unset disables it: a UE then goes idle only on `ue-release` or a lost radio link.
+# inactivity_timer_secs: 10
+
 # System information broadcast period in milliseconds (TS 38.331 §5.2.1): the
 # MIB every period and SIB1 every second period, i.e. the spec's 80/160 ms
 # cadence at the default. 0 disables the BCCH broadcast entirely, which leaves

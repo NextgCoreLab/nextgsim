@@ -3238,6 +3238,10 @@ impl NgapTask {
                 UeReleaseRequestCause::RanOriginated => NgSetupFailureCause::RadioNetwork(
                     RadioNetworkCause::ReleaseDueToNgranGeneratedReason,
                 ),
+                // TS 23.502 §4.2.6 / TS 38.413 §9.3.1.2 (#352)
+                UeReleaseRequestCause::UserInactivity => {
+                    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UserInactivity)
+                }
             };
 
             // TS 23.502 §4.2.6 step 1 / TS 38.413 §9.2.2.4: list the UE's PDU
@@ -13221,6 +13225,34 @@ mod tests {
             })
             .expect("a UE Context Release Request");
         assert_eq!(req.pdu_session_ids, vec![5, 6]);
+    }
+
+    /// #352, TS 38.413 §8.3.2 / §9.3.1.2: a user-inactivity release request
+    /// carries cause radioNetwork "user-inactivity" on the wire.
+    #[tokio::test]
+    async fn a_user_inactivity_release_request_carries_cause_user_inactivity() {
+        use nextgsim_ngap::procedures::ue_context_release::parse_ue_context_release_request;
+        let (mut task, mut sctp_rx, _) = seed_task_with_ue().await;
+        task.ue_contexts.get_mut(&10).expect("ue").amf_ue_ngap_id = Some(7777);
+        task.handle_ue_context_release_request(10, UeReleaseRequestCause::UserInactivity)
+            .await;
+        let sent = drain_sctp(&mut sctp_rx);
+        let req = sent
+            .iter()
+            .find_map(|b| {
+                decode_ngap_pdu(b)
+                    .ok()
+                    .and_then(|p| parse_ue_context_release_request(&p).ok())
+            })
+            .expect("a UE Context Release Request");
+        assert!(
+            matches!(
+                req.cause,
+                NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UserInactivity)
+            ),
+            "{:?}",
+            req.cause
+        );
     }
 
     // ========================================================================
