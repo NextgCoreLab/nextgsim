@@ -404,6 +404,12 @@ pub struct SmOrchestrator {
     /// Configured sessions whose establishment failed, waiting to be
     /// re-attempted (#379)
     retries: Vec<RetryEntry>,
+    /// PTIs whose procedure timer expired while the UE had no NAS signalling
+    /// connection: the retransmission waits for one (#409 follow-up). A 5GSM
+    /// message travels in UL NAS TRANSPORT, which 5GMM sends only in
+    /// 5GMM-CONNECTED; from 5GMM-IDLE it first sends a SERVICE REQUEST for
+    /// the pending uplink signalling (TS 24.501 §5.6.1.1).
+    held_retransmissions: std::collections::BTreeSet<u8>,
 }
 
 impl Default for SmOrchestrator {
@@ -428,6 +434,7 @@ impl SmOrchestrator {
             type_override: HashMap::new(),
             wanted: Vec::new(),
             retries: Vec::new(),
+            held_retransmissions: std::collections::BTreeSet::new(),
         }
     }
 
@@ -524,6 +531,14 @@ impl SmOrchestrator {
         self.retries.iter().any(|r| self.retry_is_due(r))
     }
 
+    /// Whether a procedure timer's retransmission waits for a NAS signalling
+    /// connection (#409 follow-up).
+    pub fn has_held_retransmission(&self) -> bool {
+        self.held_retransmissions
+            .iter()
+            .any(|pti| self.pending.contains_key(pti))
+    }
+
     /// Test hook: make every running back-off timer expire on the next tick.
     #[cfg(test)]
     pub(crate) fn expire_backoffs_for_test(&mut self) {
@@ -542,9 +557,9 @@ impl SmOrchestrator {
     pub(crate) fn expire_procedure_timers_for_test(&mut self) {
         for pti in self.pt.pending_ptis() {
             if let Some(timer) = self.pt.get_mut(pti).and_then(|t| t.timer_mut()) {
-                let mut zero = UeTimer::new(timer.code(), false, 0);
-                zero.start(true);
-                *timer = zero;
+                // The next tick is the next expiry in sequence; a restart
+                // then runs the real interval
+                timer.run_out_for_test();
             }
         }
     }
@@ -1076,14 +1091,47 @@ impl SmOrchestrator {
     // Timer driving
     // ========================================================================
 
-    /// Drive the SM procedure and back-off timers; call roughly once a
-    /// second.
+    /// Drive the SM procedure and back-off timers with a NAS signalling
+    /// connection to send on; call roughly once a second.
     pub fn tick(&mut self) -> Vec<SmOutput> {
+        self.tick_with_connection(true)
+    }
+
+    /// Drive the SM procedure and back-off timers; call roughly once a
+    /// second. `connected`: the UE is in 5GMM-CONNECTED, so an uplink 5GSM
+    /// message can go.
+    ///
+    /// TS 24.501 §6.4.1.6 a) / §6.4.2.6 a) / §6.4.3.6 a): a procedure timer's
+    /// expiry retransmits the request. Without a connection the
+    /// retransmission is held (the expiry still counts, and the timer
+    /// restarts), and it goes on the first tick with one, if the procedure is
+    /// still pending; the fifth expiry aborts as always (#409 follow-up).
+    pub fn tick_with_connection(&mut self, connected: bool) -> Vec<SmOutput> {
         let mut outs = Vec::new();
+
+        if connected {
+            for pti in std::mem::take(&mut self.held_retransmissions) {
+                if let Some(pending) = self.pending.get(&pti) {
+                    info!("Held 5GSM retransmission sent on the connection (PTI={pti})");
+                    outs.push(SmOutput::SendNasPdu(pending.ul_pdu.clone()));
+                }
+            }
+        }
 
         // Procedure timers (T3580 / T3581 / T3582)
         for pti in self.pt.check_timers() {
-            outs.extend(self.handle_procedure_timer_expiry(pti));
+            for out in self.handle_procedure_timer_expiry(pti) {
+                match out {
+                    SmOutput::SendNasPdu(_) if !connected => {
+                        info!(
+                            "5GSM retransmission (PTI={pti}) held: no NAS signalling connection \
+                             (TS 24.501 §5.6.1.1)"
+                        );
+                        self.held_retransmissions.insert(pti);
+                    }
+                    out => outs.push(out),
+                }
+            }
         }
 
         // Back-off timers: drop entries whose timer has expired. A configured
@@ -1146,6 +1194,7 @@ impl SmOrchestrator {
         warn!("T{timer_code} exhausted after {expiry_count} expiries: aborting {msg_type} (PSI={psi}, PTI={pti})");
         self.pt.abort(pti);
         self.pending.remove(&pti);
+        self.held_retransmissions.remove(&pti);
 
         match msg_type {
             PtMessageType::PduSessionEstablishmentRequest => {
@@ -2393,6 +2442,43 @@ mod tests {
     // ========================================================================
     // T3580 retransmission and exhaustion
     // ========================================================================
+
+    /// #409 follow-up, TS 24.501 §6.4.1.6 a) / §5.6.1.1: a T3580 expiry with
+    /// no NAS signalling connection holds the retransmission; it goes, the
+    /// identical octets, on the first tick with one. The fifth expiry aborts
+    /// whatever the connection, and an aborted procedure's held retransmission
+    /// goes with it.
+    #[test]
+    fn a_retransmission_without_a_connection_waits_for_one() {
+        let (mut orch, psi, pti) = started_establishment();
+        let original = orch.pending.get(&pti).unwrap().ul_pdu.clone();
+        orch.expire_procedure_timers_for_test();
+        assert!(orch.tick_with_connection(false).is_empty(), "held");
+        assert!(orch.has_held_retransmission());
+        assert_eq!(
+            orch.tick_with_connection(true),
+            vec![SmOutput::SendNasPdu(original.clone())],
+            "sent once the connection is up"
+        );
+        assert!(!orch.has_held_retransmission());
+        assert!(orch.tick_with_connection(true).is_empty(), "once");
+
+        // Expiries 2-4 idle, then the fifth: aborted, nothing held left
+        for _ in 2..MAX_T3580_RETRIES {
+            orch.expire_procedure_timers_for_test();
+            assert!(orch.tick_with_connection(false).is_empty());
+        }
+        orch.expire_procedure_timers_for_test();
+        assert_eq!(
+            orch.tick_with_connection(false),
+            vec![SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::ProtocolErrorUnspecified
+            }]
+        );
+        assert!(!orch.has_held_retransmission());
+        assert!(orch.tick_with_connection(true).is_empty(), "nothing held");
+    }
 
     #[test]
     fn test_t3580_expiry_retransmits_then_aborts() {

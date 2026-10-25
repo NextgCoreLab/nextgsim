@@ -270,6 +270,20 @@ impl UeTimer {
         self.is_running = true;
     }
 
+    /// Test hook: a running timer whose interval has just run out, so the
+    /// next [`Self::perform_tick`] is its next expiry; its interval and expiry
+    /// count are kept, so a restart runs the real interval again.
+    #[cfg(test)]
+    pub(crate) fn run_out_for_test(&mut self) {
+        let elapsed = std::time::Duration::from_secs(u64::from(self.interval_secs) + 1);
+        self.start_time = Some(
+            Instant::now()
+                .checked_sub(elapsed)
+                .unwrap_or_else(Instant::now),
+        );
+        self.is_running = true;
+    }
+
     /// Start the timer with an explicit interval in seconds.
     ///
     /// For callers that already hold a duration rather than a GPRS timer IE —
