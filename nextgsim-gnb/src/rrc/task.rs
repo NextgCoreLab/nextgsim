@@ -1816,6 +1816,33 @@ impl RrcTask {
             .process_rrc_reestablishment_request(&mut self.ue_manager, &presented)
         {
             Ok(result) => {
+                // The request can arrive under an RLS id other than the context's:
+                // a UE that lost its RLS context (a pause, or a gNB that dropped it
+                // on a heartbeat timeout) is heard again under a new id. The reply
+                // and everything after must reach the UE where it is now, so RLS
+                // rebinds the new id to the context's (the #324 mechanism).
+                // Answering on the old id sent the RRCReestablishment to an
+                // address the UE no longer had (#285 run).
+                if result.ue_id != ue_id {
+                    info!(
+                        "RRC Reestablishment of UE[{}] heard under RLS UE[{}]: rebinding",
+                        result.ue_id, ue_id
+                    );
+                    if self.ue_manager.delete_ue(ue_id).is_some() {
+                        debug!("Discarded the transient context on UE[{ue_id}]");
+                    }
+                    if let Err(e) = self
+                        .task_base
+                        .rls_tx
+                        .send(RlsMessage::RebindUe {
+                            from: ue_id,
+                            to: result.ue_id,
+                        })
+                        .await
+                    {
+                        error!("Failed to rebind UE[{ue_id}] as UE[{}]: {e}", result.ue_id);
+                    }
+                }
                 // §5.3.7.4/§5.3.7.5: SRB1's PDCP is re-established (COUNTs 0) and the
                 // RRCReestablishment is integrity protected, not ciphered (#285).
                 // The shortMAC-I was verified above with the OLD K_RRCint; the
@@ -4357,6 +4384,87 @@ mod tests {
                 decoded.next_hop_chaining_count, 6,
                 "carrying the security context's NCC"
             );
+        });
+    }
+
+    /// A UE heard again under a new RLS id (it lost its RLS context during a
+    /// pause, #285 run) re-establishes the context of its old id. RLS is told to
+    /// rebind the new id to the context's BEFORE the RRCReestablishment goes out,
+    /// and the reply is addressed to the context's id, which RLS now routes to
+    /// the UE's current address. Before, the reply went to the old id's address.
+    #[test]
+    fn a_reestablishment_under_a_new_rls_id_rebinds_it_to_the_context() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment;
+
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            while rls_rx.try_recv().is_ok() {}
+            // A transient context on the new id (left by, say, an RRCSetupRequest
+            // the UE sent there before it tried to re-establish): it must not
+            // outlive the rebind, or two contexts would name one UE.
+            task.ue_manager.create_ue(5);
+
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+
+            let mut seen = Vec::new();
+            while let Ok(TaskMessage::Message(msg)) = rls_rx.try_recv() {
+                match msg {
+                    RlsMessage::RebindUe { from, to } => seen.push(format!("rebind {from}->{to}")),
+                    RlsMessage::DownlinkRrc {
+                        ue_id,
+                        rrc_channel,
+                        data,
+                        ..
+                    } => {
+                        assert_eq!(rrc_channel, RrcChannel::DlDcch);
+                        decode_rrc_reestablishment(data.data()).expect("an RRCReestablishment");
+                        seen.push(format!("reply to {ue_id}"));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(
+                seen,
+                vec!["rebind 5->1".to_string(), "reply to 1".to_string()]
+            );
+            assert!(
+                task.ue_manager.try_find_ue(5).is_none(),
+                "no context under the new id"
+            );
+            assert!(task.ue_manager.try_find_ue(1).is_some());
+        });
+    }
+
+    /// The control: a re-establishment heard under the context's own id needs no
+    /// rebind.
+    #[test]
+    fn a_reestablishment_under_the_same_rls_id_rebinds_nothing() {
+        let config = test_config();
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            assert!(rebinds(&mut rls_rx).is_empty());
         });
     }
 
