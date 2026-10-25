@@ -208,4 +208,9 @@ asn1-compiler = { git = "https://github.com/NextgCoreLab/asn1-codegen.git", rev 
 # b168041 (nextgcore #813 / #870) adds RFC 9260 §5.1.1 stream negotiation: the
 # outbound stream count is bounded by the peer's MIS, not its OS, and
 # `Association::max_num_outbound_streams()` reports it (nextgsim #335).
-sctp-proto = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "b16804170f983b9df203b78234c9c190238010f8" }
+#
+# 66128cd (nextgcore #1142 / #1234) adds the receiving side of RFC 9260
+# §8.5.1 B: an ABORT or SHUTDOWN COMPLETE with the T bit is routed by remote
+# address and accepted under the peer's tag, so a restarted AMF's ABORT for an
+# old association's packet ends that association at once (nextgsim #411).
+sctp-proto = { git = "https://github.com/NextgCoreLab/nextgcore", rev = "66128cd8c1d31fc3b1eef9eaa34a20cabb3c277d" }
