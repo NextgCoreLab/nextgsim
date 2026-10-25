@@ -872,3 +872,131 @@ fn a_detach_during_an_attach_sends_the_request() {
     assert_eq!(ue.state(), EmmState::DeregisteredInitiated);
     assert_eq!(ue.next_deadline(), Some(now + T3421), "T3421, not T3410");
 }
+
+// ---- #382: mandatory-IE errors (TS 24.301 §7.5.1, §7.5.3) ----
+
+/// The exact EMM STATUS #96 octets (§8.2.14): PD 7 / plain header, type 0x60,
+/// EMM cause 96.
+const EMM_STATUS_96: [u8; 3] = [0x07, 0x60, 0x60];
+
+/// #382, §7.5.1 / §7.5.2: an integrity-protected EMM message whose mandatory
+/// part does not decode is answered with EMM STATUS #96, protected and ciphered
+/// like any uplink on the secure exchange. The procedure state is unchanged.
+#[test]
+fn a_protected_emm_message_with_a_bad_mandatory_ie_is_answered_with_status_96() {
+    for (name, plain) in [
+        ("IDENTITY REQUEST", vec![0x07, 0x55]),
+        ("DETACH REQUEST", vec![0x07, 0x45]),
+        ("ATTACH REJECT", vec![0x07, 0x44]),
+        ("SERVICE REJECT", vec![0x07, 0x4E]),
+        ("AUTHENTICATION REQUEST", vec![0x07, 0x52, 0x01]),
+    ] {
+        let (mut ue, mut mme, _) = attach();
+        let now = Instant::now();
+        let out = ue.on_downlink(&mme.protect(&plain, 2), now);
+        assert_eq!(out.uplink.len(), 1, "{name}: one uplink");
+        assert_eq!(
+            out.uplink[0][0] >> 4,
+            2,
+            "{name}: integrity protected and ciphered"
+        );
+        assert_eq!(mme.unprotect(&out.uplink[0]), EMM_STATUS_96, "{name}");
+        assert_eq!(ue.state(), EmmState::Registered, "{name}: state unchanged");
+    }
+}
+
+/// #382, §7.5.1 with §4.4.4.2: a plain message the UE processes unprotected
+/// gets EMM STATUS #96 (plain: no context yet); a plain message off the
+/// allow-list is discarded unread.
+#[test]
+fn a_plain_emm_message_with_a_bad_mandatory_ie_is_answered_only_when_allowed() {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    ue.initial_message(now).expect("ATTACH REQUEST");
+    let out = ue.on_downlink(&[0x07, 0x55], now);
+    assert_eq!(out.uplink, vec![EMM_STATUS_96.to_vec()], "IDENTITY REQUEST");
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+    assert_eq!(
+        ue.on_downlink(&[0x07, 0x45], now),
+        NasOutput::default(),
+        "a plain DETACH REQUEST is not on the allow-list"
+    );
+}
+
+/// #382, §7.5.1 / §7.5.2 (as #384 for 5GS): a new-context SECURITY MODE
+/// COMMAND whose mandatory part does not decode is answered with EMM STATUS
+/// #96 -- plain, since no context exists yet.
+#[test]
+fn an_undecodable_security_mode_command_is_answered_with_status_96() {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    ue.initial_message(now).expect("ATTACH REQUEST");
+    let mut mme = Mme::new(0x21);
+    ue.on_downlink(&mme.authentication_request(), now);
+    let out = ue.on_downlink(&mme.protect(&[0x07, 0x5D], 3), now);
+    assert_eq!(out.uplink, vec![EMM_STATUS_96.to_vec()]);
+    assert_eq!(ue.state(), EmmState::RegisteredInitiated);
+}
+
+/// #382, §7.5.1 / §7.5.3: a protected ESM message with a mandatory-IE error is
+/// answered with ESM STATUS #96, except that an ACTIVATE DEFAULT EPS BEARER
+/// CONTEXT REQUEST gets ACTIVATE DEFAULT EPS BEARER CONTEXT REJECT #96
+/// (§7.5.3 a)), both with the message's EBI and PTI.
+#[test]
+fn a_protected_esm_message_with_a_bad_mandatory_ie_is_answered_with_96() {
+    for (name, esm, reply) in [
+        // PDN CONNECTIVITY REJECT without its ESM cause
+        (
+            "PDN CONNECTIVITY REJECT",
+            vec![0x02, 0x07, 0xD1],
+            vec![0x02, 0x07, 0xE8, 0x60],
+        ),
+        // ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST, EBI 6, without its EPS QoS
+        (
+            "ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST",
+            vec![0x62, 0x00, 0xC1],
+            vec![0x62, 0x00, 0xC3, 0x60],
+        ),
+        // An imperative-part error: the message type is missing
+        (
+            "truncated header",
+            vec![0x52, 0x03],
+            vec![0x52, 0x03, 0xE8, 0x60],
+        ),
+    ] {
+        let (mut ue, mut mme, _) = attach();
+        let now = Instant::now();
+        let out = ue.on_downlink(&mme.protect(&esm, 2), now);
+        assert_eq!(out.uplink.len(), 1, "{name}");
+        assert_eq!(mme.unprotect(&out.uplink[0]), reply, "{name}");
+        assert_eq!(ue.default_bearer().unwrap().ebi, 5, "{name}: bearer kept");
+    }
+}
+
+/// #382, §7.5.2 / §7.5.3 a): an ATTACH ACCEPT whose ESM container is an
+/// undecodable ACTIVATE DEFAULT EPS BEARER CONTEXT REQUEST is completed with
+/// ATTACH COMPLETE carrying ACTIVATE DEFAULT EPS BEARER CONTEXT REJECT #96 (it
+/// was ESM STATUS #95), and no bearer is activated.
+#[test]
+fn an_attach_accept_with_an_undecodable_default_bearer_request_rejects_it_with_96() {
+    let now = Instant::now();
+    let mut ue = EpsNasUe::new(cfg());
+    let req = ue.initial_message(now).expect("attach due");
+    let pti = req[18];
+    let mut mme = Mme::new(0x21);
+    ue.on_downlink(&mme.authentication_request(), now);
+    let out = ue.on_downlink(&mme.security_mode_command([0xE0, 0xE0], false), now);
+    mme.unprotect(&out.uplink[0]);
+    // ESM: EBI 5, the PTI, 0xC1 -- and nothing of its mandatory part
+    let esm = [0x52, pti, 0xC1];
+    let mut m = vec![
+        0x07, 0x42, 0x01, 0x49, 0x06, 0x00, 0x99, 0xF9, 0x07, 0x00, 0x01,
+    ];
+    m.extend_from_slice(&(esm.len() as u16).to_be_bytes());
+    m.extend_from_slice(&esm);
+    let out = ue.on_downlink(&mme.protect(&m, 2), now);
+    let complete = mme.unprotect(&out.uplink[0]);
+    assert_eq!(&complete[..2], &[0x07, 0x43], "ATTACH COMPLETE");
+    assert_eq!(&complete[2..], &[0x00, 0x04, 0x52, pti, 0xC3, 0x60]);
+    assert!(ue.default_bearer().is_none());
+}
