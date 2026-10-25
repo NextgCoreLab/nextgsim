@@ -796,7 +796,20 @@ impl UeApp {
                     &mut pdu_counter,
                 )
                 .await;
-                let sm_outs = sm_orch.tick();
+                // #409 follow-up: a 5GSM retransmission waits for a NAS
+                // signalling connection, and from 5GMM-IDLE asks for one
+                let (mm_outs, sm_outs) = nextgsim_ue::nas::drive_sm_timers(&mut orch, &mut sm_orch);
+                process_mm_outputs(
+                    mm_outs,
+                    &mut orch,
+                    &mut sm_orch,
+                    &sm_session_params,
+                    &mut plmn_selector,
+                    &task_base,
+                    &tun_tx,
+                    &mut pdu_counter,
+                )
+                .await;
                 process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
                     .await;
                 // #379: a configured PDU session whose establishment failed is

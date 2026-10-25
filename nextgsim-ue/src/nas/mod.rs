@@ -19,6 +19,37 @@ pub mod lpp;
 pub mod mm;
 pub mod sm;
 
+/// The SM timers of a subscription with its own NAS signalling connection
+/// (the primary), once a second (#409 follow-up).
+///
+/// A procedure timer's retransmission (TS 24.501 §6.4.1.6 a), §6.4.2.6 a),
+/// §6.4.3.6 a)) goes in UL NAS TRANSPORT, which needs 5GMM-CONNECTED. In
+/// 5GMM-IDLE the SM orchestrator holds it, and the UE in
+/// 5GMM-REGISTERED.NORMAL-SERVICE sends a SERVICE REQUEST for the pending
+/// uplink signalling (§5.6.1.1, service type "signalling", §5.6.1.2); the MM
+/// orchestrator holds that back while T3346 or another bar is in force. The
+/// held retransmission goes on the first call with the connection up. Before,
+/// a retransmission from 5GMM-IDLE went to RRC as if it were an initial NAS
+/// message. Returns the MM and SM outputs to deliver, in that order.
+pub fn drive_sm_timers(
+    mm: &mut mm::MmOrchestrator,
+    sm: &mut sm::SmOrchestrator,
+) -> (Vec<mm::MmOutput>, Vec<sm::SmOutput>) {
+    use nextgsim_nas::ies::ie1::ServiceType;
+
+    let connected = mm.state().is_connected();
+    let sm_outs = sm.tick_with_connection(connected);
+    let mm_outs = if !connected
+        && sm.has_held_retransmission()
+        && mm.state().mm_substate() == mm::MmSubState::RegisteredNormalService
+    {
+        mm.start_service_request(ServiceType::Signalling, None)
+    } else {
+        Vec::new()
+    };
+    (mm_outs, sm_outs)
+}
+
 /// Drive the re-attempt of configured PDU sessions whose establishment failed
 /// (#379, TS 24.501 §6.4.1.4.2); call once a second after the SM tick.
 ///

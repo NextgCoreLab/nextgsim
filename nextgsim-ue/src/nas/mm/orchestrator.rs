@@ -9037,6 +9037,62 @@ mod tests {
         assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
     }
 
+    /// #409 follow-up, TS 24.501 §5.6.1.1: a T3580 retransmission in
+    /// 5GMM-IDLE is held, and the UE sends a SERVICE REQUEST for signalling
+    /// for it (once); after the Service Accept the retransmission goes.
+    #[test]
+    fn a_5gsm_retransmission_from_idle_rides_a_signalling_connection() {
+        use crate::nas::drive_sm_timers;
+        use crate::nas::sm::{SmOrchestrator, SmOutput, SmSessionParams};
+        use nextgsim_nas::messages::sm::{PduSessionTypeValue, SscModeValue};
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut sm = SmOrchestrator::new();
+        let outs = sm.establish_default_sessions(&[SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: Some("internet".to_string()),
+            s_nssai: Some(vec![0x01]),
+            emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
+        }]);
+        let Some(SmOutput::SendNasPdu(request)) = outs.first().cloned() else {
+            panic!("an establishment request: {outs:?}");
+        };
+
+        // The connection goes before the answer; T3580 expires in 5GMM-IDLE
+        orch.on_nas_signalling_connection_released();
+        sm.expire_procedure_timers_for_test();
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(
+            sm_outs.is_empty(),
+            "no UL NAS TRANSPORT from 5GMM-IDLE: {sm_outs:?}"
+        );
+        assert!(mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))));
+        assert_eq!(orch.pending_service_type, Some(ServiceType::Signalling));
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(
+            mm_outs.is_empty() && sm_outs.is_empty(),
+            "one request in flight"
+        );
+
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty(), "{mm_outs:?}");
+        assert_eq!(
+            sm_outs,
+            vec![SmOutput::SendNasPdu(request)],
+            "the retransmission"
+        );
+    }
+
     /// #379, TS 24.501 §5.6.1.5 #22 / §5.6.1.7: a SERVICE REJECT #22 with T3346
     /// holds the re-attempt's signalling Service Request back until T3346
     /// expires; then the UE asks again.
