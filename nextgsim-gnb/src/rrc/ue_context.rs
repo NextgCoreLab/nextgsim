@@ -110,6 +110,27 @@ impl std::fmt::Debug for ReestablishmentSecurity {
     }
 }
 
+/// A verified RRCReestablishmentRequest waiting for its
+/// RRCReestablishmentComplete (#414).
+///
+/// The request proves the UE only by its shortMAC-I, which a replayed request
+/// carries too (TS 33.501 §6.11), and the first message under the re-derived
+/// keys is the Complete (TS 38.331 §5.3.7.5). So the context's keys, SRB1
+/// COUNTs and state stay as they are; the re-derived keys wait here and are
+/// taken into use only when a Complete verifies under them.
+#[derive(Debug, Clone)]
+pub struct PendingReestablishment {
+    /// The keys re-derived from the context's KgNB for this cell; `None` when
+    /// AS security is not active, so there is nothing to re-key.
+    pub security: Option<ReestablishmentSecurity>,
+    /// The RRCReestablishment's `rrc-TransactionIdentifier`: a later request
+    /// for the same context is answered with the same one, so a replay landing
+    /// mid-procedure cannot make the genuine Complete's echo stale.
+    pub transaction_id: u8,
+    /// When the first RRCReestablishment went out.
+    pub since: std::time::Instant,
+}
+
 /// RRC UE context
 ///
 /// Tracks RRC-specific information for a UE, including identity and connection state.
@@ -181,6 +202,8 @@ pub struct RrcUeContext {
     /// The next DL-DCCH PDU is integrity protected but NOT ciphered: the
     /// RRCReestablishment (TS 38.331 §5.3.7.5 resumes ciphering only after it).
     pub(crate) dl_next_integrity_only: bool,
+    /// A re-establishment waiting for its RRCReestablishmentComplete (#414).
+    pub pending_reestablishment: Option<PendingReestablishment>,
 }
 
 impl RrcUeContext {
@@ -204,6 +227,7 @@ impl RrcUeContext {
             dl_protection_active: false,
             smc_complete_verified: false,
             dl_next_integrity_only: false,
+            pending_reestablishment: None,
         }
     }
 

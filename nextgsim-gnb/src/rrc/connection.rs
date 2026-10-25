@@ -576,11 +576,21 @@ impl RrcConnectionManager {
             .map(|s| s.next_hop_chaining_count)
             .unwrap_or(0);
 
+        // A re-establishment of this context already waiting for its Complete
+        // keeps its transaction id: a replayed request in the middle must not
+        // turn the genuine Complete's echo stale (#414).
         let transaction_id = {
             let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) else {
                 return Err(ReestablishmentRejection::UnknownIdentity);
             };
-            ctx.transactions.allocate(RrcProcedure::Reestablishment)
+            match ctx
+                .pending_reestablishment
+                .as_ref()
+                .filter(|p| p.since.elapsed() <= crate::rrc::task::REESTABLISHMENT_BIND_TIMEOUT)
+            {
+                Some(pending) => pending.transaction_id,
+                None => ctx.transactions.allocate(RrcProcedure::Reestablishment),
+            }
         };
 
         let rrc_reestablishment_pdu =
@@ -595,9 +605,8 @@ impl RrcConnectionManager {
                 }
             };
 
-        if let Some(ctx) = ue_mgr.try_find_ue_mut(ue_id) {
-            ctx.on_setup_sent();
-        }
+        // The context's state is left as it is: the request may be a replay,
+        // and only a verified Complete changes anything (#414).
 
         info!(
             "RRC Reestablishment for UE[{}], tid={}, c_rnti={:#06x}, pci={}, \
@@ -2072,10 +2081,6 @@ mod tests {
                 .process_rrc_reestablishment_complete(&mut ue_mgr, 1, tid.wrapping_add(1) % 4)
                 .is_none(),
             "a completion echoing the wrong tid is discarded"
-        );
-        assert!(
-            !ue_mgr.try_find_ue(1).expect("context").is_connected(),
-            "and the context is not moved to Connected"
         );
 
         assert!(
