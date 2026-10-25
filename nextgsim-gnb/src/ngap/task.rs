@@ -2811,7 +2811,15 @@ impl NgapTask {
         let amf_id = match self.select_amf(&serving_plmn, &requested_nssai) {
             Some(id) => id,
             None => {
-                warn!("No AMF available for UE {}", ue_id);
+                // The RRC connection this NAS arrived on can reach no core: release
+                // it, so the UE sees its connection go and retries once a cell is
+                // usable, instead of sitting on a connection that leads nowhere
+                // (#336; TS 24.501 §5.6.1.7 l) / §5.5.1.2.7 on the UE side).
+                warn!(
+                    "No AMF available for UE {}; releasing its RRC connection",
+                    ue_id
+                );
+                self.send_an_release(ue_id).await;
                 return;
             }
         };
@@ -5947,13 +5955,20 @@ impl NgapTask {
                 error!("Failed to send status update to App: {}", e);
             }
 
-            // If initialized, notify RRC to power on radio
+            // If initialized, notify RRC to power on radio; when the last AMF goes,
+            // power it off again, so the cell is barred instead of admitting RRC
+            // connections nothing can serve (#336).
             if any_ready {
                 let msg = RrcMessage::RadioPowerOn;
                 if let Err(e) = self.task_base.rrc_tx.send(msg).await {
                     error!("Failed to send radio power on to RRC: {}", e);
                 }
                 info!("NGAP initialized, radio powered on");
+            } else {
+                if let Err(e) = self.task_base.rrc_tx.send(RrcMessage::RadioPowerOff).await {
+                    error!("Failed to send radio power off to RRC: {}", e);
+                }
+                warn!("No AMF is ready: radio powered off, the cell is barred");
             }
         }
     }
@@ -8455,6 +8470,39 @@ mod tests {
             task.find_ue_context(3).is_some(),
             "the other AMF's UE stays"
         );
+    }
+
+    /// #336: when the last AMF goes the RRC task is told to power the radio off
+    /// (bar the cell), and an Initial UE Message that no AMF can take releases the
+    /// RRC connection it came on instead of being dropped silently.
+    #[tokio::test]
+    async fn with_no_amf_ready_the_cell_is_barred_and_an_initial_ue_is_released() {
+        let (mut task, mut rrc_rx, _gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        task.update_initialization_status().await; // AMF 1 is Ready: power on
+        task.handle_association_down(1).await;
+        let mut power_off = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::RadioPowerOff) = msg {
+                power_off = true;
+            }
+        }
+        assert!(power_off, "the last AMF going powers the radio off");
+
+        task.handle_initial_nas_delivery(
+            42,
+            OctetString::from_slice(&[0x7e, 0x00, 0x41]),
+            3,
+            None,
+            Vec::new(),
+        )
+        .await;
+        let mut released = false;
+        while let Ok(msg) = rrc_rx.try_recv() {
+            if let TaskMessage::Message(RrcMessage::AnRelease { ue_id: 42 }) = msg {
+                released = true;
+            }
+        }
+        assert!(released, "the unroutable UE's RRC connection is released");
     }
 
     /// Every NGAP PDU the task put on the SCTP channel.
