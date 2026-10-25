@@ -174,6 +174,7 @@ async fn execute<T: S1Transport>(
                 pdu,
             } => radio.send_rrc(ue, channel, lcid, pdu).await,
             Action::UserPlane { ue, bearers } => s1u.up.install(ue, &bearers),
+            Action::ReleaseUserPlane { ue, lcids } => s1u.up.release_drbs(ue, &lcids),
             Action::Broadcast { channel, pdu } => {
                 let ues: Vec<u32> = radio.ue_addr.keys().copied().collect();
                 for ue in ues {

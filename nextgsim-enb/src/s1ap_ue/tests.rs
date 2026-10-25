@@ -282,3 +282,134 @@ fn release_request_and_complete_carry_their_procedure_codes() {
         Some((1, 23, Criticality::REJECT))
     );
 }
+
+fn erab_release_command(with_list: bool) -> Vec<u8> {
+    let ie = |id, v| E_RABReleaseCommandProtocolIEs_Entry {
+        id: ProtocolIE_ID(id),
+        criticality: Criticality(Criticality::REJECT),
+        value: v,
+    };
+    let mut ies = vec![
+        ie(
+            ID_MME_UE_S1AP_ID,
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_MME_UE_S1AP_ID(MME_UE_S1AP_ID(42)),
+        ),
+        ie(
+            ID_E_NB_UE_S1AP_ID,
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_eNB_UE_S1AP_ID(ENB_UE_S1AP_ID(7)),
+        ),
+    ];
+    if with_list {
+        ies.push(ie(
+            ID_E_RAB_TO_BE_RELEASED_LIST,
+            E_RABReleaseCommandProtocolIEs_EntryValue::Id_E_RABToBeReleasedList(E_RABList(
+                [6u8, 7]
+                    .iter()
+                    .map(|id| E_RABList_Entry {
+                        id: ProtocolIE_ID(ID_E_RAB_ITEM),
+                        criticality: Criticality(Criticality::IGNORE),
+                        value: E_RABList_EntryValue::Id_E_RABItem(E_RABItem {
+                            e_rab_id: E_RAB_ID(*id),
+                            cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+                            ie_extensions: None,
+                        }),
+                    })
+                    .collect(),
+            )),
+        ));
+    }
+    ies.push(ie(
+        ID_NAS_PDU,
+        E_RABReleaseCommandProtocolIEs_EntryValue::Id_NAS_PDU(NAS_PDU(vec![0x27, 0xCD])),
+    ));
+    codec::encode_s1ap_pdu(&S1AP_PDU::InitiatingMessage(InitiatingMessage {
+        procedure_code: ProcedureCode(ID_E_RAB_RELEASE),
+        criticality: Criticality(Criticality::REJECT),
+        value: InitiatingMessageValue::Id_E_RABRelease(E_RABReleaseCommand {
+            protocol_i_es: E_RABReleaseCommandProtocolIEs(ies),
+        }),
+    }))
+    .unwrap()
+}
+
+/// #283, TS 36.413 §9.1.3.5: E-RAB RELEASE COMMAND decodes to its E-RAB IDs
+/// and NAS-PDU; without the mandatory E-RAB To Be Released List it is
+/// reported missing (§10.3.5).
+#[test]
+fn an_erab_release_command_decodes_and_its_list_is_mandatory() {
+    assert_eq!(
+        handle_s1_pdu(&erab_release_command(true)),
+        S1Inbound::ErabRelease(Box::new(ErabReleaseCommand {
+            mme_ue_s1ap_id: 42,
+            enb_ue_s1ap_id: 7,
+            erabs: vec![6, 7],
+            nas: Some(vec![0x27, 0xCD]),
+        }))
+    );
+    let S1Inbound::ErrorIndication(ei) = handle_s1_pdu(&erab_release_command(false)) else {
+        panic!("expected an Error Indication");
+    };
+    let diag = error_indication_ies(&ei)
+        .into_iter()
+        .find_map(|v| match v {
+            ErrorIndicationProtocolIEs_EntryValue::Id_CriticalityDiagnostics(d) => Some(d),
+            _ => None,
+        })
+        .expect("criticality diagnostics");
+    let item = &diag.i_es_criticality_diagnostics.as_ref().unwrap().0[0];
+    assert_eq!(
+        (item.ie_id.0, item.type_of_error.0),
+        (ID_E_RAB_TO_BE_RELEASED_LIST, TypeOfError::MISSING)
+    );
+    assert_eq!(diag.procedure_code.map(|p| p.0), Some(ID_E_RAB_RELEASE));
+}
+
+/// §9.1.3.2: E-RAB SETUP RESPONSE has its IEs in table order, all with
+/// criticality ignore, and each list only when it has an item.
+#[test]
+fn an_erab_setup_response_lists_only_what_it_has() {
+    let ids = |pdu: &S1AP_PDU| {
+        let S1AP_PDU::SuccessfulOutcome(SuccessfulOutcome {
+            value: SuccessfulOutcomeValue::Id_E_RABSetup(r),
+            ..
+        }) = pdu
+        else {
+            panic!("{pdu:?}");
+        };
+        r.protocol_i_es
+            .0
+            .iter()
+            .map(|ie| (ie.id.0, ie.criticality.0))
+            .collect::<Vec<_>>()
+    };
+    let ok = [ErabSetup {
+        e_rab_id: 6,
+        address: "10.0.0.1".parse().unwrap(),
+        teid: 9,
+    }];
+    let failed = [(
+        7,
+        Cause::RadioNetwork(CauseRadioNetwork(CauseRadioNetwork::UNKNOWN_E_RAB_ID)),
+    )];
+    let i = Criticality::IGNORE;
+    let both = build_erab_setup_response(42, 7, &ok, &failed);
+    assert_eq!(
+        ids(&both),
+        vec![
+            (ID_MME_UE_S1AP_ID, i),
+            (ID_E_NB_UE_S1AP_ID, i),
+            (ID_E_RAB_SETUP_LIST_BEARER_SU_RES, i),
+            (ID_E_RAB_FAILED_TO_SETUP_LIST_BEARER_SU_RES, i),
+        ]
+    );
+    let bytes = codec::encode_s1ap_pdu(&both).unwrap();
+    assert_eq!(codec::decode_s1ap_pdu(&bytes).unwrap(), both);
+    assert_eq!(
+        ids(&build_erab_setup_response(42, 7, &[], &failed)),
+        vec![
+            (ID_MME_UE_S1AP_ID, i),
+            (ID_E_NB_UE_S1AP_ID, i),
+            (ID_E_RAB_FAILED_TO_SETUP_LIST_BEARER_SU_RES, i),
+        ]
+    );
+}
