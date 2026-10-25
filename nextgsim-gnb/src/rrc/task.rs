@@ -589,6 +589,7 @@ impl RrcTask {
                 if let Some(plain) = self.complete_reestablishment(ue_id, data.data()).await {
                     self.pending_reestablishment_binds
                         .retain(|_, (context, _)| *context != ue_id);
+                    self.release_held_downlink(ue_id).await;
                     self.handle_ul_dcch_plain(ue_id, &plain).await;
                     return;
                 }
@@ -1317,6 +1318,8 @@ impl RrcTask {
         {
             error!("Failed to rebind UE[{rls_id}] as UE[{context}]: {e}");
         }
+        // After the rebind, so they reach the UE where it is now
+        self.release_held_downlink(context).await;
         Some(Some((context, plain)))
     }
 
@@ -1341,6 +1344,7 @@ impl RrcTask {
                  {REESTABLISHMENT_BIND_TIMEOUT:?}; its re-derived keys are dropped"
             );
             ctx.pending_reestablishment = None;
+            self.release_held_downlink(context).await;
             return None;
         }
         let plain = match (&pending.security, secured) {
@@ -2522,6 +2526,12 @@ impl RrcTask {
         if self.pending_handover_arrivals.remove(&ue_id).is_some() {
             info!("UE[{ue_id}]: the pending handover arrival is withdrawn by the release");
         }
+        // A pending re-establishment goes with the connection; the release is
+        // sent, not held (#414 review)
+        if let Some(ctx) = self.ue_manager.try_find_ue_mut(ue_id) {
+            ctx.pending_reestablishment = None;
+            ctx.held_downlink.clear();
+        }
         if let Some(result) = self.connection_manager.initiate_rrc_release(
             &mut self.ue_manager,
             ue_id,
@@ -2873,6 +2883,13 @@ impl RrcTask {
         channel: RrcChannel,
         data: OctetString,
     ) {
+        // A secured re-establishment of the context waits for its Complete:
+        // the UE re-establishing runs SRB1 on the re-derived keys, and the
+        // context keeps its current ones until the Complete proves the UE, so
+        // the DL-DCCH message is held until then (#414 review, below).
+        if channel == RrcChannel::DlDcch && self.hold_for_reestablishment(context, &data) {
+            return;
+        }
         // SRB PDCP protection on DL-DCCH once AS security is active for this UE
         // (TS 38.323 §5.8/§5.9, issue #31). Applied here because this is the single
         // downlink send point, so nothing can bypass it by calling a sibling.
@@ -2885,6 +2902,87 @@ impl RrcTask {
             None => return,
         };
         self.send_rrc_pdu(rls_id, channel, data).await;
+    }
+
+    /// Holds a DL-DCCH message for `context` while a secured re-establishment
+    /// of it is pending and unexpired (#414 review); returns whether it did.
+    ///
+    /// TS 38.331 §5.3.7.4: the re-establishing UE re-establishes SRB1's PDCP
+    /// and expects the RRCReestablishment, integrity protected under the
+    /// re-derived K_RRCint, as SRB1's next PDU (§5.3.7.5); after it, SRB1
+    /// runs on the re-derived keys. The network's next DL in the procedure is
+    /// after the RRCReestablishmentComplete (the RRCReconfiguration that
+    /// resumes the radio bearers, §5.3.7.1). The context's current keys stay
+    /// until the Complete verifies (TS 33.501 §6.11, #414), so a message sent
+    /// in between, under them, could not verify at a genuinely re-establishing
+    /// UE. The spec does not tell the network to hold; holding is what keeps
+    /// both cases working: the genuine UE gets it under the new keys after
+    /// the Complete, and a UE still on the old keys (a replayed request) gets
+    /// it under those once the re-establishment expires, at most
+    /// `REESTABLISHMENT_BIND_TIMEOUT` late.
+    fn hold_for_reestablishment(&mut self, context: i32, data: &OctetString) -> bool {
+        /// More would mean a stuck re-establishment; the expiry flushes them.
+        const MAX_HELD: usize = 64;
+        if !self.task_base.config.as_security_enabled {
+            return false;
+        }
+        let Some(ctx) = self.ue_manager.try_find_ue_mut(context) else {
+            return false;
+        };
+        let pending = ctx
+            .pending_reestablishment
+            .as_ref()
+            .filter(|p| p.security.is_some() && p.since.elapsed() <= REESTABLISHMENT_BIND_TIMEOUT);
+        if pending.is_none() {
+            return false;
+        }
+        if ctx.held_downlink.len() >= MAX_HELD {
+            warn!("UE[{context}]: {MAX_HELD} DL-DCCH messages held for the re-establishment; the oldest is dropped");
+            ctx.held_downlink.remove(0);
+        }
+        debug!("UE[{context}]: DL-DCCH message held until the re-establishment completes");
+        ctx.held_downlink.push((RrcChannel::DlDcch, data.clone()));
+        true
+    }
+
+    /// Sends what was held for `context`'s re-establishment (#414 review),
+    /// protected under the context's keys as they are now: the re-derived
+    /// ones after a Complete, the current ones after an expiry.
+    async fn release_held_downlink(&mut self, context: i32) {
+        let held = match self.ue_manager.try_find_ue_mut(context) {
+            Some(ctx) => std::mem::take(&mut ctx.held_downlink),
+            None => return,
+        };
+        if !held.is_empty() {
+            info!("UE[{context}]: {} held DL-DCCH message(s) sent", held.len());
+        }
+        for (channel, data) in held {
+            self.send_rrc_message(context, channel, data).await;
+        }
+    }
+
+    /// Drops every pending re-establishment past `REESTABLISHMENT_BIND_TIMEOUT`
+    /// and sends what it held under the current keys (#414 review).
+    async fn expire_pending_reestablishments(&mut self) {
+        let expired: Vec<i32> = self
+            .ue_manager
+            .iter_mut()
+            .filter_map(|(id, ctx)| {
+                let gone = ctx
+                    .pending_reestablishment
+                    .as_ref()
+                    .is_some_and(|p| p.since.elapsed() > REESTABLISHMENT_BIND_TIMEOUT);
+                if gone {
+                    ctx.pending_reestablishment = None;
+                }
+                (gone || (ctx.pending_reestablishment.is_none() && !ctx.held_downlink.is_empty()))
+                    .then_some(*id)
+            })
+            .collect();
+        for context in expired {
+            info!("UE[{context}]: the re-establishment expired; its re-derived keys are dropped");
+            self.release_held_downlink(context).await;
+        }
     }
 
     /// Sends an RRC PDU, protected already where it has to be, to RLS id
@@ -3362,6 +3460,7 @@ impl Task for RrcTask {
         loop {
             tokio::select! {
                 _ = si_timer.tick() => {
+                    self.expire_pending_reestablishments().await;
                     if si_period_ms > 0 {
                         si_ticks = si_ticks.wrapping_add(1);
                         self.on_system_information_period(si_ticks % 2 == 1).await;
@@ -5034,6 +5133,228 @@ mod tests {
                 1,
                 "NGAP told once, on the Complete"
             );
+        });
+    }
+
+    /// The DL-DCCH PDUs an RRC task under test sent, by RLS id.
+    fn dl_dcch_sent(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) -> Vec<(i32, Vec<u8>)> {
+        let mut out = Vec::new();
+        while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
+            if let RlsMessage::DownlinkRrc {
+                ue_id,
+                rrc_channel: RrcChannel::DlDcch,
+                data,
+                ..
+            } = msg
+            {
+                out.push((ue_id, data.data().to_vec()));
+            }
+        }
+        out
+    }
+
+    /// #414 review, TS 38.331 §5.3.7.4/§5.3.7.5: a DL-DCCH message for a
+    /// context whose secured re-establishment waits for its Complete is held:
+    /// the re-establishing UE could not verify it under the context's current
+    /// keys. The Complete commits the re-derived keys, and the held message
+    /// goes after the rebind, under them, at DL COUNT 1 (the
+    /// RRCReestablishment spent 0).
+    #[test]
+    fn downlink_during_a_secured_reestablishment_waits_for_the_complete() {
+        use nextgsim_rrc::procedures::information_transfer::decode_dl_information_transfer;
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            task.handle_uplink_rrc(
+                5,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            let tid = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .pending_reestablishment
+                .as_ref()
+                .unwrap()
+                .transaction_id;
+            let new = pending_srb(&task, 1);
+            assert_eq!(dl_dcch_sent(&mut rls_rx).len(), 1, "the RRCReestablishment");
+
+            let nas = vec![0x7E, 0x00, 0x68];
+            task.handle_nas_delivery(1, OctetString::from_slice(&nas))
+                .await;
+            assert!(dl_dcch_sent(&mut rls_rx).is_empty(), "held");
+
+            let complete = reestablishment_complete_pdu(tid);
+            let real = new.protect(0, SRB1_PDCP_BEARER, PDCP_DIRECTION_UPLINK, &complete);
+            task.handle_uplink_rrc(5, RrcChannel::UlDcch, OctetString::from_slice(&real))
+                .await;
+            let sent = dl_dcch_sent(&mut rls_rx);
+            assert_eq!(sent.len(), 1, "{sent:02x?}");
+            assert_eq!(
+                sent[0].0, 1,
+                "to the context, which RLS now routes to the UE"
+            );
+            let plain = new
+                .unprotect(1, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, &sent[0].1)
+                .expect("under the re-derived keys at DL COUNT 1");
+            let info = decode_dl_information_transfer(&plain).expect("DLInformationTransfer");
+            assert_eq!(info.dedicated_nas_message, Some(nas));
+        });
+    }
+
+    /// #414 review: the same for a re-establishment heard under the context's
+    /// own RLS id: the held message goes once the Complete commits.
+    #[test]
+    fn downlink_held_on_the_contexts_own_id_goes_after_the_complete() {
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            let tid = task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .pending_reestablishment
+                .as_ref()
+                .unwrap()
+                .transaction_id;
+            let new = pending_srb(&task, 1);
+            dl_dcch_sent(&mut rls_rx);
+            task.handle_nas_delivery(1, OctetString::from_slice(&[0x7E, 0x00, 0x68]))
+                .await;
+            assert!(dl_dcch_sent(&mut rls_rx).is_empty(), "held");
+            let real = new.protect(
+                0,
+                SRB1_PDCP_BEARER,
+                PDCP_DIRECTION_UPLINK,
+                &reestablishment_complete_pdu(tid),
+            );
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&real))
+                .await;
+            let sent = dl_dcch_sent(&mut rls_rx);
+            assert_eq!(sent.len(), 1);
+            assert!(new
+                .unprotect(1, SRB1_PDCP_BEARER, PDCP_DIRECTION_DOWNLINK, &sent[0].1)
+                .is_ok());
+        });
+    }
+
+    /// #414 review: an AN release of a context with a pending re-establishment
+    /// sends its RRCRelease; it is not held behind the re-establishment.
+    #[test]
+    fn a_release_during_a_pending_reestablishment_is_sent() {
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            dl_dcch_sent(&mut rls_rx);
+            task.handle_an_release(1).await;
+            let sent = dl_dcch_sent(&mut rls_rx);
+            assert_eq!(sent.len(), 1, "the RRCRelease");
+            assert_eq!(sent[0].0, 1);
+        });
+    }
+
+    /// #414 review: what a replayed request's re-establishment held goes under
+    /// the context's current keys once it expires, so a connected UE still on
+    /// them gets it, at most `REESTABLISHMENT_BIND_TIMEOUT` late.
+    #[test]
+    fn held_downlink_goes_under_the_current_keys_when_the_reestablishment_expires() {
+        use nextgsim_rrc::procedures::information_transfer::decode_dl_information_transfer;
+        let config = GnbConfig {
+            as_security_enabled: true,
+            ..test_config()
+        };
+        let nci = config.nci;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            secured_context(&mut task);
+            let ctx = task.ue_manager.try_find_ue(1).unwrap();
+            let keys = ctx.srb_security().unwrap();
+            let dl_count = ctx.pdcp_counts().0;
+            task.handle_uplink_rrc(
+                9,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            dl_dcch_sent(&mut rls_rx);
+            let nas = vec![0x7E, 0x00, 0x68];
+            task.handle_nas_delivery(1, OctetString::from_slice(&nas))
+                .await;
+            assert!(dl_dcch_sent(&mut rls_rx).is_empty(), "held");
+
+            task.expire_pending_reestablishments().await;
+            assert!(dl_dcch_sent(&mut rls_rx).is_empty(), "not expired yet");
+            task.ue_manager
+                .try_find_ue_mut(1)
+                .unwrap()
+                .pending_reestablishment
+                .as_mut()
+                .unwrap()
+                .since -= REESTABLISHMENT_BIND_TIMEOUT + std::time::Duration::from_millis(1);
+            task.expire_pending_reestablishments().await;
+            let sent = dl_dcch_sent(&mut rls_rx);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].0, 1);
+            let plain = keys
+                .unprotect(
+                    dl_count,
+                    SRB1_PDCP_BEARER,
+                    PDCP_DIRECTION_DOWNLINK,
+                    &sent[0].1,
+                )
+                .expect("under the current keys at the context's next DL COUNT");
+            assert_eq!(
+                decode_dl_information_transfer(&plain)
+                    .unwrap()
+                    .dedicated_nas_message,
+                Some(nas)
+            );
+            assert!(task
+                .ue_manager
+                .try_find_ue(1)
+                .unwrap()
+                .pending_reestablishment
+                .is_none());
         });
     }
 

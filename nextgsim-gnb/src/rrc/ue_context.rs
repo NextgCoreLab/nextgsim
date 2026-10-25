@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use super::redcap::RedCapProcessor;
 use super::transaction::RrcTransactionAllocator;
 use crate::tasks::GutiMobileIdentity;
+use nextgsim_common::OctetString;
 use nextgsim_pdcp::srb_security::SrbSecurity;
+use nextgsim_rls::RrcChannel;
 use nextgsim_rrc::procedures::suspend_config::{short_i_rnti_of, RanNotificationArea};
 
 /// RRC connection state
@@ -204,6 +206,13 @@ pub struct RrcUeContext {
     pub(crate) dl_next_integrity_only: bool,
     /// A re-establishment waiting for its RRCReestablishmentComplete (#414).
     pub pending_reestablishment: Option<PendingReestablishment>,
+    /// DL-DCCH messages (plain) held while a secured re-establishment waits
+    /// for its Complete: the re-establishing UE runs SRB1 on the re-derived
+    /// keys from the RRCReestablishment on, and the context's current keys
+    /// are kept until the Complete proves it (#414), so nothing sent in
+    /// between could verify at that UE. Sent once the Complete commits the
+    /// keys, or under the current keys when the re-establishment expires.
+    pub(crate) held_downlink: Vec<(RrcChannel, OctetString)>,
 }
 
 impl RrcUeContext {
@@ -228,6 +237,7 @@ impl RrcUeContext {
             smc_complete_verified: false,
             dl_next_integrity_only: false,
             pending_reestablishment: None,
+            held_downlink: Vec::new(),
         }
     }
 
