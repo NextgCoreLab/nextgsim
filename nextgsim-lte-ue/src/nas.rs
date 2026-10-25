@@ -77,9 +77,15 @@ pub trait NasLayer: Send {
         None
     }
     /// The EPS bearer identity of the default bearer, once activated: the
-    /// bearer uplink IP packets go on (TS 23.401 §4.7.2; no TFTs here).
+    /// bearer uplink IP packets no TFT picks go on (TS 23.401 §4.7.2).
     fn default_bearer_ebi(&self) -> Option<u8> {
         None
+    }
+    /// The EPS bearer an uplink IP packet goes on: a dedicated bearer whose
+    /// TFT uplink packet filter matches it, else the default bearer (TS 23.401
+    /// §5.4.1, TS 24.301 §6.4.2; #283).
+    fn uplink_bearer_for(&self, _packet: &[u8]) -> Option<u8> {
+        self.default_bearer_ebi()
     }
     /// The earliest NAS timer deadline.
     fn next_deadline(&self) -> Option<Instant> {
@@ -254,6 +260,10 @@ impl NasLayer for EpsNas {
 
     fn default_bearer_ebi(&self) -> Option<u8> {
         self.ue.default_bearer().map(|b| b.ebi)
+    }
+
+    fn uplink_bearer_for(&self, packet: &[u8]) -> Option<u8> {
+        self.ue.uplink_bearer_for(packet)
     }
 
     fn next_deadline(&self) -> Option<Instant> {

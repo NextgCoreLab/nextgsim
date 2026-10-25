@@ -743,6 +743,20 @@ impl UeRrc {
         else {
             return vec![];
         };
+        // §5.3.10.2: release each DRB of drb-ToReleaseList that is part of the
+        // current configuration, PDCP and RLC with it (#283)
+        for id in &r.drbs_released {
+            if let Some(pos) = drbs.iter().position(|d| d.drb_identity == *id) {
+                let d = drbs.remove(pos);
+                user.remove(&d.logical_channel_identity);
+                log::info!(
+                    "DRB {} released (EPS bearer {}, logical channel {})",
+                    d.drb_identity,
+                    d.eps_bearer_identity,
+                    d.logical_channel_identity
+                );
+            }
+        }
         if r.srb2 && srb2.is_none() {
             let Some(k) = keys.as_ref() else {
                 return self.leave_connected("SRB2 setup without AS security", now);
@@ -901,14 +915,15 @@ impl UeRrc {
             self.nas.on_uplink_pending();
             return self.try_establish(now);
         }
-        let ebi = self.nas.default_bearer_ebi();
+        // The bearer the TFTs pick (#283), else the default bearer's DRB
+        let ebi = self.nas.uplink_bearer_for(packet);
+        let default = self.nas.default_bearer_ebi();
         let State::Connected { cell, user, .. } = &mut self.state else {
             return vec![];
         };
-        let lcid = user
-            .iter()
-            .find(|(_, d)| Some(d.ebi) == ebi)
-            .map(|(l, _)| *l)
+        let lcid_of = |e: Option<u8>| user.iter().find(|(_, d)| Some(d.ebi) == e).map(|(l, _)| *l);
+        let lcid = lcid_of(ebi)
+            .or_else(|| lcid_of(default))
             .or_else(|| user.keys().min().copied());
         let Some(lcid) = lcid else {
             return vec![];

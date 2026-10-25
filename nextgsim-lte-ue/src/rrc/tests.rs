@@ -26,6 +26,8 @@ struct Scripted {
     /// The identity this NAS answers a paging for (#351), and the initial
     /// message it then asks for.
     paged: Option<(msg::PagedUeIdentity, Vec<u8>)>,
+    /// The EPS bearer this NAS's TFTs put UDP packets on (#283).
+    udp_bearer: Option<u8>,
 }
 
 /// The DETACH REQUEST the scripted NAS produces (#365).
@@ -67,6 +69,9 @@ impl NasLayer for Scripted {
             crate::nas::NasTimerOutcome::default()
         }
     }
+    fn uplink_bearer_for(&self, packet: &[u8]) -> Option<u8> {
+        self.udp_bearer.filter(|_| packet.get(9) == Some(&17))
+    }
     fn on_paging(&mut self, identity: &msg::PagedUeIdentity) -> bool {
         self.seen.lock().unwrap().paged += 1;
         match &self.paged {
@@ -92,6 +97,7 @@ fn ue(initial: Option<&[u8]>) -> (UeRrc, Arc<Mutex<Seen>>) {
         k_enb: Some(K_ENB),
         on_pending: None,
         paged: None,
+        udp_bearer: None,
     };
     (
         UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A)),
@@ -531,6 +537,7 @@ fn an_idle_uplink_packet_makes_nas_request_a_connection() {
         k_enb: Some(K_ENB),
         on_pending: Some(vec![0xC7, 0x02, 0xAB, 0xCD]),
         paged: None,
+        udp_bearer: None,
     };
     let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
     assert!(acquire(&mut u, cell_info(), true, now).is_empty());
@@ -576,6 +583,7 @@ fn paged_ue(seen: &Arc<Mutex<Seen>>) -> UeRrc {
             },
             vec![0xC7, 0x02, 0xAB, 0xCD],
         )),
+        udp_bearer: None,
     };
     UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A))
 }
@@ -688,4 +696,85 @@ fn an_idle_detach_requests_a_connection() {
         "RRCConnectionRequest for the detach: {acts:?}"
     );
     assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
+}
+
+/// #283: a second DRB for a dedicated bearer. The TFT's pick (here: UDP on
+/// EPS bearer 6) chooses the DRB an uplink packet goes on, anything else
+/// rides the default bearer's; drb-ToReleaseList (TS 36.331 §5.3.10.2) then
+/// removes the DRB and its traffic falls back.
+#[test]
+fn uplink_goes_on_the_drb_of_the_bearer_the_tft_picks_until_it_is_released() {
+    let now = Instant::now();
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let nas = Scripted {
+        seen,
+        initial: Some(vec![0x07, 0x41]),
+        reply: None,
+        k_enb: Some(K_ENB),
+        on_pending: None,
+        paged: None,
+        udp_bearer: Some(6),
+    };
+    let mut u = UeRrc::new(plmn(), Box::new(nas), Box::new(|| 0x12_3456_789A));
+    acquire(&mut u, cell_info(), true, now);
+    u.on_downlink(CELL, RrcChannel::DlCcch, 0, &setup(0), now);
+    let k = |t| derive_algorithm_key(&K_ENB, t, 2);
+    let mut srb1 = LteSrbPdcp::with_bearer(SRB1_BEARER, DIRECTION_DOWNLINK);
+    srb1.activate_tx_integrity(2, k(EpsAlgorithmType::RrcInt))
+        .unwrap();
+    let smc = msg::encode_security_mode_command(1, 2, 2).unwrap();
+    u.on_downlink(
+        CELL,
+        RrcChannel::DlDcch,
+        LCID_SRB1,
+        &srb1.transmit(&smc).0,
+        now,
+    );
+    srb1.activate_tx_ciphering(2, k(EpsAlgorithmType::RrcEnc))
+        .unwrap();
+    let drb = |ebi, id| DrbConfig {
+        eps_bearer_identity: ebi,
+        drb_identity: id,
+        logical_channel_identity: id + 2,
+        rlc: DrbRlc::UmSn10,
+    };
+    let mut reconfigure = |u: &mut UeRrc, tid, add: &[DrbConfig], release: &[u8]| {
+        let r = msg::encode_rrc_connection_reconfiguration_with_release(
+            tid,
+            tid == 2,
+            add,
+            release,
+            &[],
+        )
+        .unwrap();
+        u.on_downlink(
+            CELL,
+            RrcChannel::DlDcch,
+            LCID_SRB1,
+            &srb1.transmit(&r).0,
+            now,
+        );
+    };
+    let lcid_of = |u: &mut UeRrc, packet: &[u8]| match u.send_ip(packet, now).as_slice() {
+        [UeAction::Data { lcid, .. }] => *lcid,
+        acts => panic!("not one data PDU: {acts:?}"),
+    };
+    let udp = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0];
+    let icmp = [0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0];
+
+    reconfigure(&mut u, 2, &[drb(5, 1)], &[]);
+    // No DRB for bearer 6 yet: the UDP packet takes the default's.
+    assert_eq!(lcid_of(&mut u, &udp), 3);
+    reconfigure(&mut u, 3, &[drb(6, 2)], &[]);
+    assert_eq!(u.drbs(), vec![drb(5, 1), drb(6, 2)]);
+    assert_eq!(lcid_of(&mut u, &udp), 4, "on the dedicated bearer's DRB");
+    assert_eq!(lcid_of(&mut u, &icmp), 3);
+
+    reconfigure(&mut u, 0, &[], &[2, 7]);
+    assert_eq!(
+        u.drbs(),
+        vec![drb(5, 1)],
+        "DRB 2 released, unknown DRB 7 ignored"
+    );
+    assert_eq!(lcid_of(&mut u, &udp), 3);
 }
