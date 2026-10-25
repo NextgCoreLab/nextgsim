@@ -385,9 +385,13 @@ impl GtpTask {
 
     /// Handle uplink data PDU from RLS (UE -> UPF)
     async fn handle_uplink_data(&mut self, ue_id: i32, psi: i32, pdu: Vec<u8>) {
-        // Check if it's an IPv4 packet (version field in first nibble)
-        if pdu.is_empty() || (pdu[0] >> 4) != 4 {
-            debug!("Ignoring non-IPv4 packet");
+        // N3 carries the PDU session's payload whatever its PDU session type --
+        // IPv4, IPv6, IPv4v6, Ethernet or Unstructured (TS 23.501 §5.6.10, TS 29.281
+        // §5.1) -- so the gNB does not look inside it. Before #340 every non-IPv4
+        // SDU was dropped here, and IPv6 / Ethernet sessions had no uplink. Only the
+        // loopback echo below recognises IPv4 (ICMPv4 test mode).
+        if pdu.is_empty() {
+            debug!("Ignoring an empty uplink SDU");
             return;
         }
 
@@ -525,7 +529,9 @@ impl GtpTask {
         // For ICMP echo request, swap source and destination and change type to echo reply
         let mut response = pdu.clone();
 
-        if response.len() >= 20 {
+        // Only an IPv4 ICMP echo request is answered as such; any other SDU (IPv6,
+        // Ethernet, Unstructured) is echoed back unchanged (#340).
+        if response.len() >= 20 && response[0] >> 4 == 4 {
             // Extract IP header fields
             let ip_header_len = ((response[0] & 0x0F) * 4) as usize;
 
@@ -1364,6 +1370,95 @@ mod tests {
             "the signalled UPF TEID"
         );
         assert_eq!(task.uplink_without_session_drops, 3);
+    }
+
+    /// #340: the uplink of a signalled session is tunnelled whatever the SDU is.
+    /// An IPv6 packet, an Ethernet frame and an Unstructured payload each reach
+    /// the stand-in UPF unchanged as the G-PDU's T-PDU (TS 29.281 §5.1); only an
+    /// empty SDU is dropped.
+    #[tokio::test]
+    async fn a_non_ipv4_uplink_sdu_on_a_signalled_session_reaches_the_upf() {
+        let upf = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.upf_addr = Some("127.0.0.1".to_string());
+        config.upf_port = upf.local_addr().unwrap().port();
+        let (task_base, _, _, _, _, _, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::new(task_base);
+        task.udp_socket = Some(Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        ));
+        let session = PduSession::new(
+            0,
+            1,
+            GtpTunnel::new(0xABCD, upf.local_addr().unwrap()),
+            GtpTunnel::new(
+                0x2000,
+                SocketAddr::new(IpAddr::from([127, 0, 0, 1]), GTP_U_PORT),
+            ),
+        )
+        .with_qfi(1);
+        task.tunnel_manager.create_session(session).unwrap();
+
+        // IPv6: version 6, next header 58 (ICMPv6), hop limit 64, ::1 -> ::1
+        let mut ipv6 = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+        ipv6.extend_from_slice(&[0u8; 15]);
+        ipv6.push(1);
+        ipv6.extend_from_slice(&[0u8; 15]);
+        ipv6.push(1);
+        ipv6.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+        // Ethernet: dst, src, EtherType 0x0800, payload
+        let mut ethernet = vec![0x02, 0, 0, 0, 0, 1, 0x02, 0, 0, 0, 0, 2, 0x08, 0x00];
+        ethernet.extend_from_slice(b"frame");
+        let unstructured = vec![0xFF, 0x00, 0x13, 0x37];
+
+        let mut buf = [0u8; 256];
+        for sdu in [ipv6, ethernet, unstructured] {
+            task.handle_uplink_data(0, 1, sdu.clone()).await;
+            let (n, _) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), upf.recv_from(&mut buf))
+                    .await
+                    .expect("the uplink reaches the UPF")
+                    .unwrap();
+            let gpdu = GtpHeader::decode(&buf[..n]).expect("a G-PDU");
+            assert_eq!(gpdu.teid, 0xABCD);
+            assert_eq!(gpdu.payload.as_ref(), sdu.as_slice(), "T-PDU unchanged");
+        }
+
+        task.handle_uplink_data(0, 1, Vec::new()).await;
+        let got = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            upf.recv_from(&mut buf),
+        )
+        .await;
+        assert!(got.is_err(), "an empty SDU is not tunnelled");
+    }
+
+    /// #340: in loopback mode a non-IPv4 SDU is echoed back unchanged; only an
+    /// IPv4 ICMP echo request is turned into a reply. Before, a non-IPv4 SDU never
+    /// got this far, and the ICMPv4 rewrite did not check the IP version.
+    #[tokio::test]
+    async fn loopback_echoes_a_non_ipv4_sdu_unchanged() {
+        let (task_base, _, _, _, _, mut rls_rx, _) = GnbTaskBase::new(test_config(), 16);
+        let mut task = GtpTask::new(task_base);
+        assert!(task.loopback_mode);
+        // An IPv6 packet whose octets 9 / 20 would read as "ICMP echo request"
+        // to an IPv4 parser
+        // octets 12..20 would be swapped as IPv4 source/destination addresses
+        let mut ipv6 = vec![0x60, 0, 0, 0, 0, 8, 58, 64, 0, 1, 0, 0];
+        ipv6.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        ipv6.extend_from_slice(&[8, 0, 0, 0, 0, 1, 0, 1]);
+        ipv6.extend_from_slice(&[0u8; 30]);
+        task.handle_uplink_data(0, 1, ipv6.clone()).await;
+        let echo = tokio::time::timeout(std::time::Duration::from_secs(2), rls_rx.recv())
+            .await
+            .expect("a loopback echo");
+        let Some(TaskMessage::Message(RlsMessage::DownlinkData { pdu, .. })) = echo else {
+            panic!("a loopback echo: {echo:?}");
+        };
+        assert!(
+            pdu.data().ends_with(&ipv6),
+            "echoed unchanged (after any SDAP header)"
+        );
     }
 
     #[test]
