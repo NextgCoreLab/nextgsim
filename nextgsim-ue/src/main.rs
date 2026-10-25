@@ -1742,6 +1742,8 @@ async fn process_sm_outputs(
                 // "PDU Session" capitalised to match the 3GPP term used
                 // everywhere else in these logs (and in the E2E assertions).
                 info!("PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})");
+                // The PDU session status IE of a registration update (#334)
+                orch.on_pdu_session_established(psi);
                 let _ = task_base
                     .app_tx
                     .send(AppMessage::StatusUpdate(

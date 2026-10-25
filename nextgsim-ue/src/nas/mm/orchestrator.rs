@@ -649,6 +649,11 @@ pub struct MmOrchestrator {
     held_uplink_data_status: Option<u16>,
     /// Service type of the last SERVICE REQUEST sent (§5.6.1.5 #28 depends on it).
     pending_service_type: Option<ServiceType>,
+    /// The PDU sessions that are not inactive in the UE, as a PDU session
+    /// status bitmap (TS 24.501 §9.11.3.44, bit n = PSI n). Kept from the SM
+    /// layer's established / released events (#334) for the PDU session status
+    /// IE of a registration update from 5GMM-IDLE (§5.5.1.3.2).
+    active_pdu_sessions: u16,
     /// The Uplink data status the last registration update carried (#313 review):
     /// the sessions whose user plane the Registration Accept is to bring back.
     registration_uplink_data_status: Option<u16>,
@@ -804,6 +809,7 @@ impl MmOrchestrator {
             sr_backoff_until: None,
             held_uplink_data_status: None,
             pending_service_type: None,
+            active_pdu_sessions: 0,
             registration_uplink_data_status: None,
             abba: vec![0x00, 0x00],
             sqn_ms: [0u8; 6],
@@ -1818,6 +1824,20 @@ impl MmOrchestrator {
             mobile_identity.clone(),
         );
         req.uplink_data_status = uplink_data_status;
+        // TS 24.501 §5.5.1.3.2: a mobility or periodic update initiated in
+        // 5GMM-IDLE "may include a PDU session status IE ... indicating which
+        // ... PDU sessions ... are not inactive in the UE", so the AMF releases
+        // the ones the UE no longer has (§5.5.1.3.4). An all-zero value is
+        // meaningful too: the UE holds none. NON-CLEARTEXT (§4.4.6): set on
+        // `req` only, which travels in the NAS message container (#334).
+        if matches!(
+            reg_type,
+            RegistrationType::MobilityRegistrationUpdating
+                | RegistrationType::PeriodicRegistrationUpdating
+        ) && self.state.is_idle()
+        {
+            req.pdu_session_status = Some(self.active_pdu_sessions);
+        }
         // Mandatory-for-security IEs: UE security capability (replayed by
         // the network in the Security Mode Command) and requested NSSAI
         req.ue_security_capability = Some(vec![self.identity.ea_cap, self.identity.ia_cap]);
@@ -2231,11 +2251,23 @@ impl MmOrchestrator {
         outs
     }
 
+    /// PDU session `psi` is now active (#334): a registration update from
+    /// 5GMM-IDLE names it in the PDU session status IE (TS 24.501 §5.5.1.3.2).
+    pub fn on_pdu_session_established(&mut self, psi: u8) {
+        self.active_pdu_sessions |= uplink_data_status_bit(psi);
+    }
+
+    /// The PDU session status bitmap the UE would report (#334).
+    pub fn active_pdu_sessions(&self) -> u16 {
+        self.active_pdu_sessions
+    }
+
     /// PDU session `psi` was released (#313 re-review): it has no uplink data
     /// pending any more, so its bit leaves the held Uplink data status
     /// (§5.6.1.2 names only sessions with pending data).
     pub fn on_pdu_session_released(&mut self, psi: u8) {
         let bit = uplink_data_status_bit(psi);
+        self.active_pdu_sessions &= !bit;
         if let Some(status) = self.held_uplink_data_status.as_mut() {
             *status &= !bit;
             if *status == 0 {
@@ -6887,6 +6919,72 @@ mod tests {
         let mut plain_full = Vec::new();
         full.encode(&mut plain_full);
         assert_ne!(container, &plain_full);
+    }
+
+    /// #334, TS 24.501 §5.5.1.3.2: a mobility or periodic update from
+    /// 5GMM-IDLE names the UE's PDU sessions in the PDU session status IE, in
+    /// the ciphered container only (§4.4.6); a released session leaves it.
+    #[test]
+    fn an_idle_registration_update_carries_the_pdu_session_status() {
+        for reg_type in [
+            RegistrationType::MobilityRegistrationUpdating,
+            RegistrationType::PeriodicRegistrationUpdating,
+        ] {
+            let mut orch = establish_security_context();
+            let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+            orch.handle_downlink(&acc);
+            orch.on_pdu_session_established(1);
+            orch.on_pdu_session_established(5);
+            orch.on_pdu_session_established(7);
+            orch.on_pdu_session_released(7);
+            orch.on_nas_signalling_connection_released();
+
+            let outs = orch.start_registration(reg_type);
+            let pdu = first_sent_pdu(&outs).to_vec();
+            let (outer, full) = open_registration_request(&orch, &pdu);
+            assert_eq!(
+                outer.pdu_session_status, None,
+                "{reg_type:?}: not in the clear"
+            );
+            assert_eq!(
+                full.pdu_session_status,
+                Some((1 << 1) | (1 << 5)),
+                "{reg_type:?}: PSIs 1 and 5"
+            );
+        }
+    }
+
+    /// #334: with no PDU session the idle update says so (an all-zero status),
+    /// and an initial registration or an update from 5GMM-CONNECTED carries no
+    /// PDU session status IE.
+    #[test]
+    fn the_pdu_session_status_ie_is_only_for_idle_updates() {
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_nas_signalling_connection_released();
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.pdu_session_status, Some(0));
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.on_pdu_session_established(1);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let outs = orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert_eq!(full.pdu_session_status, None, "from 5GMM-CONNECTED");
+
+        // An initial registration from 5GMM-IDLE with a security context (so
+        // the full request rides the container)
+        let mut orch = establish_security_context();
+        orch.on_pdu_session_established(1);
+        orch.state_mut().switch_cm_state(CmState::Idle);
+        let outs = orch.build_and_send_registration(RegistrationType::InitialRegistration);
+        let (_, full) = open_registration_request(&orch, first_sent_pdu(&outs));
+        assert!(full.requested_nssai.is_some(), "the full request");
+        assert_eq!(full.pdu_session_status, None, "initial registration");
     }
 
     /// From 5GMM-CONNECTED a REGISTRATION REQUEST rides the existing NAS
