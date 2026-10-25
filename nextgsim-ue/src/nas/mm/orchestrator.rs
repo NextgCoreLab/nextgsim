@@ -1420,8 +1420,9 @@ impl MmOrchestrator {
     ///   - §5.5.1.3.2 f): the lower layers reported an RRC connection failure
     ///     since the last registration (`on_radio_link_failure`), so the
     ///     connection is recovered with an update in any TA;
-    ///   - the update status is 5U2 NOT UPDATED, or the UE is in
-    ///     ATTEMPTING-REGISTRATION-UPDATE: the last update did not complete.
+    ///   - the update status is 5U2 NOT UPDATED: the last update did not
+    ///     complete. (5GMM-REGISTERED.ATTEMPTING-REGISTRATION-UPDATE is always
+    ///     entered with 5U2, §5.5.1.3.7, so it needs no term of its own.)
     ///
     ///   A change to a cell in the TAI list starts nothing. Before #372 every
     ///   cell change ran an update.
@@ -1445,7 +1446,6 @@ impl MmOrchestrator {
         !self.serving_tai_in_tai_list()
             || self.connection_recovery_pending
             || self.state.update_status() == UpdateStatus::NotUpdated
-            || self.state.mm_substate() == MmSubState::RegisteredAttemptingRegistrationUpdate
     }
 
     /// The lower layers reported a radio link failure (#372). The NAS
