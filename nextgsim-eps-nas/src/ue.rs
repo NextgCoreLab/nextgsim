@@ -325,6 +325,9 @@ pub struct EpsNasUe {
     /// The TRACKING AREA UPDATE REQUEST in progress: its update type and
     /// "active" flag.
     tau_in_progress: Option<(msg::EpsUpdateType, bool)>,
+    /// The TRACKING AREA UPDATE REQUEST in progress answers a paging: the
+    /// RRC establishment cause is MT access (Annex D Table D.1.1).
+    tau_answers_paging: bool,
     /// EPS update status EU1 UPDATED (§5.1.3.3); false is EU2 NOT UPDATED or
     /// EU3 ROAMING NOT ALLOWED.
     updated: bool,
@@ -407,6 +410,7 @@ impl EpsNasUe {
             tau_periodic_due: false,
             tau_ta_due: false,
             tau_in_progress: None,
+            tau_answers_paging: false,
             updated: false,
             current_tai: None,
             last_visited_tai: None,
@@ -644,6 +648,14 @@ impl EpsNasUe {
     /// RRC establishment cause is then mt-Access (Annex D Table D.1.1).
     pub fn service_request_answers_paging(&self) -> bool {
         self.state == EmmState::ServiceRequestInitiated && self.service_request_for_paging
+    }
+
+    /// Whether the initial NAS message in progress answers a paging: a
+    /// SERVICE REQUEST (#351) or a TRACKING AREA UPDATE REQUEST (#356 review).
+    /// Annex D Table D.1.1: the RRC establishment cause is then MT access.
+    pub fn initial_message_answers_paging(&self) -> bool {
+        self.service_request_answers_paging()
+            || (self.state == EmmState::TrackingAreaUpdatingInitiated && self.tau_answers_paging)
     }
 
     /// The EMM state.
@@ -1523,7 +1535,14 @@ impl EpsNasUe {
         }
         // §5.3.5: T3412 from ATTACH ACCEPT; deactivated or zero, no periodic
         // update.
-        self.t3412_value = a.t3412_s.filter(|s| *s > 0).map(Duration::from_secs);
+        // §5.5.1.2.4: the T3412 extended value, when present, is T3412;
+        // otherwise the T3412 value (#356 review), as for TAU ACCEPT.
+        self.t3412_value = match a.t3412_extended_s {
+            Some(extended) => extended,
+            None => a.t3412_s,
+        }
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs);
         self.registered_in_current_ta();
         // §5.5.1.2.4 / §6.4.1.3: the ESM container carries ACTIVATE DEFAULT EPS
         // BEARER CONTEXT REQUEST; its accept or reject goes in ATTACH COMPLETE.

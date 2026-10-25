@@ -247,6 +247,7 @@ impl EpsNasUe {
         self.t3430 = Some(now + T3430);
         self.state = EmmState::TrackingAreaUpdatingInitiated;
         self.tau_in_progress = Some((update_type, active));
+        self.tau_answers_paging = paging;
         log::info!(
             "EMM: TRACKING AREA UPDATE REQUEST ({update_type:?}{}); T3430 started",
             if active { ", active" } else { "" }
