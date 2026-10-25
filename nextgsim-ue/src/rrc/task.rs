@@ -349,6 +349,17 @@ pub struct Srb1Config {
     pub cell_group_config: Option<CellGroupConfig>,
 }
 
+/// The source PCell's security configuration during a handover (#399).
+#[derive(Clone)]
+struct HandoverSourceSecurity {
+    as_security: Option<AsSecurityContext>,
+    as_ncc: u8,
+    nh_chain: Option<NhChain>,
+    /// Whether the handover command re-keyed (a `masterKeyUpdate`), so the
+    /// DRBs need the source keys back.
+    rekeyed: bool,
+}
+
 /// The UE's NH chain (TS 33.501 §6.9.2.1.1, Annex A.10; #325): the NH that
 /// belongs to `ncc`. At NCC 0 it is the KgNB of the AS SecurityModeCommand (the
 /// "virtual NH"), which is the SYNC-input of NH(1).
@@ -514,6 +525,13 @@ pub struct RrcTask {
     /// The DRBs keyed so far, as (PSI, DRB identity, integrity on), so a re-key
     /// re-installs their user-plane keys (#325).
     keyed_drbs: Vec<(i32, u8, bool)>,
+    /// The source PCell's security configuration, snapshotted when a handover
+    /// command is applied (#399): the AS context, the NCC and the NH chain, which
+    /// a `masterKeyUpdate` replaces with the target's. On T304 expiry the UE
+    /// "revert[s] back to the UE configuration used in the source PCell"
+    /// (TS 38.331 §5.3.5.8.3) before re-establishing, which keys from the source
+    /// KgNB (TS 33.501 §6.11). Cleared when the handover completes.
+    handover_source: Option<HandoverSourceSecurity>,
     /// KgNB handed down from the NAS plane once NAS security is active
     /// (TS 33.501 §6.9.4.1: KgNB = KDF(KAMF, uplink NAS COUNT)). Consumed by the
     /// AS SecurityModeCommand handler to derive K_RRCint/K_RRCenc (Wave-6 I5).
@@ -790,6 +808,7 @@ impl RrcTask {
             kamf: None,
             nh_chain: None,
             keyed_drbs: Vec::new(),
+            handover_source: None,
             pending_kgnb: None,
             srb1_config: None,
             rrc_setup_transaction_id: None,
@@ -4425,6 +4444,14 @@ impl RrcTask {
         // cell, because everything it protects there hangs off that key. Done here rather
         // than after the sync, so a UE that reaches the target already holds the right
         // keys (issue #39).
+        // §5.3.5.8.3: T304 expiry reverts to the source PCell's configuration,
+        // so it is kept before the target's replaces it (#399).
+        self.handover_source = Some(HandoverSourceSecurity {
+            as_security: self.as_security.clone(),
+            as_ncc: self.as_ncc,
+            nh_chain: self.nh_chain,
+            rekeyed: key_update.is_some(),
+        });
         if let Some(update) = key_update {
             self.apply_master_key_update(update, target_pci);
             // The DRBs this UE keeps run on the target's K_UP keys (#325)
@@ -4514,6 +4541,8 @@ impl RrcTask {
 
         // Complete handover
         if let Some(new_cell_id) = self.handover_manager.complete() {
+            // The target's configuration is the UE's now (#399)
+            self.handover_source = None;
             // Update serving cell
             let old_cell_id = self.serving_cell_id;
             self.serving_cell_id = Some(new_cell_id);
@@ -4586,18 +4615,24 @@ impl RrcTask {
         self.attempt_target_synchronization().await;
     }
 
-    /// Handle handover failure - initiate re-establishment
-    async fn handle_handover_failure(&mut self) {
-        warn!("Initiating RRC re-establishment after handover failure");
-
-        // Notify NAS of radio link failure
-        if let Err(e) = self
-            .task_base
-            .nas_tx
-            .send(NasMessage::RadioLinkFailure)
-            .await
-        {
-            error!("Failed to notify NAS of handover failure: {}", e);
+    /// TS 38.331 §5.3.5.8.3, T304 expiry: revert to the source PCell's
+    /// security configuration (#399) -- the AS context, the NCC and the NH chain
+    /// the handover command's `masterKeyUpdate` replaced -- and give the DRBs the
+    /// source keys back. A no-op when no handover command was applied.
+    async fn revert_to_source_security(&mut self) {
+        let Some(source) = self.handover_source.take() else {
+            return;
+        };
+        self.as_security = source.as_security;
+        self.as_ncc = source.as_ncc;
+        self.nh_chain = source.nh_chain;
+        if source.rekeyed {
+            info!(
+                "T304 expired: reverted to the source PCell's KgNB and NCC {} \
+                 (TS 38.331 §5.3.5.8.3)",
+                self.as_ncc
+            );
+            self.rekey_drbs().await;
         }
     }
 
@@ -4932,10 +4967,13 @@ impl RrcTask {
             if let Some(source_cell) = handover_source {
                 self.serving_cell_id = Some(source_cell);
             }
-            // §5.3.5.8.3 then initiates the re-establishment procedure. Reusing
-            // `handle_handover_failure` rather than a second copy: it is the same outcome
-            // the target-unreachable path already takes, and it notifies NAS as well.
-            self.handle_handover_failure().await;
+            self.revert_to_source_security().await;
+            // §5.3.5.8.3 then "initiate[s] the connection re-establishment
+            // procedure", keyed from the source KgNB restored above (#399). Without
+            // AS security there is none to initiate (§5.3.7.2), so the UE goes to
+            // RRC_IDLE and NAS hears of the failure.
+            self.initiate_reestablishment(ReestablishmentTrigger::HandoverFailure)
+                .await;
         }
 
         // T310 (TS 38.331 §5.3.10.3, issue #168): N310 consecutive out-of-sync indications
@@ -5005,6 +5043,9 @@ impl RrcTask {
         self.measurement_manager.set_serving_cell(None);
         self.cell_selector.clear_camp();
         self.last_cell_selection = None;
+        // The stored conditional reconfigurations belong to the connection
+        // that is over, as on a release (§5.3.11, #399).
+        self.cond_reconfig.clear();
         if let Err(e) = self
             .task_base
             .nas_tx
@@ -5030,7 +5071,13 @@ impl RrcTask {
             | RlfCause::SignalLostToConnectedCell
             | RlfCause::RadioLinkQualityLost => ReestablishmentTrigger::RadioLinkFailure,
         };
+        self.initiate_reestablishment(trigger).await;
+    }
 
+    /// Initiates the RRC re-establishment procedure for `trigger` (TS 38.331
+    /// §5.3.7.2), or, with no AS security to re-establish under, goes to
+    /// RRC_IDLE. Shared by a radio link failure and a T304 expiry (#399).
+    async fn initiate_reestablishment(&mut self, trigger: ReestablishmentTrigger) {
         // Per TS 38.331 §5.3.7.2 re-establishment is only initiated when AS
         // security has been activated; otherwise the UE goes to RRC_IDLE.
         let security = if self.state_machine.state().has_connection_context()
@@ -5069,7 +5116,7 @@ impl RrcTask {
                     // re-evaluates it like any other, and NAS is not told anything
                     // yet: the connection may still be recovered.
                     info!(
-                        "RLF: re-establishment initiated (cause={}, c_rnti={:#06x}, source \
+                        "Re-establishment initiated (cause={}, c_rnti={:#06x}, source \
                          pci={}); T311 running, selecting a cell",
                         params.trigger, params.c_rnti, params.pci
                     );
@@ -5100,6 +5147,10 @@ impl RrcTask {
     /// `VarShortMAC-Input` is the SOURCE PCI and C-RNTI (stored when the procedure
     /// started) and the identity of the cell selected here.
     async fn send_reestablishment_request(&mut self, cell_id: i32) {
+        // §5.3.7.3: a UE not configured with attemptCondReconfig (this UE never
+        // is) "remove[s] all the entries within the MCG VarConditionalReconfig"
+        // on selecting a cell; the candidates were the source cell's (#399).
+        self.cond_reconfig.clear();
         let Some(security) = self.as_security.clone() else {
             warn!("Re-establishment lost its AS security context; going to idle");
             self.reestablishment_proc.on_rrc_setup_fallback();
@@ -6447,6 +6498,53 @@ mod tests {
                 }
             }
             assert_eq!(rekeyed, vec![(1, 1), (2, 2)]);
+        });
+    }
+
+    /// #399, TS 38.331 §5.3.5.8.3 NOTE 1: the source configuration a T304
+    /// expiry reverts to includes each radio bearer's. The DRBs the handover
+    /// re-keyed to the target's K_UP keys are re-installed with the source's.
+    #[cfg(feature = "up-security")]
+    #[test]
+    fn a_t304_expiry_gives_the_drbs_the_source_keys_back() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let source = task.as_security.clone().expect("keyed");
+            task.keyed_drbs = vec![(1, 1, true), (2, 2, false)];
+            task.handle_handover_command(1, keyed_handover_command(0))
+                .await;
+            assert_ne!(task.as_security.as_ref().unwrap().k_up_enc, source.k_up_enc);
+            while rls_rx.try_recv().is_ok() {}
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+            let mut reverted = Vec::new();
+            while let Ok(msg) = rls_rx.try_recv() {
+                if let TaskMessage::Message(RlsMessage::InstallDrbSecurity {
+                    psi,
+                    drb_id,
+                    security,
+                }) = msg
+                {
+                    let security = security.expect("a binding");
+                    let expected = nextgsim_pdcp::UpSecurity::new(
+                        source.k_up_enc,
+                        source.k_up_int,
+                        source.ciphering_algorithm.id(),
+                        (drb_id == 1).then(|| source.integrity_algorithm.id()),
+                    )
+                    .expect("legal");
+                    let (hdr, data) = ([0x80, 0x00], b"payload");
+                    assert_eq!(
+                        security.security.protect(0, 0, 0, &hdr, data),
+                        expected.protect(0, 0, 0, &hdr, data),
+                        "DRB {drb_id} is back on the source K_UP keys"
+                    );
+                    reverted.push((psi, drb_id));
+                }
+            }
+            assert_eq!(reverted, vec![(1, 1), (2, 2)]);
         });
     }
 
@@ -10751,6 +10849,11 @@ mod tests {
 
         run_async(async {
             camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            let source_pci = task
+                .cell_selector
+                .get_cell(1)
+                .map(|c| phys_cell_id_from_nci(c.sib1.nci as u64))
+                .unwrap();
             let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
             task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
                 .await;
@@ -10771,34 +10874,152 @@ mod tests {
                 !task.handover_manager.is_in_progress(),
                 "and releases the in-progress interlock"
             );
+            // §5.3.5.8.3 then initiates re-establishment (#399): from the SOURCE
+            // PCell, whose PCI the request will carry, for a handover failure.
+            assert!(task.reestablishment_proc.is_in_progress());
             assert_eq!(
-                task.serving_cell_id,
-                Some(1),
+                task.reestablishment_proc.trigger(),
+                Some(ReestablishmentTrigger::HandoverFailure)
+            );
+            assert_eq!(
+                task.reestablishment_proc.ue_identity().1,
+                source_pci,
                 "§5.3.5.8.3: the UE reverts to the configuration used in the source PCell"
             );
-            let mut told_nas = false;
-            while let Ok(msg) = nas_rx.try_recv() {
-                if let TaskMessage::Message(NasMessage::RadioLinkFailure) = msg {
-                    told_nas = true;
-                }
-            }
             assert!(
-                told_nas,
-                "§5.3.5.8.3 then initiates re-establishment, which is what tells NAS the \
-                 radio link failed"
+                !nas_rx
+                    .try_recv()
+                    .is_ok_and(|m| matches!(m, TaskMessage::Message(NasMessage::RadioLinkFailure))),
+                "NAS is not told: the connection may still be recovered"
             );
         });
     }
 
-    /// Conditional handover is suppressed while a handover is synchronising, and resumes
-    /// once T304 has ended it.
+    /// The control: without AS security there is nothing to re-establish under
+    /// (§5.3.7.2), so a T304 expiry goes to RRC_IDLE and NAS hears of it.
+    #[test]
+    fn t304_expiry_without_as_security_goes_idle_and_tells_nas() {
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) =
+            UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_and_connected_without_keys(&mut task, &mut rls_rx).await;
+            let pdu = handover_command_pdu(UNACQUIRABLE_PCI, 500);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            while nas_rx.try_recv().is_ok() {}
+            task.handover_manager.expire_t304_for_test();
+            task.check_guard_timers().await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
+            let mut told_nas = false;
+            while let Ok(msg) = nas_rx.try_recv() {
+                told_nas |= matches!(msg, TaskMessage::Message(NasMessage::RadioLinkFailure));
+            }
+            assert!(told_nas);
+        });
+    }
+
+    /// #399, TS 38.331 §5.3.5.8.3 / TS 33.501 §6.11: a handover with a
+    /// masterKeyUpdate that times out reverts to the SOURCE KgNB, NCC and NH
+    /// chain, so the RRCReestablishmentRequest that follows carries a shortMAC-I
+    /// the source gNB verifies. Both a horizontal key update (same NCC) and a
+    /// vertical one (a new NCC, from the NH chain) are reverted.
+    #[test]
+    fn a_timed_out_keyed_handover_re_establishes_with_the_source_keys() {
+        use nextgsim_rrc::procedures::rrc_reestablishment::decode_rrc_reestablishment_request;
+        for vertical in [false, true] {
+            let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) =
+                UeTaskBase::new(test_config(), 32);
+            let mut task = RrcTask::new(task_base);
+            run_async(async {
+                camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+                task.set_kamf(TEST_KAMF);
+                // The NH chain the AS SecurityModeCommand starts (NCC 0)
+                task.nh_chain = Some(NhChain {
+                    nh: [0x5A; 32],
+                    ncc: 0,
+                });
+                let source = task.as_security.clone().expect("keyed");
+                let (source_ncc, source_chain) = (task.as_ncc, task.nh_chain.map(|c| c.nh));
+                let source_pci = task
+                    .cell_selector
+                    .get_cell(1)
+                    .map(|c| phys_cell_id_from_nci(c.sib1.nci as u64))
+                    .unwrap();
+                let ncc = if vertical { source_ncc + 1 } else { source_ncc };
+                task.handle_handover_command(1, keyed_handover_command(ncc))
+                    .await;
+                let target = task.as_security.clone().expect("keyed");
+                assert_ne!(target.kgnb, source.kgnb, "vertical={vertical}: re-keyed");
+                assert_eq!(task.as_ncc, ncc);
+
+                task.handover_manager.expire_t304_for_test();
+                task.check_guard_timers().await;
+                let now = task.as_security.clone().expect("keyed");
+                assert_eq!(now.kgnb, source.kgnb, "vertical={vertical}: source KgNB");
+                assert_eq!(now.k_rrc_int, source.k_rrc_int);
+                assert_eq!(task.as_ncc, source_ncc, "vertical={vertical}: source NCC");
+                assert_eq!(task.nh_chain.map(|c| c.nh), source_chain);
+
+                // The re-establishment's request, to the cell cell selection
+                // picks: the source is lost, a neighbour (cell 2) is heard
+                while rls_rx.try_recv().is_ok() {}
+                task.handle_signal_changed(1, i32::MIN).await;
+                task.handle_signal_changed(2, -60).await;
+                task.handle_downlink_rrc(
+                    2,
+                    RrcChannel::BcchDlSch,
+                    OctetString::from_slice(&sib1_with_nci(0x20)),
+                )
+                .await;
+                task.force_cell_selection_now();
+                task.perform_cycle().await;
+                let (channel, bytes) = next_uplink_rrc(&mut rls_rx);
+                assert_eq!(channel, RrcChannel::UlCcch);
+                let req = decode_rrc_reestablishment_request(bytes.data()).expect("a request");
+                assert_eq!(req.ue_identity.phys_cell_id, source_pci);
+                assert_eq!(
+                    req.ue_identity.short_mac_i,
+                    compute_short_mac_i(&source, source_pci, 0x20).unwrap(),
+                    "vertical={vertical}: the source gNB verifies it"
+                );
+                assert_ne!(
+                    req.ue_identity.short_mac_i,
+                    compute_short_mac_i(&target, source_pci, 0x20).unwrap()
+                );
+            });
+        }
+    }
+
+    /// #399: a handover that completes keeps the target's keys; the source
+    /// snapshot goes with the handover.
+    #[test]
+    fn a_completed_handover_drops_the_source_snapshot() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(2, -60).await;
+            let pdu = handover_command_pdu(2, 1000);
+            task.handle_handover_command(1, parse_handover_command(&pdu).expect("parse"))
+                .await;
+            assert_eq!(task.serving_cell_id, Some(2), "the handover completed");
+            assert!(task.handover_source.is_none());
+        });
+    }
+
+    /// Conditional handover is suppressed while a handover is synchronising. T304
+    /// then ends the handover and §5.3.5.8.3 initiates re-establishment (#399),
+    /// not a conditional handover: without attemptCondReconfig the candidates go
+    /// (§5.3.7.3), here with the connection, as no AS security was activated
+    /// (§5.3.7.2: RRC_IDLE).
     ///
     /// This is the consequence with no guard at all before #167, and it only became
     /// REACHABLE once a handover could stay in progress across cycles: an armed candidate
     /// that a stuck handover silently ignores is a UE that stops handing itself over with
     /// nothing in the log to say why.
     #[test]
-    fn conditional_handover_is_suppressed_while_syncing_and_resumes_after_a_t304_failure() {
+    fn conditional_handover_is_suppressed_while_syncing_and_a_t304_failure_releases_it() {
         let mut config = test_config();
         config.conditional_handover = true;
         let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
@@ -10838,18 +11059,15 @@ mod tests {
             task.check_guard_timers().await;
             assert_eq!(task.handover_manager.state(), HandoverState::Failed);
 
-            task.perform_cycle().await;
+            assert!(
+                !task.handover_manager.is_in_progress(),
+                "the interlock ended"
+            );
+            assert_eq!(task.state_machine.state(), RrcState::Idle);
             assert_eq!(
                 task.cho_candidate_count(),
                 0,
-                "§5.3.5.3: executing the candidate releases the stored set — so CHO \
-                 evaluation resumed. A handover left in progress forever would suppress \
-                 every candidate for the life of the process, silently"
-            );
-            assert_eq!(
-                task.serving_cell_id,
-                Some(2),
-                "and the UE actually moved to the candidate cell"
+                "the candidates went with the connection"
             );
         });
     }
@@ -11564,6 +11782,41 @@ mod tests {
                 !task.rlf_detector.t310_is_running(),
                 "and the detector is reset, or the next poll declares the same failure again"
             );
+        });
+    }
+
+    /// #399, TS 38.331 §5.3.7.3: a UE not configured with attemptCondReconfig
+    /// removes the stored conditional reconfigurations when it selects a cell
+    /// to re-establish on; they were the source cell's, and §5.3.5.8.3 now
+    /// sends a T304 failure here too.
+    #[test]
+    fn a_reestablishment_removes_the_stored_conditional_reconfigurations() {
+        let mut config = test_config();
+        config.conditional_handover = true;
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            connected_with_broadcast_timers(&mut task, &mut rls_rx, 1, 1, 2000).await;
+            task.handle_downlink_rrc(1, RrcChannel::DlDcch, cho_reconfiguration_pdu(2, 2))
+                .await;
+            assert_eq!(task.cho_candidate_count(), 1, "precondition: armed");
+            task.handle_radio_link_failure(RlfCause::SignalLostToConnectedCell)
+                .await;
+            task.handle_signal_changed(1, i32::MIN).await;
+            assert_eq!(task.cho_candidate_count(), 1, "kept while T311 searches");
+            while rls_rx.try_recv().is_ok() {}
+            task.handle_signal_changed(2, -60).await;
+            task.handle_downlink_rrc(
+                2,
+                RrcChannel::BcchDlSch,
+                OctetString::from_slice(&sib1_with_nci(0x20)),
+            )
+            .await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            let (channel, _) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch, "the RRCReestablishmentRequest");
+            assert_eq!(task.cho_candidate_count(), 0);
         });
     }
 
