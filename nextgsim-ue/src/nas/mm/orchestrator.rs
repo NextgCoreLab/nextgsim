@@ -1562,8 +1562,9 @@ impl MmOrchestrator {
         // only exempt requests go out under T3525.
         let substate = self.state.mm_substate();
         if self.state.is_deregistered() {
-            if self.sr_attempt_counter > 0 || self.timers.t3525.is_running() {
-                self.reset_service_request_attempts();
+            self.reset_service_request_attempts();
+            if self.timers.t3525.is_running() {
+                self.stop_t3525(&format!("entered {substate:?}"));
             }
         } else if self.timers.t3525.is_running()
             && !matches!(
@@ -1573,8 +1574,7 @@ impl MmOrchestrator {
                     | MmSubState::ServiceRequestInitiated
             )
         {
-            info!("T3525 stopped: left 5GMM-REGISTERED.NORMAL-SERVICE ({substate:?})");
-            self.timers.stop(TIMER_T3525, true);
+            self.stop_t3525(&format!("entered {substate:?}"));
         }
         let events = self.timers.perform_tick();
         let mut outs = Vec::new();
@@ -1782,12 +1782,19 @@ impl MmOrchestrator {
         vec![MmOutput::ReleaseConnectionLocally]
     }
 
-    /// Reset the service request attempt counter and stop T3525 (TS 24.501
-    /// §5.6.1.1, Table 10.2.1, #323).
+    /// Reset the service request attempt counter (TS 24.501 §5.6.1.1, #323).
+    /// T3525 is not touched: Table 10.2.1 stops it on its own conditions, see
+    /// [`Self::stop_t3525`].
     fn reset_service_request_attempts(&mut self) {
         self.sr_attempt_counter = 0;
+    }
+
+    /// Stop T3525 (Table 10.2.1: on entering a state other than
+    /// 5GMM-REGISTERED.NORMAL-SERVICE or NON-ALLOWED-SERVICE, on a new PLMN, or
+    /// when user-plane resources are established, #323).
+    fn stop_t3525(&mut self, why: &str) {
         if self.timers.t3525.is_running() {
-            info!("T3525 stopped");
+            info!("T3525 stopped: {why}");
         }
         self.timers.stop(TIMER_T3525, true);
     }
@@ -2140,7 +2147,8 @@ impl MmOrchestrator {
         self.timers.stop(TIMER_T3346, true);
         // §5.6.1.1: a completed registration resets the service request
         // attempt counter (an initial one follows 5GMM-DEREGISTERED, which
-        // resets it too); Table 10.2.1: T3525 stops on a new PLMN (#323)
+        // resets it too). T3525 stops below only if the registration brought
+        // the user plane back (Table 10.2.1, #323).
         self.reset_service_request_attempts();
         // A retry scheduled by an earlier failed attempt is moot once one is
         // accepted; left running, its expiry would re-run a registration update
@@ -2172,6 +2180,7 @@ impl MmOrchestrator {
                 info!("Registration Accept re-established the user plane for held uplink");
                 self.up_reactivation_pending = false;
                 self.held_uplink_data_status = None;
+                self.stop_t3525("user-plane resources established");
             } else {
                 warn!(
                     "Registration Accept: user-plane reactivation failed for {failed:#06x}; \
@@ -3540,9 +3549,17 @@ impl MmOrchestrator {
 
     fn handle_service_accept(&mut self, plain: &[u8]) -> Vec<MmOutput> {
         info!("Service Accept received");
-        // §5.6.1.1: "a service request procedure is successfully completed";
-        // Table 10.2.1: user-plane resources established stops T3525 (#323)
+        // §5.6.1.1: "a service request procedure is successfully completed"
+        // resets the counter; Table 10.2.1 stops T3525 when user-plane
+        // resources are established, which a SERVICE ACCEPT for signalling
+        // does not do (#323)
         self.reset_service_request_attempts();
+        if !matches!(
+            self.pending_service_type,
+            Some(ServiceType::Signalling | ServiceType::ElevatedSignalling)
+        ) {
+            self.stop_t3525("user-plane resources established");
+        }
         self.up_reactivation_pending = false;
         self.held_uplink_data_status = None;
         self.sr_reject_count = 0;
@@ -8262,8 +8279,9 @@ mod tests {
         assert_eq!(orch.service_request_attempt_counter(), 0);
     }
 
-    /// #323, §5.6.1.1: a SERVICE REJECT and a SERVICE ACCEPT reset the counter
-    /// and stop T3525.
+    /// #323, §5.6.1.1: a SERVICE REJECT and a SERVICE ACCEPT reset the
+    /// counter. Table 10.2.1: only user-plane resources being established (the
+    /// accepted paging response) stops T3525; a reject leaves it running.
     #[test]
     fn a_service_reject_or_accept_resets_the_attempt_counter() {
         for accept in [false, true] {
@@ -8280,15 +8298,68 @@ mod tests {
                 ServiceAccept::new().encode(&mut plain);
                 orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
             } else {
-                reject_service_request(&mut orch, MmCause::Congestion, None, 2);
+                reject_service_request(&mut orch, MmCause::ProtocolErrorUnspecified, None, 2);
             }
             assert_eq!(orch.service_request_attempt_counter(), 0, "accept={accept}");
-            assert!(!orch.timers().t3525.is_running(), "accept={accept}");
+            assert_eq!(
+                orch.timers().t3525.is_running(),
+                !accept,
+                "accept={accept}: T3525 stops only with the user plane"
+            );
         }
     }
 
-    /// #323, §5.6.1.1: a completed registration resets the counter and stops
-    /// T3525.
+    /// #323, Table 10.2.1: a SERVICE ACCEPT for a signalling request brings
+    /// no user plane, so T3525 keeps running.
+    #[test]
+    fn a_signalling_service_accept_leaves_t3525_running() {
+        let mut orch = registered_idle();
+        for _ in 0..SR_ATTEMPT_LIMIT {
+            unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        }
+        // A UE configured for high priority access is exempt from T3525
+        orch.high_priority_access = true;
+        assert!(!orch
+            .start_service_request(ServiceType::Signalling, None)
+            .is_empty());
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut plain = Vec::new();
+        ServiceAccept::new().encode(&mut plain);
+        orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
+        assert_eq!(orch.service_request_attempt_counter(), 0);
+        assert!(orch.timers().t3525.is_running());
+    }
+
+    /// #323, Table 10.2.1: the tick stops T3525 when the UE enters a state
+    /// other than NORMAL-SERVICE or NON-ALLOWED-SERVICE. A request in flight
+    /// (SERVICE-REQUEST-INITIATED, an exempt one) and NON-ALLOWED-SERVICE
+    /// leave it running.
+    #[test]
+    fn t3525_stops_on_leaving_normal_service() {
+        let mut orch = registered_idle();
+        for _ in 0..SR_ATTEMPT_LIMIT {
+            unanswered_service_request_from_idle(&mut orch, ServiceType::Data);
+        }
+        for keep in [
+            MmSubState::ServiceRequestInitiated,
+            MmSubState::RegisteredNonAllowedService,
+            MmSubState::RegisteredNormalService,
+        ] {
+            orch.state_mut().switch_mm_state(keep);
+            orch.tick();
+            assert!(orch.timers().t3525.is_running(), "{keep:?}: kept");
+        }
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredLimitedService);
+        orch.tick();
+        assert!(
+            !orch.timers().t3525.is_running(),
+            "LIMITED-SERVICE: stopped"
+        );
+    }
+
+    /// #323, §5.6.1.1: a completed registration resets the counter. With no
+    /// user plane brought back, T3525 keeps running (Table 10.2.1).
     #[test]
     fn a_registration_accept_resets_the_attempt_counter() {
         let mut orch = registered_idle();
@@ -8300,7 +8371,37 @@ mod tests {
         let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 2);
         orch.handle_downlink(&acc);
         assert_eq!(orch.service_request_attempt_counter(), 0);
-        assert!(!orch.timers().t3525.is_running());
+        assert!(orch.timers().t3525.is_running());
+    }
+
+    /// #323, Table 10.2.1: a Registration Accept that re-establishes the user
+    /// plane the update asked for stops T3525; one that does not leaves it.
+    #[test]
+    fn a_registration_accept_restoring_the_user_plane_stops_t3525() {
+        for (failed, stopped) in [(Some(0x0000), true), (Some(0x0002), false)] {
+            let mut orch = idle_with_held_uplink();
+            orch.timers.start(TIMER_T3525, true);
+            orch.start_registration(RegistrationType::MobilityRegistrationUpdating);
+            assert_eq!(
+                orch.registration_uplink_data_status,
+                uplink_data_status(&[1])
+            );
+            let mut acc = RegistrationAccept::new(Ie5gsRegistrationResult::new(
+                SmsOverNasAllowed::NotAllowed,
+                RegistrationResultValue::ThreeGppAccess,
+            ));
+            acc.tai_list = Some(vec![0x00, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x01]);
+            acc.pdu_session_reactivation_result = failed;
+            let mut plain = Vec::new();
+            acc.encode(&mut plain);
+            orch.state_mut().switch_cm_state(CmState::Connected);
+            orch.handle_downlink(&protect_downlink(&orch, &plain, 3));
+            assert_eq!(
+                !orch.timers().t3525.is_running(),
+                stopped,
+                "failed={failed:?}"
+            );
+        }
     }
 
     /// #323: T3525 expiry lets held uplink ask again.
