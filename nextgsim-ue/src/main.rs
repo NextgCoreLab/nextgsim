@@ -799,6 +799,24 @@ impl UeApp {
                 let sm_outs = sm_orch.tick();
                 process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
                     .await;
+                // #379: a configured PDU session whose establishment failed is
+                // asked for again once its back-off timer expires or is
+                // stopped, or after the UE's own wait (TS 24.501 §6.4.1.4.2).
+                let (mm_outs, sm_outs) =
+                    nextgsim_ue::nas::drive_session_retries(&mut orch, &mut sm_orch);
+                process_mm_outputs(
+                    mm_outs,
+                    &mut orch,
+                    &mut sm_orch,
+                    &sm_session_params,
+                    &mut plmn_selector,
+                    &task_base,
+                    &tun_tx,
+                    &mut pdu_counter,
+                )
+                .await;
+                process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
+                    .await;
 
                 // MINT secondary subscriptions (Rel-18, TS 23.761): start the
                 // secondary registrations once the primary is registered, then
@@ -1748,6 +1766,8 @@ async fn process_sm_outputs(
                 // "PDU Session" capitalised to match the 3GPP term used
                 // everywhere else in these logs (and in the E2E assertions).
                 info!("PDU Session {psi} is now ACTIVE (IPv4: {ipv4:?})");
+                // The PDU session status IE of a registration update (#334)
+                orch.on_pdu_session_established(psi);
                 let _ = task_base
                     .app_tx
                     .send(AppMessage::StatusUpdate(
