@@ -560,6 +560,9 @@ pub struct AttachAccept {
     pub emm_cause: Option<u8>,
     /// T3402 (IEI 17), seconds.
     pub t3402_s: Option<u64>,
+    /// T3412 extended value (IEI 5E, GPRS timer 3, §8.2.1.12): `Some(None)` =
+    /// deactivated; unit 111 leaves it `None` (TS 24.008 §10.5.7.4a NOTE 2).
+    pub t3412_extended_s: Option<Option<u64>>,
 }
 
 /// TRACKING AREA UPDATE ACCEPT (§8.2.26), the IEs this UE acts on.
@@ -705,6 +708,7 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                 guti: None,
                 emm_cause: None,
                 t3402_s: None,
+                t3412_extended_s: None,
             };
             for (iei, v) in r.optional_ies(&[(0x13, 6), (0x53, 2), (0x17, 2), (0x59, 2)])? {
                 match iei {
@@ -714,6 +718,12 @@ pub fn decode_downlink_emm(msg: &[u8]) -> Result<DownlinkEmm, NasDecodeError> {
                     },
                     0x53 => a.emm_cause = v.first().copied(),
                     0x17 => a.t3402_s = timer2(v),
+                    0x5E => {
+                        a.t3412_extended_s = v
+                            .first()
+                            .filter(|o| *o >> 5 != 0b111)
+                            .map(|o| gprs_timer3_seconds(*o))
+                    }
                     _ => {}
                 }
             }
