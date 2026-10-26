@@ -10,6 +10,7 @@
 //! `specs/eps-nas-attach-and-as-security.md` in the nextg root repo.
 
 pub mod config;
+pub mod control;
 pub mod nas;
 pub mod rrc;
 pub mod task;

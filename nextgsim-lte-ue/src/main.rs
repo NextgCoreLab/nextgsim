@@ -3,6 +3,8 @@
 //! ```bash
 //! lte-ue -c config/lte-ue.yaml
 //! lte-ue detach [--switch-off] [--timeout SECS]   # ask the running UE to detach
+//! lte-ue bearer-modify <EBI> <GBR-kbps> [--timeout SECS]
+//! lte-ue bearer-release <EBI> [--timeout SECS]
 //! ```
 //!
 //! With a `subscriber` configured the UE attaches (TS 24.301 §5.5.1) on the
@@ -15,6 +17,14 @@
 //! UE runs a UE-initiated detach (TS 24.301 §5.5.2.2, #365). The command exits
 //! 0 once the UE is EMM-DEREGISTERED (after DETACH ACCEPT, or at once for a
 //! switch-off detach), 1 otherwise.
+//!
+//! `lte-ue bearer-modify` and `lte-ue bearer-release` run a UE-requested bearer
+//! resource modification (TS 24.301 §6.5.4, #434) of a dedicated EPS bearer:
+//! new QoS (MBR = GBR = the rate, both ways) for its traffic flows, or the
+//! release of all of them. They exit 0 once the network's MODIFY, or
+//! DEACTIVATE, EPS BEARER CONTEXT REQUEST for it was accepted (`modified`,
+//! `released`), 1 on a refusal, a BEARER RESOURCE MODIFICATION REJECT or a
+//! T3481 abort. The socket protocol is in [`nextgsim_lte_ue::control`].
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
@@ -62,6 +72,34 @@ enum Command {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
+    /// Ask the running UE for new QoS for a dedicated EPS bearer (TS 24.301
+    /// §6.5.4): MBR = GBR = the rate, uplink and downlink. Waits until the
+    /// network's MODIFY EPS BEARER CONTEXT REQUEST was accepted.
+    BearerModify {
+        /// The dedicated bearer's EPS bearer identity
+        ebi: u8,
+        /// The guaranteed (and maximum) bit rate, kbit/s
+        gbr_kbps: u32,
+        /// Seconds to wait for the network
+        #[arg(long, default_value_t = nextgsim_lte_ue::control::DEFAULT_TIMEOUT_SECS)]
+        timeout: u64,
+        /// The UE's control socket
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
+    /// Ask the running UE to release a dedicated EPS bearer (TS 24.301
+    /// §6.5.4, every packet filter deleted, ESM cause #36). Waits until the
+    /// network's DEACTIVATE EPS BEARER CONTEXT REQUEST was accepted.
+    BearerRelease {
+        /// The dedicated bearer's EPS bearer identity
+        ebi: u8,
+        /// Seconds to wait for the network
+        #[arg(long, default_value_t = nextgsim_lte_ue::control::DEFAULT_TIMEOUT_SECS)]
+        timeout: u64,
+        /// The UE's control socket
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
+    },
 }
 
 /// The control socket path: `LTE_UE_CONTROL_SOCKET`, else the default.
@@ -70,24 +108,27 @@ fn control_socket_path(arg: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_CONTROL_SOCKET.to_string())
 }
 
-/// `lte-ue detach`: send the command and report the UE's answer.
-async fn detach_client(switch_off: bool, timeout: u64, socket: Option<String>) -> ExitCode {
+/// `lte-ue detach` / `bearer-modify` / `bearer-release`: send the command
+/// `line` and print the UE's answer; success when it is `done`.
+async fn control_client(
+    name: &str,
+    line: String,
+    done: &str,
+    timeout: u64,
+    socket: Option<String>,
+) -> ExitCode {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     let path = control_socket_path(socket);
     let stream = match tokio::net::UnixStream::connect(&path).await {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("lte-ue detach: cannot reach the UE at {path}: {e}");
+            eprintln!("lte-ue {name}: cannot reach the UE at {path}: {e}");
             return ExitCode::FAILURE;
         }
     };
     let (read, mut write) = stream.into_split();
-    let line = format!(
-        "detach{} {timeout}\n",
-        if switch_off { " switch-off" } else { "" }
-    );
-    if let Err(e) = write.write_all(line.as_bytes()).await {
-        eprintln!("lte-ue detach: {e}");
+    if let Err(e) = write.write_all(format!("{line}\n").as_bytes()).await {
+        eprintln!("lte-ue {name}: {e}");
         return ExitCode::FAILURE;
     }
     let mut answer = String::new();
@@ -97,25 +138,25 @@ async fn detach_client(switch_off: bool, timeout: u64, socket: Option<String>) -
         Ok(Ok(_)) => {
             let answer = answer.trim();
             println!("{answer}");
-            if answer.starts_with("detached") {
+            if answer == done {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::FAILURE
             }
         }
         Ok(Err(e)) => {
-            eprintln!("lte-ue detach: {e}");
+            eprintln!("lte-ue {name}: {e}");
             ExitCode::FAILURE
         }
         Err(_) => {
-            eprintln!("lte-ue detach: no answer from the UE");
+            eprintln!("lte-ue {name}: no answer from the UE");
             ExitCode::FAILURE
         }
     }
 }
 
-/// Serve the control socket (#365): each connection carries one command line,
-/// `detach [switch-off] [TIMEOUT_SECS]`, and gets one answer line.
+/// Serve the control socket (#365, #434): each connection carries one command
+/// line ([`nextgsim_lte_ue::control`]) and gets one answer line.
 async fn control_server(
     path: String,
     status: Option<Arc<Mutex<EpsNasStatus>>>,
@@ -173,51 +214,48 @@ async fn serve_control(
     {
         return;
     }
-    let words: Vec<&str> = line.split_whitespace().collect();
-    let answer = match words.as_slice() {
-        ["detach", rest @ ..] => {
-            let switch_off = rest.contains(&"switch-off");
-            let timeout = rest
-                .iter()
-                .find_map(|w| w.parse::<u64>().ok())
-                .unwrap_or(60);
-            match status {
-                None => "error: no subscriber configured, nothing to detach".to_string(),
-                Some(status) => {
-                    let state = || status.lock().map(|s| s.state).ok();
-                    let deadline =
-                        tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
-                    let mut asked: Option<tokio::time::Instant> = None;
-                    loop {
-                        let now = tokio::time::Instant::now();
-                        match state() {
-                            Some(EmmState::Detached) => break "detached".to_string(),
-                            Some(EmmState::DeregisteredInitiated) => {}
-                            // Ask (again, at most once a second): RRC does not act
-                            // on a detach while a connection is being set up.
-                            _ if asked
-                                .is_none_or(|t| now >= t + std::time::Duration::from_secs(1)) =>
-                            {
-                                let _ =
-                                    commands.send(nextgsim_lte_ue::task::ControlCommand::Detach {
-                                        switch_off,
-                                    });
-                                asked = Some(now);
-                            }
-                            _ => {}
-                        }
-                        if now >= deadline {
-                            break format!(
-                                "error: not detached within {timeout} s (EMM {:?})",
-                                state()
-                            );
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    use nextgsim_lte_ue::control::{parse_line, run_bearer_command, ControlRequest};
+    let answer = match (parse_line(&line), status) {
+        (Err(e), _) => e,
+        (Ok(ControlRequest::Detach { .. }), None) => {
+            "error: no subscriber configured, nothing to detach".to_string()
+        }
+        (Ok(ControlRequest::Bearer { .. }), None) => {
+            "error: no subscriber configured, no EPS bearers".to_string()
+        }
+        (Ok(ControlRequest::Bearer { cmd, timeout }), Some(status)) => {
+            run_bearer_command(&status, &commands, cmd, timeout).await
+        }
+        (
+            Ok(ControlRequest::Detach {
+                switch_off,
+                timeout,
+            }),
+            Some(status),
+        ) => {
+            let state = || status.lock().map(|s| s.state).ok();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout);
+            let mut asked: Option<tokio::time::Instant> = None;
+            loop {
+                let now = tokio::time::Instant::now();
+                match state() {
+                    Some(EmmState::Detached) => break "detached".to_string(),
+                    Some(EmmState::DeregisteredInitiated) => {}
+                    // Ask (again, at most once a second): RRC does not act
+                    // on a detach while a connection is being set up.
+                    _ if asked.is_none_or(|t| now >= t + std::time::Duration::from_secs(1)) => {
+                        let _ = commands
+                            .send(nextgsim_lte_ue::task::ControlCommand::Detach { switch_off });
+                        asked = Some(now);
                     }
+                    _ => {}
                 }
+                if now >= deadline {
+                    break format!("error: not detached within {timeout} s (EMM {:?})", state());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
-        _ => format!("error: unknown command {:?}", line.trim()),
     };
     let _ = write.write_all(format!("{answer}\n").as_bytes()).await;
 }
@@ -230,13 +268,36 @@ async fn main() -> ExitCode {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     let args = Args::parse();
-    if let Some(Command::Detach {
-        switch_off,
-        timeout,
-        socket,
-    }) = args.command
-    {
-        return detach_client(switch_off, timeout, socket).await;
+    match args.command {
+        Some(Command::Detach {
+            switch_off,
+            timeout,
+            socket,
+        }) => {
+            let line = format!(
+                "detach{} {timeout}",
+                if switch_off { " switch-off" } else { "" }
+            );
+            return control_client("detach", line, "detached", timeout, socket).await;
+        }
+        Some(Command::BearerModify {
+            ebi,
+            gbr_kbps,
+            timeout,
+            socket,
+        }) => {
+            let line = format!("bearer-modify {ebi} {gbr_kbps} {timeout}");
+            return control_client("bearer-modify", line, "modified", timeout, socket).await;
+        }
+        Some(Command::BearerRelease {
+            ebi,
+            timeout,
+            socket,
+        }) => {
+            let line = format!("bearer-release {ebi} {timeout}");
+            return control_client("bearer-release", line, "released", timeout, socket).await;
+        }
+        None => {}
     }
     let Some(config_file) = args.config_file else {
         eprintln!("lte-ue: -c <config> is required to run the UE");

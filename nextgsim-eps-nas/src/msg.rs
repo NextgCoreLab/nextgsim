@@ -502,11 +502,15 @@ pub fn encode_modify_reject(ebi: u8, pti: u8, esm_cause: u8) -> Vec<u8> {
 /// identity 0 in the header (§9.3.2: a UE-requested procedure), the PTI, the
 /// EPS bearer identity for packet filter in bits 4-1 with a spare half octet
 /// in bits 8-5, the LV Traffic flow aggregate description (§9.9.4.15, coded
-/// as the TFT of TS 24.008 §10.5.6.12), and the optional ESM cause (TV 58).
+/// as the TFT of TS 24.008 §10.5.6.12), then, in the order of Table
+/// 8.3.10.1, the optional Required traffic flow QoS (TLV 5B, EPS quality of
+/// service §9.9.4.3; `required_qos` is its contents, #434) and ESM cause
+/// (TV 58).
 pub fn encode_bearer_resource_modification_request(
     pti: u8,
     ebi_for_packet_filter: u8,
     traffic_flow_aggregate: &[u8],
+    required_qos: Option<&[u8]>,
     esm_cause: Option<u8>,
 ) -> Vec<u8> {
     let mut out = vec![
@@ -517,6 +521,10 @@ pub fn encode_bearer_resource_modification_request(
         traffic_flow_aggregate.len() as u8,
     ];
     out.extend_from_slice(traffic_flow_aggregate);
+    if let Some(q) = required_qos {
+        out.extend_from_slice(&[0x5B, q.len() as u8]);
+        out.extend_from_slice(q);
+    }
     if let Some(c) = esm_cause {
         out.extend_from_slice(&[0x58, c]);
     }

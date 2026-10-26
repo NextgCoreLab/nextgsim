@@ -34,6 +34,7 @@ use std::time::{Duration, Instant};
 
 use nextgsim_common::Plmn;
 use nextgsim_crypto::eps_kdf::{derive_algorithm_key, EpsAlgorithmType};
+use nextgsim_eps_nas::{BearerCommand, BearerCommandRefusal};
 use nextgsim_lte_rrc::msg::{
     self, BcchDlSch, CellInfo, DlCcch, DlDcch, DrbConfig, DrbRlc, InitialUeIdentity, MibInfo,
     PlmnId, Reconfiguration, Sib2Info,
@@ -916,6 +917,43 @@ impl UeRrc {
             State::Connecting { .. } => {
                 log::info!("detach asked for while an RRC connection is being set up; not now");
                 Vec::new()
+            }
+        }
+    }
+
+    /// A UE-requested bearer resource modification (TS 24.301 §6.5.4, #434).
+    ///
+    /// Connected, NAS sends the BEARER RESOURCE MODIFICATION REQUEST now in a
+    /// ULInformationTransfer and the PTI is returned. In RRC_IDLE NAS asks for
+    /// a connection (a SERVICE REQUEST) and the UE establishes one, and while
+    /// one is being set up nothing is sent: both answer
+    /// [`BearerCommandRefusal::NotConnected`], and the caller asks again.
+    pub fn bearer_command(
+        &mut self,
+        cmd: BearerCommand,
+        now: Instant,
+    ) -> (Vec<UeAction>, Result<u8, BearerCommandRefusal>) {
+        match &self.state {
+            State::Connected { cell, .. } => {
+                let cell = *cell;
+                match self.nas.bearer_command(cmd, true) {
+                    Ok((pti, out)) => (self.send_ul_nas(cell, out.uplink), Ok(pti)),
+                    Err(e) => (Vec::new(), Err(e)),
+                }
+            }
+            State::Idle => {
+                let r = self.nas.bearer_command(cmd, false).map(|(pti, _)| pti);
+                let acts = if r == Err(BearerCommandRefusal::NotConnected) {
+                    self.try_establish(now)
+                } else {
+                    Vec::new()
+                };
+                (acts, r)
+            }
+            State::Connecting { .. } => {
+                // Refusals still answer; a request is not sent yet.
+                let r = self.nas.bearer_command(cmd, false).map(|(pti, _)| pti);
+                (Vec::new(), r)
             }
         }
     }

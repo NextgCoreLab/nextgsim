@@ -9,12 +9,13 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use nextgsim_eps_nas::{BearerCommand, BearerCommandRefusal};
 use nextgsim_rls::{
     codec as rls_codec, lte, CellSearchEvent, PduType, RlsHeartbeatAck, RlsMessage,
     RlsPduTransmission, RlsPduTransmissionAck, SimCoord, UeCellSearch,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::LteUeConfig;
 use crate::nas::NasLayer;
@@ -50,14 +51,22 @@ impl IpIo {
     }
 }
 
-/// A command to the running UE from outside the task (the `lte-ue detach`
-/// control socket, #365).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A command to the running UE from outside the task (the `lte-ue` control
+/// socket: detach #365, bearer commands #434).
+#[derive(Debug)]
 pub enum ControlCommand {
     /// UE-initiated detach (TS 24.301 §5.5.2.2).
     Detach {
         /// The detach type's switch-off bit (§9.9.3.7): no DETACH ACCEPT follows.
         switch_off: bool,
+    },
+    /// A UE-requested bearer resource modification (TS 24.301 §6.5.4, #434).
+    Bearer {
+        /// What to ask for.
+        cmd: BearerCommand,
+        /// The PTI of the procedure started, or why none was
+        /// ([`UeRrc::bearer_command`]).
+        reply: oneshot::Sender<Result<u8, BearerCommandRefusal>>,
     },
 }
 
@@ -170,6 +179,12 @@ async fn run_inner(
                         if switch_off { " (switch off)" } else { "" }
                     );
                     rrc.detach(switch_off, Instant::now())
+                }
+                ControlCommand::Bearer { cmd, reply } => {
+                    log::info!("control: {cmd:?} requested");
+                    let (acts, started) = rrc.bearer_command(cmd, Instant::now());
+                    let _ = reply.send(started);
+                    acts
                 }
             },
             Some(packet) = ip.uplink.recv() => rrc.send_ip(&packet, Instant::now()),

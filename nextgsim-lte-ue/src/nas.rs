@@ -14,7 +14,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use nextgsim_eps_nas::{DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, PagedWith};
+use nextgsim_eps_nas::{
+    BearerCommand, BearerCommandRefusal, BearerResourceOutcome, DefaultBearer, EmmState,
+    EpsNasConfig, EpsNasUe, PagedWith,
+};
 use nextgsim_lte_rrc::msg::{EstablishmentCauseValue, PagedUeIdentity};
 
 /// What NAS hands RRC when it needs a connection.
@@ -113,6 +116,19 @@ pub trait NasLayer: Send {
     fn detach(&mut self, _switch_off: bool, _connected: bool) -> NasTimerOutcome {
         NasTimerOutcome::default()
     }
+    /// A UE-requested bearer resource modification (TS 24.301 §6.5.4, #434).
+    /// `connected` as for [`NasLayer::detach`]. Returns the procedure's PTI and
+    /// the uplink to send now; [`BearerCommandRefusal::NotConnected`] asks for
+    /// a connection (NAS then has a SERVICE REQUEST as its initial message)
+    /// and for the command again once connected. A NAS without EPS bearers
+    /// refuses as not EMM-REGISTERED.
+    fn bearer_command(
+        &mut self,
+        _cmd: BearerCommand,
+        _connected: bool,
+    ) -> Result<(u8, NasTimerOutcome), BearerCommandRefusal> {
+        Err(BearerCommandRefusal::NotRegistered(EmmState::Deregistered))
+    }
 }
 
 /// A NAS that never requests a connection: the UE selects a cell and camps
@@ -142,6 +158,21 @@ pub struct EpsNasStatus {
     pub tau_attempts: u8,
     /// The M-TMSI of the GUTI, once assigned.
     pub m_tmsi: Option<u32>,
+    /// How the recent UE-requested bearer resource modifications ended, by
+    /// PTI (#434).
+    pub bearer_outcomes: Vec<(u8, BearerResourceOutcome)>,
+}
+
+impl EpsNasStatus {
+    /// How the UE-requested bearer resource modification on `pti` ended;
+    /// `None` while it runs.
+    pub fn bearer_outcome(&self, pti: u8) -> Option<BearerResourceOutcome> {
+        self.bearer_outcomes
+            .iter()
+            .rev()
+            .find(|(p, _)| *p == pti)
+            .map(|(_, o)| *o)
+    }
 }
 
 /// TS 24.301 EPS NAS for the RRC: [`EpsNasUe`] behind the [`NasLayer`] seam.
@@ -160,6 +191,7 @@ impl EpsNas {
             bearer: None,
             tau_attempts: 0,
             m_tmsi: None,
+            bearer_outcomes: Vec::new(),
         }));
         Self { ue, status }
     }
@@ -180,6 +212,7 @@ impl EpsNas {
             s.bearer = self.ue.default_bearer().cloned();
             s.tau_attempts = self.ue.tau_attempts();
             s.m_tmsi = self.ue.guti().map(|g| g.m_tmsi);
+            s.bearer_outcomes = self.ue.bearer_resource_outcomes().to_vec();
         }
     }
 }
@@ -278,6 +311,23 @@ impl NasLayer for EpsNas {
         }
     }
 
+    fn bearer_command(
+        &mut self,
+        cmd: BearerCommand,
+        connected: bool,
+    ) -> Result<(u8, NasTimerOutcome), BearerCommandRefusal> {
+        let started = self.ue.bearer_command(cmd, connected, Instant::now());
+        self.publish();
+        let (pti, out) = started?;
+        Ok((
+            pti,
+            NasTimerOutcome {
+                uplink: out.uplink,
+                release: out.release,
+            },
+        ))
+    }
+
     fn default_bearer_ebi(&self) -> Option<u8> {
         self.ue.default_bearer().map(|b| b.ebi)
     }
@@ -322,6 +372,7 @@ mod tests {
                 bearer: None,
                 tau_attempts: 0,
                 m_tmsi: None,
+                bearer_outcomes: Vec::new(),
             })),
             ue,
         };
@@ -416,6 +467,48 @@ mod tests {
             nas.status.lock().unwrap().state,
             EmmState::DeregisteredInitiated
         );
+    }
+
+    /// #434: the real EpsNas runs a bearer release and publishes how it ended,
+    /// which is what the control socket's answer waits on.
+    #[test]
+    fn a_bearer_release_is_sent_and_its_outcome_published() {
+        use nextgsim_eps_nas::testing::attach;
+        let (ue, mut mme, _) = attach();
+        let mut nas = EpsNas {
+            status: Arc::new(Mutex::new(EpsNasStatus {
+                state: ue.state(),
+                bearer: None,
+                tau_attempts: 0,
+                m_tmsi: None,
+                bearer_outcomes: Vec::new(),
+            })),
+            ue,
+        };
+        // ACTIVATE DEDICATED EPS BEARER CONTEXT REQUEST: EBI 6, linked 5, QCI 1,
+        // one uplink UDP filter (id 1)
+        let act = [
+            0x62, 0x00, 0xC5, 0x05, 0x01, 0x01, 0x06, 0x21, 0x21, 0x10, 0x02, 0x30, 0x11,
+        ];
+        let reply = nas.on_downlink_nas(&mme.protect(&act, 2));
+        assert_eq!(mme.unprotect(&reply[0]), vec![0x62, 0x00, 0xC6]);
+
+        let cmd = BearerCommand::Release { ebi: 6 };
+        assert_eq!(
+            nas.bearer_command(BearerCommand::Release { ebi: 5 }, true),
+            Err(BearerCommandRefusal::DefaultBearer(5))
+        );
+        let (pti, out) = nas.bearer_command(cmd, true).expect("started");
+        assert_eq!(
+            mme.unprotect(&out.uplink[0]),
+            vec![0x02, pti, 0xD6, 0x06, 0x02, 0xA1, 0x01, 0x58, 36]
+        );
+        assert_eq!(nas.status.lock().unwrap().bearer_outcome(pti), None);
+        let reply = nas.on_downlink_nas(&mme.protect(&[0x62, pti, 0xCD, 36], 2));
+        assert_eq!(mme.unprotect(&reply[0]), vec![0x62, pti, 0xCE]);
+        let outcome = nas.status.lock().unwrap().bearer_outcome(pti);
+        assert_eq!(outcome, Some(BearerResourceOutcome::Deactivated));
+        assert_eq!(cmd.answer(outcome.unwrap()), Ok("released"));
     }
 
     /// Another UE's IMSI must not wipe this UE's registration.

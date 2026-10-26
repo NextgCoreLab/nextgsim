@@ -400,6 +400,20 @@ impl Tft {
     }
 }
 
+/// A Traffic flow aggregate description (TS 24.301 §9.9.4.15, coded as the
+/// TFT of TS 24.008 §10.5.6.12) for a UE-requested change of the QoS of
+/// existing traffic flows (§6.5.4.2, #434): TFT operation code 110 "No TFT
+/// operation", E bit 0, and the packet filter list holding the identifiers of
+/// the packet filters the QoS applies to, one octet each (bits 4-1).
+///
+/// [`Tft::decode`] refuses such a list in a TFT the network sends
+/// (§6.4.3.4 b)); this is the UE's own aggregate, built only here.
+pub fn no_operation_aggregate(ids: &[u8]) -> Vec<u8> {
+    let mut out = vec![(TftOperation::NoOperation.bits() << 5) | (ids.len() as u8 & 0x0F)];
+    out.extend(ids.iter().map(|i| i & 0x0F));
+    out
+}
+
 fn component_type(c: &FilterComponent) -> u8 {
     let mut v = Vec::new();
     c.encode(&mut v);
@@ -901,5 +915,17 @@ mod tests {
             apply_operation(&[], &op(TftOperation::CreateNew, vec![down], vec![]), true),
             Err(TftError::SemanticFilter)
         );
+    }
+
+    /// #434, TS 24.008 §10.5.6.12: the UE's "No TFT operation" aggregate is
+    /// operation code 110 with the identifiers in the packet filter list.
+    #[test]
+    fn a_no_operation_aggregate_lists_the_identifiers() {
+        assert_eq!(no_operation_aggregate(&[1]), vec![0xC1, 0x01]);
+        assert_eq!(
+            no_operation_aggregate(&[1, 2, 15]),
+            vec![0xC3, 0x01, 0x02, 0x0F]
+        );
+        assert_eq!(no_operation_aggregate(&[]), vec![0xC0]);
     }
 }
