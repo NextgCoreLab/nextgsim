@@ -863,6 +863,12 @@ jobs:
             || { echo "::error::the UE never received RRCRelease, so it is not CM-IDLE"; \
                  tail -60 /tmp/ue.log; exit 1; }
           # Uplink data from CM-IDLE triggers the Service Request (TS 24.501 §5.6.1.1).
+          # The ping may lose packets while the Service Request runs, hence
+          # `|| true`; the interface itself must exist, or the ping sends
+          # nothing and the check below fails for the wrong reason (#432).
+          docker compose exec -T ue ip link show uesimtun0 >/dev/null \
+            || { echo "::error::the UE has no uesimtun0 (tun_name is a prefix, #432)"; \
+                 docker compose exec -T ue ip -o link show; exit 1; }
           docker compose exec -T ue ping -I uesimtun0 -c 3 -W 3 10.45.0.1 || true
           for _ in $(seq 1 30); do
             docker compose logs amf > /tmp/amf.log 2>&1 || true

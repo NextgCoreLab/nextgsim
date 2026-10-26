@@ -67,4 +67,4 @@ data:
       slices:
         - sst: 1
           sd: null
-    tun_name: "uesimtun0"
+    tun_name: "uesimtun"

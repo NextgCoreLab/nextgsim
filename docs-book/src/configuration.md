@@ -237,7 +237,7 @@ tun_name: null
 | `gnb_search_list` | list of string | Yes | - | gNB RLS addresses: IPs or hostnames, optionally `:port` (default 4997). Hostnames are re-resolved periodically and on losing the cell. Must be non-empty (validated) |
 | `sessions` | list | Yes | - | PDU sessions to establish after registration; may be `[]` |
 | `configured_nssai` | `{slices: [...]}` | Yes | - | Configured NSSAI |
-| `tun_name` | string | No | none | TUN interface name; unset gives `uesimtun<N>` |
+| `tun_name` | string | No | none | TUN interface name prefix: interfaces are `<tun_name><N>`, the lowest N free in the process (`uesimtun` gives `uesimtun0` first); unset gives `uesimtun<N>` |
 
 #### PDU sessions (`sessions[]`)
 
