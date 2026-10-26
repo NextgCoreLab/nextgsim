@@ -32,6 +32,13 @@ fn allocate_tun_index() -> u32 {
     index
 }
 
+/// The interface name for index `index`: `<prefix><index>` (#419). `tun_name`
+/// is this prefix, so a config naming the interface in full (`uesimtun0`) gets
+/// `uesimtun00` (#432).
+fn interface_name(prefix: &str, index: u32) -> String {
+    format!("{prefix}{index}")
+}
+
 /// Gives interface index `index` back.
 fn release_tun_index(index: u32) {
     TUN_INDICES
@@ -206,7 +213,7 @@ impl TunTask {
         let index = allocate_tun_index();
         let config = TunConfig::builder()
             .name_prefix(&self.config.name_prefix)
-            .name(format!("{}{index}", self.config.name_prefix))
+            .name(interface_name(&self.config.name_prefix, index))
             .address(address)
             .netmask(netmask)
             .mtu(self.config.mtu)
@@ -216,6 +223,9 @@ impl TunTask {
         match TunInterface::create_and_configure(&config, psi).await {
             Ok(interface) => {
                 let name = interface.name().to_string();
+                // The allocated name, not the prefix (#432): the app logs it as
+                // the interface to use.
+                let created_name = name.clone();
                 info!(
                     "Created TUN interface {} for PSI {} with address {}/{}",
                     name, psi, address, netmask
@@ -283,7 +293,7 @@ impl TunTask {
                     .app_tx
                     .send(TunAppMessage::InterfaceCreated {
                         psi,
-                        name: self.config.name_prefix.clone(),
+                        name: created_name,
                     })
                     .await;
             }
@@ -442,6 +452,66 @@ mod tests {
         let config = TunTaskConfig::default();
         assert_eq!(config.name_prefix, "uesimtun");
         assert_eq!(config.mtu, 1400);
+    }
+
+    /// #432: `tun_name` is a prefix, so the first interface is `<tun_name>0`.
+    #[test]
+    fn the_first_interface_is_the_prefix_and_zero() {
+        assert_eq!(interface_name("uesimtun", 0), "uesimtun0");
+        assert_eq!(interface_name("uesimtun", 3), "uesimtun3");
+    }
+
+    /// #432: every shipped UE config sets `tun_name` to a PREFIX. A full name
+    /// ending in a digit (`uesimtun0`) gave `uesimtun00`, so every consumer
+    /// looking for `uesimtun0` missed the interface.
+    #[test]
+    fn every_shipped_tun_name_is_a_prefix() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = vec![
+            root.join("k8s/configmap.yaml"),
+            root.join("docker/exit-gate/ue.yaml"),
+        ];
+        let mut dirs = vec![root.join("config")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("config dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if path.extension().is_some_and(|e| e == "yaml") {
+                    files.push(path);
+                }
+            }
+        }
+        let mut seen = 0;
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("shipped config");
+            for line in text.lines() {
+                let Some(value) = line.trim().strip_prefix("tun_name:") else {
+                    continue;
+                };
+                let value = value
+                    .split('#')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches('"');
+                if value.is_empty() || value == "null" || value == "~" {
+                    continue;
+                }
+                seen += 1;
+                assert!(
+                    !value.ends_with(|c: char| c.is_ascii_digit()),
+                    "{}: tun_name {value:?} is a prefix (<tun_name><N>), so it must not end \
+                     in a digit; the first interface would be {}",
+                    file.display(),
+                    interface_name(value, 0)
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no shipped config sets tun_name; the test reads the wrong files"
+        );
     }
 
     /// #419: interface names are unique in the process, across TUN tasks:

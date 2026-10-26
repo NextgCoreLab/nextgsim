@@ -192,8 +192,9 @@ configured_nssai:
     - sst: 1
       sd: null
 
-# TUN interface name (optional, for user plane)
-tun_name: "uesimtun0"
+# TUN interface name PREFIX (optional, for user plane): each PDU session
+# gets <tun_name><N>, the lowest free N, so the first one is uesimtun0.
+tun_name: "uesimtun"
 
 # RedCap (Reduced Capability) UE indication (Rel-17, TS 38.101).
 # When true the UE signals redcapIndication in RRCSetupComplete; the gNB caps
