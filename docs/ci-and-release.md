@@ -60,8 +60,9 @@ rebuild it (`mdbook build docs-book`) in the same change as any edit under
 
 ### `release.yml`
 
-Manual dispatch only. It releases this repo as a commit pair that nextgcore's
-cross-repo E2E validated:
+Dispatched by hand to cut a release; a pushed version tag only publishes images
+(see [Docker Hub images](#docker-hub-images)). It releases this repo as a commit
+pair that nextgcore's cross-repo E2E validated:
 
 | Input | Meaning |
 |-------|---------|
@@ -75,6 +76,79 @@ longer on the branch or a tag that already exists, generates the release notes
 from `git log <previous tag>..<sha>` grouped by commit prefix, bumps
 `[workspace.package] version` in `Cargo.toml` and asserts the bump, then
 commits, tags, pushes and runs `gh release create`.
+
+### Docker Hub images
+
+`release.yml` publishes every image in `docker/release-images.json` to Docker
+Hub (nextgcore #420):
+
+| Image | Built from | Binary |
+|-------|------------|--------|
+| `nextgsim-nr-gnb` | `Dockerfile.gnb-local` | `nr-gnb`, with `kernel-sctp` |
+| `nextgsim-nr-ue` | `Dockerfile.ue-local` | `nr-ue`, plus `nr-cli` (`nr-ue-deregister` needs it) |
+| `nextgsim-lte-enb` | `Dockerfile.enb-local` | `lte-enb`, with `kernel-sctp` |
+| `nextgsim-lte-ue` | `Dockerfile.lte-ue-local`, stage `release` | `lte-ue` |
+
+The binaries are built in `rust:1.95.0-bookworm`, matching the images' Debian
+bookworm base, with the features nextgcore's `Dockerfile.builder` uses for the
+validated E2E. The base images (`debian:bookworm-slim`, and `rust:1.95.0-bookworm` for the
+build) and every action in `release.yml` are pinned by digest or commit SHA, with the tag in a
+comment. To bump a base image, run `docker buildx imagetools inspect <tag>` and replace the
+digest.
+
+No published image carries a subscriber key. The gNB and UE images bake no config. The eNB
+image bakes `config/enb.yaml`, which holds no secret. The LTE UE image is the `release` stage of
+`Dockerfile.lte-ue-local`, without `config/lte-ue.yaml`, whose K/OPc are public test values.
+Mount your own config at `/etc/nextgsim/lte-ue.yaml`, for example
+`-v ./lte-ue.yaml:/etc/nextgsim/lte-ue.yaml:ro`. The default target, which local and E2E
+builds use, still bakes the test config. The `Release image list` check fails if a published
+stage COPYs a config holding `key`, `op` or `opc`. The published names replace the local names `nextgsim/nr-gnb`,
+`nextgsim-gnb` and so on. nextgcore publishes the core images the same way.
+
+**Trigger: a version tag only.** Publishing runs for:
+- a pushed tag `X.Y.Z` or `X.Y.Z-<pre>`;
+- the tag a dispatched `release.yml` run with `dry_run: false` has just
+  created. That tag is pushed with `GITHUB_TOKEN`, which starts no workflow, so
+  the same run publishes it.
+
+Nothing is pushed from a PR, a branch, the nightly or a dry run. The tagged commit must also be on
+`main` (`publish-gate` checks its ancestry and fails otherwise), so only reviewed code is
+published. Recommended: a tag ruleset (Settings, Rules, Rulesets) that restricts who may create
+or move `[0-9]*` tags, since any writer can otherwise push one.
+
+**Setup.** Repository settings, Secrets and variables, Actions:
+
+| Name | Kind | Value |
+|------|------|-------|
+| `DOCKERHUB_USERNAME` | secret | the Docker Hub account that pushes |
+| `DOCKERHUB_TOKEN` | secret | a Docker Hub access token with Read & Write scope, not the password |
+| `DOCKERHUB_NAMESPACE` | variable (optional) | the Docker Hub organisation. Without it, images go under `DOCKERHUB_USERNAME` |
+
+Credentials live only in these secrets, never in a file. If either secret is
+missing, the `publish-gate` job prints a "Docker Hub publish skipped" notice and
+the publish jobs are skipped. The release itself still succeeds. To publish a
+release made before the secrets existed, add them and re-run that run's
+`Docker Hub publish gate` job. GitHub re-runs its dependent jobs with it.
+
+**What is pushed.** Each image is `<namespace>/<image>:<version>`, built from
+the tagged commit. After every versioned push has succeeded,
+`<namespace>/<image>:latest` is moved to it. A pre-release never moves `latest`.
+
+**First publish.** A pushed image name is public and cannot be cleanly
+withdrawn, so prove the setup first. Point `DOCKERHUB_NAMESPACE` at a private
+namespace and push a pre-release tag such as `0.2.0-rc.1`. Check the images,
+then set the variable to the public organisation.
+
+**The list cannot silently go stale.** `ci.yml`'s `Release image list` job runs
+`docker/check-release-images.sh` on every push and PR. It fails when any of
+these is in neither the manifest's `images` nor its `excluded` list (which gives
+a reason for each entry):
+- a cargo `[[bin]]` target;
+- a tracked `Dockerfile*`;
+- a `nextgsim` image a compose file or k8s manifest references.
+
+The Open5GS exit-gate images (`docker/exit-gate/`) and the `nr-loadtest` tool
+are excluded, with their reasons.
 
 ## Local pre-push gate (mirror of the fast gate)
 
@@ -98,6 +172,8 @@ from the nextgcore repo: `cd ../nextgcore/docker/rust && ./e2e.sh`.
 3. Run `release.yml` with `dry_run: true`, read the output, then again with
    `dry_run: false`. It bumps the version, tags `X.Y.Z` and publishes the GitHub
    release, which triggers `pages.yml`.
+   With the Docker Hub secrets set, the same run then pushes the images
+   ([Docker Hub images](#docker-hub-images)).
 
 > Keep the honest framing: matched-sim validated (not real-peer, not
 > certified); the 6G crates are research prototypes, disabled by default.

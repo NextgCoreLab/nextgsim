@@ -1,0 +1,87 @@
+{
+  "_comment": [
+    "The images a release publishes to Docker Hub (nextgcore #420). release.yml builds each",
+    "binary with its cargo_args in a Debian bookworm toolchain (the images' runtime base, and",
+    "the build nextgcore's E2E validates), then pushes <namespace>/<image>:<version> and :latest.",
+    "ci.yml's release-images job (docker/check-release-images.sh) fails when a [[bin]] target,",
+    "a Dockerfile, or an image a compose file or k8s manifest references is neither here nor in",
+    "`excluded`. local_names are the names compose, k8s and nextgcore's CI use for the image.",
+    "extra_binaries are built too and land in binaries/ beside the image's own binary.",
+    "target, when set, is the Dockerfile stage the release builds (--target)."
+  ],
+  "images": [
+    {
+      "image": "nextgsim-nr-gnb",
+      "dockerfile": "Dockerfile.gnb-local",
+      "context": ".",
+      "binary": "nr-gnb",
+      "cargo_args": "-p nextgsim-gnb --features kernel-sctp --bin nr-gnb",
+      "local_names": [
+        "nextgsim/nr-gnb",
+        "nextgsim-gnb"
+      ]
+    },
+    {
+      "image": "nextgsim-nr-ue",
+      "dockerfile": "Dockerfile.ue-local",
+      "context": ".",
+      "binary": "nr-ue",
+      "cargo_args": "-p nextgsim-ue --bin nr-ue",
+      "local_names": [
+        "nextgsim/nr-ue",
+        "nextgsim-ue"
+      ],
+      "extra_binaries": [
+        {
+          "binary": "nr-cli",
+          "cargo_args": "-p nextgsim-cli --bin nr-cli",
+          "why": "Dockerfile.ue-local COPYs it when present; nr-ue-deregister needs it (#365)"
+        }
+      ]
+    },
+    {
+      "image": "nextgsim-lte-enb",
+      "dockerfile": "Dockerfile.enb-local",
+      "context": ".",
+      "binary": "lte-enb",
+      "cargo_args": "-p nextgsim-enb --features kernel-sctp --bin lte-enb",
+      "local_names": [
+        "nextgsim/lte-enb",
+        "nextgsim-lte-enb"
+      ]
+    },
+    {
+      "image": "nextgsim-lte-ue",
+      "dockerfile": "Dockerfile.lte-ue-local",
+      "context": ".",
+      "binary": "lte-ue",
+      "cargo_args": "-p nextgsim-lte-ue --bin lte-ue",
+      "local_names": [
+        "nextgsim/lte-ue",
+        "nextgsim-lte-ue"
+      ],
+      "target": "release",
+      "why_target": "the default target bakes config/lte-ue.yaml with the public test K/OPc; the published image carries no subscriber key, so the config is mounted at /etc/nextgsim/lte-ue.yaml"
+    }
+  ],
+  "excluded": [
+    {
+      "path": "docker/exit-gate/Dockerfile.gnb-kernel",
+      "reason": "Open5GS interop exit-gate harness: a hand-built kernel-SCTP gNB on Debian trixie, run locally against openverso/open5gs; not a release image",
+      "local_names": [
+        "nextgsim-gnb-kernel"
+      ]
+    },
+    {
+      "path": "docker/exit-gate/Dockerfile.ue-kernel",
+      "reason": "Open5GS interop exit-gate harness UE (see Dockerfile.gnb-kernel); not a release image",
+      "local_names": [
+        "nextgsim-ue-kernel"
+      ]
+    },
+    {
+      "bin": "nr-loadtest",
+      "reason": "load-test command-line tool; no image is defined for it"
+    }
+  ]
+}

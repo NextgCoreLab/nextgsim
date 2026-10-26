@@ -10,7 +10,9 @@
 # lte-ue-ping-check (scripts/lte-ue-ping-check.sh) asserts a 0%-loss ping
 # through the PDN once the bearer is up; lte-ue-detach (scripts/lte-ue-detach.sh)
 # makes the running UE detach and waits for it (#365).
-FROM debian:bookworm-slim
+# Base images are pinned by digest so a release is reproducible (#420). To bump: 
+# `docker buildx imagetools inspect <tag>` and replace the digest.
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS release
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
@@ -21,11 +23,19 @@ RUN apt-get update && apt-get install -y \
 COPY binaries/lte-ue /usr/local/bin/
 COPY scripts/lte-ue-ping-check.sh /usr/local/bin/lte-ue-ping-check
 COPY scripts/lte-ue-detach.sh /usr/local/bin/lte-ue-detach
-COPY config/lte-ue.yaml /etc/nextgsim/lte-ue.yaml
 
+RUN mkdir -p /etc/nextgsim
 WORKDIR /etc/nextgsim
 
 ENV RUST_LOG=info
 
 ENTRYPOINT ["lte-ue"]
 CMD ["-c", "/etc/nextgsim/lte-ue.yaml"]
+
+# The default target bakes config/lte-ue.yaml, the test subscriber the EPC
+# compose stack and E2E provision (its K/OPc are public test values). The
+# PUBLISHED image is the `release` stage above, built with
+# `--target release` (nextgcore #420): it carries no config and so no subscriber
+# key; mount your own at /etc/nextgsim/lte-ue.yaml.
+FROM release AS with-test-config
+COPY config/lte-ue.yaml /etc/nextgsim/lte-ue.yaml
