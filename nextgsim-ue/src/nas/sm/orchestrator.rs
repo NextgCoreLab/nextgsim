@@ -626,6 +626,24 @@ impl SmOrchestrator {
         }
     }
 
+    /// Test hook: every session awaiting its establishment's answer is
+    /// active, its procedure gone; returns their PSIs.
+    #[cfg(test)]
+    pub(crate) fn activate_pending_sessions_for_test(&mut self) -> Vec<u8> {
+        for pti in self.pt.pending_ptis() {
+            self.pt.abort(pti);
+            self.pending.remove(&pti);
+        }
+        let mut psis = Vec::new();
+        for s in self.sessions.iter_mut().flatten() {
+            if s.state == PsState::ActivePending {
+                s.state = PsState::Active;
+                psis.push(s.psi);
+            }
+        }
+        psis
+    }
+
     /// Test hook: end every queued re-attempt's own wait now.
     #[cfg(test)]
     pub(crate) fn end_retry_waits_for_test(&mut self) {
@@ -1267,6 +1285,23 @@ impl SmOrchestrator {
             PtMessageType::PduSessionReleaseRequest => (SM_TIMER_T3582, MAX_T3582_RETRIES),
         };
 
+        if msg_type == PtMessageType::PduSessionEstablishmentRequest
+            && self.is_emergency_procedure(pti)
+        {
+            // §6.4.1.6 a): on the first expiry of T3580 for an "initial
+            // emergency request" or "existing emergency PDU session" the UE
+            // does not retransmit; it may "inform the upper layers of the
+            // failure of the procedure" (which may make another emergency
+            // call attempt) or re-register for emergency services. This UE
+            // informs the upper layers: the procedure ends, and nothing is
+            // re-attempted on its own (#426 review).
+            warn!(
+                "T{timer_code} expired for an emergency PDU session request (PSI={psi}, \
+                 PTI={pti}): the procedure ends, the upper layers are told (TS 24.501 \
+                 §6.4.1.6 a))"
+            );
+            return self.abort_procedure(pti);
+        }
         if expiry_count < max_retries {
             // Retransmit and restart the timer without clearing the count
             let Some(pending) = self.pending.get(&pti) else {
@@ -1336,7 +1371,11 @@ impl SmOrchestrator {
                 // A configured session is asked for again after the UE's own
                 // wait (#379).
                 let session = self.take_session(psi);
-                self.retry_failed_establishment(session);
+                // An emergency one is the upper layers' to try again
+                // (§6.4.1.6 a), NOTE)
+                if !session.as_ref().is_some_and(|s| s.params.emergency) {
+                    self.retry_failed_establishment(session);
+                }
                 vec![SmOutput::SessionEstablishmentFailed {
                     psi,
                     cause: SmCause::ProtocolErrorUnspecified,
@@ -2639,11 +2678,15 @@ mod tests {
     #[test]
     fn an_emergency_retransmission_is_held_only_without_a_connection() {
         let mut orch = new_orch();
-        let outs = orch.start_establishment(SmSessionParams {
+        orch.start_establishment(SmSessionParams {
             emergency: true,
             dnn: None,
             ..test_params()
         });
+        // A modification of the emergency PDU session: its T3581 retransmits
+        // (an emergency establishment's T3580 does not, §6.4.1.6 a))
+        let psi = orch.activate_pending_sessions_for_test()[0];
+        let outs = orch.start_modification(psi);
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
         let pti = inner[2];
         let original = orch.pending.get(&pti).unwrap().ul_pdu.clone();
@@ -2701,6 +2744,35 @@ mod tests {
             orch.pt.get(pti).is_none_or(|t| !t.is_pending()),
             "the PTI is released"
         );
+    }
+
+    /// #426 review, TS 24.501 §6.4.1.6 a): T3580 expiring for an emergency
+    /// PDU session request does not retransmit. The procedure ends on the
+    /// first expiry, the failure goes to the upper layers, the PTI is
+    /// released, and nothing is re-attempted on the UE's own.
+    #[test]
+    fn an_emergency_establishment_is_not_retransmitted_on_t3580() {
+        let mut orch = new_orch();
+        // A configured one, which a non-emergency failure would re-attempt (#379)
+        let outs = orch.establish_default_sessions(&[SmSessionParams {
+            emergency: true,
+            dnn: None,
+            ..test_params()
+        }]);
+        let (t, inner) = unwrap_ul(first_sent_pdu(&outs));
+        let (psi, pti) = (t.pdu_session_id.unwrap(), inner[2]);
+        orch.expire_procedure_timers_for_test();
+        assert_eq!(
+            orch.tick_with_connection(true),
+            vec![SmOutput::SessionEstablishmentFailed {
+                psi,
+                cause: SmCause::ProtocolErrorUnspecified
+            }],
+            "no retransmission; the upper layers are told"
+        );
+        assert!(orch.pt.get(pti).is_none_or(|t| !t.is_pending()));
+        assert!(orch.session(psi).is_none());
+        assert!(!orch.has_pending_retry(), "no re-attempt of its own");
     }
 
     #[test]

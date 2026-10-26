@@ -9037,6 +9037,50 @@ mod tests {
         assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
     }
 
+    /// #426 review: during a registration or deregistration procedure
+    /// (5GMM-REGISTERED-INITIATED / -DEREGISTERED-INITIATED) a 5GSM
+    /// retransmission is held, though connected; once 5GMM-REGISTERED it goes.
+    #[test]
+    fn a_5gsm_retransmission_waits_out_a_registration_procedure() {
+        use crate::nas::drive_sm_timers;
+        use crate::nas::sm::{SmOrchestrator, SmOutput, SmSessionParams};
+        use nextgsim_nas::messages::sm::{PduSessionTypeValue, SscModeValue};
+
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        let mut sm = SmOrchestrator::new();
+        let outs = sm.start_establishment(SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: Some("internet".to_string()),
+            s_nssai: None,
+            emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
+        });
+        let Some(SmOutput::SendNasPdu(request)) = outs.first().cloned() else {
+            panic!("an establishment request: {outs:?}");
+        };
+        for during in [
+            MmSubState::RegisteredInitiated,
+            MmSubState::DeregisteredInitiated,
+        ] {
+            orch.state_mut().switch_mm_state(during);
+            sm.expire_procedure_timers_for_test();
+            let (_, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+            assert!(sm_outs.is_empty(), "{during:?}: held");
+            orch.state_mut()
+                .switch_mm_state(MmSubState::RegisteredNormalService);
+            assert_eq!(
+                crate::nas::flush_held_sm(&orch, &mut sm),
+                vec![SmOutput::SendNasPdu(request.clone())],
+                "after {during:?}"
+            );
+        }
+    }
+
     /// #424 review: an emergency PDU session's retransmission in
     /// 5GMM-REGISTERED.LIMITED-SERVICE goes on the connection; in 5GMM-IDLE
     /// it is held and the UE asks for emergency services (§5.6.1.1).
@@ -9055,7 +9099,7 @@ mod tests {
         orch.state_mut()
             .switch_mm_state(MmSubState::RegisteredLimitedService);
         let mut sm = SmOrchestrator::new();
-        let outs = sm.start_establishment(SmSessionParams {
+        sm.start_establishment(SmSessionParams {
             session_type: PduSessionTypeValue::Ipv4,
             ssc_mode: SscModeValue::SscMode1,
             dnn: None,
@@ -9064,8 +9108,12 @@ mod tests {
             requested_5qi: None,
             subscription_index: 0,
         });
+        // A modification of the emergency session (an emergency
+        // establishment's T3580 does not retransmit, §6.4.1.6 a))
+        let psi = sm.activate_pending_sessions_for_test()[0];
+        let outs = sm.start_modification(psi);
         let Some(SmOutput::SendNasPdu(request)) = outs.first().cloned() else {
-            panic!("an emergency establishment request: {outs:?}");
+            panic!("an emergency session's modification request: {outs:?}");
         };
         sm.expire_procedure_timers_for_test();
         let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
