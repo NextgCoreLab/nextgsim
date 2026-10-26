@@ -5962,6 +5962,7 @@ mod tests {
                 enabled: true,
                 secondary_supis: vec!["999700000000101".to_string()],
                 disaster_roaming: true,
+                simultaneous_registration: true,
                 ..MintConfig::default()
             }),
             ..UeConfig::default()

@@ -2482,16 +2482,19 @@ impl UeConfig {
     /// primary as it is, then one per secondary SUPI. Each is run as its own
     /// UE instance -- its own RLS identity, RRC connection, NAS and TUN -- as
     /// two UEs would be, each USIM registering on its own (TS 23.501 §5.38).
+    /// The secondaries run only with `simultaneous_registration`: without it,
+    /// only the primary subscription is registered.
     /// A secondary keeps the keys, PLMN and gNB search list; its SUPI is the
     /// secondary one and `active_subscription` names it, so its sessions are
     /// those the DNN map routes to it. Without MINT, or for a configuration
     /// that already is one subscription's, just this one.
     pub fn subscription_configs(&self) -> Vec<UeConfig> {
-        let Some(mint) = self
-            .mint_config
-            .as_ref()
-            .filter(|m| m.enabled && m.active_subscription == 0 && !m.secondary_supis.is_empty())
-        else {
+        let Some(mint) = self.mint_config.as_ref().filter(|m| {
+            m.enabled
+                && m.active_subscription == 0
+                && m.simultaneous_registration
+                && !m.secondary_supis.is_empty()
+        }) else {
             return vec![self.clone()];
         };
         let mut out = vec![self.clone()];
@@ -2501,6 +2504,9 @@ impl UeConfig {
             if let Some(m) = sub.mint_config.as_mut() {
                 m.active_subscription = (i + 1) as u8;
             }
+            // The aerial-UE identity and its tracking reports are the
+            // device's, registered by the primary (TS 23.256) (#427 review)
+            sub.uav_config = None;
             out.push(sub);
         }
         out
@@ -3297,6 +3303,15 @@ configured_nssai:
                 }],
                 disaster_roaming: true,
             }),
+            uav_config: Some(UavConfig {
+                is_aerial_ue: true,
+                uav_id: Some("uav-1".to_string()),
+                uss_address: None,
+                max_altitude_meters: 120.0,
+                remote_id_enabled: true,
+                c2_link_required: false,
+                uuaa_payload_hex: None,
+            }),
             ..UeConfig::default()
         };
         let subs = config.subscription_configs();
@@ -3310,7 +3325,23 @@ configured_nssai:
         );
         assert_eq!(subs[1].hplmn.mcc, config.hplmn.mcc);
         assert_eq!(subs[1].subscription_configs().len(), 1, "already one");
+        assert!(
+            subs[1].uav_config.is_none(),
+            "the UAV identity is the primary's"
+        );
 
+        // Without simultaneous registration only the primary registers
+        config
+            .mint_config
+            .as_mut()
+            .unwrap()
+            .simultaneous_registration = false;
+        assert_eq!(config.subscription_configs().len(), 1);
+        config
+            .mint_config
+            .as_mut()
+            .unwrap()
+            .simultaneous_registration = true;
         config.mint_config.as_mut().unwrap().enabled = false;
         assert_eq!(config.subscription_configs().len(), 1);
         assert_eq!(UeConfig::default().subscription_configs().len(), 1);

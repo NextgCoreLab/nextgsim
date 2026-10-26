@@ -303,7 +303,11 @@ impl UeApp {
         let (up_ready_tx, mut up_ready_rx) = watch::channel(false);
 
         // Spawn TUN task (handles TUN interface for user plane data)
-        let tun_config = TunTaskConfig::default();
+        // `tun_name` is the interface name prefix: `<tun_name><N>` (#427 review)
+        let mut tun_config = TunTaskConfig::default();
+        if let Some(prefix) = task_base.config.tun_name.as_ref() {
+            tun_config.name_prefix = prefix.clone();
+        }
         tokio::spawn(async move {
             let mut tun_task = TunTask::new(tun_config, tun_app_tx);
             tun_task.run(tun_rx).await;
@@ -2271,10 +2275,11 @@ async fn run_ue(options: UeOptions) -> Result<()> {
     // Create and run UE instances
     let mut ue_apps: Vec<UeApp> = Vec::new();
     let mut next_instance: u32 = 0;
+    // Every instance's configuration first: two instances registering one
+    // SUPI would take each other's registration over at the AMF (#427 review)
+    let all_configs = all_ue_instance_configs(&base_config, options.num_ue)?;
 
-    for i in 0..options.num_ue {
-        let configs = ue_instance_configs(&base_config, i, options.num_ue)?;
-
+    for (i, configs) in (0..options.num_ue).zip(all_configs) {
         // Apply tempo delay between UE starts
         if i > 0 && options.tempo > 0 {
             info!("Waiting {}ms before starting UE {}...", options.tempo, i);
@@ -2320,17 +2325,45 @@ async fn run_ue(options: UeOptions) -> Result<()> {
 fn ue_instance_configs(base: &UeConfig, i: u32, num_ue: u32) -> Result<Vec<UeConfig>> {
     let mut config = base.clone();
     if num_ue > 1 {
+        // Strided by the number of subscriptions per UE (#427 review): with
+        // consecutive primary and secondary SUPIs (…001, …002) UE i gets
+        // …001 + i·2 and …002 + i·2, so the ranges interleave rather than
+        // meet. One subscription per UE keeps the stride of 1.
+        let stride = 1 + config.subscription_configs().len().saturating_sub(1) as u64;
+        let offset = u64::from(i) * stride;
         if let Some(ref supi) = base.supi {
-            let new_imsi = increment_imsi(&supi.to_string(), u64::from(i))?;
+            let new_imsi = increment_imsi(&supi.to_string(), offset)?;
             config.supi = Some(nextgsim_common::Supi::imsi(new_imsi));
         }
         if let Some(mint) = config.mint_config.as_mut() {
             for supi in &mut mint.secondary_supis {
-                *supi = increment_imsi(supi, u64::from(i))?;
+                *supi = increment_imsi(supi, offset)?;
             }
         }
     }
     Ok(config.subscription_configs())
+}
+
+/// [`ue_instance_configs`] of every UE `0..num_ue`, refused when two
+/// instances would register the same SUPI -- the `--num-ue` increments of
+/// consecutive primary and secondary SUPIs can meet (#427 review); the AMF
+/// would treat the second registration as the first UE's.
+fn all_ue_instance_configs(base: &UeConfig, num_ue: u32) -> Result<Vec<Vec<UeConfig>>> {
+    let all: Vec<Vec<UeConfig>> = (0..num_ue)
+        .map(|i| ue_instance_configs(base, i, num_ue))
+        .collect::<Result<_>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for supi in all.iter().flatten().filter_map(|c| c.supi.as_ref()) {
+        let supi = supi.to_string();
+        if !seen.insert(supi.clone()) {
+            anyhow::bail!(
+                "two UE instances would register {supi}: with --num-ue {num_ue} the incremented \
+                 primary and MINT secondary SUPIs overlap; space the secondary SUPIs at least \
+                 {num_ue} apart from the primary's"
+            );
+        }
+    }
+    Ok(all)
 }
 
 fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
@@ -2402,8 +2435,8 @@ mod tests {
             [
                 "imsi-999700000000001",
                 "imsi-999700000000101",
-                "imsi-999700000000002",
-                "imsi-999700000000102"
+                "imsi-999700000000003",
+                "imsi-999700000000103"
             ]
         );
         for configs in &ues {
@@ -2423,6 +2456,34 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+
+        // #427 review: consecutive SUPIs (the shipped example, …001 and …002)
+        // with --num-ue 2 are strided apart, not met
+        base.mint_config.as_mut().unwrap().secondary_supis = vec!["999700000000002".into()];
+        let supis: Vec<String> = all_ue_instance_configs(&base, 2)
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|c| c.supi.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            supis,
+            [
+                "imsi-999700000000001",
+                "imsi-999700000000002",
+                "imsi-999700000000003",
+                "imsi-999700000000004"
+            ]
+        );
+        // SUPIs that would still meet (…001 and …003, stride 2) are refused
+        // at startup, naming the SUPI
+        base.mint_config.as_mut().unwrap().secondary_supis = vec!["999700000000003".into()];
+        let err = all_ue_instance_configs(&base, 2).unwrap_err().to_string();
+        assert!(err.contains("imsi-999700000000003"), "{err}");
+        assert!(
+            all_ue_instance_configs(&base, 1).is_ok(),
+            "one UE: no overlap"
         );
     }
 

@@ -239,7 +239,7 @@ tun_name: null
 | `gnb_search_list` | list of string | Yes | - | gNB RLS addresses: IPs or hostnames, optionally `:port` (default 4997). Hostnames are re-resolved periodically and on losing the cell. Must be non-empty (validated) |
 | `sessions` | list | Yes | - | PDU sessions to establish after registration; may be `[]` |
 | `configured_nssai` | `{slices: [...]}` | Yes | - | Configured NSSAI |
-| `tun_name` | string | No | none | TUN interface name; unset gives `uesimtun<N>` |
+| `tun_name` | string | No | none | TUN interface name prefix: interfaces are `<tun_name><N>`, unique in the process; unset gives `uesimtun<N>` |
 
 #### PDU sessions (`sessions[]`)
 
@@ -293,7 +293,7 @@ nextgcore. Each is inert unless set.
 | `mint_config.enabled` | bool | false | Run one UE instance per subscription |
 | `mint_config.secondary_supis` | list of string | `[]` | Secondary SUPIs; each must be provisioned in the core |
 | `mint_config.active_subscription` | u8 | 0 | The subscription an instance is; set by the UE per instance, leave 0 |
-| `mint_config.simultaneous_registration` | bool | false | Register secondaries alongside the primary |
+| `mint_config.simultaneous_registration` | bool | false | Run the secondary subscriptions' instances alongside the primary; without it only the primary registers |
 | `mint_config.disaster_roaming` | bool | false | Set the disaster-roaming indication on secondary registrations |
 | `mint_config.dnn_subscription_map` | list of `{dnn, subscription_index}` | `[]` | Which subscription's instance establishes a DNN's PDU session |
 | `uav_config` | object | none | **UAV** (TS 23.256). Registers an aerial UE and periodically sends a tracking report the AMF checks against its geofence |
