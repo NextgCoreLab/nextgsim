@@ -459,9 +459,14 @@ impl MmUeIdentity {
             // so the Registration Request advertises the SNPN being accessed.
             snpn_nid: config.snpn_config.as_ref().map(|s| s.nid.clone()),
             high_priority_access: config.high_priority_access,
-            // The primary subscription never sets disaster-roaming; MINT
-            // secondary identities opt in via `with_supi` (TS 23.761 §4.2).
-            disaster_roaming: false,
+            // MINT (TS 23.761 §4.2, #419): a secondary subscription's UE
+            // instance sets the disaster-roaming indication when configured;
+            // the primary never does.
+            disaster_roaming: config.subscription_index() != 0
+                && config
+                    .mint_config
+                    .as_ref()
+                    .is_some_and(|m| m.disaster_roaming),
             // UAV (Rel-18, TS 23.256): aerial UE registers with its CAA-level
             // ID so the AMF grants/tracks flight authorization. Inert (None)
             // unless the UE config enables the UAV feature.
@@ -474,26 +479,6 @@ impl MmUeIdentity {
             // config so the Registration Request signals it to the AMF.
             redcap: config.redcap,
         }
-    }
-
-    /// Derive a MINT secondary-subscription identity from the UE configuration
-    /// but for a different SUPI value (TS 23.761): the home PLMN, keys and
-    /// security capabilities are shared with the primary, only the signalled
-    /// SUPI and the pre-built SUCI differ. `disaster_roaming` controls the
-    /// disaster-roaming indication in this subscription's Registration Request.
-    pub fn for_secondary_supi(
-        config: &UeConfig,
-        suci: Vec<u8>,
-        supi_value: &str,
-        disaster_roaming: bool,
-    ) -> Self {
-        let mut id = Self::from_config(config, suci);
-        id.supi = supi_value.to_string();
-        id.disaster_roaming = disaster_roaming;
-        // A MINT secondary subscription is not the aerial-UE registration; the
-        // UAV indication belongs only to the primary subscription's identity.
-        id.uav_indication = None;
-        id
     }
 }
 
@@ -5963,6 +5948,43 @@ mod tests {
     /// Locate a contiguous byte subsequence; returns the start index if found.
     fn find_subseq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// #419: a MINT secondary subscription's own UE instance registers with
+    /// its own SUPI and, when configured, the disaster-roaming indication;
+    /// the primary's never carries it.
+    #[test]
+    fn a_secondary_subscription_instance_registers_with_disaster_roaming() {
+        use nextgsim_common::config::MintConfig;
+        let mut config = UeConfig {
+            supi: Some(nextgsim_common::Supi::imsi("999700000000001".to_string())),
+            mint_config: Some(MintConfig {
+                enabled: true,
+                secondary_supis: vec!["999700000000101".to_string()],
+                disaster_roaming: true,
+                ..MintConfig::default()
+            }),
+            ..UeConfig::default()
+        };
+        config.hplmn.mcc = 999;
+        config.hplmn.mnc = 70;
+        let subs = config.subscription_configs();
+        let identity = |c: &UeConfig| {
+            let suci = crate::nas::mm::suci::build_suci(c).expect("SUCI");
+            MmUeIdentity::from_config(c, suci)
+        };
+        let primary = identity(&subs[0]);
+        let secondary = identity(&subs[1]);
+        assert!(!primary.disaster_roaming);
+        assert!(secondary.disaster_roaming);
+        assert_eq!(secondary.supi, "999700000000101");
+        assert_ne!(primary.supi, secondary.supi);
+
+        let mut orch = MmOrchestrator::new(secondary);
+        let outs = orch.start_registration(RegistrationType::InitialRegistration);
+        let wire = first_sent_pdu(&outs).to_vec();
+        let decoded = RegistrationRequest::decode(&mut &wire[3..]).unwrap();
+        assert!(decoded.disaster_roaming, "the indication is in its request");
     }
 
     #[test]
