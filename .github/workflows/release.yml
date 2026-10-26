@@ -42,6 +42,14 @@ on:
         required: true
         type: boolean
         default: true
+  # nextgcore #420: a pushed version tag publishes that tag's images to Docker
+  # Hub. The tag `release` creates below is pushed with GITHUB_TOKEN, which
+  # starts no workflow (a GitHub Actions rule), so a dispatched release publishes
+  # in its own run instead (the publish-* jobs below); the two never both fire.
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+-*"
 
 permissions:
   contents: write
@@ -49,6 +57,8 @@ permissions:
 jobs:
   release:
     name: Release nextgsim
+    # A tag push has no release to cut: the tag already exists.
+    if: ${{ github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     steps:
       # Full history: the notes come from `git log <prev-tag>..<sha>` and the
@@ -280,3 +290,200 @@ jobs:
             --title "nextgsim ${version}" \
             --notes-file notes.md
           echo "released ${version}" >> "$GITHUB_STEP_SUMMARY"
+
+  # ==========================================================================
+  # nextgcore #420: publish the release's images to Docker Hub.
+  #
+  # WHAT. Every image in docker/release-images.json (ci.yml's release-images
+  # job fails when a binary, Dockerfile or deployed image is missing from it),
+  # built from the VERSION TAG, pushed as <namespace>/<image>:<version>, and
+  # :latest moved only after every versioned push succeeded. The tag is on the
+  # bump commit atop the validated sha, so these are the gNB/UE/eNB/LTE-UE of
+  # the commit pair nextgcore's E2E validated.
+  #
+  # WHEN. Only for a version tag: a pushed x.y.z tag, or the tag a non-dry-run
+  # dispatch of `release` above just created. Never from a PR, a branch or the
+  # nightly, so `latest` always means "the last release".
+  #
+  # CREDENTIALS. The repository secrets DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+  # (a Docker Hub access token with push scope, not a password). The optional
+  # repository VARIABLE DOCKERHUB_NAMESPACE names the Docker Hub organisation;
+  # without it the images go under the username. With either secret absent,
+  # publish-gate prints a notice and every publish job is skipped: the release
+  # itself still succeeds. See docs/ci-and-release.md, "Docker Hub images".
+  # ==========================================================================
+  publish-gate:
+    name: Docker Hub publish gate
+    needs: release
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'push' ||
+      (github.event_name == 'workflow_dispatch' && needs.release.result == 'success' && !inputs.dry_run)) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      enabled: ${{ steps.gate.outputs.enabled }}
+      version: ${{ steps.gate.outputs.version }}
+      latest: ${{ steps.gate.outputs.latest }}
+      revision: ${{ steps.gate.outputs.revision }}
+      matrix: ${{ steps.gate.outputs.matrix }}
+      images: ${{ steps.gate.outputs.images }}
+    steps:
+      - name: Checkout the version tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+
+      - name: Decide whether to publish, and what
+        id: gate
+        env:
+          VERSION: ${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          # Whether the secrets are SET, never their values.
+          HAS_USERNAME: ${{ secrets.DOCKERHUB_USERNAME != '' }}
+          HAS_TOKEN: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_USERNAME" != true ] || [ "$HAS_TOKEN" != true ]; then
+            echo "::notice title=Docker Hub publish skipped::The DOCKERHUB_USERNAME and DOCKERHUB_TOKEN repository secrets are not both set, so no image was pushed for ${VERSION}. Add them (docs/ci-and-release.md, \"Docker Hub images\") and re-run this job to publish this tag."
+            echo "### Docker Hub publish skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "DOCKERHUB_USERNAME / DOCKERHUB_TOKEN are not set; nothing was pushed." >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::${VERSION} is not a version tag (x.y.z or x.y.z-pre); refusing to publish."
+            exit 1
+          fi
+          # A pre-release is published under its version only.
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then latest=true; else latest=false; fi
+          docker/check-release-images.sh
+          {
+            echo "enabled=true"
+            echo "version=${VERSION}"
+            echo "latest=${latest}"
+            echo "revision=$(git rev-parse HEAD)"
+            echo "matrix=$(jq -c '.images' docker/release-images.json)"
+            echo "images=$(jq -r '[.images[].image] | join(" ")' docker/release-images.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Publishing $(jq '.images | length' docker/release-images.json) images as ${VERSION} (latest: ${latest})."
+
+  publish-binaries:
+    name: Build the release binaries
+    needs: publish-gate
+    if: ${{ !cancelled() && needs.publish-gate.outputs.enabled == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout the version tag
+        uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.publish-gate.outputs.version }}
+
+      # In Debian bookworm, the images' runtime base (a binary linked on the
+      # Ubuntu runner needs a newer glibc than bookworm has), with the features
+      # nextgcore's Dockerfile.builder uses for the validated E2E: kernel SCTP
+      # for the gNB and the eNB.
+      - name: Build the binaries
+        run: |
+          set -euo pipefail
+          jq -r '.images[] | .cargo_args, (.extra_binaries // [])[].cargo_args' docker/release-images.json > .release-cargo-args
+          docker run --rm -v "$PWD":/src -w /src rust:1.95.0-bookworm bash -euo pipefail -c '
+            apt-get update
+            apt-get install -y --no-install-recommends pkg-config libssl-dev cmake g++ \
+              protobuf-compiler libclang-dev clang libsctp-dev
+            while IFS= read -r args; do
+              echo "cargo build --release ${args}"
+              cargo build --release ${args}
+            done < .release-cargo-args'
+          mkdir -p /tmp/release-binaries
+          for b in $(jq -r '.images[] | .binary, (.extra_binaries // [])[].binary' docker/release-images.json); do
+            test -x "target/release/${b}" \
+              || { echo "::error::no target/release/${b} after the build"; exit 1; }
+            cp "target/release/${b}" /tmp/release-binaries/
+          done
+          ls -la /tmp/release-binaries
+
+      - name: Upload the binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: /tmp/release-binaries/
+          retention-days: 1
+          if-no-files-found: error
+
+  publish-images:
+    name: Publish ${{ matrix.image }}
+    needs: [publish-gate, publish-binaries]
+    if: ${{ !cancelled() && needs.publish-gate.outputs.enabled == 'true' && needs.publish-binaries.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      # Every leg runs: one failed image must not leave the others unpushed,
+      # and publish-latest below waits for all of them.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.publish-gate.outputs.matrix) }}
+    env:
+      NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
+      VERSION: ${{ needs.publish-gate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ needs.publish-gate.outputs.version }}
+      - name: Download the binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: release-binaries
+          path: binaries
+      # upload-artifact does not keep the mode bits, and the Dockerfiles COPY
+      # the binaries as they are. Every leg gets every binary, so an image's
+      # extra_binaries (nr-cli in the UE image) are in binaries/ too.
+      - name: Make the binaries executable
+        run: chmod 0755 binaries/*
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ env.NAMESPACE }}/${{ matrix.image }}:${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.revision=${{ needs.publish-gate.outputs.revision }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+  # `latest` moves only after EVERY versioned image pushed (publish-images
+  # succeeds only when all of its legs did), and never for a pre-release.
+  publish-latest:
+    name: Move latest to this release
+    needs: [publish-gate, publish-images]
+    if: ${{ !cancelled() && needs.publish-gate.outputs.latest == 'true' && needs.publish-images.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    env:
+      NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
+      VERSION: ${{ needs.publish-gate.outputs.version }}
+      IMAGES: ${{ needs.publish-gate.outputs.images }}
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Tag every image latest
+        run: |
+          set -euo pipefail
+          for image in $IMAGES; do
+            docker buildx imagetools create \
+              -t "${NAMESPACE}/${image}:latest" "${NAMESPACE}/${image}:${VERSION}"
+          done
+          {
+            echo "### Published to Docker Hub as ${VERSION} and latest"
+            for image in $IMAGES; do echo "* \`${image}\`"; done
+          } >> "$GITHUB_STEP_SUMMARY"

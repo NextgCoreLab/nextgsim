@@ -11,7 +11,14 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+- Releases publish the `nextgsim-nr-gnb`, `nextgsim-nr-ue`, `nextgsim-lte-enb` and
+  `nextgsim-lte-ue` images to Docker Hub (nextgcore #420). On a version tag, `release.yml`
+  pushes every image in `docker/release-images.json` as `<namespace>/<image>:<version>`, then
+  moves `latest` once every versioned push has succeeded. Publishing needs the
+  `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets, and is skipped with a notice
+  without them. A CI check fails when a binary, Dockerfile or deployed image is missing from the
+  list. See `docs/ci-and-release.md`, "Docker Hub images".
 
 ## [0.2.0] — Unreleased (draft for operator review)
 
