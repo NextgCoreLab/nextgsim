@@ -61,10 +61,11 @@ pub fn drive_sm_timers(
 
 /// Whether a 5GSM message can go now: a NAS signalling connection, and not
 /// while the SERVICE REQUEST that asked for it is still unanswered (#420
-/// review). Any 5GMM-REGISTERED substate, LIMITED-SERVICE included (#424
-/// review): only the lack of a connection holds a retransmission back.
+/// review), nor during a registration or deregistration procedure (#426
+/// review): 5GMM-REGISTERED, any substate, LIMITED-SERVICE included (#424
+/// review); only the lack of a connection holds a retransmission back there.
 fn sm_transport_ready(mm: &mm::MmOrchestrator) -> bool {
-    mm.state().is_connected() && mm.state().mm_state() != mm::MmState::ServiceRequestInitiated
+    mm.state().is_connected() && mm.state().mm_state() == mm::MmState::Registered
 }
 
 /// The held 5GSM retransmissions, once the connection a SERVICE REQUEST asked
