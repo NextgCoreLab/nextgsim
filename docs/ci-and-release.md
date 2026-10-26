@@ -87,11 +87,22 @@ Hub (nextgcore #420):
 | `nextgsim-nr-gnb` | `Dockerfile.gnb-local` | `nr-gnb`, with `kernel-sctp` |
 | `nextgsim-nr-ue` | `Dockerfile.ue-local` | `nr-ue`, plus `nr-cli` (`nr-ue-deregister` needs it) |
 | `nextgsim-lte-enb` | `Dockerfile.enb-local` | `lte-enb`, with `kernel-sctp` |
-| `nextgsim-lte-ue` | `Dockerfile.lte-ue-local` | `lte-ue` |
+| `nextgsim-lte-ue` | `Dockerfile.lte-ue-local`, stage `release` | `lte-ue` |
 
 The binaries are built in `rust:1.95.0-bookworm`, matching the images' Debian
 bookworm base, with the features nextgcore's `Dockerfile.builder` uses for the
-validated E2E. The published names replace the local names `nextgsim/nr-gnb`,
+validated E2E. The base images (`debian:bookworm-slim`, and `rust:1.95.0-bookworm` for the
+build) and every action in `release.yml` are pinned by digest or commit SHA, with the tag in a
+comment. To bump a base image, run `docker buildx imagetools inspect <tag>` and replace the
+digest.
+
+No published image carries a subscriber key. The gNB and UE images bake no config. The eNB
+image bakes `config/enb.yaml`, which holds no secret. The LTE UE image is the `release` stage of
+`Dockerfile.lte-ue-local`, without `config/lte-ue.yaml`, whose K/OPc are public test values.
+Mount your own config at `/etc/nextgsim/lte-ue.yaml`, for example
+`-v ./lte-ue.yaml:/etc/nextgsim/lte-ue.yaml:ro`. The default target, which local and E2E
+builds use, still bakes the test config. The `Release image list` check fails if a published
+stage COPYs a config holding `key`, `op` or `opc`. The published names replace the local names `nextgsim/nr-gnb`,
 `nextgsim-gnb` and so on. nextgcore publishes the core images the same way.
 
 **Trigger: a version tag only.** Publishing runs for:
@@ -100,7 +111,10 @@ validated E2E. The published names replace the local names `nextgsim/nr-gnb`,
   created. That tag is pushed with `GITHUB_TOKEN`, which starts no workflow, so
   the same run publishes it.
 
-Nothing is pushed from a PR, a branch, the nightly or a dry run.
+Nothing is pushed from a PR, a branch, the nightly or a dry run. The tagged commit must also be on
+`main` (`publish-gate` checks its ancestry and fails otherwise), so only reviewed code is
+published. Recommended: a tag ruleset (Settings, Rules, Rulesets) that restricts who may create
+or move `[0-9]*` tags, since any writer can otherwise push one.
 
 **Setup.** Repository settings, Secrets and variables, Actions:
 

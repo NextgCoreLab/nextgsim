@@ -47,6 +47,23 @@ while IFS=$'\t' read -r image binary args; do
   [ -n "$image" ] || continue
   [[ " ${args} " == *" --bin ${binary} "* ]] || err "${image}: extra binary ${binary}: cargo_args do not build --bin ${binary}"
 done < <(jq -r '.images[] | .image as $i | (.extra_binaries // [])[] | [$i, .binary, .cargo_args] | @tsv' "$manifest")
+# No published image may bake a subscriber key (K, OP/OPc). The published
+# stage is the manifest's `target`, else the Dockerfile's last stage (and, for
+# a target, the lines from its FROM to the next FROM).
+while IFS=$'\t' read -r image dockerfile target; do
+  [ -f "$dockerfile" ] || continue
+  if [ -n "$target" ]; then
+    stage=$(awk -v t="$target" 'toupper($1)=="FROM" { on = (tolower($NF) == tolower(t)) } on' "$dockerfile")
+    [ -n "$stage" ] || err "${image}: ${dockerfile} has no stage named ${target}"
+  else
+    stage=$(awk 'toupper($1)=="FROM" { buf="" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$dockerfile")
+  fi
+  for f in $(grep -E '^COPY ' <<<"$stage" | grep -oE 'config/[^ ]+' || true); do
+    if [ -f "$f" ] && grep -qiE '^[[:space:]]*(key|op|opc)[[:space:]]*:' "$f"; then
+      err "${image}: the published stage bakes ${f}, which holds a subscriber key (K/OP/OPc); mount it at run time instead"
+    fi
+  done
+done < <(jq -r '.images[] | [.image, .dockerfile, (.target // "")] | @tsv' "$manifest")
 while IFS= read -r p; do
   [ -z "$p" ] || [ -e "$p" ] || err "${manifest}: excluded path ${p} does not exist"
 done <<<"$excluded_paths"

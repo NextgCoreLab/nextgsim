@@ -64,7 +64,7 @@ jobs:
       # Full history: the notes come from `git log <prev-tag>..<sha>` and the
       # ancestry check needs the graph.
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
@@ -330,9 +330,11 @@ jobs:
       images: ${{ steps.gate.outputs.images }}
     steps:
       - name: Checkout the version tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+          # The ancestry check below needs main's history.
+          fetch-depth: 0
 
       - name: Decide whether to publish, and what
         id: gate
@@ -352,6 +354,14 @@ jobs:
           fi
           if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
             echo "::error::${VERSION} is not a version tag (x.y.z or x.y.z-pre); refusing to publish."
+            exit 1
+          fi
+          # Only reviewed code is published (#420 review): any writer can push a
+          # tag, so the tagged commit must be reachable from main, which only
+          # reviewed merges reach. A dispatched release's bump commit is on main.
+          git fetch --quiet origin main
+          if ! git merge-base --is-ancestor HEAD FETCH_HEAD; then
+            echo "::error::tag ${VERSION} ($(git rev-parse HEAD)) is not on main; refusing to publish an unreviewed commit."
             exit 1
           fi
           # A pre-release is published under its version only.
@@ -376,7 +386,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout the version tag
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
 
@@ -388,7 +398,7 @@ jobs:
         run: |
           set -euo pipefail
           jq -r '.images[] | .cargo_args, (.extra_binaries // [])[].cargo_args' docker/release-images.json > .release-cargo-args
-          docker run --rm -v "$PWD":/src -w /src rust:1.95.0-bookworm bash -euo pipefail -c '
+          docker run --rm -v "$PWD":/src -w /src rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 bash -euo pipefail -c '
             apt-get update
             apt-get install -y --no-install-recommends pkg-config libssl-dev cmake g++ \
               protobuf-compiler libclang-dev clang libsctp-dev
@@ -405,7 +415,7 @@ jobs:
           ls -la /tmp/release-binaries
 
       - name: Upload the binaries
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-binaries
           path: /tmp/release-binaries/
@@ -429,11 +439,11 @@ jobs:
       NAMESPACE: ${{ vars.DOCKERHUB_NAMESPACE || secrets.DOCKERHUB_USERNAME }}
       VERSION: ${{ needs.publish-gate.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: refs/tags/${{ needs.publish-gate.outputs.version }}
       - name: Download the binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release-binaries
           path: binaries
@@ -451,6 +461,8 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # A stage without baked test config, where the manifest names one.
+          target: ${{ matrix.target }}
           push: true
           tags: ${{ env.NAMESPACE }}/${{ matrix.image }}:${{ env.VERSION }}
           labels: |

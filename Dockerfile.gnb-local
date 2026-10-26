@@ -1,5 +1,7 @@
 # nextgsim-gnb - 5G gNodeB Simulator (pre-built binary)
-FROM debian:bookworm-slim
+# Base images are pinned by digest so a release is reproducible (#420). To bump: 
+# `docker buildx imagetools inspect <tag>` and replace the digest.
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \

@@ -6,7 +6,8 @@
     "ci.yml's release-images job (docker/check-release-images.sh) fails when a [[bin]] target,",
     "a Dockerfile, or an image a compose file or k8s manifest references is neither here nor in",
     "`excluded`. local_names are the names compose, k8s and nextgcore's CI use for the image.",
-    "extra_binaries are built too and land in binaries/ beside the image's own binary."
+    "extra_binaries are built too and land in binaries/ beside the image's own binary.",
+    "target, when set, is the Dockerfile stage the release builds (--target)."
   ],
   "images": [
     {
@@ -58,7 +59,9 @@
       "local_names": [
         "nextgsim/lte-ue",
         "nextgsim-lte-ue"
-      ]
+      ],
+      "target": "release",
+      "why_target": "the default target bakes config/lte-ue.yaml with the public test K/OPc; the published image carries no subscriber key, so the config is mounted at /etc/nextgsim/lte-ue.yaml"
     }
   ],
   "excluded": [
