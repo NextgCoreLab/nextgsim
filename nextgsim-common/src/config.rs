@@ -1804,7 +1804,10 @@ pub struct MintConfig {
     /// Secondary SUPIs for additional subscriptions
     #[serde(default)]
     pub secondary_supis: Vec<String>,
-    /// Active subscription index (0 = primary)
+    /// The subscription this UE instance is (0 = primary; i = the SUPI
+    /// `secondary_supis[i - 1]`). Each subscription runs as its own UE
+    /// instance (#419), whose configuration [`UeConfig::subscription_configs`]
+    /// derives with this set.
     #[serde(default)]
     pub active_subscription: u8,
     /// Allow simultaneous registration on multiple PLMNs
@@ -2466,6 +2469,49 @@ impl GnbConfig {
 }
 
 impl UeConfig {
+    /// The MINT subscription this configuration is (0 = primary, or with no
+    /// MINT configuration), see [`MintConfig::active_subscription`].
+    pub fn subscription_index(&self) -> u8 {
+        self.mint_config
+            .as_ref()
+            .filter(|m| m.enabled)
+            .map_or(0, |m| m.active_subscription)
+    }
+
+    /// One configuration per MINT subscription (Rel-18, TS 23.761, #419): the
+    /// primary as it is, then one per secondary SUPI. Each is run as its own
+    /// UE instance -- its own RLS identity, RRC connection, NAS and TUN -- as
+    /// two UEs would be, each USIM registering on its own (TS 23.501 §5.38).
+    /// The secondaries run only with `simultaneous_registration`: without it,
+    /// only the primary subscription is registered.
+    /// A secondary keeps the keys, PLMN and gNB search list; its SUPI is the
+    /// secondary one and `active_subscription` names it, so its sessions are
+    /// those the DNN map routes to it. Without MINT, or for a configuration
+    /// that already is one subscription's, just this one.
+    pub fn subscription_configs(&self) -> Vec<UeConfig> {
+        let Some(mint) = self.mint_config.as_ref().filter(|m| {
+            m.enabled
+                && m.active_subscription == 0
+                && m.simultaneous_registration
+                && !m.secondary_supis.is_empty()
+        }) else {
+            return vec![self.clone()];
+        };
+        let mut out = vec![self.clone()];
+        for (i, supi) in mint.secondary_supis.iter().enumerate() {
+            let mut sub = self.clone();
+            sub.supi = Some(Supi::imsi(supi.clone()));
+            if let Some(m) = sub.mint_config.as_mut() {
+                m.active_subscription = (i + 1) as u8;
+            }
+            // The aerial-UE identity and its tracking reports are the
+            // device's, registered by the primary (TS 23.256) (#427 review)
+            sub.uav_config = None;
+            out.push(sub);
+        }
+        out
+    }
+
     /// Parses a UE configuration from a YAML string.
     ///
     /// # Arguments
@@ -3237,6 +3283,68 @@ configured_nssai:
         assert!(config.pqc_config.enabled);
         assert_eq!(config.pqc_config.kem_algorithm, KemAlgorithm::Kyber1024);
         assert_eq!(config.pqc_config.sign_algorithm, SignAlgorithm::Dilithium5);
+    }
+
+    /// #419: one configuration per MINT subscription. The secondary has its
+    /// SUPI and names itself, and keeps everything else; a configuration that
+    /// already is one subscription's, or one without MINT, is just itself.
+    #[test]
+    fn mint_subscriptions_get_a_configuration_each() {
+        let mut config = UeConfig {
+            supi: Some(Supi::imsi("999700000000001".to_string())),
+            mint_config: Some(MintConfig {
+                enabled: true,
+                secondary_supis: vec!["999700000000002".to_string()],
+                active_subscription: 0,
+                simultaneous_registration: true,
+                dnn_subscription_map: vec![DnnSubscription {
+                    dnn: "enterprise".to_string(),
+                    subscription_index: 1,
+                }],
+                disaster_roaming: true,
+            }),
+            uav_config: Some(UavConfig {
+                is_aerial_ue: true,
+                uav_id: Some("uav-1".to_string()),
+                uss_address: None,
+                max_altitude_meters: 120.0,
+                remote_id_enabled: true,
+                c2_link_required: false,
+                uuaa_payload_hex: None,
+            }),
+            ..UeConfig::default()
+        };
+        let subs = config.subscription_configs();
+        assert_eq!(subs.len(), 2);
+        assert_eq!(subs[0].subscription_index(), 0);
+        assert_eq!(subs[0].supi, config.supi);
+        assert_eq!(subs[1].subscription_index(), 1);
+        assert_eq!(
+            subs[1].supi.as_ref().map(ToString::to_string).as_deref(),
+            Some("imsi-999700000000002")
+        );
+        assert_eq!(subs[1].hplmn.mcc, config.hplmn.mcc);
+        assert_eq!(subs[1].subscription_configs().len(), 1, "already one");
+        assert!(
+            subs[1].uav_config.is_none(),
+            "the UAV identity is the primary's"
+        );
+
+        // Without simultaneous registration only the primary registers
+        config
+            .mint_config
+            .as_mut()
+            .unwrap()
+            .simultaneous_registration = false;
+        assert_eq!(config.subscription_configs().len(), 1);
+        config
+            .mint_config
+            .as_mut()
+            .unwrap()
+            .simultaneous_registration = true;
+        config.mint_config.as_mut().unwrap().enabled = false;
+        assert_eq!(config.subscription_configs().len(), 1);
+        assert_eq!(UeConfig::default().subscription_configs().len(), 1);
     }
 
     #[test]

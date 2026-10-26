@@ -303,7 +303,11 @@ impl UeApp {
         let (up_ready_tx, mut up_ready_rx) = watch::channel(false);
 
         // Spawn TUN task (handles TUN interface for user plane data)
-        let tun_config = TunTaskConfig::default();
+        // `tun_name` is the interface name prefix: `<tun_name><N>` (#427 review)
+        let mut tun_config = TunTaskConfig::default();
+        if let Some(prefix) = task_base.config.tun_name.as_ref() {
+            tun_config.name_prefix = prefix.clone();
+        }
         tokio::spawn(async move {
             let mut tun_task = TunTask::new(tun_config, tun_app_tx);
             tun_task.run(tun_rx).await;
@@ -606,21 +610,10 @@ impl UeApp {
         ));
         let sm_session_params = SmSessionParams::from_config(&task_base.config);
 
-        // MINT secondary-subscription driver (Rel-18, TS 23.761). Inert unless
-        // the UE config enables MINT with secondary SUPIs; it owns each
-        // secondary subscription's MM/security context and SM sessions. Only
-        // the primary subscription's sessions (subscription_index 0) are
-        // established by the main `sm_orch`; secondary-SUPI sessions are routed
-        // here per the DNN→subscription map.
-        let mut mint_secondary =
-            nextgsim_ue::nas::mm::MintSecondary::from_config(&task_base.config);
-        if mint_secondary.is_active() {
-            info!(
-                "MINT enabled: {} secondary subscription(s), disaster_roaming={}",
-                "configured",
-                mint_secondary.disaster_roaming()
-            );
-        }
+        // MINT (Rel-18, TS 23.761, #419): every subscription is its own UE
+        // instance with its own RLS identity, RRC connection, NAS and TUN
+        // (`UeConfig::subscription_configs`), so this one drives its own
+        // subscription only.
 
         // TS 23.122 PLMN selector (automatic mode), consuming the MM
         // orchestrator's forbidden-PLMN list
@@ -831,39 +824,6 @@ impl UeApp {
                 process_sm_outputs(sm_outs, &mut orch, &task_base, &tun_tx, &mut pdu_counter)
                     .await;
 
-                // MINT secondary subscriptions (Rel-18, TS 23.761): start the
-                // secondary registrations once the primary is registered, then
-                // drive their MM/SM timers each tick.
-                if mint_secondary.is_active() && orch.state().is_registered() {
-                    let started = mint_secondary.start_secondary_registrations();
-                    for (index, outs) in started {
-                        process_secondary_mm_outputs(
-                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
-                            &mut pdu_counter,
-                        )
-                        .await;
-                    }
-                    let ticks = mint_secondary.tick();
-                    for (index, outs) in ticks {
-                        process_secondary_mm_outputs(
-                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
-                            &mut pdu_counter,
-                        )
-                        .await;
-                    }
-                    // #409: the secondary subscriptions' SM timers and the
-                    // re-attempt of their configured sessions, on the shared
-                    // radio connection
-                    let sm_ticks = mint_secondary.tick_sessions(orch.state().is_connected());
-                    for (index, outs) in sm_ticks {
-                        process_secondary_sm_outputs(
-                            index, outs, &mut mint_secondary, &task_base, &tun_tx,
-                            &mut pdu_counter,
-                        )
-                        .await;
-                    }
-                }
-
                 // UAV tracking report (Rel-18, TS 23.256): once the aerial UE
                 // is registered, periodically report its position so the AMF
                 // can run the geofence and enforce flight authorization. The
@@ -924,21 +884,7 @@ impl UeApp {
                             // a strict peer always wraps N1 SM containers
                             // (TS 24.501 Section 5.4.5).
                             if pdu.len() >= 4 && pdu.data()[0] == 0x7E {
-                                // MINT (Rel-18, TS 23.761): on the shared radio
-                                // connection, route the downlink to a secondary
-                                // subscription's MM context when it owns the
-                                // in-flight procedure; otherwise to the primary.
-                                if let Some(index) = mint_secondary.owns_pending_downlink() {
-                                    process_secondary_downlink(
-                                        index,
-                                        pdu.data(),
-                                        &mut mint_secondary,
-                                        &task_base,
-                                        &tun_tx,
-                                        &mut pdu_counter,
-                                    )
-                                    .await;
-                                } else {
+                                {
                                     let outs = orch.handle_downlink(pdu.data());
                                     process_mm_outputs(
                                         outs,
@@ -1340,13 +1286,9 @@ impl UeApp {
                                     _ => None,
                                 }
                             });
-                            // MINT (Rel-18, TS 23.761): a CLI-triggered session
-                            // also routes to the subscription mapped to its DNN.
-                            let subscription_index = task_base
-                                .config
-                                .mint_config
-                                .as_ref()
-                                .map_or(0, |m| m.subscription_for_dnn(dnn.as_deref()));
+                            // MINT (Rel-18, TS 23.761, #419): a CLI-triggered
+                            // session is this instance's, so its subscription's.
+                            let subscription_index = task_base.config.subscription_index();
                             let params = SmSessionParams {
                                 session_type: requested_type,
                                 ssc_mode: SscModeValue::SscMode1,
@@ -1616,13 +1558,13 @@ async fn process_mm_outputs(
                     // Give the core a moment to finish the registration
                     // path before requesting the PDU session
                     tokio::time::sleep(Duration::from_millis(500)).await;
-                    // MINT (Rel-18, TS 23.761): the primary subscription only
-                    // establishes sessions routed to it (subscription_index 0);
-                    // secondary-SUPI sessions are established by the MINT driver
-                    // under their own SUPI's context.
+                    // MINT (Rel-18, TS 23.761, #419): this instance establishes
+                    // the sessions the DNN map routes to its subscription; the
+                    // others are another subscription's, in its own instance.
+                    let own = task_base.config.subscription_index();
                     let primary_params: Vec<_> = sm_session_params
                         .iter()
-                        .filter(|p| p.subscription_index == 0)
+                        .filter(|p| p.subscription_index == own)
                         .cloned()
                         .collect();
                     let outs = sm_orch.establish_default_sessions(&primary_params);
@@ -1863,265 +1805,6 @@ async fn process_sm_outputs(
 /// transmit its NAS PDUs over the shared radio connection, and on its
 /// registration success report the subscription to the MINT task and establish
 /// the PDU sessions routed to this subscription's SUPI under its own context.
-async fn process_secondary_mm_outputs(
-    index: u8,
-    outputs: Vec<nextgsim_ue::nas::mm::MmOutput>,
-    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
-    task_base: &UeTaskBase,
-    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
-    pdu_counter: &mut u32,
-) {
-    use nextgsim_ue::nas::mm::MmOutput;
-
-    for output in outputs {
-        match output {
-            MmOutput::SendNasPdu(nas_pdu) => {
-                *pdu_counter += 1;
-                let _ = task_base
-                    .rrc_tx
-                    .send(RrcMessage::UplinkNasDelivery {
-                        pdu_id: *pdu_counter,
-                        pdu: nas_pdu.into(),
-                    })
-                    .await;
-            }
-            MmOutput::RegistrationSucceeded => {
-                info!("MINT: secondary subscription {index} registered");
-                // Report the secondary registration to the MINT task so it
-                // tracks per-SUPI state (TS 23.761).
-                if let Some(ref rel18) = task_base.rel18 {
-                    let supi = mint_secondary
-                        .get_mut(index)
-                        .map(|s| s.supi.clone())
-                        .unwrap_or_default();
-                    let _ = supi; // SUPI is tracked by index in the MINT task
-                    let _ = rel18
-                        .mint_tx
-                        .send(MintMessage::RegistrationUpdate {
-                            subscription_index: index,
-                            registered: true,
-                            serving_plmn: Some((
-                                task_base.config.hplmn.mcc,
-                                task_base.config.hplmn.mnc,
-                            )),
-                            guti: None,
-                        })
-                        .await;
-                }
-                // Establish this subscription's PDU sessions (routed by DNN to
-                // this SUPI) under its own MM/security context, so the SMF
-                // resolves SUPI-N's subscription in UDM/UDR.
-                let params = nextgsim_ue::nas::mm::MintSecondary::session_params_for(
-                    &task_base.config,
-                    index,
-                );
-                if let Some(sub) = mint_secondary.get_mut(index) {
-                    if sub.sm.active_sessions().is_empty() && !params.is_empty() {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                        let sm_outs = sub.sm.establish_default_sessions(&params);
-                        process_secondary_sm_outputs(
-                            index,
-                            sm_outs,
-                            mint_secondary,
-                            task_base,
-                            tun_tx,
-                            pdu_counter,
-                        )
-                        .await;
-                    }
-                }
-            }
-            MmOutput::EquivalentPlmnsUpdated(plmns) => {
-                // A MINT secondary subscription does not drive the primary
-                // PLMN selector; its equivalent-PLMN list is tracked per-SUPI
-                // by the secondary context only (TS 23.761 / TS 23.122).
-                tracing::debug!(
-                    "MINT: secondary subscription {index} equivalent-PLMN list ({} entries)",
-                    plmns.len()
-                );
-            }
-            MmOutput::RegistrationFailed(cause) => {
-                warn!("MINT: secondary subscription {index} registration failed: {cause:?}");
-            }
-            MmOutput::AuthenticationRejected => {
-                warn!("MINT: secondary subscription {index} authentication rejected");
-            }
-            MmOutput::PlmnSearchNeeded => {
-                warn!("MINT: secondary subscription {index} requested PLMN search (ignored)");
-            }
-            MmOutput::NotHandled(plain) => {
-                // Dispatch a plain 5GMM message the secondary orchestrator does
-                // not own (e.g. DL NAS Transport carrying its 5GSM responses).
-                if plain.len() >= 3
-                    && plain[2] == u8::from(nextgsim_nas::enums::MmMessageType::DlNasTransport)
-                {
-                    use nextgsim_nas::messages::mm::DlNasTransport;
-                    if let Ok(dl) = DlNasTransport::decode(&mut &plain[3..]) {
-                        if let Some(sub) = mint_secondary.get_mut(index) {
-                            let sm_outs = sub.sm.handle_dl_nas_transport(&dl);
-                            process_secondary_sm_outputs(
-                                index,
-                                sm_outs,
-                                mint_secondary,
-                                task_base,
-                                tun_tx,
-                                pdu_counter,
-                            )
-                            .await;
-                        }
-                    }
-                }
-            }
-            MmOutput::AsSecurityKgnb(_kgnb) => {
-                // A MINT secondary subscription shares the primary UE's AS/RRC
-                // security context; it never drives an independent AS
-                // SecurityModeCommand, so its KgNB is not plumbed to RRC.
-                tracing::debug!(
-                    "MINT: secondary subscription {index} KgNB derived (not used for AS security)"
-                );
-            }
-            MmOutput::NetworkPduSessionStatus(status) => {
-                // A MINT secondary subscription's sessions live in its own
-                // SmOrchestrator, which this function does not hold -- it drives
-                // `mint_secondary`, whose sessions are reconciled by
-                // `process_secondary_sm_outputs`. Reconciling the PRIMARY
-                // orchestrator against a secondary's Accept would release the
-                // wrong UE's sessions, so this is recorded and not acted on.
-                tracing::debug!(
-                    "MINT: secondary subscription {index} PDU session status {status:#06x} \
-                     not reconciled (secondary session state is held separately)"
-                );
-            }
-            MmOutput::ReleasePduSessionsLocally => {
-                // As above: a secondary's sessions are not held here.
-                tracing::debug!(
-                    "MINT: secondary subscription {index} de-registered by the network; \
-                     its sessions are not held here"
-                );
-            }
-            MmOutput::ReleaseConnectionLocally => {
-                // The radio connection is shared with the primary subscription;
-                // a secondary's registration timeout must not tear it down.
-                tracing::debug!(
-                    "MINT: secondary subscription {index} T3510 expired; shared RRC connection kept"
-                );
-            }
-            MmOutput::ForbiddenTaisChanged { .. } => {
-                // Cell selection follows the primary subscription.
-                tracing::debug!(
-                    "MINT: secondary subscription {index} forbidden-TA lists changed (not applied to cell selection)"
-                );
-            }
-        }
-    }
-}
-
-/// Process a downlink NAS PDU for a MINT secondary subscription's MM context.
-async fn process_secondary_downlink(
-    index: u8,
-    pdu: &[u8],
-    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
-    task_base: &UeTaskBase,
-    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
-    pdu_counter: &mut u32,
-) {
-    let outs = match mint_secondary.get_mut(index) {
-        Some(sub) => sub.mm.handle_downlink(pdu),
-        None => return,
-    };
-    process_secondary_mm_outputs(index, outs, mint_secondary, task_base, tun_tx, pdu_counter).await;
-}
-
-/// Deliver a MINT secondary subscription's SM outputs: protect the UL NAS
-/// Transport with that subscription's MM security context and transmit it,
-/// and manage TUN interfaces for its session lifecycle (Rel-18, TS 23.761).
-async fn process_secondary_sm_outputs(
-    index: u8,
-    outputs: Vec<nextgsim_ue::nas::sm::SmOutput>,
-    mint_secondary: &mut nextgsim_ue::nas::mm::MintSecondary,
-    task_base: &UeTaskBase,
-    tun_tx: &tokio::sync::mpsc::Sender<TunMessage>,
-    pdu_counter: &mut u32,
-) {
-    use nextgsim_ue::nas::sm::SmOutput;
-
-    for output in outputs {
-        match output {
-            SmOutput::SendNasPdu(plain) => {
-                let pdu = match mint_secondary.get_mut(index) {
-                    Some(sub) => sub.mm.protect_if_active(plain),
-                    None => return,
-                };
-                *pdu_counter += 1;
-                let _ = task_base
-                    .rrc_tx
-                    .send(RrcMessage::UplinkNasDelivery {
-                        pdu_id: *pdu_counter,
-                        pdu: pdu.into(),
-                    })
-                    .await;
-            }
-            SmOutput::SessionEstablished { psi, ipv4 } => {
-                info!(
-                    "MINT: secondary subscription {index} PDU session {psi} ACTIVE (IPv4: {ipv4:?})"
-                );
-                // Report the session to the MINT task (per-SUPI session count).
-                if let Some(ref rel18) = task_base.rel18 {
-                    let _ = rel18
-                        .mint_tx
-                        .send(MintMessage::SessionUpdate {
-                            subscription_index: index,
-                            psi,
-                            active: true,
-                        })
-                        .await;
-                }
-                if let Some(ip) = ipv4 {
-                    let address = Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]);
-                    let _ = tun_tx
-                        .send(TunMessage::CreateInterface {
-                            psi: i32::from(psi),
-                            address,
-                            netmask: Ipv4Addr::new(255, 255, 255, 0),
-                        })
-                        .await;
-                }
-            }
-            SmOutput::SessionEstablishmentFailed { psi, cause } => {
-                warn!(
-                    "MINT: secondary subscription {index} PDU session {psi} establishment failed: {cause:?}"
-                );
-            }
-            SmOutput::SessionReleased { psi } => {
-                info!("MINT: secondary subscription {index} PDU session {psi} released");
-                if let Some(ref rel18) = task_base.rel18 {
-                    let _ = rel18
-                        .mint_tx
-                        .send(MintMessage::SessionUpdate {
-                            subscription_index: index,
-                            psi,
-                            active: false,
-                        })
-                        .await;
-                }
-                let _ = tun_tx
-                    .send(TunMessage::DestroyInterface {
-                        psi: i32::from(psi),
-                    })
-                    .await;
-            }
-            SmOutput::SessionModified { psi } => {
-                info!("MINT: secondary subscription {index} PDU session {psi} modified");
-            }
-            SmOutput::SessionModificationFailed { psi, cause } => {
-                warn!(
-                    "MINT: secondary subscription {index} PDU session {psi} modification failed: {cause:?}"
-                );
-            }
-        }
-    }
-}
-
 /// Run TS 23.122 automatic PLMN selection: feed the selector with the MM
 /// orchestrator's forbidden-PLMN list and either trigger a registration
 /// attempt on the selected PLMN or enter limited service.
@@ -2218,7 +1901,7 @@ async fn notify_rel18_registration(task_base: &UeTaskBase, registered: bool) {
     let _ = rel18
         .mint_tx
         .send(MintMessage::RegistrationUpdate {
-            subscription_index: 0,
+            subscription_index: task_base.config.subscription_index(),
             registered,
             serving_plmn,
             guti: None,
@@ -2591,32 +2274,34 @@ async fn run_ue(options: UeOptions) -> Result<()> {
 
     // Create and run UE instances
     let mut ue_apps: Vec<UeApp> = Vec::new();
+    let mut next_instance: u32 = 0;
+    // Every instance's configuration first: two instances registering one
+    // SUPI would take each other's registration over at the AMF (#427 review)
+    let all_configs = all_ue_instance_configs(&base_config, options.num_ue)?;
 
-    for i in 0..options.num_ue {
-        // Clone config for each UE instance
-        let mut config = base_config.clone();
-
-        // Increment IMSI for multi-UE scenarios
-        if options.num_ue > 1 {
-            if let Some(ref supi) = base_config.supi {
-                let new_imsi = increment_imsi(&supi.to_string(), i as u64)?;
-                config.supi = Some(nextgsim_common::Supi::imsi(new_imsi));
-            }
-        }
-
+    for (i, configs) in (0..options.num_ue).zip(all_configs) {
         // Apply tempo delay between UE starts
         if i > 0 && options.tempo > 0 {
             info!("Waiting {}ms before starting UE {}...", options.tempo, i);
             tokio::time::sleep(Duration::from_millis(options.tempo)).await;
         }
 
-        // Create UE instance
-        info!("Starting UE instance {}...", i);
-        let ue_app = UeApp::new(config, i, options.disable_cmd).await?;
-        ue_apps.push(ue_app);
+        // MINT (Rel-18, TS 23.761, #419): each subscription runs as its own
+        // UE instance -- its own RLS identity, RRC connection, NAS and TUN --
+        // as two UEs would (TS 23.501 §5.38: each USIM registers on its own).
+        for sub_config in configs {
+            let instance = next_instance;
+            next_instance += 1;
+            info!(
+                "Starting UE instance {instance} (subscription {})...",
+                sub_config.subscription_index()
+            );
+            let ue_app = UeApp::new(sub_config, instance, options.disable_cmd).await?;
+            ue_apps.push(ue_app);
+        }
     }
 
-    info!("All {} UE instance(s) started", options.num_ue);
+    info!("All {} UE instance(s) started", ue_apps.len());
 
     // Wait for shutdown signal
     signal::ctrl_c().await?;
@@ -2632,6 +2317,55 @@ async fn run_ue(options: UeOptions) -> Result<()> {
 
 /// Increments an IMSI string by a given offset.
 /// IMSI is a 15-digit string, and we increment the numeric value.
+/// The configurations of UE `i` of `num_ue`, one per MINT subscription
+/// (#419): the IMSIs incremented by `i` when there are several UEs, the
+/// secondary SUPIs too so two UEs share none, then
+/// [`UeConfig::subscription_configs`]. Each is started as its own UE instance
+/// -- its own RLS identity, RRC connection, NAS and TUN.
+fn ue_instance_configs(base: &UeConfig, i: u32, num_ue: u32) -> Result<Vec<UeConfig>> {
+    let mut config = base.clone();
+    if num_ue > 1 {
+        // Strided by the number of subscriptions per UE (#427 review): with
+        // consecutive primary and secondary SUPIs (…001, …002) UE i gets
+        // …001 + i·2 and …002 + i·2, so the ranges interleave rather than
+        // meet. One subscription per UE keeps the stride of 1.
+        let stride = 1 + config.subscription_configs().len().saturating_sub(1) as u64;
+        let offset = u64::from(i) * stride;
+        if let Some(ref supi) = base.supi {
+            let new_imsi = increment_imsi(&supi.to_string(), offset)?;
+            config.supi = Some(nextgsim_common::Supi::imsi(new_imsi));
+        }
+        if let Some(mint) = config.mint_config.as_mut() {
+            for supi in &mut mint.secondary_supis {
+                *supi = increment_imsi(supi, offset)?;
+            }
+        }
+    }
+    Ok(config.subscription_configs())
+}
+
+/// [`ue_instance_configs`] of every UE `0..num_ue`, refused when two
+/// instances would register the same SUPI -- the `--num-ue` increments of
+/// consecutive primary and secondary SUPIs can meet (#427 review); the AMF
+/// would treat the second registration as the first UE's.
+fn all_ue_instance_configs(base: &UeConfig, num_ue: u32) -> Result<Vec<Vec<UeConfig>>> {
+    let all: Vec<Vec<UeConfig>> = (0..num_ue)
+        .map(|i| ue_instance_configs(base, i, num_ue))
+        .collect::<Result<_>>()?;
+    let mut seen = std::collections::BTreeSet::new();
+    for supi in all.iter().flatten().filter_map(|c| c.supi.as_ref()) {
+        let supi = supi.to_string();
+        if !seen.insert(supi.clone()) {
+            anyhow::bail!(
+                "two UE instances would register {supi}: with --num-ue {num_ue} the incremented \
+                 primary and MINT secondary SUPIs overlap; space the secondary SUPIs at least \
+                 {num_ue} apart from the primary's"
+            );
+        }
+    }
+    Ok(all)
+}
+
 fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
     // Remove "imsi-" prefix if present
     let digits = if let Some(stripped) = imsi.strip_prefix("imsi-") {
@@ -2653,6 +2387,106 @@ fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #419: a MINT UE runs one instance per subscription. Each has its own
+    /// SUPI and subscription index and establishes the sessions the DNN map
+    /// routes to it; with several UEs the secondary SUPIs are incremented
+    /// with the primary, so no two instances share a SUPI.
+    #[test]
+    fn a_mint_ue_runs_one_instance_per_subscription() {
+        use nextgsim_common::config::{DnnSubscription, MintConfig};
+        use nextgsim_ue::nas::sm::SmSessionParams;
+        let mut base = UeConfig {
+            supi: Some(nextgsim_common::Supi::imsi("999700000000001".to_string())),
+            mint_config: Some(MintConfig {
+                enabled: true,
+                secondary_supis: vec!["999700000000101".to_string()],
+                active_subscription: 0,
+                simultaneous_registration: true,
+                dnn_subscription_map: vec![DnnSubscription {
+                    dnn: "enterprise".to_string(),
+                    subscription_index: 1,
+                }],
+                disaster_roaming: false,
+            }),
+            ..UeConfig::default()
+        };
+        base.sessions = ["internet", "enterprise"]
+            .iter()
+            .map(|d| nextgsim_common::config::SessionConfig {
+                session_type: nextgsim_common::config::PduSessionType::Ipv4,
+                s_nssai: None,
+                apn: Some((*d).to_string()),
+                is_emergency: false,
+                requested_5qi: None,
+            })
+            .collect();
+
+        let ues: Vec<Vec<UeConfig>> = (0..2)
+            .map(|i| ue_instance_configs(&base, i, 2).unwrap())
+            .collect();
+        let supis: Vec<String> = ues
+            .iter()
+            .flatten()
+            .map(|c| c.supi.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            supis,
+            [
+                "imsi-999700000000001",
+                "imsi-999700000000101",
+                "imsi-999700000000003",
+                "imsi-999700000000103"
+            ]
+        );
+        for configs in &ues {
+            for (index, c) in configs.iter().enumerate() {
+                assert_eq!(usize::from(c.subscription_index()), index);
+                // The sessions this instance establishes (main loop filter)
+                let own: Vec<_> = SmSessionParams::from_config(c)
+                    .into_iter()
+                    .filter(|p| p.subscription_index == c.subscription_index())
+                    .map(|p| p.dnn.unwrap())
+                    .collect();
+                assert_eq!(own, [["internet"], ["enterprise"]][index]);
+            }
+        }
+        assert_eq!(
+            ue_instance_configs(&UeConfig::default(), 0, 1)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // #427 review: consecutive SUPIs (the shipped example, …001 and …002)
+        // with --num-ue 2 are strided apart, not met
+        base.mint_config.as_mut().unwrap().secondary_supis = vec!["999700000000002".into()];
+        let supis: Vec<String> = all_ue_instance_configs(&base, 2)
+            .unwrap()
+            .iter()
+            .flatten()
+            .map(|c| c.supi.as_ref().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            supis,
+            [
+                "imsi-999700000000001",
+                "imsi-999700000000002",
+                "imsi-999700000000003",
+                "imsi-999700000000004"
+            ]
+        );
+        // SUPIs that would still meet (…001 and …003, stride 2) are refused
+        // at startup, naming the SUPI
+        base.mint_config.as_mut().unwrap().secondary_supis = vec!["999700000000003".into()];
+        let err = all_ue_instance_configs(&base, 2).unwrap_err().to_string();
+        assert!(err.contains("imsi-999700000000003"), "{err}");
+        assert!(
+            all_ue_instance_configs(&base, 1).is_ok(),
+            "one UE: no overlap"
+        );
+    }
+
     use clap::CommandFactory;
 
     #[test]

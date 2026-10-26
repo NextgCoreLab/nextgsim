@@ -25,7 +25,6 @@
 mod config_update;
 mod deregistration;
 mod emergency;
-mod mint;
 mod orchestrator;
 mod persistence;
 mod service_request;
@@ -36,7 +35,6 @@ mod uuaa;
 pub use config_update::*;
 pub use deregistration::*;
 pub use emergency::*;
-pub use mint::*;
 pub use orchestrator::*;
 pub use persistence::*;
 pub use service_request::*;
