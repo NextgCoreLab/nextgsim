@@ -118,11 +118,18 @@ sessions:
   #   requested_5qi: 82
 
 # MINT (Multi-IMSI / multi-USIM) configuration, Rel-18 (TS 23.761).
-# Models a UE holding more than one subscription (SUPI). After the primary
-# subscription registers, the UE initiates a simultaneous registration for each
-# secondary SUPI (its own SUCI/GUTI/security context). A PDU session whose DNN
-# matches dnn_subscription_map is established under the mapped subscription's
-# SUPI, so the core resolves that SUPI's subscription in UDM/UDR.
+# Models a UE holding more than one subscription (SUPI). Each subscription runs
+# as its own UE instance -- its own RLS identity, RRC connection, NAS and TUN
+# interface -- so the gNB and the core see one UE per SUPI (TS 23.501 §5.38,
+# nextgsim #419). A PDU session whose DNN matches dnn_subscription_map is
+# established by the mapped subscription's instance. `active_subscription` is
+# set per instance by the UE itself; leave it 0 here.
+#
+# The instances share one network namespace, and their PDU session addresses
+# can share a subnet. With strict reverse-path filtering the kernel then drops
+# the downlink of all but the first interface: run with
+# net.ipv4.conf.all.rp_filter=2 (loose), e.g. `docker run --sysctl
+# net.ipv4.conf.all.rp_filter=2 --sysctl net.ipv4.conf.default.rp_filter=2`.
 #
 # To demonstrate: provision the secondary subscriber in nextgcore MongoDB
 # (docs/assets/webui/mongo-init.js seeds IMSI 999700000000002), add an

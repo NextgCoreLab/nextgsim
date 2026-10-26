@@ -14,6 +14,32 @@ use super::config::TunConfig;
 use super::interface::{TunInterface, TunWriter};
 use super::packet::{is_valid_ip_packet, IpPacket};
 
+/// The `<prefix><N>` interface indices in use in this process, across every UE
+/// instance's TUN task (#419): a MINT subscription, like each `--num-ue` UE,
+/// is its own instance with its own TUN task, and they share the host's
+/// interface namespace. Before, every interface was named the bare prefix, so
+/// a second one failed with EBUSY.
+static TUN_INDICES: std::sync::Mutex<std::collections::BTreeSet<u32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// The lowest free interface index, now in use.
+fn allocate_tun_index() -> u32 {
+    let mut used = TUN_INDICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = (0..).find(|i| !used.contains(i)).unwrap_or(0);
+    used.insert(index);
+    index
+}
+
+/// Gives interface index `index` back.
+fn release_tun_index(index: u32) {
+    TUN_INDICES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&index);
+}
+
 /// TUN task configuration
 #[derive(Debug, Clone)]
 pub struct TunTaskConfig {
@@ -105,6 +131,8 @@ pub struct TunTask {
     /// the device outlived the session, and re-creating it for the next session
     /// failed with EBUSY (nextgsim #272).
     readers: HashMap<i32, tokio::task::JoinHandle<()>>,
+    /// Each interface's index in its `<prefix><N>` name (#419).
+    indices: HashMap<i32, u32>,
 }
 
 impl TunTask {
@@ -115,6 +143,7 @@ impl TunTask {
             app_tx,
             interfaces: HashMap::new(),
             readers: HashMap::new(),
+            indices: HashMap::new(),
         }
     }
 
@@ -174,8 +203,10 @@ impl TunTask {
             return;
         }
 
+        let index = allocate_tun_index();
         let config = TunConfig::builder()
             .name_prefix(&self.config.name_prefix)
+            .name(format!("{}{index}", self.config.name_prefix))
             .address(address)
             .netmask(netmask)
             .mtu(self.config.mtu)
@@ -195,6 +226,7 @@ impl TunTask {
 
                 // Store the writer for downlink data
                 self.interfaces.insert(psi, writer);
+                self.indices.insert(psi, index);
 
                 // Spawn reader task for uplink data
                 let app_tx = self.app_tx.clone();
@@ -256,6 +288,7 @@ impl TunTask {
                     .await;
             }
             Err(e) => {
+                release_tun_index(index);
                 error!("Failed to create TUN interface for PSI {}: {}", psi, e);
                 let _ = self
                     .app_tx
@@ -269,6 +302,9 @@ impl TunTask {
 
     /// Destroy a TUN interface
     async fn destroy_interface(&mut self, psi: i32) {
+        if let Some(index) = self.indices.remove(&psi) {
+            release_tun_index(index);
+        }
         if let Some(interface) = self.interfaces.remove(&psi) {
             // Stop the reader and wait for it, so its half of the device is
             // dropped and the device is closed before this returns.
@@ -406,6 +442,29 @@ mod tests {
         let config = TunTaskConfig::default();
         assert_eq!(config.name_prefix, "uesimtun");
         assert_eq!(config.mtu, 1400);
+    }
+
+    /// #419: interface names are unique in the process, across TUN tasks:
+    /// the lowest free index, and a released one is reused.
+    #[test]
+    fn tun_indices_are_unique_and_reused() {
+        let a = allocate_tun_index();
+        let b = allocate_tun_index();
+        assert_ne!(a, b);
+        release_tun_index(a);
+        // Other tests may allocate meanwhile; a released index comes back
+        // before any higher one is handed out twice
+        let again: Vec<u32> = (0..64).map(|_| allocate_tun_index()).collect();
+        assert!(again.contains(&a), "the released index is reused");
+        assert!(!again.contains(&b), "one in use is not");
+        let mut sorted = again.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), again.len(), "no index twice");
+        release_tun_index(b);
+        for i in again {
+            release_tun_index(i);
+        }
     }
 
     #[test]

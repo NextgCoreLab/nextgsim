@@ -289,13 +289,13 @@ nextgcore. Each is inert unless set.
 | `snpn_config.nid` | string | - | Network Identifier (required inside the block), for example `"7AB01234567"`. The AMF accepts it only if it is in `AMF_SNPN_ALLOWED_NIDS` (or that variable is unset), otherwise rejects with 5GMM cause #75 |
 | `snpn_config.cag_ids` | list of u32 | `[]` | Closed Access Group IDs |
 | `snpn_config.onboarding_enabled` | bool | false | Request SNPN onboarding |
-| `mint_config` | object | none | **MINT** / disaster roaming (TS 23.761). After the primary registers, the UE registers each secondary SUPI |
-| `mint_config.enabled` | bool | false | Enable the secondary-subscription driver |
+| `mint_config` | object | none | **MINT** / disaster roaming (TS 23.761). Each subscription runs as its own UE instance: its own RLS identity, RRC connection, NAS and `uesimtun<N>` interface, so the gNB and core see one UE per SUPI (#419). The instances share a netns; use loose reverse-path filtering (`net.ipv4.conf.all.rp_filter=2`) when their addresses share a subnet |
+| `mint_config.enabled` | bool | false | Run one UE instance per subscription |
 | `mint_config.secondary_supis` | list of string | `[]` | Secondary SUPIs; each must be provisioned in the core |
-| `mint_config.active_subscription` | u8 | 0 | Active subscription index (0 is the primary) |
+| `mint_config.active_subscription` | u8 | 0 | The subscription an instance is; set by the UE per instance, leave 0 |
 | `mint_config.simultaneous_registration` | bool | false | Register secondaries alongside the primary |
 | `mint_config.disaster_roaming` | bool | false | Set the disaster-roaming indication on secondary registrations |
-| `mint_config.dnn_subscription_map` | list of `{dnn, subscription_index}` | `[]` | Establish a DNN's PDU session under a secondary SUPI |
+| `mint_config.dnn_subscription_map` | list of `{dnn, subscription_index}` | `[]` | Which subscription's instance establishes a DNN's PDU session |
 | `uav_config` | object | none | **UAV** (TS 23.256). Registers an aerial UE and periodically sends a tracking report the AMF checks against its geofence |
 | `uav_config.is_aerial_ue` | bool | false | Register as an aerial UE |
 | `uav_config.uav_id`, `uav_config.uss_address` | string | none | CAA-level UAV ID; USS address |
