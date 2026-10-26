@@ -9059,6 +9059,76 @@ mod tests {
         assert!(carries_establishment_request(&sm_outs), "{sm_outs:?}");
     }
 
+    /// #424 review: an emergency PDU session's retransmission in
+    /// 5GMM-REGISTERED.LIMITED-SERVICE goes on the connection; in 5GMM-IDLE
+    /// it is held and the UE asks for emergency services (§5.6.1.1).
+    #[test]
+    fn a_5gsm_retransmission_in_limited_service_is_not_held() {
+        use crate::nas::drive_sm_timers;
+        use crate::nas::sm::{SmOrchestrator, SmOutput, SmSessionParams};
+        use nextgsim_nas::messages::sm::{PduSessionTypeValue, SscModeValue};
+
+        // #424 review: connected in 5GMM-REGISTERED.LIMITED-SERVICE the
+        // retransmission goes; only the lack of a connection holds it
+        let mut orch = establish_security_context();
+        let acc = protect_downlink(&orch, &build_registration_accept_pdu(true), 1);
+        orch.handle_downlink(&acc);
+        orch.state_mut().switch_cm_state(CmState::Connected);
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredLimitedService);
+        let mut sm = SmOrchestrator::new();
+        let outs = sm.start_establishment(SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: None,
+            s_nssai: None,
+            emergency: true,
+            requested_5qi: None,
+            subscription_index: 0,
+        });
+        let Some(SmOutput::SendNasPdu(request)) = outs.first().cloned() else {
+            panic!("an emergency establishment request: {outs:?}");
+        };
+        sm.expire_procedure_timers_for_test();
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty());
+        assert_eq!(sm_outs, vec![SmOutput::SendNasPdu(request)]);
+        // Nor is another session's: only the lack of a connection holds it
+        let mut other = SmOrchestrator::new();
+        let outs = other.start_establishment(SmSessionParams {
+            session_type: PduSessionTypeValue::Ipv4,
+            ssc_mode: SscModeValue::SscMode1,
+            dnn: Some("internet".to_string()),
+            s_nssai: None,
+            emergency: false,
+            requested_5qi: None,
+            subscription_index: 0,
+        });
+        let Some(SmOutput::SendNasPdu(other_request)) = outs.first().cloned() else {
+            panic!("an establishment request: {outs:?}");
+        };
+        other.expire_procedure_timers_for_test();
+        let (_, sm_outs) = drive_sm_timers(&mut orch, &mut other);
+        assert_eq!(sm_outs, vec![SmOutput::SendNasPdu(other_request)]);
+
+        // In 5GMM-IDLE it is held, and the UE asks for a connection for
+        // emergency services, which LIMITED-SERVICE still allows (§5.6.1.1)
+        orch.on_nas_signalling_connection_released();
+        orch.state_mut()
+            .switch_mm_state(MmSubState::RegisteredLimitedService);
+        sm.expire_procedure_timers_for_test();
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(sm_outs.is_empty(), "{sm_outs:?}");
+        assert!(
+            mm_outs.iter().any(|o| matches!(o, MmOutput::SendNasPdu(_))),
+            "{mm_outs:?}"
+        );
+        assert_eq!(
+            orch.pending_service_type,
+            Some(ServiceType::EmergencyServices)
+        );
+    }
+
     /// #409 follow-up, TS 24.501 §5.6.1.1: a T3580 retransmission in
     /// 5GMM-IDLE is held, and the UE sends a SERVICE REQUEST for signalling
     /// for it (once); after the Service Accept the retransmission goes.
@@ -9102,17 +9172,25 @@ mod tests {
             "one request in flight"
         );
 
+        // RRC is up, but the Service Request is unanswered: not yet
         orch.state_mut().switch_cm_state(CmState::Connected);
+        assert!(crate::nas::flush_held_sm(&orch, &mut sm).is_empty());
+        let (_, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(
+            sm_outs.is_empty(),
+            "not before the Service Accept: {sm_outs:?}"
+        );
+        // The Service Accept: out at once, not on the next tick
         let mut plain = Vec::new();
         ServiceAccept::new().encode(&mut plain);
         orch.handle_downlink(&protect_downlink(&orch, &plain, 2));
-        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
-        assert!(mm_outs.is_empty(), "{mm_outs:?}");
         assert_eq!(
-            sm_outs,
+            crate::nas::flush_held_sm(&orch, &mut sm),
             vec![SmOutput::SendNasPdu(request)],
-            "the retransmission"
+            "the retransmission, on the Service Accept"
         );
+        let (mm_outs, sm_outs) = drive_sm_timers(&mut orch, &mut sm);
+        assert!(mm_outs.is_empty() && sm_outs.is_empty(), "once");
     }
 
     /// #379, TS 24.501 §5.6.1.5 #22 / §5.6.1.7: a SERVICE REJECT #22 with T3346

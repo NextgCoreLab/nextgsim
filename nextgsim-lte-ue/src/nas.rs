@@ -192,8 +192,9 @@ impl NasLayer for EpsNas {
         // TS 24.301 Annex D Table D.1.1: attach and tracking area update are
         // "mo-Signalling"; a service request for uplink user data is
         // "mo-Data".
-        // A service request answering a paging is "mt-Access" (#351).
-        let cause = if self.ue.service_request_answers_paging() {
+        // A service request (#351) or a tracking area update (#356 review)
+        // answering a paging is "mt-Access".
+        let cause = if self.ue.initial_message_answers_paging() {
             EstablishmentCauseValue::MtAccess
         } else if self.ue.state() == EmmState::ServiceRequestInitiated {
             EstablishmentCauseValue::MoData
@@ -346,6 +347,26 @@ mod tests {
             "SERVICE REQUEST, security header type 12"
         );
         assert_eq!(initial.s_tmsi, Some((0x01, 0xC000_0001)));
+    }
+
+    /// #356 review, TS 24.301 Annex D Table D.1.1: a TRACKING AREA UPDATE
+    /// REQUEST that answers a paging goes with cause mt-Access; one that
+    /// does not, mo-Signalling.
+    #[test]
+    fn a_tracking_area_update_answering_a_paging_is_mt_access() {
+        let mut nas = registered();
+        nas.on_serving_cell(2);
+        assert!(nas.on_paging(&OUR_S_TMSI));
+        let initial = nas.initial_nas().expect("the paging response");
+        assert_eq!(initial.cause, EstablishmentCauseValue::MtAccess);
+        assert_eq!(initial.nas[0], 0x17, "integrity protected, not ciphered");
+        assert_eq!(initial.nas[7], 0x48, "TRACKING AREA UPDATE REQUEST");
+
+        let mut nas = registered();
+        nas.on_serving_cell(2);
+        let initial = nas.initial_nas().expect("the TA update");
+        assert_eq!(initial.nas[7], 0x48);
+        assert_eq!(initial.cause, EstablishmentCauseValue::MoSignalling);
     }
 
     /// Another UE's S-TMSI is not this UE's paging: no connection, nothing owed.

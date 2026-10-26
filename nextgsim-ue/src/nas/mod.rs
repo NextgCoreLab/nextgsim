@@ -38,16 +38,49 @@ pub fn drive_sm_timers(
     use nextgsim_nas::ies::ie1::ServiceType;
 
     let connected = mm.state().is_connected();
-    let sm_outs = sm.tick_with_connection(connected);
-    let mm_outs = if !connected
-        && sm.has_held_retransmission()
-        && mm.state().mm_substate() == mm::MmSubState::RegisteredNormalService
+    let sm_outs = sm.tick_with_transport(connected, sm_transport_ready(mm));
+    let substate = mm.state().mm_substate();
+    let mm_outs = if connected || !sm.has_held_retransmission() {
+        Vec::new()
+    } else if sm.has_held_emergency_retransmission()
+        && matches!(
+            substate,
+            mm::MmSubState::RegisteredNormalService | mm::MmSubState::RegisteredLimitedService
+        )
     {
+        // §5.6.1.1 / §5.6.1.2: service type "emergency services", which a UE
+        // in 5GMM-REGISTERED.LIMITED-SERVICE may still ask for (#424 review)
+        mm.start_service_request(ServiceType::EmergencyServices, None)
+    } else if substate == mm::MmSubState::RegisteredNormalService {
         mm.start_service_request(ServiceType::Signalling, None)
     } else {
         Vec::new()
     };
     (mm_outs, sm_outs)
+}
+
+/// Whether a 5GSM message can go now: a NAS signalling connection, and not
+/// while the SERVICE REQUEST that asked for it is still unanswered (#420
+/// review). Any 5GMM-REGISTERED substate, LIMITED-SERVICE included (#424
+/// review): only the lack of a connection holds a retransmission back.
+fn sm_transport_ready(mm: &mm::MmOrchestrator) -> bool {
+    mm.state().is_connected() && mm.state().mm_state() != mm::MmState::ServiceRequestInitiated
+}
+
+/// The held 5GSM retransmissions, once the connection a SERVICE REQUEST asked
+/// for is up (#420 review): call after each downlink NAS message, so they go
+/// on the Service Accept rather than on the next tick.
+pub fn flush_held_sm(mm: &mm::MmOrchestrator, sm: &mut sm::SmOrchestrator) -> Vec<sm::SmOutput> {
+    if !sm.has_held_retransmission() {
+        Vec::new()
+    } else if sm_transport_ready(mm) {
+        sm.take_held_retransmissions()
+    } else if mm.state().is_connected() {
+        // An emergency PDU session's goes on any connection (#424 review)
+        sm.take_held_emergency()
+    } else {
+        Vec::new()
+    }
 }
 
 /// Drive the re-attempt of configured PDU sessions whose establishment failed

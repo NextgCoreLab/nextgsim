@@ -160,6 +160,11 @@ impl Mme {
     }
 
     pub fn attach_accept(&mut self, pti: u8) -> Vec<u8> {
+        self.attach_accept_with(pti, &[])
+    }
+
+    /// ATTACH ACCEPT with `extra` optional IEs after the GUTI.
+    pub fn attach_accept_with(&mut self, pti: u8, extra: &[u8]) -> Vec<u8> {
         // ESM: EBI 5, PTI, 0xC1, QoS LV {QCI 9}, APN LV "internet", PDN address
         // LV {IPv4 10.45.0.2}.
         let mut esm = vec![0x52, pti, 0xC1, 0x01, 0x09];
@@ -175,6 +180,7 @@ impl Mme {
         m.extend_from_slice(&[
             0x50, 0x0B, 0xF6, 0x99, 0xF9, 0x07, 0x00, 0x02, 0x01, 0xC0, 0x00, 0x00, 0x01,
         ]);
+        m.extend_from_slice(extra);
         self.protect(&m, 2)
     }
 }
@@ -182,6 +188,11 @@ impl Mme {
 /// Run the attach up to and including ATTACH COMPLETE; returns the UE, the
 /// MME and the decoded ATTACH COMPLETE.
 pub fn attach() -> (EpsNasUe, Mme, Vec<u8>) {
+    attach_with(&[])
+}
+
+/// [`attach`], with `extra` optional IEs in the ATTACH ACCEPT.
+pub fn attach_with(extra: &[u8]) -> (EpsNasUe, Mme, Vec<u8>) {
     let now = Instant::now();
     let mut ue = EpsNasUe::new(cfg());
     let req = ue.initial_message(now).expect("attach due");
@@ -213,7 +224,7 @@ pub fn attach() -> (EpsNasUe, Mme, Vec<u8>) {
     assert_eq!(&plain[..2], &[0x07, 0x5E]);
     assert_eq!(plain[2], 0x23, "IMEISV requested, IMEISV sent");
 
-    let out = ue.on_downlink(&mme.attach_accept(pti), now);
+    let out = ue.on_downlink(&mme.attach_accept_with(pti, extra), now);
     let complete = mme.unprotect(&out.uplink[0]);
     (ue, mme, complete)
 }

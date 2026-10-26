@@ -448,11 +448,33 @@ fn a_lost_ta_update_attempts_again_and_answers_paging() {
     assert!(ue.on_paging(PagedWith::STmsi));
     let req = tau_request(&mut ue, &mut mme, now);
     assert_eq!(req[2], 0x18, "TA updating with the active flag");
+    assert!(
+        ue.initial_message_answers_paging(),
+        "Annex D Table D.1.1: MT access"
+    );
     ue.on_released(now);
     assert_eq!(ue.tau_attempts(), 2);
     ue.on_serving_cell(3);
     assert_eq!(ue.tau_attempts(), 0, "a new TA resets the counter");
     tau_request(&mut ue, &mut mme, now);
+    assert!(
+        !ue.initial_message_answers_paging(),
+        "not paged: originating signalling"
+    );
+}
+
+/// #356 review, §5.5.1.2.4: the T3412 extended value IE (5E, GPRS timer 3)
+/// of the ATTACH ACCEPT is T3412, over the T3412 value; a unit of 111
+/// leaves the T3412 value in force, as on the TAU ACCEPT path.
+#[test]
+fn the_attach_accepts_t3412_extended_value_is_t3412() {
+    // Unit 001 (1 h), value 2: 2 h
+    let (ue, _, _) = crate::testing::attach_with(&[0x5E, 0x01, 0x22]);
+    assert_eq!(ue.t3412(), Some(Duration::from_secs(2 * 3600)));
+    let (ue, _, _) = crate::testing::attach_with(&[0x5E, 0x01, 0xE2]);
+    assert_eq!(ue.t3412(), Some(T3412_ATTACH), "unit 111: the T3412 value");
+    let (ue, _, _) = crate::testing::attach_with(&[]);
+    assert_eq!(ue.t3412(), Some(T3412_ATTACH));
 }
 
 /// #356, §5.5.3.2.6 l): no update while T3346 runs; for a TA outside the list
