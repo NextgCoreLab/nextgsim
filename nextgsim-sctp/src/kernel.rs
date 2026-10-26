@@ -207,6 +207,43 @@ struct RawRecv {
     msg_flags: c_int,
 }
 
+/// `enum sctp_sn_type` (`<linux/sctp.h>`): counted from `SCTP_SN_TYPE_BASE`.
+const SCTP_SN_TYPE_BASE: u16 = 1 << 15;
+const SCTP_ASSOC_CHANGE: u16 = SCTP_SN_TYPE_BASE + 1;
+const SCTP_SHUTDOWN_EVENT: u16 = SCTP_SN_TYPE_BASE + 5;
+/// `enum sctp_sac_state` (`<linux/sctp.h>`).
+const SCTP_COMM_LOST: u16 = 1;
+const SCTP_RESTART: u16 = 2;
+const SCTP_SHUTDOWN_COMP: u16 = 3;
+const SCTP_CANT_STR_ASSOC: u16 = 4;
+
+/// A notification that ends the association as this node knew it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Notification {
+    Shutdown,
+    /// `SCTP_ASSOC_CHANGE` with COMM_LOST, SHUTDOWN_COMP or CANT_STR_ASSOC.
+    Lost(u16),
+    /// `SCTP_ASSOC_CHANGE` with RESTART.
+    PeerRestarted,
+}
+
+/// Classify a notification: `struct sctp_assoc_change` is `sac_type` (u16),
+/// `sac_flags` (u16), `sac_length` (u32), `sac_state` (u16), ... (RFC 6458 §6.1.1).
+fn notification_event(body: &[u8]) -> Option<Notification> {
+    let sn_type = u16::from_ne_bytes([*body.first()?, *body.get(1)?]);
+    match sn_type {
+        SCTP_SHUTDOWN_EVENT => Some(Notification::Shutdown),
+        SCTP_ASSOC_CHANGE if body.len() >= 10 => match u16::from_ne_bytes([body[8], body[9]]) {
+            SCTP_RESTART => Some(Notification::PeerRestarted),
+            s @ (SCTP_COMM_LOST | SCTP_SHUTDOWN_COMP | SCTP_CANT_STR_ASSOC) => {
+                Some(Notification::Lost(s))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// One `sctp_recvmsg` on `fd` into a `cap`-byte buffer. `Err` carries errno,
 /// so EAGAIN surfaces as [`io::ErrorKind::WouldBlock`] — never as data.
 fn raw_recvmsg(fd: RawFd, cap: usize) -> io::Result<RawRecv> {
@@ -711,40 +748,35 @@ impl KernelSctpAssociation {
     }
 
     /// Inspect an SCTP notification body and update `established` if it
-    /// indicates the association is gone (SHUTDOWN / COMM_LOST).
+    /// indicates the association is gone or its peer restarted.
     ///
     /// The notification body begins with a `sctp_notification` whose first
-    /// `u16` is `sn_type`. We only need to distinguish the terminal events.
+    /// `u16` is `sn_type` (`enum sctp_sn_type` in `<linux/sctp.h>`, counted from
+    /// `SCTP_SN_TYPE_BASE = 1 << 15`; RFC 6458 §6.1 leaves the numbers to the
+    /// implementation). Until #430 the types were 0x0001 / 0x0006 and the states
+    /// off by one, so no notification ever matched.
+    ///
+    /// A peer restart (`SCTP_RESTART`, RFC 6458 §6.1.1, RFC 9260 §5.2.2): the AMF
+    /// or MME lost its association state, so what this node set up over it (NG or
+    /// S1 Setup, UE contexts) is gone at the peer. The association is reported
+    /// down, which runs the existing teardown and a fresh Setup.
     fn handle_notification_state(&mut self, body: &[u8]) {
-        // sctp_assoc_change == 0x0001; sctp_shutdown_event == 0x0006 (UAPI).
-        const SCTP_ASSOC_CHANGE: u16 = 0x0001;
-        const SCTP_SHUTDOWN_EVENT: u16 = 0x0006;
-        // sac_state for SCTP_ASSOC_CHANGE: SCTP_COMM_LOST == 2, SCTP_SHUTDOWN_COMP == 4.
-        const SCTP_COMM_LOST: u16 = 2;
-        const SCTP_SHUTDOWN_COMP: u16 = 4;
-
-        if body.len() < 2 {
-            return;
-        }
-        let sn_type = u16::from_ne_bytes([body[0], body[1]]);
-        match sn_type {
-            SCTP_SHUTDOWN_EVENT => {
-                info!("Kernel SCTP SHUTDOWN_EVENT — association closing");
-                self.established = false;
-            }
-            // struct sctp_assoc_change: sn_type(u16), sn_flags(u16),
-            // sn_length(u32), sac_state(u16), ...
-            SCTP_ASSOC_CHANGE if body.len() >= 10 => {
-                let sac_state = u16::from_ne_bytes([body[8], body[9]]);
-                if sac_state == SCTP_COMM_LOST || sac_state == SCTP_SHUTDOWN_COMP {
-                    info!(
-                        "Kernel SCTP ASSOC_CHANGE state={} — association lost",
-                        sac_state
+        if let Some(event) = notification_event(body) {
+            match event {
+                Notification::Shutdown => {
+                    info!("Kernel SCTP SHUTDOWN_EVENT — association closing");
+                }
+                Notification::Lost(state) => {
+                    info!("Kernel SCTP ASSOC_CHANGE state={state} — association lost");
+                }
+                Notification::PeerRestarted => {
+                    warn!(
+                        "Kernel SCTP ASSOC_CHANGE SCTP_RESTART — the peer restarted; the \
+                         association is torn down so the Setup is redone"
                     );
-                    self.established = false;
                 }
             }
-            _ => {}
+            self.established = false;
         }
     }
 
@@ -1162,6 +1194,121 @@ mod tests {
             .expect("recv returns once the peer has shut down");
         assert!(matches!(end, Ok(None)), "EOF, got {end:?}");
         assert!(!client.is_established());
+        server.join().expect("server thread");
+    }
+
+    /// #430: notifications decode with `<linux/sctp.h>`'s numbers (sn_type from
+    /// 0x8000, sac_state COMM_UP 0 .. CANT_STR_ASSOC 4).
+    #[test]
+    fn notifications_decode_with_the_kernels_numbers() {
+        use super::{notification_event, Notification};
+        let assoc = |state: u16| {
+            let mut b = vec![0u8; 20];
+            b[..2].copy_from_slice(&0x8001u16.to_ne_bytes());
+            b[8..10].copy_from_slice(&state.to_ne_bytes());
+            b
+        };
+        assert_eq!(notification_event(&assoc(0)), None, "COMM_UP");
+        assert_eq!(notification_event(&assoc(1)), Some(Notification::Lost(1)));
+        assert_eq!(
+            notification_event(&assoc(2)),
+            Some(Notification::PeerRestarted)
+        );
+        assert_eq!(notification_event(&assoc(3)), Some(Notification::Lost(3)));
+        assert_eq!(
+            notification_event(&0x8005u16.to_ne_bytes()),
+            Some(Notification::Shutdown)
+        );
+        assert_eq!(
+            notification_event(&1u16.to_ne_bytes()),
+            None,
+            "the old number"
+        );
+    }
+
+    /// #430: the AMF/MME aborts (SO_LINGER 0). The client learns it from the
+    /// `SCTP_ASSOC_CHANGE` / `COMM_LOST` notification: `try_recv` reports the
+    /// association closed and `is_established` is false.
+    #[tokio::test]
+    async fn a_peer_abort_is_seen_by_its_notification() {
+        let Some((addr, server)) = kernel_server(|conn| {
+            conn.set_linger(Some(std::time::Duration::ZERO))
+                .expect("SO_LINGER");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            drop(conn);
+        }) else {
+            return;
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let mut client =
+            super::KernelSctpAssociation::connect(any, addr, &SctpConfig::default(), S1AP_PPID)
+                .await
+                .expect("connect");
+        server.join().expect("server thread");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut closed = false;
+        while std::time::Instant::now() < deadline {
+            match client.try_recv() {
+                Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                Ok(Some(m)) => panic!("unexpected data {m:?}"),
+                Err(crate::SctpError::AssociationClosed) => {
+                    closed = true;
+                    break;
+                }
+                Err(e) => panic!("the notification, not an error, ends it: {e:?}"),
+            }
+        }
+        assert!(closed, "the ABORT is seen");
+        assert!(!client.is_established());
+    }
+
+    /// #430: an `SCTP_ASSOC_CHANGE` / `SCTP_RESTART` notification (the peer
+    /// restarted, RFC 6458 §6.1.1, RFC 9260 §5.2.2) on a live association reaches
+    /// its handler: the receive step reports the association down, so the gNB's
+    /// teardown runs and its Setup is redone.
+    ///
+    /// The notification is fed to the real association's `classify` (the step
+    /// every `sctp_recvmsg` goes through). A kernel RESTART cannot be produced on
+    /// one host: the restarted peer's INIT reuses the 4-tuple of the old
+    /// association, which the same kernel still holds, so `connect` fails with
+    /// EADDRNOTAVAIL until that association is gone, and closing it sends a
+    /// SHUTDOWN or ABORT first.
+    #[tokio::test]
+    async fn a_peer_restart_reaches_the_handler() {
+        let Some((addr, server)) = kernel_server(|_conn| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }) else {
+            return;
+        };
+        let any: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let mut client =
+            super::KernelSctpAssociation::connect(any, addr, &SctpConfig::default(), S1AP_PPID)
+                .await
+                .expect("connect");
+        assert!(client.is_established());
+        // struct sctp_assoc_change: sac_type SCTP_ASSOC_CHANGE (0x8001), flags,
+        // length 20, sac_state SCTP_RESTART (2), ...
+        let mut body = vec![0u8; 20];
+        body[..2].copy_from_slice(&0x8001u16.to_ne_bytes());
+        body[4..8].copy_from_slice(&20u32.to_ne_bytes());
+        body[8..10].copy_from_slice(&2u16.to_ne_bytes());
+        // SAFETY: an all-zero `sctp_sndrcvinfo` is a valid value of the C struct.
+        let sinfo: libc::sctp_sndrcvinfo = unsafe { std::mem::zeroed() };
+        let step = client.classify(super::RawRecv {
+            n: body.len(),
+            buf: body,
+            sinfo,
+            msg_flags: libc::MSG_NOTIFICATION,
+        });
+        assert!(
+            matches!(step, super::RecvStep::Closed),
+            "the restart ends it"
+        );
+        assert!(!client.is_established());
+        assert!(matches!(
+            client.try_recv(),
+            Err(crate::SctpError::AssociationClosed)
+        ));
         server.join().expect("server thread");
     }
 
