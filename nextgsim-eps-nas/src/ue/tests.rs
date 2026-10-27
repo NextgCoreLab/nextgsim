@@ -1585,7 +1585,8 @@ fn command(ue: &mut EpsNasUe, mme: &mut Mme, cmd: BearerCommand, now: Instant) -
 /// #434, §6.5.4.2 / Table 8.3.10.1: `bearer-modify 6 1000` is a BEARER
 /// RESOURCE MODIFICATION REQUEST with EBI 0 and its PTI in the header, type
 /// D6, EBI for packet filter 6, Traffic flow aggregate "No TFT operation"
-/// (110, TS 24.008 §10.5.6.12) naming filter 1, and Required traffic flow
+/// (110, E bit, no packet filter, TS 24.008 §10.5.6.12) naming filter 1 in
+/// parameter 03H, and Required traffic flow
 /// QoS (5B, §9.9.4.3): QCI 1, MBR UL/DL and GBR UL/DL 1000 kbit/s, coded
 /// 0x87 (576 + 7 x 64 = 1024, the next coded value). No ESM cause. T3481
 /// runs; a MODIFY EPS BEARER CONTEXT REQUEST with the PTI, accepted, ends it
@@ -1601,7 +1602,10 @@ fn bearer_modify_sends_no_tft_operation_with_the_required_qos_and_ends_modified(
     assert_ne!(pti, 0);
     assert_eq!(
         req,
-        vec![0x02, pti, 0xD6, 0x06, 0x02, 0xC1, 0x01, 0x5B, 0x05, 0x01, 0x87, 0x87, 0x87, 0x87]
+        vec![
+            0x02, pti, 0xD6, 0x06, 0x04, 0xD0, 0x03, 0x01, 0x01, 0x5B, 0x05, 0x01, 0x87, 0x87,
+            0x87, 0x87
+        ]
     );
     assert_eq!(ue.next_deadline(), Some(now + T3481));
     assert_eq!(ue.bearer_resource_outcome(pti), None, "pending");
@@ -1630,7 +1634,7 @@ fn bearer_modify_codes_a_high_rate_in_the_extended_octets() {
     };
     let (_, req) = command(&mut ue, &mut mme, cmd, Instant::now());
     assert_eq!(
-        &req[7..],
+        &req[9..],
         &[0x5B, 0x09, 0x02, 0xFE, 0xFE, 0xFE, 0xFE, 0x4E, 0x4E, 0x4E, 0x4E]
     );
 }
@@ -1743,7 +1747,8 @@ fn a_bearer_command_answered_otherwise_is_an_error() {
 }
 
 /// #434: refused, with nothing sent and no PTI used: the default bearer, an
-/// EBI with no bearer, a rate the EPS QoS IE cannot code, a second command
+/// EBI with no bearer, a rate the EPS QoS IE cannot code, a GBR for a
+/// non-GBR bearer, a second command
 /// on a bearer under modification, and a UE that is not EMM-REGISTERED.
 #[test]
 fn bearer_commands_are_refused_for_the_default_bearer_an_unknown_ebi_and_no_registration() {
@@ -1763,6 +1768,16 @@ fn bearer_commands_are_refused_for_the_default_bearer_an_unknown_ebi_and_no_regi
     assert!(
         R::DefaultBearer(5).to_string().contains("default bearer"),
         "the error line names it"
+    );
+
+    // A non-GBR dedicated bearer (QCI 9) has no GBR to modify; it can be
+    // released
+    let mut act = activate_dedicated(7, 5, &[0x21, 0x22, 0x20, 0x02, 0x30, 0x06]);
+    act[5] = 9;
+    esm_reply(&mut ue, &mut mme, &act);
+    assert_eq!(
+        ue.bearer_command(modify(7, 64), true, now),
+        Err(R::NonGbrBearer(7, 9))
     );
 
     command(&mut ue, &mut mme, modify(6, 10_000_000), now);

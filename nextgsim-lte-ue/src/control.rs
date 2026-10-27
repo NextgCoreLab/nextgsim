@@ -23,6 +23,9 @@ use crate::task::ControlCommand;
 /// How long a command waits for the UE unless the line names another.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
+/// The longest wait a line may ask for: a day.
+pub const MAX_TIMEOUT_SECS: u64 = 86_400;
+
 /// A parsed control line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRequest {
@@ -51,7 +54,13 @@ pub fn parse_line(line: &str) -> Result<ControlRequest, String> {
             [] => Ok(DEFAULT_TIMEOUT_SECS),
             [t] => t
                 .parse()
-                .map_err(|_| format!("error: timeout {t:?} is not a number of seconds")),
+                .ok()
+                .filter(|t| *t <= MAX_TIMEOUT_SECS)
+                .ok_or_else(|| {
+                    format!(
+                        "error: timeout {t:?} is not a number of seconds up to {MAX_TIMEOUT_SECS}"
+                    )
+                }),
             _ => Err(format!("error: too many arguments in {:?}", line.trim())),
         }
     };
@@ -65,7 +74,8 @@ pub fn parse_line(line: &str) -> Result<ControlRequest, String> {
             timeout: rest
                 .iter()
                 .find_map(|w| w.parse::<u64>().ok())
-                .unwrap_or(DEFAULT_TIMEOUT_SECS),
+                .unwrap_or(DEFAULT_TIMEOUT_SECS)
+                .min(MAX_TIMEOUT_SECS),
         }),
         ["bearer-modify", e, rate, rest @ ..] => {
             let gbr_kbps = rate
@@ -176,6 +186,14 @@ mod tests {
                 timeout: 5
             })
         );
+        // A huge detach timeout is capped, not an Instant overflow
+        assert_eq!(
+            parse_line("detach 18446744073709551615"),
+            Ok(ControlRequest::Detach {
+                switch_off: false,
+                timeout: MAX_TIMEOUT_SECS
+            })
+        );
         for bad in [
             "bearer-modify 6",
             "bearer-modify x 100",
@@ -184,6 +202,7 @@ mod tests {
             "bearer-release",
             "bearer-release six",
             "bearer-release 6 soon",
+            "bearer-release 6 18446744073709551615",
             "attach",
         ] {
             let e = parse_line(bad).unwrap_err();

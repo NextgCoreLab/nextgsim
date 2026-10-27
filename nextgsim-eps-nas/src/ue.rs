@@ -297,6 +297,9 @@ pub enum BearerCommandRefusal {
     NoPacketFilters(u8),
     /// A bit rate the EPS QoS IE cannot code (above 10 Gbit/s).
     RateOutOfRange(u32),
+    /// A GBR for a bearer whose QCI is non-GBR (TS 23.203 Table 6.1.7): the
+    /// network ignores the bit rates of such a bearer (TS 24.301 §9.9.4.3).
+    NonGbrBearer(u8, u8),
 }
 
 impl std::fmt::Display for BearerCommandRefusal {
@@ -315,6 +318,10 @@ impl std::fmt::Display for BearerCommandRefusal {
                 "a bearer resource modification of EPS bearer {e} is already in progress"
             ),
             Self::NoPacketFilters(e) => write!(f, "EPS bearer {e} has no packet filter"),
+            Self::NonGbrBearer(e, q) => write!(
+                f,
+                "EPS bearer {e} has the non-GBR QCI {q}; it has no GBR to modify"
+            ),
             Self::RateOutOfRange(r) => write!(
                 f,
                 "{r} kbit/s is above the {} kbit/s the EPS QoS IE codes",
@@ -2443,6 +2450,9 @@ impl EpsNasUe {
         let ids: Vec<u8> = bearer.filters.iter().map(|f| f.id).collect();
         let qci = bearer.qci;
         let qos = match cmd {
+            BearerCommand::Modify { .. } if !is_gbr_qci(qci) => {
+                return Err(R::NonGbrBearer(ebi, qci));
+            }
             BearerCommand::Modify { gbr_kbps, .. } => {
                 let r = (gbr_kbps, gbr_kbps);
                 let qos =
@@ -2580,6 +2590,12 @@ impl EpsNasUe {
         log::info!("ESM: EPS bearer {ebi} deactivated locally");
         self.dedicated.retain(|b| b.ebi != ebi);
     }
+}
+
+/// Whether a standardized QCI is of resource type GBR or delay-critical GBR
+/// (TS 23.203 Table 6.1.7-A): 1-4, 65-67, 71-73, 75, 76, 82-85.
+fn is_gbr_qci(qci: u8) -> bool {
+    matches!(qci, 1..=4 | 65..=67 | 71..=73 | 75 | 76 | 82..=85)
 }
 
 /// The IMEI of an IMEISV: its first 14 digits plus the Luhn check digit

@@ -402,17 +402,23 @@ impl Tft {
 
 /// A Traffic flow aggregate description (TS 24.301 §9.9.4.15, coded as the
 /// TFT of TS 24.008 §10.5.6.12) for a UE-requested change of the QoS of
-/// existing traffic flows (§6.5.4.2, #434): TFT operation code 110 "No TFT
-/// operation", E bit 0, and the packet filter list holding the identifiers of
-/// the packet filters the QoS applies to, one octet each (bits 4-1).
-///
-/// [`Tft::decode`] refuses such a list in a TFT the network sends
-/// (§6.4.3.4 b)); this is the UE's own aggregate, built only here.
+/// existing traffic flows (§6.5.4.2, #434). TS 24.301 §6.5.4.2: the UE
+/// includes "the packet filter identifier(s) ... in the Packet filter
+/// identifier parameter in the parameters list" and sets the TFT operation
+/// code to "No TFT operation"; TS 24.008 §10.5.6.12: for that operation the
+/// number of packet filters is coded as 0 and the packet filter list is
+/// empty. So: op code 110, E bit 1, count 0, then parameter 03H "Packet
+/// filter identifier" with one octet per identifier (bits 4-1).
 pub fn no_operation_aggregate(ids: &[u8]) -> Vec<u8> {
-    let mut out = vec![(TftOperation::NoOperation.bits() << 5) | (ids.len() as u8 & 0x0F)];
+    let mut out = vec![(TftOperation::NoOperation.bits() << 5) | 0x10];
+    out.extend_from_slice(&[PARAMETER_PACKET_FILTER_IDENTIFIER, ids.len() as u8]);
     out.extend(ids.iter().map(|i| i & 0x0F));
     out
 }
+
+/// TS 24.008 §10.5.6.12, parameters list: parameter identifier 03H "Packet
+/// filter identifier".
+const PARAMETER_PACKET_FILTER_IDENTIFIER: u8 = 0x03;
 
 fn component_type(c: &FilterComponent) -> u8 {
     let mut v = Vec::new();
@@ -917,15 +923,19 @@ mod tests {
         );
     }
 
-    /// #434, TS 24.008 §10.5.6.12: the UE's "No TFT operation" aggregate is
-    /// operation code 110 with the identifiers in the packet filter list.
+    /// #434, TS 24.301 §6.5.4.2 and TS 24.008 §10.5.6.12: the UE's "No TFT
+    /// operation" aggregate is operation code 110, E bit set, no packet filter,
+    /// and the identifiers in parameter 03H of the parameters list.
     #[test]
     fn a_no_operation_aggregate_lists_the_identifiers() {
-        assert_eq!(no_operation_aggregate(&[1]), vec![0xC1, 0x01]);
+        assert_eq!(no_operation_aggregate(&[1]), vec![0xD0, 0x03, 0x01, 0x01]);
         assert_eq!(
             no_operation_aggregate(&[1, 2, 15]),
-            vec![0xC3, 0x01, 0x02, 0x0F]
+            vec![0xD0, 0x03, 0x03, 0x01, 0x02, 0x0F]
         );
-        assert_eq!(no_operation_aggregate(&[]), vec![0xC0]);
+        // The UE's own decoder reads it as op 110 with no packet filter
+        let t = Tft::decode(&no_operation_aggregate(&[1, 2])).unwrap();
+        assert_eq!(t.operation, TftOperation::NoOperation);
+        assert!(t.filters.is_empty() && t.deleted_ids.is_empty());
     }
 }
