@@ -832,3 +832,259 @@ fn the_camped_cells_tracking_area_reaches_nas() {
     assert_eq!(u.state(), UeRrcState::Camped { cell: other });
     assert_eq!(seen.lock().unwrap().serving, vec![1, 7]);
 }
+
+// --- #435: uplink held while the user plane is down, at the RRC/NAS seam,
+// with the real EpsNas (registered, EMM-IDLE) behind it.
+
+mod held_uplink {
+    use super::*;
+    use crate::nas::EpsNas;
+    use nextgsim_crypto::eps_kdf::derive_kenb;
+    use nextgsim_eps_nas::testing::{registered_idle, Mme};
+    use nextgsim_pdcp::lte_drb::drb_bearer;
+
+    /// The default bearer's DRB as the eNB configures it.
+    const DRB: DrbConfig = DrbConfig {
+        eps_bearer_identity: 5,
+        drb_identity: 1,
+        logical_channel_identity: 3,
+        rlc: DrbRlc::UmSn10,
+    };
+
+    /// An IPv4 packet whose last octet tells it apart.
+    fn packet(tag: u8, len: usize) -> Vec<u8> {
+        let mut p = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 1, 0, 0];
+        p.resize(len.max(13), 0);
+        *p.last_mut().unwrap() = tag;
+        p
+    }
+
+    /// An EMM-REGISTERED UE in RRC_IDLE, camped on the cell of its TA.
+    fn idle_ue() -> (UeRrc, Mme) {
+        let (ue, mme, _) = registered_idle();
+        let mut u = UeRrc::new(
+            plmn(),
+            Box::new(EpsNas::from_ue(ue)),
+            Box::new(|| 0x12_3456_789A),
+        );
+        assert!(acquire(&mut u, cell_info(), true, Instant::now()).is_empty());
+        assert_eq!(u.state(), UeRrcState::Camped { cell: CELL });
+        (u, mme)
+    }
+
+    /// The eNB's side of the connection the SERVICE REQUEST sets up.
+    struct Enb {
+        srb1: LteSrbPdcp,
+        k_enb: [u8; 32],
+    }
+
+    /// RRCConnectionSetup; the SERVICE REQUEST in the Complete is checked
+    /// by the MME, and its COUNT keys K_eNB (TS 33.401 §7.2.6.2).
+    fn set_up(u: &mut UeRrc, mme: &mut Mme) -> Enb {
+        let acts = u.on_downlink(CELL, RrcChannel::DlCcch, 0, &setup(0), Instant::now());
+        let [UeAction::Rrc { pdu, .. }] = acts.as_slice() else {
+            panic!("{acts:?}");
+        };
+        let sdu = LteSrbPdcp::new().receive(pdu).unwrap().sdu;
+        let msg::UlDcch::ConnectionSetupComplete { nas, .. } = msg::decode_ul_dcch(&sdu).unwrap()
+        else {
+            panic!("not a Complete");
+        };
+        let count = mme.verify_service_request(&nas);
+        assert_eq!(u.state(), UeRrcState::Connected { cell: CELL });
+        Enb {
+            srb1: LteSrbPdcp::with_bearer(SRB1_BEARER, DIRECTION_DOWNLINK),
+            k_enb: derive_kenb(&mme.kasme, count),
+        }
+    }
+
+    /// AS SMC, then the reconfiguration that sets up the default bearer's
+    /// DRB; returns what the UE sends for it.
+    fn bearers_up(u: &mut UeRrc, enb: &mut Enb) -> Vec<UeAction> {
+        let k = |t| derive_algorithm_key(&enb.k_enb, t, 2);
+        enb.srb1
+            .activate_tx_integrity(2, k(EpsAlgorithmType::RrcInt))
+            .unwrap();
+        let smc = msg::encode_security_mode_command(1, 2, 2).unwrap();
+        let acts = u.on_downlink(
+            CELL,
+            RrcChannel::DlDcch,
+            LCID_SRB1,
+            &enb.srb1.transmit(&smc).0,
+            Instant::now(),
+        );
+        assert_eq!(acts.len(), 1, "SecurityModeComplete only: {acts:?}");
+        assert!(u.as_security_active());
+        enb.srb1
+            .activate_tx_ciphering(2, k(EpsAlgorithmType::RrcEnc))
+            .unwrap();
+        let reconf = msg::encode_rrc_connection_reconfiguration(2, true, &[DRB], &[]).unwrap();
+        u.on_downlink(
+            CELL,
+            RrcChannel::DlDcch,
+            LCID_SRB1,
+            &enb.srb1.transmit(&reconf).0,
+            Instant::now(),
+        )
+    }
+
+    /// The IP packets in `acts`' data PDUs, through the eNB's RLC UM and
+    /// PDCP for the DRB; asserts nothing else but RRC goes before them.
+    fn uplink_ip(enb: &Enb, acts: &[UeAction]) -> Vec<Vec<u8>> {
+        let k_up = derive_algorithm_key(&enb.k_enb, EpsAlgorithmType::UpEnc, 2);
+        let mut pdcp = LteDrbPdcp::new(drb_bearer(3), DIRECTION_DOWNLINK, 2, k_up).unwrap();
+        let mut rx = LteUmRx::new(DRB_T_REORDERING);
+        acts.iter()
+            .filter_map(|a| match a {
+                UeAction::Data { lcid: 3, pdu, .. } => {
+                    let sdus = rx.receive(pdu, Instant::now()).unwrap();
+                    Some(pdcp.receive(&sdus[0]).unwrap().0)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// #435: the packet that starts the service request from RRC_IDLE, and
+    /// those offered while the connection is set up, go out first and in
+    /// order through the default bearer's DRB once it is up.
+    #[test]
+    fn a_packet_offered_in_idle_is_sent_first_once_the_bearers_are_up() {
+        let (mut u, mut mme) = idle_ue();
+        let acts = u.send_ip(&packet(1, 40), Instant::now());
+        assert!(
+            matches!(
+                acts.as_slice(),
+                [UeAction::Rrc {
+                    channel: RrcChannel::UlCcch,
+                    ..
+                }]
+            ),
+            "the packet starts the connection: {acts:?}"
+        );
+        assert_eq!(u.held_uplink(), 1, "and is held, not dropped");
+        assert!(u.send_ip(&packet(2, 40), Instant::now()).is_empty());
+        let mut enb = set_up(&mut u, &mut mme);
+        assert!(u.send_ip(&packet(3, 40), Instant::now()).is_empty());
+        assert_eq!(u.held_uplink(), 3);
+
+        let acts = bearers_up(&mut u, &mut enb);
+        assert!(
+            matches!(
+                acts.first(),
+                Some(UeAction::Rrc {
+                    lcid: LCID_SRB1,
+                    ..
+                })
+            ),
+            "RRCConnectionReconfigurationComplete before the data: {acts:?}"
+        );
+        assert_eq!(
+            uplink_ip(&enb, &acts),
+            vec![packet(1, 40), packet(2, 40), packet(3, 40)],
+            "the held packets, oldest first"
+        );
+        assert_eq!(u.held_uplink(), 0);
+        assert_eq!(u.held_uplink_dropped(), 0);
+        // Live traffic goes straight out after them.
+        let acts = u.send_ip(&packet(4, 40), Instant::now());
+        assert!(matches!(acts.as_slice(), [UeAction::Data { lcid: 3, .. }]));
+    }
+
+    /// #435: the hold is bounded in packets and in bytes; the oldest go.
+    #[test]
+    fn the_held_uplink_is_bounded() {
+        use crate::uplink_buffer::{DEFAULT_UPLINK_HOLD_BYTES, DEFAULT_UPLINK_HOLD_PACKETS};
+        // Small packets: the packet bound holds.
+        let (mut u, mut mme) = idle_ue();
+        let n = DEFAULT_UPLINK_HOLD_PACKETS + 6;
+        for tag in 0..n {
+            u.send_ip(&packet(tag as u8, 40), Instant::now());
+        }
+        assert_eq!(u.held_uplink(), DEFAULT_UPLINK_HOLD_PACKETS);
+        assert_eq!(u.held_uplink_dropped(), 6);
+        let mut enb = set_up(&mut u, &mut mme);
+        let acts = bearers_up(&mut u, &mut enb);
+        let sent = uplink_ip(&enb, &acts);
+        let expect: Vec<_> = (6..n).map(|t| packet(t as u8, 40)).collect();
+        assert_eq!(sent, expect, "the newest kept, in order");
+
+        // Full-size packets: the byte bound holds first.
+        let (mut u, _) = idle_ue();
+        for tag in 0..DEFAULT_UPLINK_HOLD_PACKETS {
+            u.send_ip(&packet(tag as u8, 1500), Instant::now());
+        }
+        let fit = DEFAULT_UPLINK_HOLD_BYTES / 1500;
+        assert!(fit < DEFAULT_UPLINK_HOLD_PACKETS);
+        assert_eq!(u.held_uplink(), fit);
+        assert_eq!(
+            u.held_uplink_dropped(),
+            (DEFAULT_UPLINK_HOLD_PACKETS - fit) as u64
+        );
+    }
+
+    /// #435: T3417 expiry, a SERVICE REJECT, a detach and a lower layer
+    /// failure each end the service request without the user plane; what
+    /// was held for it is discarded, and a later user plane does not carry
+    /// it.
+    #[test]
+    fn a_failed_service_request_discards_the_held_uplink() {
+        // T3417 (5 s, §10.2) expires: NAS releases the connection locally.
+        let (mut u, mut mme) = idle_ue();
+        u.send_ip(&packet(1, 40), Instant::now());
+        u.send_ip(&packet(2, 40), Instant::now());
+        set_up(&mut u, &mut mme);
+        u.on_timer(Instant::now() + Duration::from_secs(6));
+        assert_eq!(u.held_uplink(), 0);
+        assert_eq!(u.held_uplink_discarded(), 2);
+        // A later service request starts afresh: only the new packet goes.
+        let acts = u.send_ip(&packet(3, 40), Instant::now());
+        assert!(matches!(
+            acts.as_slice(),
+            [UeAction::Rrc {
+                channel: RrcChannel::UlCcch,
+                ..
+            }]
+        ));
+        let mut enb = set_up(&mut u, &mut mme);
+        let acts = bearers_up(&mut u, &mut enb);
+        let sent = uplink_ip(&enb, &acts);
+        assert_eq!(sent, vec![packet(3, 40)]);
+
+        // SERVICE REJECT #10 (§5.6.1.5) on the connection.
+        let (mut u, mut mme) = idle_ue();
+        u.send_ip(&packet(1, 40), Instant::now());
+        let mut enb = set_up(&mut u, &mut mme);
+        u.send_ip(&packet(2, 40), Instant::now());
+        let reject = msg::encode_dl_information_transfer(0, &[0x07, 0x4E, 10]).unwrap();
+        u.on_downlink(
+            CELL,
+            RrcChannel::DlDcch,
+            LCID_SRB1,
+            &enb.srb1.transmit(&reject).0,
+            Instant::now(),
+        );
+        assert_eq!(u.state(), UeRrcState::Connected { cell: CELL });
+        assert_eq!((u.held_uplink(), u.held_uplink_discarded()), (0, 2));
+        assert!(
+            u.send_ip(&packet(3, 40), Instant::now()).is_empty() && u.held_uplink() == 0,
+            "after the reject nothing is waited for: not held"
+        );
+
+        // A detach during the service request (§5.5.2.2.1).
+        let (mut u, mut mme) = idle_ue();
+        u.send_ip(&packet(1, 40), Instant::now());
+        set_up(&mut u, &mut mme);
+        let acts = u.detach(false, Instant::now());
+        assert_eq!(acts.len(), 1, "the DETACH REQUEST: {acts:?}");
+        assert_eq!((u.held_uplink(), u.held_uplink_discarded()), (0, 1));
+
+        // T300 expiry: lower layer failure (§5.6.1.6 a).
+        let (mut u, _) = idle_ue();
+        let start = Instant::now();
+        u.send_ip(&packet(1, 40), start);
+        assert_eq!(u.state(), UeRrcState::Connecting { cell: CELL });
+        u.on_timer(start + Duration::from_millis(1000));
+        assert_eq!((u.held_uplink(), u.held_uplink_discarded()), (0, 1));
+    }
+}

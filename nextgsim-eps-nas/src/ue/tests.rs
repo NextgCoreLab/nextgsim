@@ -1833,3 +1833,61 @@ fn a_detach_ends_a_running_bearer_command() {
     assert_eq!(outcome, BearerResourceOutcome::Cleared);
     assert!(cmd.answer(outcome).is_err());
 }
+
+/// #435: the user plane is awaited from pending uplink data to the end of
+/// the service request, and each way it ends without the user plane is
+/// reported once.
+#[test]
+fn a_service_request_reports_once_how_it_failed() {
+    let (mut ue, mut mme, now) = registered_idle();
+    assert!(!ue.user_plane_awaited());
+    ue.on_uplink_data_pending();
+    assert!(ue.user_plane_awaited(), "pending uplink data");
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    assert!(ue.user_plane_awaited(), "SERVICE REQUEST sent");
+    ue.on_timer(now + T3417);
+    assert!(!ue.user_plane_awaited());
+    assert_eq!(
+        ue.take_service_request_failure(),
+        Some(ServiceRequestFailure::T3417Expired)
+    );
+    assert_eq!(ue.take_service_request_failure(), None, "once");
+    ue.on_released(now + T3417);
+    assert_eq!(ue.take_service_request_failure(), None);
+
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_downlink(&[0x07, 0x4E, 22, 0x5F, 0x01, 0x01], now);
+    assert_eq!(
+        ue.take_service_request_failure(),
+        Some(ServiceRequestFailure::Rejected(22))
+    );
+
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_released(now);
+    assert_eq!(
+        ue.take_service_request_failure(),
+        Some(ServiceRequestFailure::LowerLayerFailure)
+    );
+
+    // A detach with uplink data pending, before the SERVICE REQUEST went.
+    let (mut ue, _mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    ue.detach(false, false, now);
+    assert_eq!(
+        ue.take_service_request_failure(),
+        Some(ServiceRequestFailure::Detach)
+    );
+
+    // The user plane set up: no failure.
+    let (mut ue, mut mme, now) = registered_idle();
+    ue.on_uplink_data_pending();
+    mme.verify_service_request(&ue.initial_message(now).unwrap());
+    ue.on_user_plane_established();
+    assert!(!ue.user_plane_awaited());
+    ue.on_released(now);
+    assert_eq!(ue.take_service_request_failure(), None);
+}

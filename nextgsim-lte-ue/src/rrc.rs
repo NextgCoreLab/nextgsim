@@ -25,9 +25,12 @@
 //!   entity ciphered with `K_UPenc` over TS 36.322 RLC UM; the UE refuses a
 //!   DRB configuration it does not support by leaving RRC_CONNECTED
 //!   (§5.3.5.5).
-//! - **User plane**: IP packets in ([`UeRrc::send_ip`]) go on the default
-//!   bearer's DRB; RLC PDUs in ([`UeRrc::on_data`]) come out as
-//!   [`UeAction::DeliverIp`].
+//! - **User plane**: IP packets in ([`UeRrc::send_ip`]) go on the DRB of the
+//!   bearer the TFTs pick; RLC PDUs in ([`UeRrc::on_data`]) come out as
+//!   [`UeAction::DeliverIp`]. Packets offered with no DRB, while NAS expects
+//!   one (a service request, an attach), are held in a bounded
+//!   [`UplinkBuffer`] and sent in order once the DRBs are set up; a failed
+//!   service request discards them (#435).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -47,6 +50,7 @@ use nextgsim_rls::lte::{LCID_SRB1, LCID_SRB2};
 use nextgsim_rls::RrcChannel;
 
 use crate::nas::{InitialNas, NasLayer, RrcIndication};
+use crate::uplink_buffer::UplinkBuffer;
 
 /// BEARER of SRB2: RB identity 2 − 1 (TS 36.323 §5.6.0).
 const SRB2_BEARER: u8 = 1;
@@ -173,6 +177,10 @@ pub struct UeRrc {
     barred_until: Option<Instant>,
     nas: Box<dyn NasLayer>,
     random: Box<dyn FnMut() -> u64 + Send>,
+    /// Uplink IP packets waiting for the user plane (#435).
+    held: UplinkBuffer,
+    /// Held packets discarded because the service request failed.
+    held_discarded: u64,
 }
 
 impl std::fmt::Debug for UeRrc {
@@ -201,7 +209,64 @@ impl UeRrc {
             barred_until: None,
             nas,
             random,
+            held: UplinkBuffer::default(),
+            held_discarded: 0,
         }
+    }
+
+    /// Uplink IP packets held for the user plane now (#435).
+    pub fn held_uplink(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Held uplink packets dropped because the buffer was full (#435).
+    pub fn held_uplink_dropped(&self) -> u64 {
+        self.held.dropped()
+    }
+
+    /// Held uplink packets discarded because the procedure they waited for
+    /// ended without the user plane (#435).
+    pub fn held_uplink_discarded(&self) -> u64 {
+        self.held_discarded
+    }
+
+    /// After every input that can move NAS or set up DRBs (#435): send what
+    /// is held once a DRB exists, or discard it when the service request it
+    /// waited for failed, or when, idle again, nothing will set up the user
+    /// plane for it.
+    fn settle(&mut self, mut acts: Vec<UeAction>) -> Vec<UeAction> {
+        if let Some(why) = self.nas.take_service_request_failure() {
+            self.discard_held(&format!("the service request failed ({why})"));
+        }
+        if self.held.is_empty() {
+            return acts;
+        }
+        match &self.state {
+            State::Connected { user, .. } if !user.is_empty() => {
+                let held = self.held.drain();
+                log::info!(
+                    "user plane ready: sending {} uplink packet(s) held while it was down",
+                    held.len()
+                );
+                for p in held {
+                    acts.extend(self.transmit_ip(&p));
+                }
+            }
+            State::Idle if !self.nas.awaits_user_plane() => {
+                self.discard_held("the connection ended before the user plane was set up");
+            }
+            _ => {}
+        }
+        acts
+    }
+
+    fn discard_held(&mut self, why: &str) {
+        if self.held.is_empty() {
+            return;
+        }
+        let n = self.held.drain().len();
+        self.held_discarded += n as u64;
+        log::warn!("{n} held uplink packet(s) discarded: {why}");
     }
 
     /// The current state.
@@ -351,6 +416,11 @@ impl UeRrc {
 
     /// `cell` is no longer heard.
     pub fn on_cell_lost(&mut self, cell: u64, now: Instant) -> Vec<UeAction> {
+        let acts = self.on_cell_lost_inner(cell, now);
+        self.settle(acts)
+    }
+
+    fn on_cell_lost_inner(&mut self, cell: u64, now: Instant) -> Vec<UeAction> {
         self.cells.remove(&cell);
         let serving = match &self.state {
             State::Connecting { cell: c, .. } | State::Connected { cell: c, .. } => Some(*c),
@@ -377,6 +447,11 @@ impl UeRrc {
 
     /// Timers: T300 (§5.3.3.6), T302 (§5.3.3.8) and NAS's.
     pub fn on_timer(&mut self, now: Instant) -> Vec<UeAction> {
+        let acts = self.on_timer_inner(now);
+        self.settle(acts)
+    }
+
+    fn on_timer_inner(&mut self, now: Instant) -> Vec<UeAction> {
         let mut delivered = Vec::new();
         if let State::Connected { user, .. } = &mut self.state {
             for d in user.values_mut() {
@@ -422,6 +497,18 @@ impl UeRrc {
 
     /// An RRC PDU from `cell` on a downlink channel.
     pub fn on_downlink(
+        &mut self,
+        cell: u64,
+        channel: RrcChannel,
+        lcid: u8,
+        pdu: &[u8],
+        now: Instant,
+    ) -> Vec<UeAction> {
+        let acts = self.on_downlink_inner(cell, channel, lcid, pdu, now);
+        self.settle(acts)
+    }
+
+    fn on_downlink_inner(
         &mut self,
         cell: u64,
         channel: RrcChannel,
@@ -896,6 +983,11 @@ impl UeRrc {
     /// handed RRC its initial message, and the detach is asked for again once
     /// connected (the caller retries).
     pub fn detach(&mut self, switch_off: bool, now: Instant) -> Vec<UeAction> {
+        let acts = self.detach_inner(switch_off, now);
+        self.settle(acts)
+    }
+
+    fn detach_inner(&mut self, switch_off: bool, now: Instant) -> Vec<UeAction> {
         match &self.state {
             State::Connected { cell, .. } => {
                 let cell = *cell;
@@ -933,6 +1025,15 @@ impl UeRrc {
         cmd: BearerCommand,
         now: Instant,
     ) -> (Vec<UeAction>, Result<u8, BearerCommandRefusal>) {
+        let (acts, r) = self.bearer_command_inner(cmd, now);
+        (self.settle(acts), r)
+    }
+
+    fn bearer_command_inner(
+        &mut self,
+        cmd: BearerCommand,
+        now: Instant,
+    ) -> (Vec<UeAction>, Result<u8, BearerCommandRefusal>) {
         match &self.state {
             State::Connected { cell, .. } => {
                 let cell = *cell;
@@ -958,16 +1059,48 @@ impl UeRrc {
         }
     }
 
-    /// An IP packet from the IP stack, for the default bearer's DRB (the
-    /// lowest LCID when NAS names no default bearer). Dropped when no DRB is
-    /// set up; in RRC_IDLE NAS is told uplink data is pending, which starts a
-    /// service request (TS 24.301 §5.6.1.1 b) -- the packet itself is not
-    /// buffered.
+    /// An IP packet from the IP stack, for the DRB of the bearer the TFTs
+    /// pick (the lowest LCID when NAS names no default bearer).
+    ///
+    /// With no DRB set up, in RRC_IDLE NAS is told uplink data is pending,
+    /// which starts a service request (TS 24.301 §5.6.1.1 b). The packet is
+    /// held while NAS expects the user plane radio bearers (§5.6.1.4), or
+    /// while earlier packets are held, and goes out first, in order, once
+    /// they are set up (#435); otherwise it is dropped.
     pub fn send_ip(&mut self, packet: &[u8], now: Instant) -> Vec<UeAction> {
-        if matches!(self.state, State::Idle) {
-            self.nas.on_uplink_pending();
-            return self.try_establish(now);
+        let acts = self.send_ip_inner(packet, now);
+        self.settle(acts)
+    }
+
+    fn send_ip_inner(&mut self, packet: &[u8], now: Instant) -> Vec<UeAction> {
+        // `settle` sends what is held as soon as a DRB exists, so with one,
+        // nothing held is waiting ahead of this packet.
+        if matches!(&self.state, State::Connected { user, .. } if !user.is_empty()) {
+            return self.transmit_ip(packet).into_iter().collect();
         }
+        let idle = matches!(self.state, State::Idle);
+        if idle {
+            self.nas.on_uplink_pending();
+        }
+        if self.nas.awaits_user_plane() || !self.held.is_empty() {
+            self.held.hold(packet);
+            log::debug!(
+                "no user plane yet: uplink packet held ({} held, {} dropped)",
+                self.held.len(),
+                self.held.dropped()
+            );
+        } else {
+            log::debug!("uplink packet discarded: no DRB and no procedure to set one up");
+        }
+        if idle {
+            self.try_establish(now)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// `packet` through PDCP and RLC on the DRB the TFTs pick, if any.
+    fn transmit_ip(&mut self, packet: &[u8]) -> Option<UeAction> {
         // The DRB of the bearer the TFTs pick (TS 23.401 §5.4.1, #283). With
         // a default bearer, no pick means the packet is discarded; so does a
         // pick whose DRB is not set up -- another bearer's DRB would carry it
@@ -976,7 +1109,7 @@ impl UeRrc {
         let ebi = self.nas.uplink_bearer_for(packet);
         let has_default = self.nas.default_bearer_ebi().is_some();
         let State::Connected { cell, user, .. } = &mut self.state else {
-            return vec![];
+            return None;
         };
         let lcid = match ebi {
             Some(e) => user.iter().find(|(_, d)| d.ebi == e).map(|(l, _)| *l),
@@ -985,15 +1118,15 @@ impl UeRrc {
         };
         let Some(lcid) = lcid else {
             log::debug!("uplink packet discarded: no DRB for EPS bearer {ebi:?}");
-            return vec![];
+            return None;
         };
         let d = user.get_mut(&lcid).expect("found above");
         let pdcp = d.pdcp.transmit(packet).0;
-        vec![UeAction::Data {
+        Some(UeAction::Data {
             cell: *cell,
             lcid,
             pdu: d.tx.transmit(&pdcp),
-        }]
+        })
     }
 
     fn send_ul_nas(&mut self, cell: u64, nas_msgs: Vec<Vec<u8>>) -> Vec<UeAction> {

@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use nextgsim_eps_nas::{
     BearerCommand, BearerCommandRefusal, BearerResourceOutcome, DefaultBearer, EmmState,
-    EpsNasConfig, EpsNasUe, PagedWith,
+    EpsNasConfig, EpsNasUe, PagedWith, ServiceRequestFailure,
 };
 use nextgsim_lte_rrc::msg::{EstablishmentCauseValue, PagedUeIdentity};
 
@@ -74,6 +74,17 @@ pub trait NasLayer: Send {
     /// An uplink IP packet found no DRB because the UE is in RRC_IDLE: NAS
     /// may want a connection for it (TS 24.301 §5.6.1.1 b).
     fn on_uplink_pending(&mut self) {}
+    /// Whether NAS expects the user plane radio bearers to be set up by a
+    /// procedure under way or about to start (a service request, an attach),
+    /// so RRC holds uplink IP packets that have no DRB yet (#435).
+    fn awaits_user_plane(&self) -> bool {
+        false
+    }
+    /// How the last service request ended without the user plane, once
+    /// (#435): RRC then discards the uplink it held for it.
+    fn take_service_request_failure(&mut self) -> Option<ServiceRequestFailure> {
+        None
+    }
     /// RRC camps on a cell of tracking area `tac` of the selected PLMN
     /// (SIB1 `trackingAreaCode`): NAS compares its TAI with the TAI list
     /// (TS 24.301 §5.5.3.2.2 a), #356).
@@ -185,7 +196,12 @@ pub struct EpsNas {
 impl EpsNas {
     /// A UE NAS for `cfg`, EMM-DEREGISTERED with an attach due.
     pub fn new(cfg: EpsNasConfig) -> Self {
-        let ue = EpsNasUe::new(cfg);
+        Self::from_ue(EpsNasUe::new(cfg))
+    }
+
+    /// The layer around an existing EMM entity (tests drive one through an
+    /// attach first).
+    pub(crate) fn from_ue(ue: EpsNasUe) -> Self {
         let status = Arc::new(Mutex::new(EpsNasStatus {
             state: ue.state(),
             bearer: None,
@@ -262,6 +278,14 @@ impl NasLayer for EpsNas {
 
     fn on_uplink_pending(&mut self) {
         self.ue.on_uplink_data_pending();
+    }
+
+    fn awaits_user_plane(&self) -> bool {
+        self.ue.user_plane_awaited()
+    }
+
+    fn take_service_request_failure(&mut self) -> Option<ServiceRequestFailure> {
+        self.ue.take_service_request_failure()
     }
 
     fn on_serving_cell(&mut self, tac: u16) {

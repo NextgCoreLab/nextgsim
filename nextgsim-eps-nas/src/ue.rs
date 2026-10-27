@@ -276,6 +276,33 @@ impl BearerCommand {
     }
 }
 
+/// How a service request for uplink user data ended without the user plane
+/// (#435): the uplink the UE held for it is discarded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceRequestFailure {
+    /// T3417 expired (§5.6.1.6 c).
+    T3417Expired,
+    /// SERVICE REJECT with this EMM cause (§5.6.1.5).
+    Rejected(u8),
+    /// A detach, the UE's (§5.5.2.2.1) or the network's (§5.5.2.3.4 e),
+    /// aborted it.
+    Detach,
+    /// Lower layer failure or release of the NAS signalling connection
+    /// before the user plane radio bearers were set up (§5.6.1.6 a).
+    LowerLayerFailure,
+}
+
+impl std::fmt::Display for ServiceRequestFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::T3417Expired => write!(f, "T3417 expired"),
+            Self::Rejected(c) => write!(f, "SERVICE REJECT #{c}"),
+            Self::Detach => write!(f, "detach"),
+            Self::LowerLayerFailure => write!(f, "lower layer failure"),
+        }
+    }
+}
+
 /// Why a [`BearerCommand`] was not started (#434).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BearerCommandRefusal {
@@ -439,6 +466,9 @@ pub struct EpsNasUe {
     secure_exchange: bool,
     /// Uplink user data is waiting for a connection (§5.6.1.1 b).
     uplink_pending: bool,
+    /// How the last service request ended without the user plane, until
+    /// [`EpsNasUe::take_service_request_failure`] reads it (#435).
+    service_request_failure: Option<ServiceRequestFailure>,
     t3417: Option<Instant>,
     t3440: Option<Instant>,
     /// T3346 from a SERVICE REJECT #22: no service request before it expires
@@ -548,6 +578,7 @@ impl EpsNasUe {
             stored_auth: None,
             secure_exchange: false,
             uplink_pending: false,
+            service_request_failure: None,
             t3417: None,
             t3440: None,
             t3346: None,
@@ -665,6 +696,9 @@ impl EpsNasUe {
             EmmState::DeregisteredInitiated | EmmState::Detached | EmmState::NoService(_) => {
                 return NasOutput::default();
             }
+        }
+        if self.state == EmmState::ServiceRequestInitiated || self.uplink_pending {
+            self.service_request_failure = Some(ServiceRequestFailure::Detach);
         }
         self.t3417 = None;
         self.uplink_pending = false;
@@ -909,6 +943,29 @@ impl EpsNasUe {
         }
     }
 
+    /// Whether a procedure under way, or about to start, is expected to set
+    /// up the user plane radio bearers, so uplink user data offered now is
+    /// worth holding for them (#435): a service request (pending or
+    /// initiated, §5.6.1), an attach (the default bearer, §5.5.1.2.4), or a
+    /// tracking area update with the "active" flag (§5.5.3.2.2).
+    pub fn user_plane_awaited(&self) -> bool {
+        match self.state {
+            EmmState::ServiceRequestInitiated | EmmState::RegisteredInitiated => true,
+            EmmState::Registered => self.uplink_pending,
+            EmmState::TrackingAreaUpdatingInitiated => {
+                self.tau_in_progress.is_some_and(|(_, active)| active)
+            }
+            _ => false,
+        }
+    }
+
+    /// How the last service request ended without the user plane, once
+    /// (#435): T3417 expiry, a SERVICE REJECT, a detach, or a lower layer
+    /// failure. `None` when none failed since the last call.
+    pub fn take_service_request_failure(&mut self) -> Option<ServiceRequestFailure> {
+        self.service_request_failure.take()
+    }
+
     /// The lower layers indicate that the user plane radio bearers are set
     /// up: the service request completed successfully (§5.6.1.4).
     ///
@@ -1079,6 +1136,7 @@ impl EpsNasUe {
             // uplink data starts a new service request.
             log::warn!("EMM: T3417 expired; service request aborted (§5.6.1.6 c)");
             self.t3417 = None;
+            self.service_request_failure = Some(ServiceRequestFailure::T3417Expired);
             self.state = EmmState::Registered;
             self.secure_exchange = false;
             return NasOutput {
@@ -1208,6 +1266,7 @@ impl EpsNasUe {
             // plane radio bearers are set up aborts the procedure.
             log::warn!("EMM: NAS signalling connection lost during service request (§5.6.1.6 a)");
             self.t3417 = None;
+            self.service_request_failure = Some(ServiceRequestFailure::LowerLayerFailure);
             self.state = EmmState::Registered;
         }
         // A paging response that never went out (the establishment failed or
@@ -1818,6 +1877,7 @@ impl EpsNasUe {
             return;
         }
         self.t3417 = None;
+        self.service_request_failure = Some(ServiceRequestFailure::Rejected(r.cause));
         log::warn!("EMM: SERVICE REJECT #{}", r.cause);
         match r.cause {
             emm_cause::ILLEGAL_UE
@@ -1896,6 +1956,9 @@ impl EpsNasUe {
         // §5.5.2.3.4 e): a detach colliding with the UE's own attach or
         // service request is progressed; those procedures are aborted, and so
         // is a tracking area update (§5.5.3.2.6 f).
+        if self.state == EmmState::ServiceRequestInitiated {
+            self.service_request_failure = Some(ServiceRequestFailure::Detach);
+        }
         self.t3410 = None;
         self.t3417 = None;
         self.t3430 = None;
