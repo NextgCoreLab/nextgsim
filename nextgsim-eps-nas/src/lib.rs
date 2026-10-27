@@ -28,5 +28,5 @@ pub mod ue;
 
 pub use ue::{
     BearerCommand, BearerCommandRefusal, BearerResourceOutcome, DedicatedBearer, DefaultBearer,
-    EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith,
+    EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith, ServiceRequestFailure,
 };

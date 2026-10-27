@@ -14,3 +14,4 @@ pub mod control;
 pub mod nas;
 pub mod rrc;
 pub mod task;
+pub mod uplink_buffer;
