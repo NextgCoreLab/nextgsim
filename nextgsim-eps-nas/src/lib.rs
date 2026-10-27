@@ -27,5 +27,6 @@ pub mod tft;
 pub mod ue;
 
 pub use ue::{
-    DedicatedBearer, DefaultBearer, EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith,
+    BearerCommand, BearerCommandRefusal, BearerResourceOutcome, DedicatedBearer, DefaultBearer,
+    EmmState, EpsNasConfig, EpsNasUe, NasOutput, PagedWith,
 };

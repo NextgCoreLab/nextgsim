@@ -1559,3 +1559,277 @@ fn a_crossing_network_detach_cancels_the_reattach() {
     ue.on_released(now);
     assert_eq!(ue.initial_message(now), None, "no re-attach");
 }
+
+// ============================================================================
+// UE-requested bearer resource modification on command (TS 24.301 §6.5.4,
+// nextgsim #434)
+// ============================================================================
+
+/// An attached, connected UE with dedicated bearer 6 (QCI 1, SIP filter 1).
+fn with_dedicated_6() -> (EpsNasUe, Mme, Instant) {
+    let (mut ue, mut mme, _) = attach();
+    esm_reply(&mut ue, &mut mme, &activate_dedicated(6, 5, &sip_tft()));
+    (ue, mme, Instant::now())
+}
+
+/// Run `cmd` connected; its PTI and the plain BEARER RESOURCE MODIFICATION
+/// REQUEST.
+fn command(ue: &mut EpsNasUe, mme: &mut Mme, cmd: BearerCommand, now: Instant) -> (u8, Vec<u8>) {
+    let (pti, out) = ue.bearer_command(cmd, true, now).expect("started");
+    let sent = plain_uplinks(mme, &out);
+    assert_eq!(sent.len(), 1, "{sent:02x?}");
+    assert_eq!(sent[0][1], pti, "the request carries the PTI returned");
+    (pti, sent[0].clone())
+}
+
+/// #434, §6.5.4.2 / Table 8.3.10.1: `bearer-modify 6 1000` is a BEARER
+/// RESOURCE MODIFICATION REQUEST with EBI 0 and its PTI in the header, type
+/// D6, EBI for packet filter 6, Traffic flow aggregate "No TFT operation"
+/// (110, E bit, no packet filter, TS 24.008 §10.5.6.12) naming filter 1 in
+/// parameter 03H, and Required traffic flow
+/// QoS (5B, §9.9.4.3): QCI 1, MBR UL/DL and GBR UL/DL 1000 kbit/s, coded
+/// 0x87 (576 + 7 x 64 = 1024, the next coded value). No ESM cause. T3481
+/// runs; a MODIFY EPS BEARER CONTEXT REQUEST with the PTI, accepted, ends it
+/// as "modified".
+#[test]
+fn bearer_modify_sends_no_tft_operation_with_the_required_qos_and_ends_modified() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    let cmd = BearerCommand::Modify {
+        ebi: 6,
+        gbr_kbps: 1000,
+    };
+    let (pti, req) = command(&mut ue, &mut mme, cmd, now);
+    assert_ne!(pti, 0);
+    assert_eq!(
+        req,
+        vec![
+            0x02, pti, 0xD6, 0x06, 0x04, 0xD0, 0x03, 0x01, 0x01, 0x5B, 0x05, 0x01, 0x87, 0x87,
+            0x87, 0x87
+        ]
+    );
+    assert_eq!(ue.next_deadline(), Some(now + T3481));
+    assert_eq!(ue.bearer_resource_outcome(pti), None, "pending");
+
+    let modify = [0x62, pti, 0xC9, 0x5B, 0x05, 0x01, 0x87, 0x87, 0x87, 0x87];
+    assert_eq!(esm_reply(&mut ue, &mut mme, &modify), vec![0x62, pti, 0xCA]);
+    assert_eq!(ue.next_deadline(), None, "T3481 stopped");
+    let outcome = ue.bearer_resource_outcome(pti).expect("ended");
+    assert_eq!(outcome, BearerResourceOutcome::Modified);
+    assert_eq!(cmd.answer(outcome), Ok("modified"));
+    assert_eq!(ue.dedicated_bearers()[0].ebi, 6, "kept");
+}
+
+/// #434: the Required traffic flow QoS takes the bearer's QCI and grows the
+/// extended octets past 8640 kbit/s: 20 Mbit/s is base 0xFE, extended 0x4E
+/// (16 + 4 Mbit/s), 9 octets of contents.
+#[test]
+fn bearer_modify_codes_a_high_rate_in_the_extended_octets() {
+    let (mut ue, mut mme, _) = attach();
+    let mut act = activate_dedicated(6, 5, &sip_tft());
+    act[5] = 2; // QCI 2
+    esm_reply(&mut ue, &mut mme, &act);
+    let cmd = BearerCommand::Modify {
+        ebi: 6,
+        gbr_kbps: 20_000,
+    };
+    let (_, req) = command(&mut ue, &mut mme, cmd, Instant::now());
+    assert_eq!(
+        &req[9..],
+        &[0x5B, 0x09, 0x02, 0xFE, 0xFE, 0xFE, 0xFE, 0x4E, 0x4E, 0x4E, 0x4E]
+    );
+}
+
+/// #434, §6.5.4.2: `bearer-release 6` reuses the precedence-clash request:
+/// "Delete packet filters from existing TFT" (101) naming every filter of the
+/// bearer, ESM cause #36. The network's DEACTIVATE EPS BEARER CONTEXT REQUEST
+/// for EBI 6, accepted, ends it as "released"; the bearer is gone.
+#[test]
+fn bearer_release_deletes_every_filter_and_ends_released() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    // A second filter (id 2) on EBI 6, so the list has two identifiers
+    let add = [0x61, 0x22, 0x30, 0x02, 0x30, 0x06];
+    esm_reply(&mut ue, &mut mme, &modify_tft(6, &add));
+    let cmd = BearerCommand::Release { ebi: 6 };
+    let (pti, req) = command(&mut ue, &mut mme, cmd, now);
+    assert_eq!(
+        req,
+        vec![0x02, pti, 0xD6, 0x06, 0x03, 0xA2, 0x01, 0x02, 0x58, 36]
+    );
+    assert_eq!(ue.next_deadline(), Some(now + T3481));
+    assert_eq!(ue.bearer_resource_outcome(pti), None, "pending");
+
+    let deactivate = [0x62, pti, 0xCD, 36];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &deactivate),
+        vec![0x62, pti, 0xCE]
+    );
+    let outcome = ue.bearer_resource_outcome(pti).expect("ended");
+    assert_eq!(cmd.answer(outcome), Ok("released"));
+    assert!(ue.dedicated_bearers().is_empty());
+    assert_eq!(ue.next_deadline(), None);
+}
+
+/// #434, §6.5.4.4: a BEARER RESOURCE MODIFICATION REJECT ends the command in
+/// an error naming the cause; the bearer stays for #30.
+#[test]
+fn a_rejected_bearer_command_answers_the_cause() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    let cmd = BearerCommand::Modify {
+        ebi: 6,
+        gbr_kbps: 64,
+    };
+    let (pti, _) = command(&mut ue, &mut mme, cmd, now);
+    ue.on_downlink(&mme.protect(&[0x02, pti, 0xD7, 30], 2), now);
+    let outcome = ue.bearer_resource_outcome(pti).expect("ended");
+    assert_eq!(outcome, BearerResourceOutcome::Rejected(30));
+    let err = cmd.answer(outcome).unwrap_err();
+    assert!(err.contains("REJECT") && err.contains("#30"), "{err}");
+    assert_eq!(ue.dedicated_bearers().len(), 1);
+}
+
+/// #434, §6.5.4.5 a): four retransmissions, then the fifth T3481 expiry aborts
+/// the command; the answer says so.
+#[test]
+fn a_bearer_command_t3481_gives_up_after_the_fifth_expiry() {
+    let (mut ue, mut mme, mut now) = with_dedicated_6();
+    let cmd = BearerCommand::Modify {
+        ebi: 6,
+        gbr_kbps: 128,
+    };
+    let (pti, req) = command(&mut ue, &mut mme, cmd, now);
+    for n in 1..=4 {
+        now += T3481;
+        let out = ue.on_timer(now);
+        assert_eq!(plain_uplinks(&mut mme, &out), vec![req.clone()], "#{n}");
+        assert_eq!(ue.bearer_resource_outcome(pti), None);
+    }
+    now += T3481;
+    assert!(ue.on_timer(now).uplink.is_empty());
+    let outcome = ue.bearer_resource_outcome(pti).expect("ended");
+    assert_eq!(outcome, BearerResourceOutcome::Aborted);
+    assert!(cmd.answer(outcome).unwrap_err().contains("T3481"));
+    assert_eq!(ue.dedicated_bearers().len(), 1, "a modify keeps the bearer");
+}
+
+/// #434: a MODIFY with the PTI that the UE itself rejects (§6.4.3.4 a) 3):
+/// it would empty the dedicated bearer's TFT, #41) is not "modified"; a release
+/// answered by a MODIFY is not "released", nor a modify answered by a
+/// DEACTIVATE "modified".
+#[test]
+fn a_bearer_command_answered_otherwise_is_an_error() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    let modify = BearerCommand::Modify {
+        ebi: 6,
+        gbr_kbps: 64,
+    };
+    let (pti, _) = command(&mut ue, &mut mme, modify, now);
+    // Delete the only filter of the dedicated bearer: §6.4.3.4 a) 3), #41
+    let bad = [0x62, pti, 0xC9, 0x36, 0x02, 0xA1, 0x01];
+    assert_eq!(
+        esm_reply(&mut ue, &mut mme, &bad),
+        vec![0x62, pti, 0xCB, 41]
+    );
+    let outcome = ue.bearer_resource_outcome(pti).unwrap();
+    assert_eq!(outcome, BearerResourceOutcome::ModifyNotAccepted(Some(41)));
+    assert!(modify.answer(outcome).is_err());
+
+    let release = BearerCommand::Release { ebi: 6 };
+    let (pti, _) = command(&mut ue, &mut mme, release, now);
+    esm_reply(&mut ue, &mut mme, &[0x62, pti, 0xC9, 0x5B, 0x01, 0x01]);
+    let outcome = ue.bearer_resource_outcome(pti).unwrap();
+    assert!(release.answer(outcome).unwrap_err().contains("instead"));
+
+    let (pti, _) = command(&mut ue, &mut mme, modify, now);
+    esm_reply(&mut ue, &mut mme, &[0x62, 0x00, 0xCD, 36]);
+    let outcome = ue.bearer_resource_outcome(pti).unwrap();
+    assert_eq!(outcome, BearerResourceOutcome::Deactivated, "§6.5.4.5 c)");
+    assert!(modify.answer(outcome).unwrap_err().contains("instead"));
+}
+
+/// #434: refused, with nothing sent and no PTI used: the default bearer, an
+/// EBI with no bearer, a rate the EPS QoS IE cannot code, a GBR for a
+/// non-GBR bearer, a second command
+/// on a bearer under modification, and a UE that is not EMM-REGISTERED.
+#[test]
+fn bearer_commands_are_refused_for_the_default_bearer_an_unknown_ebi_and_no_registration() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    let modify = |ebi, gbr_kbps| BearerCommand::Modify { ebi, gbr_kbps };
+    use BearerCommandRefusal as R;
+    for (cmd, refusal) in [
+        (modify(5, 64), R::DefaultBearer(5)),
+        (BearerCommand::Release { ebi: 5 }, R::DefaultBearer(5)),
+        (modify(9, 64), R::UnknownBearer(9)),
+        (BearerCommand::Release { ebi: 9 }, R::UnknownBearer(9)),
+        (modify(6, 10_000_001), R::RateOutOfRange(10_000_001)),
+    ] {
+        assert_eq!(ue.bearer_command(cmd, true, now), Err(refusal), "{cmd:?}");
+    }
+    assert_eq!(ue.next_deadline(), None, "nothing started");
+    assert!(
+        R::DefaultBearer(5).to_string().contains("default bearer"),
+        "the error line names it"
+    );
+
+    // A non-GBR dedicated bearer (QCI 9) has no GBR to modify; it can be
+    // released
+    let mut act = activate_dedicated(7, 5, &[0x21, 0x22, 0x20, 0x02, 0x30, 0x06]);
+    act[5] = 9;
+    esm_reply(&mut ue, &mut mme, &act);
+    assert_eq!(
+        ue.bearer_command(modify(7, 64), true, now),
+        Err(R::NonGbrBearer(7, 9))
+    );
+
+    command(&mut ue, &mut mme, modify(6, 10_000_000), now);
+    assert_eq!(
+        ue.bearer_command(BearerCommand::Release { ebi: 6 }, true, now),
+        Err(R::InProgress(6))
+    );
+
+    let mut fresh = EpsNasUe::new(cfg());
+    assert_eq!(
+        fresh.bearer_command(modify(6, 64), true, now),
+        Err(R::NotRegistered(EmmState::Deregistered))
+    );
+    let out = ue.detach(false, true, now);
+    assert!(!out.uplink.is_empty());
+    assert_eq!(
+        ue.bearer_command(modify(6, 64), true, now),
+        Err(R::NotRegistered(EmmState::DeregisteredInitiated))
+    );
+}
+
+/// #434: EMM-REGISTERED in EMM-IDLE, the command is not sent; it asks for a
+/// connection, and the UE's next initial message is a SERVICE REQUEST. Once
+/// the service request is done, the command goes.
+#[test]
+fn an_idle_bearer_command_starts_a_service_request_first() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    ue.on_released(now);
+    let cmd = BearerCommand::Release { ebi: 6 };
+    assert_eq!(
+        ue.bearer_command(cmd, false, now),
+        Err(BearerCommandRefusal::NotConnected)
+    );
+    let sr = ue.initial_message(now).expect("SERVICE REQUEST");
+    mme.verify_service_request(&sr);
+    assert_eq!(
+        ue.bearer_command(cmd, true, now),
+        Err(BearerCommandRefusal::NotConnected),
+        "not before the service request completes"
+    );
+    ue.on_user_plane_established();
+    command(&mut ue, &mut mme, cmd, now);
+}
+
+/// #434: a detach while a command runs ends it: the bearer contexts go.
+#[test]
+fn a_detach_ends_a_running_bearer_command() {
+    let (mut ue, mut mme, now) = with_dedicated_6();
+    let cmd = BearerCommand::Release { ebi: 6 };
+    let (pti, _) = command(&mut ue, &mut mme, cmd, now);
+    ue.detach(true, true, now);
+    let outcome = ue.bearer_resource_outcome(pti).expect("ended");
+    assert_eq!(outcome, BearerResourceOutcome::Cleared);
+    assert!(cmd.answer(outcome).is_err());
+}

@@ -546,6 +546,79 @@ pub fn decode_apn(v: &[u8]) -> String {
     labels.join(".")
 }
 
+/// The highest bit rate the EPS QoS IE codes (TS 24.301 Table 9.9.4.3.1,
+/// extended-2 octet `11110110`): 10 Gbit/s, in kbit/s.
+pub const MAX_EPS_QOS_KBPS: u32 = 10_000_000;
+
+/// A bit rate in kbit/s as the three octets of TS 24.301 Table 9.9.4.3.1:
+/// the base octet (TS 24.008 Table 10.5.156 coding), the extended octet and
+/// the extended-2 octet. A rate between two coded values is rounded up to the
+/// next one; 0 kbit/s is base `11111111`. Above 8640 kbit/s the base octet is
+/// `11111110` and the extended octet carries the rate; above 256 Mbit/s the
+/// extended octet is `11111010` and the extended-2 octet carries it. `None`
+/// above [`MAX_EPS_QOS_KBPS`].
+pub fn encode_eps_bit_rate(kbps: u32) -> Option<[u8; 3]> {
+    let b = |v: u32| u8::try_from(v).expect("coded value fits an octet");
+    Some(match kbps {
+        0 => [0xFF, 0, 0],
+        1..=63 => [b(kbps), 0, 0],
+        64..=568 => [b(0x40 + (kbps - 64).div_ceil(8)), 0, 0],
+        569..=8640 => [b(0x80 + (kbps.max(576) - 576).div_ceil(64)), 0, 0],
+        8641..=16_000 => [0xFE, b((kbps - 8600).div_ceil(100)), 0],
+        16_001..=128_000 => [0xFE, b(0x4A + (kbps - 16_000).div_ceil(1000)), 0],
+        128_001..=256_000 => [0xFE, b(0xBA + (kbps - 128_000).div_ceil(2000)), 0],
+        256_001..=500_000 => [0xFE, 0xFA, b((kbps - 256_000).div_ceil(4000))],
+        500_001..=1_500_000 => [0xFE, 0xFA, b(0x3D + (kbps - 500_000).div_ceil(10_000))],
+        1_500_001..=MAX_EPS_QOS_KBPS => {
+            [0xFE, 0xFA, b(0xA1 + (kbps - 1_500_000).div_ceil(100_000))]
+        }
+        _ => return None,
+    })
+}
+
+/// The bit rate, in kbit/s, the three octets of [`encode_eps_bit_rate`] stand
+/// for (TS 24.301 Table 9.9.4.3.1): what the network reads.
+pub fn decode_eps_bit_rate([base, ext, ext2]: [u8; 3]) -> u32 {
+    let (base, ext, ext2) = (u32::from(base), u32::from(ext), u32::from(ext2));
+    match (ext2, ext) {
+        (1..=0x3D, _) => 256_000 + ext2 * 4000,
+        (0x3E..=0xA1, _) => 500_000 + (ext2 - 0x3D) * 10_000,
+        (0xA2.., _) => 1_500_000 + (ext2.min(0xF6) - 0xA1) * 100_000,
+        (0, 1..=0x4A) => 8600 + ext * 100,
+        (0, 0x4B..=0xBA) => 16_000 + (ext - 0x4A) * 1000,
+        (0, 0xBB..) => 128_000 + (ext.min(0xFA) - 0xBA) * 2000,
+        (0, 0) => match base {
+            0 | 0xFF => 0,
+            1..=0x3F => base,
+            0x40..=0x7F => 64 + (base - 0x40) * 8,
+            _ => 576 + (base - 0x80) * 64,
+        },
+    }
+}
+
+/// The contents of an EPS quality of service IE (TS 24.301 §9.9.4.3, from
+/// octet 3) for a GBR request: the QCI, then MBR UL, MBR DL, GBR UL, GBR DL.
+/// The extended octets (8-11) follow when a rate is above 8640 kbit/s, the
+/// extended-2 octets (12-15) when one is above 256 Mbit/s: 5, 9 or 13 octets.
+/// `None` when a rate is above [`MAX_EPS_QOS_KBPS`].
+pub fn encode_eps_qos(qci: u8, mbr: (u32, u32), gbr: (u32, u32)) -> Option<Vec<u8>> {
+    let rates = [mbr.0, mbr.1, gbr.0, gbr.1]
+        .into_iter()
+        .map(encode_eps_bit_rate)
+        .collect::<Option<Vec<_>>>()?;
+    let mut out = vec![qci];
+    out.extend(rates.iter().map(|r| r[0]));
+    let ext = rates.iter().any(|r| r[1] != 0);
+    let ext2 = rates.iter().any(|r| r[2] != 0);
+    if ext || ext2 {
+        out.extend(rates.iter().map(|r| r[1]));
+    }
+    if ext2 {
+        out.extend(rates.iter().map(|r| r[2]));
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -683,5 +756,70 @@ mod tests {
         assert_eq!(gprs_timer3_seconds(0b101_00011), Some(180));
         assert_eq!(gprs_timer3_seconds(0b110_00001), Some(320 * 3600));
         assert_eq!(gprs_timer3_seconds(0b111_00001), None);
+    }
+
+    /// #434, TS 24.301 Table 9.9.4.3.1: each range's first and last coded
+    /// value, a rate between two coded values rounded up, and 0 kbit/s as
+    /// `11111111`.
+    #[test]
+    fn eps_bit_rates_code_per_table_9_9_4_3_1() {
+        for (kbps, octets, reads) in [
+            (0, [0xFF, 0, 0], 0),
+            (1, [0x01, 0, 0], 1),
+            (63, [0x3F, 0, 0], 63),
+            (64, [0x40, 0, 0], 64),
+            (65, [0x41, 0, 0], 72),
+            (568, [0x7F, 0, 0], 568),
+            (569, [0x80, 0, 0], 576),
+            (1000, [0x87, 0, 0], 1024),
+            (8640, [0xFE, 0, 0], 8640),
+            (8641, [0xFE, 0x01, 0], 8700),
+            (16_000, [0xFE, 0x4A, 0], 16_000),
+            (16_001, [0xFE, 0x4B, 0], 17_000),
+            (128_000, [0xFE, 0xBA, 0], 128_000),
+            (128_001, [0xFE, 0xBB, 0], 130_000),
+            (256_000, [0xFE, 0xFA, 0], 256_000),
+            (256_001, [0xFE, 0xFA, 0x01], 260_000),
+            (500_000, [0xFE, 0xFA, 0x3D], 500_000),
+            (500_001, [0xFE, 0xFA, 0x3E], 510_000),
+            (1_500_000, [0xFE, 0xFA, 0xA1], 1_500_000),
+            (1_500_001, [0xFE, 0xFA, 0xA2], 1_600_000),
+            (10_000_000, [0xFE, 0xFA, 0xF6], 10_000_000),
+        ] {
+            assert_eq!(encode_eps_bit_rate(kbps), Some(octets), "{kbps} kbit/s");
+            assert_eq!(decode_eps_bit_rate(octets), reads, "{kbps} kbit/s");
+        }
+        assert_eq!(encode_eps_bit_rate(10_000_001), None);
+        // Never below the asked rate, and never more than one step above it
+        for kbps in (0..10_000_000).step_by(997) {
+            let reads = decode_eps_bit_rate(encode_eps_bit_rate(kbps).unwrap());
+            assert!(reads >= kbps, "{kbps}");
+            assert_eq!(
+                encode_eps_bit_rate(reads).map(decode_eps_bit_rate),
+                Some(reads)
+            );
+        }
+    }
+
+    /// #434, §9.9.4.3: 5 octets of contents up to 8640 kbit/s, 9 with the
+    /// extended octets, 13 with the extended-2 ones; a rate the IE cannot code
+    /// is refused.
+    #[test]
+    fn eps_qos_contents_grow_with_the_rates() {
+        assert_eq!(
+            encode_eps_qos(1, (64, 64), (64, 64)),
+            Some(vec![1, 0x40, 0x40, 0x40, 0x40])
+        );
+        assert_eq!(
+            encode_eps_qos(1, (20_000, 64), (64, 64)),
+            Some(vec![1, 0xFE, 0x40, 0x40, 0x40, 0x4E, 0, 0, 0])
+        );
+        assert_eq!(
+            encode_eps_qos(1, (300_000, 300_000), (300_000, 300_000)),
+            Some(vec![
+                1, 0xFE, 0xFE, 0xFE, 0xFE, 0xFA, 0xFA, 0xFA, 0xFA, 0x0B, 0x0B, 0x0B, 0x0B
+            ])
+        );
+        assert_eq!(encode_eps_qos(1, (64, 64), (64, 10_000_001)), None);
     }
 }
