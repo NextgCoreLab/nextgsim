@@ -704,6 +704,11 @@ jobs:
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     needs: test
+    env:
+      # nextgcore's docker-compose.yml fails fast without it (nextgcore #837): no
+      # Grafana credential is committed. A per-run throwaway value, the same one
+      # nextgcore's own docker-e2e job sets; Grafana is not started here.
+      GRAFANA_ADMIN_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - name: Checkout nextgsim
         uses: actions/checkout@v4
