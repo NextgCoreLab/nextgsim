@@ -40,7 +40,7 @@ tests (and usually clippy):
 
 | Job | What it does |
 |-----|--------------|
-| **Docker Build** | Builds `nr-gnb`, `nr-ue`, `lte-enb` (with `kernel-sctp`) and `lte-ue`, then the four images `nextgsim/nr-gnb`, `nextgsim/nr-ue`, `nextgsim/lte-enb`, `nextgsim/lte-ue`, and checks each exists |
+| **Docker Build** | Builds `nr-gnb`, `nr-ue`, `lte-enb` (with `kernel-sctp`) and `lte-ue`, pre-pulls the images' base images with a retry (#448), then builds the four images `nextgsim/nr-gnb`, `nextgsim/nr-ue`, `nextgsim/lte-enb`, `nextgsim/lte-ue` once each, and checks each exists |
 | **Interop E2E** | Checks out nextgcore `main`, builds both workspaces with nextgcore's builder, starts the 5GC, and registers a real UE through this repo's gNB over N2 |
 
 The nightly runs an hour after nextgcore's (04:00 UTC), so it tests a
@@ -104,6 +104,24 @@ Mount your own config at `/etc/nextgsim/lte-ue.yaml`, for example
 builds use, still bakes the test config. The `Release image list` check fails if a published
 stage COPYs a config holding `key`, `op` or `opc`. The published names replace the local names `nextgsim/nr-gnb`,
 `nextgsim-gnb` and so on. nextgcore publishes the core images the same way.
+
+**Transient registry failures (#448).** Only the steps that are safe to repeat are retried, by
+`docker/retry.sh`: 5 attempts, with 5, 10, 20 and 40 s waits between them. When every attempt
+fails, the step fails with the command's own exit status.
+
+| Step | Retried | Why |
+|------|---------|-----|
+| Docker Build: pre-pull every `FROM` base of the four Dockerfiles (`docker/pull-base-images.sh`) | yes | A pull has no side effect. A digest-pinned base then resolves from the local store, so the build makes no registry round trip for it |
+| Docker Build: the four `docker build`s | no | A genuine build error fails on the first attempt |
+| `publish-binaries`: pull the `rust` toolchain image | yes | `docker run` then finds it locally |
+| `publish-images`: warm build (same file, target and context, no output) | yes | It tags, loads and pushes nothing. It fills the docker-container builder's cache, which a `docker pull` cannot reach because that builder has its own store |
+| `publish-images`: the build-push-action push | **no** | A partial push can leave blobs or the tag behind, and a re-run could publish the tag twice from a rebuilt image. A failed leg fails, `latest` does not move, and you re-run the failed job yourself |
+| `publish-latest`: `imagetools create` | **no** | It is a registry write |
+
+A deterministic build error in the warm step is still retried, so it costs about five builds
+plus 75 s before the leg fails. That is accepted: a release usually builds code the nightly
+has already built, though nothing guarantees it (a hand-pushed tag, or commits merged after the
+validated sha).
 
 **Trigger: a version tag only.** Publishing runs for:
 - a pushed tag `X.Y.Z` or `X.Y.Z-<pre>`;
