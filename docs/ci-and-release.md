@@ -119,8 +119,8 @@ fails, the step fails with the command's own exit status.
 | `publish-latest`: `imagetools create` | **no** | It is a registry write |
 
 A deterministic build error in the warm step is still retried, so it costs about five builds
-plus 75 s before the leg fails. That is accepted: the release builds a commit that the nightly
-has already built.
+plus 75 s before the leg fails. That is accepted: a release usually builds a commit the nightly
+has already built (a dispatched release always does; a hand-pushed tag need not).
 
 **Trigger: a version tag only.** Publishing runs for:
 - a pushed tag `X.Y.Z` or `X.Y.Z-<pre>`;
