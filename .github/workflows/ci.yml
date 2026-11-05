@@ -624,6 +624,22 @@ jobs:
           cp target/release/lte-enb binaries/
           cp target/release/lte-ue binaries/
 
+      # #448: a nightly failed in `Build gNB image` on `failed to resolve source
+      # metadata for docker.io/library/debian:bookworm-slim@sha256:...: TLS
+      # handshake timeout` -- one Docker Hub blip, no second chance. The
+      # registry round trip is moved HERE, where it is retried (5 attempts,
+      # 5/10/20/40s backoff): every base the four Dockerfiles build FROM is
+      # pulled into the daemon's image store, and a digest-pinned base then
+      # resolves locally, so the builds below do not contact Docker Hub for it.
+      # The builds themselves are NOT retried: a genuine build error still fails
+      # its step on the first attempt. A pull that fails all five times fails
+      # this step.
+      - name: Pre-pull the base images (retried)
+        run: |
+          set -euo pipefail
+          docker/pull-base-images.sh Dockerfile.gnb-local Dockerfile.ue-local \
+            Dockerfile.enb-local Dockerfile.lte-ue-local
+
       - name: Build gNB image
         run: |
           docker build -f Dockerfile.gnb-local -t nextgsim/nr-gnb:latest .

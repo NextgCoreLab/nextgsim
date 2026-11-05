@@ -394,11 +394,19 @@ jobs:
       # Ubuntu runner needs a newer glibc than bookworm has), with the features
       # nextgcore's Dockerfile.builder uses for the validated E2E: kernel SCTP
       # for the gNB and the eNB.
+      #
+      # #448: the toolchain image is pulled first, retried with backoff, so one
+      # Docker Hub blip does not fail the release; `docker run` then finds it in
+      # the local store and contacts no registry. Only the pull is retried,
+      # never the cargo build.
       - name: Build the binaries
+        env:
+          TOOLCHAIN_IMAGE: rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
         run: |
           set -euo pipefail
+          docker/retry.sh docker pull "$TOOLCHAIN_IMAGE"
           jq -r '.images[] | .cargo_args, (.extra_binaries // [])[].cargo_args' docker/release-images.json > .release-cargo-args
-          docker run --rm -v "$PWD":/src -w /src rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 bash -euo pipefail -c '
+          docker run --rm -v "$PWD":/src -w /src "$TOOLCHAIN_IMAGE" bash -euo pipefail -c '
             apt-get update
             apt-get install -y --no-install-recommends pkg-config libssl-dev cmake g++ \
               protobuf-compiler libclang-dev clang libsctp-dev
@@ -457,6 +465,34 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+      # #448: the registry pulls are retried HERE, and the push below is not.
+      #
+      # This builds the same file, target and context as the push step, with
+      # NO output: nothing is tagged, loaded or pushed, so a repeat has no
+      # side effect. It resolves and pulls the digest-pinned base (and runs
+      # the apt-get layers) into this job's buildx builder, retried 5 times
+      # with 5/10/20/40s backoff. The push step then finds every layer cached
+      # and the base's manifest in the builder's content store, so it does not
+      # contact Docker Hub for the base at all.
+      #
+      # A `docker pull` would NOT do this here: setup-buildx-action's builder
+      # is a docker-container builder with its own store, separate from the
+      # daemon's, so a pre-pulled image is invisible to it.
+      #
+      # WHY THE PUSH IS NOT RETRIED. A push that fails part-way may already
+      # have written some blobs or the tag, and re-running it would publish
+      # the tag a second time, possibly from a rebuilt image with a different
+      # digest. A failed push fails the leg (publish-latest then does not move
+      # latest), and the operator re-runs the failed job deliberately.
+      - name: Warm the builder (pull and build, retried; never pushes)
+        env:
+          DOCKERFILE: ${{ matrix.dockerfile }}
+          TARGET: ${{ matrix.target }}
+          CONTEXT: ${{ matrix.context }}
+        run: |
+          set -euo pipefail
+          docker/retry.sh docker buildx build --file "$DOCKERFILE" \
+            ${TARGET:+--target "$TARGET"} "$CONTEXT"
       - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ${{ matrix.context }}
