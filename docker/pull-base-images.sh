@@ -42,7 +42,7 @@ refs=$(awk '
     if (i + 2 <= NF && toupper($(i + 1)) == "AS") { stages[tolower($(i + 2))] = 1 }
     if (ref == "" || tolower(ref) == "scratch" || (tolower(ref) in stages)) { next }
     if (ref ~ /\$/ || platform ~ /\$/) {
-      printf "::warning::%s:%d: FROM %s uses a build ARG; not pre-pulled\n", FILENAME, FNR, ref > "/dev/stderr"
+      printf "::warning::%s:%d: \"%s\" uses a build ARG in its image or --platform; not pre-pulled\n", FILENAME, FNR, $0 > "/dev/stderr"
       next
     }
     key = ref "\t" platform
