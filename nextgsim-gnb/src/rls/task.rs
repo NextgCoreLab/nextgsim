@@ -624,6 +624,12 @@ impl RlsTask {
         let Some(ref sixg) = self.task_base.sixg else {
             return;
         };
+        // Another 6G task can be on while NWDAF is not (or is not compiled in).
+        // Its receiver was then dropped at spawn, and every heartbeat would log
+        // a failed send.
+        if sixg.nwdaf_tx.is_closed() {
+            return;
+        }
         // The UE id is assigned when the tracker first sees the STI, so a
         // heartbeat from a UE the tracker has not admitted has no id to report
         // under. Skipped rather than reported under a placeholder id, which
@@ -669,6 +675,10 @@ impl RlsTask {
         let Some(ref sixg) = self.task_base.sixg else {
             return;
         };
+        // No NWDAF task listening; see `forward_measurement_to_nwdaf`.
+        if sixg.nwdaf_tx.is_closed() {
+            return;
+        }
 
         // A zero-length window would divide by zero; a window with no traffic is
         // a real measurement of zero and is reported as such.

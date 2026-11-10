@@ -10,7 +10,9 @@ publish = false
 # build of nextgsim-gnb. Off by default so `cargo test --workspace` exercises the
 # lean gNB build. Run the 6G tests with:
 #   cargo test -p nextgsim-integration-tests --features 6g
-6g = ["nextgsim-gnb/6g"]
+# Also enables the UE SHE client, so src/sixg_live_wiring.rs (#452) can show a
+# UE RRC event reaching it through the UE's library wiring.
+6g = ["nextgsim-gnb/6g", "nextgsim-ue/nextgsim-she"]
 # Enables the DRB PDCP end-to-end test (src/drb_pdcp_user_plane.rs), which needs
 # the sublayer interposed on BOTH ends (issue #33). Forwarded to both crates
 # together on purpose: a gNB with PDCP and a UE without would have the UE read a
@@ -119,6 +121,13 @@ path = "src/cross_crate_integration.rs"
 [[test]]
 name = "sixg_task_integration"
 path = "src/sixg_task_integration.rs"
+
+# #452: the core tasks reach the 6G and Rel-18 tasks through the library wiring
+# (`GnbWiring` / `UeWiring`) the binaries run. Compiles to an empty binary
+# without `6g`, like `sixg_task_integration`.
+[[test]]
+name = "sixg_live_wiring"
+path = "src/sixg_live_wiring.rs"
 
 [[test]]
 name = "rrc_handshake"

@@ -20,6 +20,7 @@ pub mod rrc;
 pub mod tasks;
 pub mod timer;
 pub mod tun;
+pub mod wiring;
 
 // Shared unit-test helpers: the `tracing` capture behind the honesty invariants
 // (#54, #55) and a `UeTaskBase` builder. Test-only, so it ships in no build.

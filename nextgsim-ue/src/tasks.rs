@@ -2142,6 +2142,24 @@ impl TaskManager {
         self.task_base.init_rel18_tasks(channel_capacity)
     }
 
+    /// Initialize the 6G task handles on the manager's task base and return the
+    /// receivers for the task loops.
+    ///
+    /// The same ordering rule as [`TaskManager::init_rel18_tasks`] applies: a
+    /// task base cloned before this keeps `sixg: None`, so nothing that task
+    /// sends reaches a 6G task (#452). [`crate::wiring::UeWiring`] is the one
+    /// caller that gets the order right.
+    #[cfg(any(
+        feature = "nextgsim-she",
+        feature = "nextgsim-nwdaf",
+        feature = "nextgsim-isac",
+        feature = "nextgsim-fl",
+        feature = "nextgsim-semantic",
+    ))]
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> UeSixgReceivers {
+        self.task_base.init_6g_tasks(channel_capacity)
+    }
+
     /// Returns a receiver for the shutdown signal.
     ///
     /// Tasks can use this to detect when shutdown has been requested.

@@ -33,23 +33,13 @@ use nextgsim_common::config::UeConfig;
 use nextgsim_ue::app::MmStatePublisher;
 use nextgsim_ue::nas::mm::registration_type_for_cell_category;
 use nextgsim_ue::tun::{TunAppMessage, TunMessage, TunTask, TunTaskConfig, UplinkBuffer};
-#[cfg(feature = "nextgsim-fl")]
-use nextgsim_ue::FlParticipantTask;
-#[cfg(feature = "nextgsim-isac")]
-use nextgsim_ue::IsacSensorTask;
-#[cfg(feature = "nextgsim-nwdaf")]
-use nextgsim_ue::NwdafReporterTask;
-#[cfg(feature = "nextgsim-semantic")]
-use nextgsim_ue::SemanticCodecTask;
-#[cfg(feature = "nextgsim-she")]
-use nextgsim_ue::SheClientTask;
-use nextgsim_ue::{
-    AppMessage, AppTask, MintMessage, MintTask, NasMessage, RangingTask, RlsMessage, RlsTask,
-    RrcMessage, Task, TaskManager, TaskMessage, UeRel18Receivers, UeStatusUpdate, UeTaskBase,
-    DEFAULT_CHANNEL_CAPACITY,
-};
+use nextgsim_ue::wiring::UeWiring;
 #[cfg(feature = "sidelink")]
-use nextgsim_ue::{SidelinkMessage, SidelinkTask};
+use nextgsim_ue::SidelinkMessage;
+use nextgsim_ue::{
+    AppMessage, MintMessage, NasMessage, RlsMessage, RrcMessage, TaskManager, TaskMessage,
+    UeStatusUpdate, UeTaskBase, DEFAULT_CHANNEL_CAPACITY,
+};
 
 /// nextgsim UE - 5G User Equipment Simulator
 #[derive(Parser, Debug)]
@@ -248,31 +238,20 @@ impl UeApp {
             instance_id, config.hplmn.mcc, config.hplmn.mnc, config.gnb_search_list
         );
 
-        // Create TaskManager with all channels
-        let (mut task_manager, app_rx, nas_rx, rrc_rx, rls_rx) =
-            TaskManager::new(config.clone(), DEFAULT_CHANNEL_CAPACITY);
-
-        // Install the Rel-18 task handles (Ranging, MINT, Sidelink) before any
-        // task base clone so every task can reach the Rel-18 actors.
-        let rel18_rxs = task_manager.init_rel18_tasks(DEFAULT_CHANNEL_CAPACITY);
-
-        let task_base = task_manager.task_base();
-        let shutdown_rx = task_manager.shutdown_receiver();
+        // Build the task graph in the library (`nextgsim_ue::wiring`), which
+        // installs the Rel-18 and 6G handles before anything clones the task
+        // base (#452), and spawns the library tasks. The integration tests run
+        // this same wiring.
+        let wiring = UeWiring::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let task_base = wiring.task_base();
+        let shutdown_rx = wiring.task_manager.shutdown_receiver();
 
         // Generate node name for CLI
         let node_name = format!("ue{instance_id}");
+        let (task_manager, nas_rx) = wiring.spawn((!disable_cmd).then_some(node_name));
 
-        // Spawn all tasks
-        Self::spawn_tasks(
-            task_base.clone(),
-            app_rx,
-            nas_rx,
-            rrc_rx,
-            rls_rx,
-            rel18_rxs,
-            disable_cmd,
-            node_name,
-        );
+        // The NAS task and the TUN forwarding are binary code.
+        Self::spawn_binary_tasks(task_base, nas_rx);
 
         Ok(Self {
             instance_id,
@@ -281,18 +260,12 @@ impl UeApp {
         })
     }
 
-    /// Spawns all UE tasks
-    #[allow(unused_mut)]
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_tasks(
-        mut task_base: UeTaskBase,
-        app_rx: tokio::sync::mpsc::Receiver<TaskMessage<AppMessage>>,
+    /// Spawns the tasks whose code lives in the binary: the TUN task, the TUN
+    /// forwarder and the NAS task. `task_base` must come from
+    /// [`UeWiring::task_base`], so it already carries every optional handle.
+    fn spawn_binary_tasks(
+        task_base: UeTaskBase,
         nas_rx: tokio::sync::mpsc::Receiver<TaskMessage<NasMessage>>,
-        rrc_rx: tokio::sync::mpsc::Receiver<TaskMessage<RrcMessage>>,
-        rls_rx: tokio::sync::mpsc::Receiver<TaskMessage<RlsMessage>>,
-        rel18_rxs: UeRel18Receivers,
-        disable_cmd: bool,
-        node_name: String,
     ) {
         // Create TUN task channel
         let (tun_tx, tun_rx) = tokio::sync::mpsc::channel::<TunMessage>(64);
@@ -418,144 +391,12 @@ impl UeApp {
             }
         });
 
-        // Spawn App task (handles status updates and CLI commands)
-        let app_task_base = task_base.clone();
-        tokio::spawn(async move {
-            let mut app_task = if disable_cmd {
-                AppTask::new_without_cli(app_task_base)
-            } else {
-                let mut task = AppTask::new(app_task_base);
-                // Initialize CLI server
-                match task.init_cli_server(vec![node_name]).await {
-                    Ok(port) => {
-                        if port > 0 {
-                            info!("CLI server listening on port {}", port);
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to initialize CLI server: {}", e);
-                    }
-                }
-                task
-            };
-            app_task.run(app_rx).await;
-        });
-        info!("App task spawned");
-
         // Spawn NAS task (handles MM and SM procedures)
         let nas_task_base = task_base.clone();
         tokio::spawn(async move {
             Self::run_nas_task(nas_task_base, nas_rx, tun_tx, up_ready_tx).await
         });
         info!("NAS task spawned");
-
-        // Spawn RRC task: the conformant library RrcTask (issue #30). It runs
-        // real RRC connection establishment (RRCSetupRequest on SRB0/CCCH →
-        // RRCSetup → RRCSetupComplete on SRB1/DCCH, TS 38.331 §5.3.3), cell
-        // selection, UAC, re-establishment, resume and AS-security — replacing
-        // the former inline loop that smuggled the initial NAS as a raw PDU on
-        // UL-DCCH and flipped Connected on any downlink RRC message.
-        let rrc_task_base = task_base.clone();
-        let mut rrc_task = nextgsim_ue::rrc::RrcTask::new(rrc_task_base);
-        tokio::spawn(async move { rrc_task.run(rrc_rx).await });
-        info!("RRC task spawned (library RrcTask)");
-
-        // Spawn Rel-18 5G-Advanced tasks (Ranging TS 23.586, MINT TS 23.761,
-        // Sidelink). The handles were installed by the TaskManager before the
-        // task base was cloned, so all tasks can reach these actors.
-        let UeRel18Receivers {
-            ranging_rx,
-            mint_rx,
-            #[cfg(feature = "sidelink")]
-            sidelink_rx,
-        } = rel18_rxs;
-        let mut ranging_task = RangingTask::new(task_base.clone());
-        tokio::spawn(async move { ranging_task.run(ranging_rx).await });
-        info!("{}", nextgsim_ue::ranging::SPAWN_LOG);
-        let mut mint_task = MintTask::new(task_base.clone());
-        tokio::spawn(async move { mint_task.run(mint_rx).await });
-        info!("MINT task spawned (Rel-18, TS 23.761)");
-        // Issue #54: the sidelink surface is an inert facade, so a default build
-        // neither spawns it nor logs anything about it.
-        #[cfg(feature = "sidelink")]
-        {
-            let mut sidelink_task = SidelinkTask::new(task_base.clone());
-            tokio::spawn(async move { sidelink_task.run(sidelink_rx).await });
-            info!("{}", nextgsim_ue::sidelink::SPAWN_LOG);
-        }
-
-        // Spawn 6G AI-native network function tasks (Rel-20)
-        #[cfg(any(
-            feature = "nextgsim-she",
-            feature = "nextgsim-nwdaf",
-            feature = "nextgsim-isac",
-            feature = "nextgsim-fl",
-            feature = "nextgsim-semantic",
-        ))]
-        {
-            let any_6g = false
-                || cfg!(feature = "nextgsim-she") && task_base.config.she_enabled
-                || cfg!(feature = "nextgsim-nwdaf") && task_base.config.ai_ml_enabled
-                || cfg!(feature = "nextgsim-isac") && task_base.config.isac_enabled
-                || cfg!(feature = "nextgsim-fl") && task_base.config.federated_learning_enabled
-                || cfg!(feature = "nextgsim-semantic") && task_base.config.semantic_comm_enabled;
-
-            if any_6g {
-                let sixg_rxs = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
-
-                #[cfg(feature = "nextgsim-she")]
-                if task_base.config.she_enabled {
-                    let mut she_task = SheClientTask::new(task_base.clone());
-                    tokio::spawn(async move {
-                        she_task.run(sixg_rxs.she_client_rx).await;
-                    });
-                    info!("SHE Client task spawned");
-                }
-
-                #[cfg(feature = "nextgsim-nwdaf")]
-                if task_base.config.ai_ml_enabled {
-                    let mut nwdaf_task = NwdafReporterTask::new(task_base.clone());
-                    tokio::spawn(async move {
-                        nwdaf_task.run(sixg_rxs.nwdaf_reporter_rx).await;
-                    });
-                    info!("NWDAF Reporter task spawned");
-                }
-
-                #[cfg(feature = "nextgsim-isac")]
-                if task_base.config.isac_enabled {
-                    let mut isac_task = IsacSensorTask::new(task_base.clone());
-                    tokio::spawn(async move {
-                        isac_task.run(sixg_rxs.isac_sensor_rx).await;
-                    });
-                    info!("ISAC Sensor task spawned");
-                }
-
-                #[cfg(feature = "nextgsim-fl")]
-                if task_base.config.federated_learning_enabled {
-                    let mut fl_task = FlParticipantTask::new(task_base.clone());
-                    tokio::spawn(async move {
-                        fl_task.run(sixg_rxs.fl_participant_rx).await;
-                    });
-                    info!("FL Participant task spawned");
-                }
-
-                #[cfg(feature = "nextgsim-semantic")]
-                if task_base.config.semantic_comm_enabled {
-                    let mut semantic_task = SemanticCodecTask::new(task_base.clone());
-                    tokio::spawn(async move {
-                        semantic_task.run(sixg_rxs.semantic_codec_rx).await;
-                    });
-                    info!("Semantic Codec task spawned");
-                }
-            }
-        }
-
-        // Spawn RLS task (handles cell search and gNB communication)
-        let mut rls_task = RlsTask::from_ue_config(task_base);
-        tokio::spawn(async move {
-            rls_task.run(rls_rx).await;
-        });
-        info!("RLS task spawned");
     }
 
     /// Runs the NAS task (handles MM and SM procedures)
