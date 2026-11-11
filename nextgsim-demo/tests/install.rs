@@ -53,7 +53,11 @@ fn install_logs_one_banner_is_write_once_and_serves_the_cli() {
             Some("baseline")
         );
 
-        // Write-once: a second install is refused and changes nothing.
+        // Write-once: a second init or install is refused and changes nothing.
+        assert_eq!(
+            init_from_yaml("demo: ~\n", DemoRegistry::default()).err(),
+            Some(nextgsim_demo::DemoConfigError::AlreadyInstalled)
+        );
         assert_eq!(
             install(DemoRuntime::default()).err(),
             Some(AlreadyInstalled)
