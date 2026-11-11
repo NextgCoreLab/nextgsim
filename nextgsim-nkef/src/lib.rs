@@ -47,6 +47,7 @@ pub mod access;
 pub mod distributed;
 pub mod embedder;
 pub mod events;
+pub mod live;
 pub mod ontology;
 pub mod query;
 pub mod rag;

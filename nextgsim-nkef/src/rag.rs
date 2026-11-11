@@ -250,8 +250,11 @@ impl ContextBuilder {
                 entry_text.push('\n');
             }
 
-            // Check token limit
-            if output.len() + entry_text.len() > max_chars && included_count > 0 {
+            // The budget is a hard cap (nextgsim#488): an entry that does not fit
+            // is not admitted, the first one included. Admitting the first entry
+            // regardless returned a context larger than `max_tokens` whenever the
+            // best match alone exceeded it.
+            if output.len() + entry_text.len() > max_chars {
                 break;
             }
 
@@ -313,7 +316,7 @@ impl ContextBuilder {
                 }
             }
 
-            if output.len() + entry_text.len() > max_chars && included_count > 0 {
+            if output.len() + entry_text.len() > max_chars {
                 break;
             }
 
@@ -383,7 +386,7 @@ impl ContextBuilder {
             }
 
             let entry_json = serde_json::to_string(&entry_map).unwrap_or_default();
-            if current_len + entry_json.len() > max_chars && included_count > 0 {
+            if current_len + entry_json.len() > max_chars {
                 break;
             }
 
@@ -539,6 +542,36 @@ mod tests {
         // Should be truncated due to token limit
         assert!(context.entry_count < 20);
         assert!(context.truncated);
+    }
+
+    /// nextgsim#488: the token budget is a hard cap. A best match larger than the
+    /// whole budget is not admitted, in every format; it used to be, because the
+    /// first entry skipped the check.
+    ///
+    /// REVERT-VERIFIED: restoring `&& included_count > 0` fails every format.
+    #[test]
+    fn the_token_budget_holds_even_for_the_first_entry() {
+        for format in [
+            ContextFormat::Markdown,
+            ContextFormat::PlainText,
+            ContextFormat::Json,
+        ] {
+            let config = RagConfig {
+                format,
+                ..RagConfig::default().with_max_tokens(5)
+            };
+            let mut builder = ContextBuilder::with_config(config);
+            let entity = Entity::new("gnb-big", EntityType::Gnb)
+                .with_property("description", "x".repeat(200));
+            builder.add_entity(&entity, 0.9, &[]);
+            let context = builder.build();
+            assert_eq!(context.entry_count, 0, "{format:?}: {}", context.text);
+            assert!(
+                !context.text.contains("xxxx"),
+                "{format:?}: {}",
+                context.text
+            );
+        }
     }
 
     #[test]

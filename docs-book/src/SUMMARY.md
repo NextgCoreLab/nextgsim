@@ -27,6 +27,7 @@
 
 # Demos
 
+- [D447A: live-state knowledge exposure](demos/d447a-nkef-live.md)
 - [D440B: verified model loading](demos/d440b-model-verify.md)
 - [D441C: UE Mobility from AMF location events](demos/d441c-amf-mobility.md)
 

@@ -1,0 +1,14 @@
+diff --git a/nextgsim-nkef/src/live.rs b/nextgsim-nkef/src/live.rs
+index 13492f9..6ecf90c 100644
+--- a/nextgsim-nkef/src/live.rs
++++ b/nextgsim-nkef/src/live.rs
+@@ -417,7 +417,8 @@ impl LiveStore {
+     pub fn bundle(&self, question: &str, consumer: Consumer, budget: usize, now_ms: u64) -> Bundle {
+         match consumer {
+             Consumer::Internal => self.internal_bundle(question, budget, now_ms),
+-            Consumer::External => self.external_bundle(budget, now_ms),
++            // REVERT ARM 447-projection: the external consumer gets the internal bundle.
++            Consumer::External => self.internal_bundle(question, budget, now_ms),
+         }
+     }
+ 
