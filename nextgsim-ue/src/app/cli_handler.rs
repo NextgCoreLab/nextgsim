@@ -191,6 +191,9 @@ pub struct CliHandler {
     next_psi: u8,
     /// Active PDU sessions (PSI -> session info)
     active_sessions: Vec<u8>,
+    /// The Session-AMBR the network last set on a live session with a PDU
+    /// SESSION MODIFICATION COMMAND (#454), by PSI. Dropped with the session.
+    session_ambrs: std::collections::HashMap<u8, nextgsim_nas::messages::sm::IeSessionAmbr>,
     /// CM state as last published by the NAS task (issue #270)
     cm_state: CmState,
 }
@@ -208,6 +211,7 @@ impl CliHandler {
             pt_manager: ProcedureTransactionManager::new(),
             next_psi: 1, // PSI starts at 1
             active_sessions: Vec::new(),
+            session_ambrs: std::collections::HashMap::new(),
             cm_state: CmState::Idle,
         }
     }
@@ -644,6 +648,22 @@ impl CliHandler {
     /// Marks a PDU session as released.
     pub fn on_session_released(&mut self, psi: u8) {
         self.active_sessions.retain(|&p| p != psi);
+        self.session_ambrs.remove(&psi);
+    }
+
+    /// Records the Session-AMBR the network set on a session (#454).
+    pub fn on_session_parameters_changed(
+        &mut self,
+        psi: u8,
+        session_ambr: nextgsim_nas::messages::sm::IeSessionAmbr,
+    ) {
+        self.session_ambrs.insert(psi, session_ambr);
+    }
+
+    /// The Session-AMBR the network last set on `psi` with a modification, if
+    /// it has set one.
+    pub fn session_ambr(&self, psi: u8) -> Option<&nextgsim_nas::messages::sm::IeSessionAmbr> {
+        self.session_ambrs.get(&psi)
     }
 
     /// Completes a procedure transaction.

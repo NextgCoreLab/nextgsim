@@ -287,6 +287,21 @@ pub enum SmOutput {
         /// PDU session identity
         psi: u8,
     },
+    /// A PDU SESSION MODIFICATION COMMAND changed the session's Session-AMBR.
+    /// The network includes the IE "when the session-AMBR of the PDU session is
+    /// modified" (TS 24.501 §8.3.9.3, §6.3.2.2).
+    ///
+    /// Raised whoever started the procedure, so a network-initiated change
+    /// (PTI "No procedure transaction identity assigned", §6.3.2.2) reaches the
+    /// layers above NAS, which `SessionModified` does not report (#454). Not
+    /// raised when the command carries no Session-AMBR or repeats the stored
+    /// one.
+    SessionParametersChanged {
+        /// PDU session identity
+        psi: u8,
+        /// The Session-AMBR now in force
+        session_ambr: IeSessionAmbr,
+    },
     /// A UE-initiated modification was rejected
     SessionModificationFailed {
         /// PDU session identity
@@ -1901,12 +1916,26 @@ impl SmOrchestrator {
         if let Some(s) = self.sessions[psi as usize].as_mut() {
             if let Some(ref ambr) = cmd.session_ambr {
                 if ambr.len() >= 6 {
-                    s.session_ambr = Some(IeSessionAmbr {
+                    let session_ambr = IeSessionAmbr {
                         downlink_unit: ambr[0],
                         downlink: u16::from_be_bytes([ambr[1], ambr[2]]),
                         uplink_unit: ambr[3],
                         uplink: u16::from_be_bytes([ambr[4], ambr[5]]),
-                    });
+                    };
+                    if s.session_ambr.as_ref() != Some(&session_ambr) {
+                        info!(
+                            "PDU session {psi}: Session-AMBR now DL {} (unit {}) / UL {} (unit {})",
+                            session_ambr.downlink,
+                            session_ambr.downlink_unit,
+                            session_ambr.uplink,
+                            session_ambr.uplink_unit
+                        );
+                        outs.push(SmOutput::SessionParametersChanged {
+                            psi,
+                            session_ambr: session_ambr.clone(),
+                        });
+                    }
+                    s.session_ambr = Some(session_ambr);
                 }
             }
             if let Some(ref rules) = cmd.authorized_qos_rules {
@@ -2907,6 +2936,16 @@ mod tests {
         let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
 
         assert!(outs.contains(&SmOutput::SessionModified { psi }));
+        // The new AMBR is reported as well; SessionModified carries none.
+        assert!(outs.contains(&SmOutput::SessionParametersChanged {
+            psi,
+            session_ambr: IeSessionAmbr {
+                downlink_unit: 0x06,
+                downlink: 300,
+                uplink_unit: 0x06,
+                uplink: 100,
+            },
+        }));
         // The UE must answer with Modification Complete
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
         assert_eq!(inner[3], 0xCC);
@@ -2941,13 +2980,56 @@ mod tests {
     #[test]
     fn test_network_initiated_modification_command() {
         let (mut orch, psi) = established();
-        // Network-initiated: PTI 0
+        // Network-initiated: PTI 0, no Session-AMBR
         let cmd = vec![0x2E, psi, 0x00, 0xCB];
         let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
         let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
         assert_eq!(inner[3], 0xCC, "must reply with Modification Complete");
         assert_eq!(inner[2], 0x00, "PTI 0 echoed");
         assert!(!outs.contains(&SmOutput::SessionModified { psi }));
+        assert!(
+            !outs
+                .iter()
+                .any(|o| matches!(o, SmOutput::SessionParametersChanged { .. })),
+            "no Session-AMBR, nothing changed"
+        );
+    }
+
+    /// #454: a network-initiated (PTI 0, TS 24.501 §6.3.2.2) command with a new
+    /// Session-AMBR is applied, answered, and reported upward with that AMBR.
+    /// The command bytes are the ones nextgcore's smfd emits:
+    /// [2E PSI PTI CB 2A 06 <ambr>], here DL 300 / UL 100 in unit 06 (Mbps).
+    #[test]
+    fn a_network_initiated_ambr_change_is_reported_upward() {
+        let (mut orch, psi) = established();
+        let cmd = vec![
+            0x2E, psi, 0x00, 0xCB, 0x2A, 0x06, 0x06, 0x01, 0x2C, 0x06, 0x00, 0x64,
+        ];
+        let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd.clone(), psi));
+
+        let expected = IeSessionAmbr {
+            downlink_unit: 0x06,
+            downlink: 300,
+            uplink_unit: 0x06,
+            uplink: 100,
+        };
+        assert!(outs.contains(&SmOutput::SessionParametersChanged {
+            psi,
+            session_ambr: expected.clone(),
+        }));
+        assert!(
+            !outs.contains(&SmOutput::SessionModified { psi }),
+            "SessionModified still means a UE-initiated modification completed"
+        );
+        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(inner[3], 0xCC, "still answered with Modification Complete");
+        assert_eq!(orch.session(psi).unwrap().session_ambr, Some(expected));
+
+        // The same AMBR again changes nothing, so nothing is reported.
+        let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
+        assert!(!outs
+            .iter()
+            .any(|o| matches!(o, SmOutput::SessionParametersChanged { .. })));
     }
 
     // ========================================================================

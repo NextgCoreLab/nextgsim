@@ -152,6 +152,17 @@ impl AppTask {
             UeStatusUpdate::SessionRelease { psi } => {
                 self.cli_handler.on_session_released(psi as u8);
             }
+            UeStatusUpdate::SessionParametersChanged { psi, session_ambr } => {
+                info!(
+                    "PDU session {psi}: network set Session-AMBR DL {} (unit {}) / UL {} (unit {})",
+                    session_ambr.downlink,
+                    session_ambr.downlink_unit,
+                    session_ambr.uplink,
+                    session_ambr.uplink_unit
+                );
+                self.cli_handler
+                    .on_session_parameters_changed(psi as u8, session_ambr);
+            }
             UeStatusUpdate::CmStateChanged { cm_state } => {
                 info!("CM state changed to: {}", cm_state);
                 self.cli_handler.set_cm_state(cm_state);
@@ -702,6 +713,26 @@ mod tests {
         task.handle_status_update(UeStatusUpdate::SessionEstablishment { psi: 5 });
         task.handle_status_update(UeStatusUpdate::SessionRelease { psi: 5 });
         assert_eq!(task.cli_handler.active_session_count(), 0);
+    }
+
+    /// #454: the App task keeps the Session-AMBR the network set, and drops it
+    /// with the session.
+    #[test]
+    fn a_session_parameters_change_is_recorded_until_release() {
+        use nextgsim_nas::messages::sm::IeSessionAmbr;
+        let task_base = create_task_base();
+        let mut task = AppTask::new(task_base);
+        let ambr = IeSessionAmbr::new(0x06, 300, 0x06, 100);
+
+        task.handle_status_update(UeStatusUpdate::SessionEstablishment { psi: 5 });
+        task.handle_status_update(UeStatusUpdate::SessionParametersChanged {
+            psi: 5,
+            session_ambr: ambr.clone(),
+        });
+        assert_eq!(task.cli_handler.session_ambr(5), Some(&ambr));
+
+        task.handle_status_update(UeStatusUpdate::SessionRelease { psi: 5 });
+        assert_eq!(task.cli_handler.session_ambr(5), None);
     }
 
     #[test]

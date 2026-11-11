@@ -233,6 +233,15 @@ pub enum UeStatusUpdate {
         /// PDU session ID
         psi: i32,
     },
+    /// The network changed a live PDU session's Session-AMBR with a PDU
+    /// SESSION MODIFICATION COMMAND, network- or UE-initiated (TS 24.501
+    /// §6.3.2.3, #454). Carries the value now in force.
+    SessionParametersChanged {
+        /// PDU session ID
+        psi: i32,
+        /// The Session-AMBR now in force (TS 24.501 §9.11.4.14)
+        session_ambr: nextgsim_nas::messages::sm::IeSessionAmbr,
+    },
     /// CM state changed
     CmStateChanged {
         /// New CM state

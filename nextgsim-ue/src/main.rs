@@ -1632,6 +1632,19 @@ async fn process_sm_outputs(
             SmOutput::SessionModified { psi } => {
                 info!("PDU session {psi} modification completed");
             }
+            SmOutput::SessionParametersChanged { psi, session_ambr } => {
+                // Up to the App task (#454): the NAS layer applied the new
+                // Session-AMBR already; this is what tells the layer above.
+                let _ = task_base
+                    .app_tx
+                    .send(AppMessage::StatusUpdate(
+                        UeStatusUpdate::SessionParametersChanged {
+                            psi: i32::from(psi),
+                            session_ambr,
+                        },
+                    ))
+                    .await;
+            }
             SmOutput::SessionModificationFailed { psi, cause } => {
                 warn!(
                     "PDU session {psi} modification failed: {:?} (#{})",
@@ -2228,6 +2241,48 @@ fn increment_imsi(imsi: &str, offset: u64) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #454: a `SessionParametersChanged` from the SM orchestrator reaches the
+    /// App task as a status update carrying the same Session-AMBR.
+    #[tokio::test]
+    async fn a_session_parameters_change_is_forwarded_to_the_app_task() {
+        use nextgsim_nas::messages::sm::IeSessionAmbr;
+        use nextgsim_ue::nas::mm::{MmOrchestrator, MmUeIdentity};
+        use nextgsim_ue::nas::sm::SmOutput;
+        use nextgsim_ue::TaskManager;
+
+        let config = UeConfig::default();
+        let (task_manager, mut app_rx, _nas_rx, _rrc_rx, _rls_rx) =
+            TaskManager::new(config.clone(), 16);
+        let task_base = task_manager.task_base();
+        let suci = build_suci_from_config(&config).unwrap_or_default();
+        let mut orch = MmOrchestrator::new(MmUeIdentity::from_config(&config, suci));
+        let (tun_tx, _tun_rx) = tokio::sync::mpsc::channel(4);
+        let mut pdu_counter = 0;
+        let ambr = IeSessionAmbr::new(0x06, 300, 0x06, 100);
+
+        process_sm_outputs(
+            vec![SmOutput::SessionParametersChanged {
+                psi: 1,
+                session_ambr: ambr.clone(),
+            }],
+            &mut orch,
+            &task_base,
+            &tun_tx,
+            &mut pdu_counter,
+        )
+        .await;
+
+        match app_rx.try_recv() {
+            Ok(TaskMessage::Message(AppMessage::StatusUpdate(
+                UeStatusUpdate::SessionParametersChanged { psi, session_ambr },
+            ))) => {
+                assert_eq!(psi, 1);
+                assert_eq!(session_ambr, ambr);
+            }
+            other => panic!("expected the change on the App task's inbox, got {other:?}"),
+        }
+    }
 
     /// #419: a MINT UE runs one instance per subscription. Each has its own
     /// SUPI and subscription index and establishes the sessions the DNN map
