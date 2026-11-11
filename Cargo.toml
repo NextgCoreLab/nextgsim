@@ -27,6 +27,7 @@ members = [
     "nextgsim-agent",
     "nextgsim-fl",
     "nextgsim-semantic",
+    "nextgsim-demo",
     "tests",
 ]
 
@@ -140,6 +141,7 @@ nextgsim-sctp = { path = "nextgsim-sctp" }
 nextgsim-gnb = { path = "nextgsim-gnb" }
 nextgsim-ue = { path = "nextgsim-ue" }
 nextgsim-cli = { path = "nextgsim-cli" }
+nextgsim-demo = { path = "nextgsim-demo" }
 
 # AI/ML crates (6G AI-native network functions)
 nextgsim-ai = { path = "nextgsim-ai" }

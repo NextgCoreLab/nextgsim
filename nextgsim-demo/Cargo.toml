@@ -1,0 +1,19 @@
+[package]
+name = "nextgsim-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "nextgsim demo toggle convention (nextgsim#458): the demo: config block, its errors, banner, metric, log prefix and nr-cli demo set/show"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_yaml.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
