@@ -1548,9 +1548,6 @@ jobs:
           demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml
           demo_assert_private
 
-      - name: Install libsctp
-        run: sudo apt-get update && sudo apt-get install -y libsctp-dev
-
       - name: Build the 5GC via nextgcore's builder, the gNB with the demo feature
         run: |
           set -euo pipefail
@@ -1562,7 +1559,11 @@ jobs:
           docker cp builder:/out/. docker/rust/binaries/
           docker rm builder
           cd ../nextgsim
-          cargo build --release -p nextgsim-gnb --features demo-d446a-agent-conflict -p nextgsim-cli
+          # Built in a bookworm container: the images are debian:bookworm-slim
+          # (glibc 2.36), and a binary built on the runner needs GLIBC_2.38.
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
+            'apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
+             cargo build --release -p nextgsim-gnb --features demo-d446a-agent-conflict -p nextgsim-cli'
           mkdir -p binaries
           cp target/release/nr-gnb target/release/nr-cli binaries/
           cp ../nextgcore/docker/rust/binaries/nr-ue binaries/
