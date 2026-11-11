@@ -54,6 +54,9 @@ const UDP_BUFFER_SIZE: usize = 65535;
 /// matching the grant it is supposed to bound.
 pub(crate) const MAC_GRANT_BYTES: usize = 1500;
 
+/// The shortest gap between two "NWDAF inbox full" warnings.
+const NWDAF_DROP_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// RLS Task for managing radio link simulation
 pub struct RlsTask {
     /// Task base for inter-task communication
@@ -109,6 +112,11 @@ pub struct RlsTask {
     /// so the elapsed time has to be measured rather than assumed from the timer
     /// period -- a busy task ticks late and would otherwise overstate throughput.
     load_window_start: Instant,
+    /// Reports to NWDAF dropped because its inbox was full (see
+    /// [`RlsTask::offer_to_nwdaf`]).
+    nwdaf_dropped: u64,
+    /// When a full-inbox drop was last logged, for rate limiting.
+    nwdaf_drop_logged_at: Option<Instant>,
     /// The MAC grant ceiling in force for one UE, in octets, for those UEs whose
     /// declared capabilities bound them below the cell budget (issue #57).
     ///
@@ -162,6 +170,8 @@ impl RlsTask {
             started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
+            nwdaf_dropped: 0,
+            nwdaf_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
@@ -193,6 +203,8 @@ impl RlsTask {
             started_at: Instant::now(),
             load_window_octets: 0,
             load_window_start: Instant::now(),
+            nwdaf_dropped: 0,
+            nwdaf_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
@@ -616,18 +628,12 @@ impl RlsTask {
     /// figure and models no interference, so there is nothing to derive a
     /// quality ratio from. Sending a number would be inventing one.
     async fn forward_measurement_to_nwdaf(
-        &self,
+        &mut self,
         sti: u64,
         ack: &RlsHeartbeatAck,
         heartbeat: &nextgsim_rls::RlsHeartbeat,
     ) {
-        let Some(ref sixg) = self.task_base.sixg else {
-            return;
-        };
-        // Another 6G task can be on while NWDAF is not (or is not compiled in).
-        // Its receiver was then dropped at spawn, and every heartbeat would log
-        // a failed send.
-        if sixg.nwdaf_tx.is_closed() {
+        if self.task_base.sixg.is_none() {
             return;
         }
         // The UE id is assigned when the tracker first sees the STI, so a
@@ -648,9 +654,7 @@ impl RlsTask {
                 heartbeat.sim_pos.z as f32,
             ),
         };
-        if let Err(e) = sixg.nwdaf_tx.send(msg).await {
-            warn!("RLS: failed to forward UE measurement to NWDAF: {}", e);
-        }
+        self.offer_to_nwdaf(msg);
     }
 
     /// Report the cell's measured load to NWDAF and open a new window (issue #18).
@@ -672,11 +676,7 @@ impl RlsTask {
         self.load_window_octets = 0;
         self.load_window_start = Instant::now();
 
-        let Some(ref sixg) = self.task_base.sixg else {
-            return;
-        };
-        // No NWDAF task listening; see `forward_measurement_to_nwdaf`.
-        if sixg.nwdaf_tx.is_closed() {
+        if self.task_base.sixg.is_none() {
             return;
         }
 
@@ -695,8 +695,37 @@ impl RlsTask {
             connected_ues: self.ue_addresses.len() as u32,
             throughput_mbps,
         };
-        if let Err(e) = sixg.nwdaf_tx.send(msg).await {
-            warn!("RLS: failed to forward cell load to NWDAF: {}", e);
+        self.offer_to_nwdaf(msg);
+    }
+
+    /// Hands `msg` to the NWDAF task without waiting.
+    ///
+    /// This task relays the user plane and answers heartbeats, so it must never
+    /// wait on analytics: a full NWDAF inbox drops the report, counts it in
+    /// `nwdaf_dropped`, and logs at most once per [`NWDAF_DROP_LOG_INTERVAL`].
+    /// A closed inbox means no NWDAF task is listening (another 6G task is on
+    /// without it, or it is not compiled in), which is not a drop and is not
+    /// logged.
+    fn offer_to_nwdaf(&mut self, msg: NwdafMessage) {
+        let result = match &self.task_base.sixg {
+            Some(sixg) => sixg.nwdaf_tx.try_send(msg),
+            None => return,
+        };
+        match result {
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.nwdaf_dropped += 1;
+                let due = self
+                    .nwdaf_drop_logged_at
+                    .is_none_or(|at| at.elapsed() >= NWDAF_DROP_LOG_INTERVAL);
+                if due {
+                    self.nwdaf_drop_logged_at = Some(Instant::now());
+                    warn!(
+                        "RLS: NWDAF inbox full, report dropped ({} dropped so far)",
+                        self.nwdaf_dropped
+                    );
+                }
+            }
         }
     }
 
@@ -2585,7 +2614,7 @@ mod tests {
     #[tokio::test]
     async fn a_heartbeat_from_an_unadmitted_ue_reports_nothing() {
         // Reporting under a placeholder id would merge two UEs' histories.
-        let (task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        let (mut task, mut nwdaf_rx) = rls_task_with_nwdaf();
         let heartbeat = nextgsim_rls::RlsHeartbeat::with_position(0x1111, SimCoord::new(1, 2, 3));
         let ack = RlsHeartbeatAck::with_dbm(0x1111, -70);
         task.forward_measurement_to_nwdaf(0x1111, &ack, &heartbeat)
@@ -2681,6 +2710,55 @@ mod tests {
             uplink_len * 2,
             "downlink counted too"
         );
+    }
+
+    /// The RLS task relays the user plane, so a full NWDAF inbox must not stall
+    /// it: the report is dropped and counted, and the call returns at once.
+    #[tokio::test]
+    async fn a_full_nwdaf_inbox_drops_the_report_instead_of_blocking() {
+        // Capacity 16, never drained.
+        let (mut task, mut nwdaf_rx) = rls_task_with_nwdaf();
+        task.sti_to_ue_id.insert(0xABCD, 7);
+        for _ in 0..16 {
+            task.report_cell_load_to_nwdaf().await;
+        }
+        assert_eq!(task.nwdaf_dropped, 0, "16 reports fit");
+
+        let heartbeat =
+            nextgsim_rls::RlsHeartbeat::with_position(0xABCD, SimCoord::new(10, 20, 30));
+        let ack = RlsHeartbeatAck::with_dbm(0xABCD, -87);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            task.report_cell_load_to_nwdaf().await;
+            task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+                .await;
+        })
+        .await
+        .expect("a full NWDAF inbox must not block the RLS task");
+        assert_eq!(task.nwdaf_dropped, 2, "both reports dropped and counted");
+
+        // Draining one slot lets the next report through again.
+        let _ = nwdaf_rx.recv().await;
+        task.report_cell_load_to_nwdaf().await;
+        assert_eq!(task.nwdaf_dropped, 2);
+    }
+
+    /// Another 6G task can be enabled without NWDAF, or NWDAF can be enabled
+    /// without its feature: the wiring then drops the NWDAF receiver. That is
+    /// not a drop -- nobody is listening -- so nothing is counted.
+    #[tokio::test]
+    async fn a_closed_nwdaf_inbox_is_not_counted_as_a_drop() {
+        let (mut task, nwdaf_rx) = rls_task_with_nwdaf();
+        drop(nwdaf_rx);
+        task.sti_to_ue_id.insert(0xABCD, 7);
+        let heartbeat =
+            nextgsim_rls::RlsHeartbeat::with_position(0xABCD, SimCoord::new(10, 20, 30));
+        let ack = RlsHeartbeatAck::with_dbm(0xABCD, -87);
+
+        task.report_cell_load_to_nwdaf().await;
+        task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+            .await;
+
+        assert_eq!(task.nwdaf_dropped, 0);
     }
 
     #[tokio::test]

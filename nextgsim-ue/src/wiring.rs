@@ -309,3 +309,42 @@ fn spawn_6g_tasks(task_base: &UeTaskBase, sixg: UeSixgReceivers) {
         info!("Semantic Codec task spawned");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::DEFAULT_CHANNEL_CAPACITY;
+
+    /// A default config builds the core and Rel-18 channels and no 6G ones, and
+    /// every handed-out base carries the Rel-18 handles (#452).
+    #[test]
+    fn a_default_config_builds_no_6g_channels() {
+        let wiring = UeWiring::new(UeConfig::default(), DEFAULT_CHANNEL_CAPACITY);
+        let base = wiring.task_base();
+        assert!(base.rel18.is_some(), "Rel-18 handles are always installed");
+        #[cfg(any(
+            feature = "nextgsim-she",
+            feature = "nextgsim-nwdaf",
+            feature = "nextgsim-isac",
+            feature = "nextgsim-fl",
+            feature = "nextgsim-semantic",
+        ))]
+        {
+            assert!(wiring.sixg.is_none());
+            assert!(base.sixg.is_none());
+        }
+    }
+
+    /// With a 6G task enabled, every handed-out base carries the 6G handles.
+    #[cfg(feature = "nextgsim-she")]
+    #[test]
+    fn the_task_base_carries_the_6g_handles() {
+        let config = UeConfig {
+            she_enabled: true,
+            ..UeConfig::default()
+        };
+        let wiring = UeWiring::new(config, DEFAULT_CHANNEL_CAPACITY);
+        assert!(wiring.sixg.is_some());
+        assert!(wiring.task_base().sixg.is_some());
+    }
+}
