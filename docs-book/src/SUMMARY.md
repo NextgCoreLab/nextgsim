@@ -28,6 +28,7 @@
 # Demos
 
 - [D440B: verified model loading](demos/d440b-model-verify.md)
+- [D441C: UE Mobility from AMF location events](demos/d441c-amf-mobility.md)
 
 # Community
 
