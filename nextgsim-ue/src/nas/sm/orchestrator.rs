@@ -257,6 +257,25 @@ impl PduSession {
     }
 }
 
+/// A Session-AMBR as (downlink, uplink) rates in kbps, so two encodings of the
+/// same rate compare equal.
+///
+/// TS 24.501 Table 9.11.4.14.1: unit 1 is 1 Kbps and each further unit is four
+/// times the previous one, up to 25 (256 Pbps). Unit 0 is read as 1 Kbps (the
+/// table's NOTE), and units above 25 as 256 Pbps ("Other values shall be
+/// interpreted as multiples of 256 Pbps"). `u128` holds the largest product,
+/// 65535 × 4^24 kbps.
+fn ambr_rates_kbps(ambr: &IeSessionAmbr) -> (u128, u128) {
+    fn kbps(unit: u8, value: u16) -> u128 {
+        let step = u32::from(unit.clamp(1, 25) - 1);
+        u128::from(value) * 4u128.pow(step)
+    }
+    (
+        kbps(ambr.downlink_unit, ambr.downlink),
+        kbps(ambr.uplink_unit, ambr.uplink),
+    )
+}
+
 /// Outputs produced by the orchestrator for the caller (NAS task) to act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmOutput {
@@ -1922,7 +1941,13 @@ impl SmOrchestrator {
                         uplink_unit: ambr[3],
                         uplink: u16::from_be_bytes([ambr[4], ambr[5]]),
                     };
-                    if s.session_ambr.as_ref() != Some(&session_ambr) {
+                    // Compared as rates, not as raw unit and value: the same rate
+                    // restated in another unit is not a change (#454 review).
+                    let changed = s
+                        .session_ambr
+                        .as_ref()
+                        .is_none_or(|old| ambr_rates_kbps(old) != ambr_rates_kbps(&session_ambr));
+                    if changed {
                         info!(
                             "PDU session {psi}: Session-AMBR now DL {} (unit {}) / UL {} (unit {})",
                             session_ambr.downlink,
@@ -2992,6 +3017,36 @@ mod tests {
                 .iter()
                 .any(|o| matches!(o, SmOutput::SessionParametersChanged { .. })),
             "no Session-AMBR, nothing changed"
+        );
+    }
+
+    /// #454 review: the same rate restated in another unit is not a change, so
+    /// nothing is reported. DL 200 Mbps / UL 50 Mbps (the `established()`
+    /// session) re-sent as 800 x 256 kbps / 50 x 1 Mbps.
+    #[test]
+    fn an_ambr_restated_in_another_unit_is_not_a_change() {
+        let (mut orch, psi) = established();
+        // unit 05 = 256 kbps, 800 x 256 kbps = 200 Mbps; UL unchanged.
+        let cmd = vec![
+            0x2E, psi, 0x00, 0xCB, 0x2A, 0x06, 0x05, 0x03, 0x20, 0x06, 0x00, 0x32,
+        ];
+        let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
+        assert!(!outs
+            .iter()
+            .any(|o| matches!(o, SmOutput::SessionParametersChanged { .. })));
+        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(inner[3], 0xCC, "still answered with Modification Complete");
+    }
+
+    #[test]
+    fn ambr_rates_follow_the_unit_table() {
+        // 1 Kbps, 4 Kbps, 1 Mbps (unit 6 = 4^5 kbps), and the 256 Pbps ceiling.
+        assert_eq!(ambr_rates_kbps(&IeSessionAmbr::new(1, 7, 2, 7)), (7, 28));
+        assert_eq!(ambr_rates_kbps(&IeSessionAmbr::new(6, 1, 0, 1)), (1024, 1));
+        assert_eq!(
+            ambr_rates_kbps(&IeSessionAmbr::new(25, 1, 200, 1)),
+            (4u128.pow(24), 4u128.pow(24)),
+            "units above 25 read as 256 Pbps"
         );
     }
 
