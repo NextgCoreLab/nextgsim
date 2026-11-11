@@ -11,7 +11,11 @@ default = []
 # Shared, reusable ONNX model registry (issue #17): load-by-id, versioning,
 # warmup, with engines shared as `Arc<OnnxEngine>`. Off by default; consumer
 # wiring is additive, so their existing direct `load_model` paths are untouched.
-model-registry = []
+#
+# With it on, a model can also be registered *verified* (nextgsim#463): a
+# manifest pins its sha256, opset, input/output shapes and golden vectors, and
+# the model is activated only when every check passes.
+model-registry = ["dep:sha2"]
 
 [dependencies]
 # Async runtime
@@ -42,9 +46,13 @@ half = { workspace = true }
 # Random number generation
 rand = { workspace = true }
 
+# The model manifest's sha256 check (nextgsim#463), only with `model-registry`.
+sha2 = { workspace = true, optional = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -19,15 +19,16 @@
 - [PDU Sessions & the User-Plane Data Path](concepts/pdu-session-userplane.md)
 - [The AI & 6G Simulation Stack](concepts/ai-6g-stack.md)
 
-# Demos
-
-- [D446A: agent conflict over a booster cell](demos/d446a-agent-conflict.md)
-
 # Reference
 
 - [Features & APIs](reference.md)
 - [Gap Analysis: 6G](gaps/6g-gap-analysis.md)
 - [Gap Analysis: Protocols](gaps/gap-protocols.md)
+
+# Demos
+
+- [D440B: verified model loading](demos/d440b-model-verify.md)
+- [D446A: agent conflict over a booster cell](demos/d446a-agent-conflict.md)
 
 # Community
 
