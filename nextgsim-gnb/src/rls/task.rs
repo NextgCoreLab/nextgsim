@@ -15,7 +15,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
+    AgentMessage, GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
@@ -117,6 +117,10 @@ pub struct RlsTask {
     nwdaf_dropped: u64,
     /// When a full-inbox drop was last logged, for rate limiting.
     nwdaf_drop_logged_at: Option<Instant>,
+    /// Agent observations dropped because its inbox was full (#459).
+    agent_dropped: u64,
+    /// When an Agent drop was last logged, for rate limiting.
+    agent_drop_logged_at: Option<Instant>,
     /// The MAC grant ceiling in force for one UE, in octets, for those UEs whose
     /// declared capabilities bound them below the cell budget (issue #57).
     ///
@@ -172,6 +176,8 @@ impl RlsTask {
             load_window_start: Instant::now(),
             nwdaf_dropped: 0,
             nwdaf_drop_logged_at: None,
+            agent_dropped: 0,
+            agent_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
@@ -205,6 +211,8 @@ impl RlsTask {
             load_window_start: Instant::now(),
             nwdaf_dropped: 0,
             nwdaf_drop_logged_at: None,
+            agent_dropped: 0,
+            agent_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
@@ -691,13 +699,46 @@ impl RlsTask {
             None
         };
 
+        let cell_id = self.task_base.config.cell_id() as i32;
+        let connected_ues = self.ue_addresses.len() as u32;
         let msg = NwdafMessage::CellLoad {
-            cell_id: self.task_base.config.cell_id() as i32,
+            cell_id,
             prb_usage: None,
-            connected_ues: self.ue_addresses.len() as u32,
+            connected_ues,
             throughput_mbps,
         };
         self.offer_to_nwdaf(msg);
+        // The same measured window is the Agent's periodic observation (#459):
+        // its production producer, on the same tick.
+        self.offer_to_agent(AgentMessage::CellObservation {
+            cell_id,
+            connected_ues,
+            throughput_mbps,
+        });
+    }
+
+    /// Hands `msg` to the Agent task without waiting, on the same terms as
+    /// [`RlsTask::offer_to_nwdaf`]: a full inbox drops and counts it (logged at
+    /// most once per [`NWDAF_DROP_LOG_INTERVAL`]), and a closed one -- no Agent
+    /// task listening -- is neither counted nor logged.
+    fn offer_to_agent(&mut self, msg: AgentMessage) {
+        let result = match &self.task_base.sixg {
+            Some(sixg) => sixg.agent_tx.try_send(msg),
+            None => return,
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = result {
+            self.agent_dropped += 1;
+            let due = self
+                .agent_drop_logged_at
+                .is_none_or(|at| at.elapsed() >= NWDAF_DROP_LOG_INTERVAL);
+            if due {
+                self.agent_drop_logged_at = Some(Instant::now());
+                warn!(
+                    "RLS: Agent inbox full, observation dropped ({} dropped so far)",
+                    self.agent_dropped
+                );
+            }
+        }
     }
 
     /// Hands `msg` to the NWDAF task without waiting.
@@ -2827,6 +2868,43 @@ mod tests {
             .await;
 
         assert_eq!(task.nwdaf_dropped, 0);
+    }
+
+    /// #459: each cell-load tick also hands the Agent task its periodic cell
+    /// observation, with the same measured window, and a full Agent inbox does
+    /// not block the RLS task.
+    #[tokio::test]
+    async fn the_load_tick_observes_the_cell_for_the_agent() {
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut sixg = task_base.init_6g_tasks(1);
+        let mut task = RlsTask::new(task_base);
+        task.ue_addresses
+            .insert(1, "127.0.0.1:1000".parse().unwrap());
+        task.load_window_octets = 125_000;
+        task.load_window_start = Instant::now() - Duration::from_secs(1);
+
+        task.report_cell_load_to_nwdaf().await;
+
+        let Some(TaskMessage::Message(AgentMessage::CellObservation {
+            cell_id,
+            connected_ues,
+            throughput_mbps,
+        })) = sixg.agent_rx.try_recv().ok()
+        else {
+            panic!("the load tick must observe the cell for the Agent");
+        };
+        assert_eq!(cell_id, test_config().cell_id() as i32);
+        assert_eq!(connected_ues, 1);
+        let mbps = throughput_mbps.expect("measured throughput");
+        assert!((0.9..1.2).contains(&mbps), "got {mbps}");
+
+        // Capacity 1: fill it, then a further tick must return and count a drop.
+        task.report_cell_load_to_nwdaf().await;
+        tokio::time::timeout(Duration::from_secs(1), task.report_cell_load_to_nwdaf())
+            .await
+            .expect("a full Agent inbox must not block the RLS task");
+        assert_eq!(task.agent_dropped, 1);
     }
 
     #[tokio::test]

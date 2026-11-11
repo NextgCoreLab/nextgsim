@@ -36,6 +36,8 @@ use crate::rrc::security::{
     SMC_COMPLETE_PDCP_COUNT, SMC_PDCP_COUNT, SRB1_BEARER,
 };
 use crate::rrc::state::{RrcState, RrcStateMachine};
+#[cfg(feature = "nextgsim-nwdaf")]
+use crate::tasks::NwdafReporterMessage;
 #[cfg(feature = "nextgsim-she")]
 use crate::tasks::SheClientMessage;
 #[cfg(feature = "nextgsim-isac")]
@@ -1284,6 +1286,48 @@ impl RrcTask {
                 // T310's expiry is declared by `check_guard_timers`, with the other guards.
                 self.evaluate_radio_link_quality();
             }
+        }
+        // The UE NWDAF reporter's production producer (#459): one serving-cell
+        // measurement per cycle, in every state, once a cell is selected.
+        #[cfg(feature = "nextgsim-nwdaf")]
+        self.report_serving_measurement_to_nwdaf();
+    }
+
+    /// Hands the serving cell's latest RSRP to the NWDAF reporter (#459).
+    ///
+    /// Nothing is sent before a cell is selected or measured, and nothing is
+    /// made up: RSRQ and SINR stay `None` because the RLS channel model yields
+    /// one received power, and position and velocity stay `None` because the RRC
+    /// task does not track the UE's motion. `try_send`, because RRC must never
+    /// wait on analytics; a full or closed inbox drops the report.
+    #[cfg(feature = "nextgsim-nwdaf")]
+    fn report_serving_measurement_to_nwdaf(&self) {
+        let Some(ref sixg) = self.task_base.sixg else {
+            return;
+        };
+        // The level the RLS reported for the serving cell, which the cell
+        // selector holds from the first heartbeat ack on; the measurement
+        // manager only learns a cell once its level changes.
+        let Some(rsrp) = self
+            .serving_cell_id
+            .and_then(|cell_id| self.cell_selector.get_cell(cell_id))
+            .map(|cell| cell.dbm)
+        else {
+            return;
+        };
+        let msg = NwdafReporterMessage::ReportMeasurement {
+            rsrp: rsrp as f32,
+            rsrq: None,
+            sinr: None,
+            position: None,
+            velocity: None,
+            timestamp_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = sixg.nwdaf_reporter_tx.try_send(msg) {
+            debug!("NWDAF reporter inbox full, serving-cell measurement dropped");
         }
     }
 
