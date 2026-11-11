@@ -220,6 +220,21 @@ impl AppTask {
 
     /// Processes a raw CLI command from the server.
     async fn process_cli_command(&mut self, cmd: CliCommand) {
+        // `demo ...` (nextgsim#458) is answered from the process's demo state and
+        // never reaches the gNB command set.
+        if let Some(result) = nextgsim_demo::route_cli(&cmd.command, "nr-cli") {
+            if let Some(server) = &self.cli_server {
+                let sent = match result {
+                    Ok(out) => server.send_result(cmd.client_addr, out).await,
+                    Err(e) => server.send_error(cmd.client_addr, e.to_string()).await,
+                };
+                if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // Parse the command
         let command = match parse_cli_command(&cmd.command) {
             Ok(parsed) => parsed,

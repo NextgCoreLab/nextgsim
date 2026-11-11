@@ -1633,6 +1633,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgsim-demo"
+version = "0.1.0"
+dependencies = [
+ "serde_yaml",
+ "thiserror 1.0.69",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "nextgsim-enb"
 version = "0.1.0"
 dependencies = [
@@ -1701,6 +1711,7 @@ dependencies = [
  "nextgsim-agent",
  "nextgsim-common",
  "nextgsim-crypto",
+ "nextgsim-demo",
  "nextgsim-fl",
  "nextgsim-gtp",
  "nextgsim-isac",
@@ -1747,6 +1758,7 @@ dependencies = [
  "nextgsim-ai",
  "nextgsim-common",
  "nextgsim-crypto",
+ "nextgsim-demo",
  "nextgsim-fl",
  "nextgsim-gnb",
  "nextgsim-gtp",
@@ -2020,6 +2032,7 @@ dependencies = [
  "nextgsim-agent",
  "nextgsim-common",
  "nextgsim-crypto",
+ "nextgsim-demo",
  "nextgsim-fl",
  "nextgsim-gtp",
  "nextgsim-isac",

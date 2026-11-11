@@ -80,6 +80,7 @@ path = "src/main.rs"
 [dependencies]
 nextgsim-common.workspace = true
 nextgsim-sbi-client = { workspace = true, optional = true }
+nextgsim-demo.workspace = true
 nextgsim-crypto.workspace = true
 nextgsim-nas.workspace = true
 nextgsim-rrc.workspace = true

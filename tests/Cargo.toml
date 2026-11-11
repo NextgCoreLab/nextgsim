@@ -54,6 +54,7 @@ nextgsim-rlc = { path = "../nextgsim-rlc" }
 nextgsim-sctp = { path = "../nextgsim-sctp" }
 nextgsim-gnb = { path = "../nextgsim-gnb" }
 nextgsim-ue = { path = "../nextgsim-ue" }
+nextgsim-demo = { path = "../nextgsim-demo" }
 
 # 6G AI-native network function crates
 nextgsim-ai = { path = "../nextgsim-ai" }
@@ -185,6 +186,12 @@ path = "src/sdap_user_plane.rs"
 [[test]]
 name = "gnb_cli_reachability"
 path = "src/gnb_cli_reachability.rs"
+
+# `nr-cli <node> demo ...` on a running gNB and UE (#461). Its own binary: the
+# demo state is process-global and write-once.
+[[test]]
+name = "demo_cli"
+path = "src/demo_cli.rs"
 
 # RRC_INACTIVE resume end to end under the SHIPPED config (issue #201): a suspended UE
 # sends an RRCResumeRequest1 whose resumeMAC-I the gNB verifies, and the NAS returns on

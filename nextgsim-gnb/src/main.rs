@@ -58,6 +58,13 @@ impl GnbApp {
         info!("Loading configuration from: {}", config_path);
         let config = load_and_validate_gnb_config(config_path)
             .with_context(|| format!("Failed to load configuration from {config_path}"))?;
+        // The demo toggle (nextgsim#458): an unknown demo key or mode fails
+        // startup here. A default build registers no demo, so a config without a
+        // `demo:` block installs an empty state and changes nothing.
+        let config_text = std::fs::read_to_string(config_path)
+            .with_context(|| format!("Failed to read configuration from {config_path}"))?;
+        nextgsim_gnb::demo::init(&config_text)
+            .with_context(|| format!("Invalid demo block in {config_path}"))?;
 
         info!(
             "Configuration loaded: NCI={:#x}, PLMN={}-{}, TAC={}",

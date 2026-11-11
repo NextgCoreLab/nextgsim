@@ -73,6 +73,7 @@
 //! ```
 
 pub mod app;
+pub mod demo;
 pub mod gtp;
 pub mod ngap;
 pub mod rls;
