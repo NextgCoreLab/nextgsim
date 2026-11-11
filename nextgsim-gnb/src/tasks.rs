@@ -1758,6 +1758,26 @@ impl TaskManager {
         self.task_base.clone()
     }
 
+    /// Initialize the 6G task handles on the manager's own task base and return
+    /// the receivers for the task loops.
+    ///
+    /// Must be called before any [`TaskManager::task_base`] clone is handed to a
+    /// task: the handles are a by-value `Option`, so a clone taken earlier keeps
+    /// `sixg: None` for good and nothing that task sends reaches a 6G task
+    /// (#452). Initializing here rather than on a clone also lets
+    /// [`TaskManager::shutdown`] reach the 6G tasks.
+    /// [`crate::wiring::GnbWiring`] is the one caller that gets the order right.
+    pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> GnbSixgReceivers {
+        self.task_base.init_6g_tasks(channel_capacity)
+    }
+
+    /// Initialize the Rel-18 task handles (Energy) on the manager's own task
+    /// base and return the receivers. The same ordering rule as
+    /// [`TaskManager::init_6g_tasks`] applies.
+    pub fn init_rel18_tasks(&mut self, channel_capacity: usize) -> GnbRel18Receivers {
+        self.task_base.init_rel18_tasks(channel_capacity)
+    }
+
     /// Returns a receiver for the shutdown signal.
     ///
     /// Tasks can use this to detect when shutdown has been requested.

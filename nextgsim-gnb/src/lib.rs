@@ -79,6 +79,7 @@ pub mod rls;
 pub mod rrc;
 pub mod sctp;
 pub mod tasks;
+pub mod wiring;
 
 // 6G AI-native network function modules (optional; each gated behind its crate
 // feature so a lean `cargo build -p nextgsim-gnb` excludes them).
@@ -142,6 +143,9 @@ pub use tasks::{
 
 // Re-export lifecycle management types
 pub use tasks::{TaskError, TaskId, TaskInfo, TaskManager, TaskState, DEFAULT_SHUTDOWN_TIMEOUT_MS};
+
+// Re-export the task wiring the binary and the integration tests share (#452)
+pub use wiring::{GnbCoreReceivers, GnbWiring};
 
 // Re-export 6G AI-native network function types (feature-gated to match the
 // optional module declarations above).
