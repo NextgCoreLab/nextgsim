@@ -119,8 +119,9 @@ async fn run() -> Result<(), Fail> {
         .get("nfInstances")
         .and_then(Value::as_array)
         .map_or(0, Vec::len);
-    // NWDAF_URI is the fallback while nextgcore's NWDAF profile leaves AF out
-    // of allowedNfTypes, so the NRF returns no NWDAF to an AF requester.
+    // NWDAF_URI is an optional fallback for a core whose NWDAF profile leaves
+    // the requester type out of allowedNfTypes (nextgcore before #1412 did so
+    // for AF). The nightly passes none, so there discovery must find the NWDAF.
     let nwdaf = match (nwdaf_endpoint(&disc), std::env::var("NWDAF_URI")) {
         (Some(ep), _) => ep,
         (None, Ok(uri)) => uri,
@@ -196,7 +197,7 @@ async fn run() -> Result<(), Fail> {
             r
         }
         // EXPECT_TOKEN=refused:<error>: the NRF is expected to refuse (e.g.
-        // unauthorized_client while nextgcore#1412 is open). The client must
+        // unauthorized_client for a consumer type the NWDAF does not allow). The client must
         // fail closed: the refusal is the result and no tokenless call follows.
         Err(SbiError::TokenRefused { status, error })
             if mode == "oauth2" && expect.strip_prefix("refused:") == error.as_deref() =>
