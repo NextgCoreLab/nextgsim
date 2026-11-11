@@ -479,9 +479,11 @@ impl RlsTask {
             warn!("RLC PDU for unknown UE[{}] dropped", ue_id);
             return;
         };
-        // Downlink half of the cell-load measurement (issue #18). Counted here
-        // rather than at the GTP boundary so a PDU the RLC layer splits is
-        // counted as the two PDUs the radio actually carries.
+        // Cell load (issue #18): this path carries the RLC STATUS PDUs and AM
+        // retransmissions `poll_rlc_timers` and `send_pending_status` produce,
+        // which occupy the downlink as much as first transmissions do. First
+        // transmissions of user data are counted in `handle_downlink_data`,
+        // which sends without coming through here, so nothing is counted twice.
         self.load_window_octets += pdu.len() as u64;
         let transmission = RlsPduTransmission {
             sti: self.sti,
@@ -1052,6 +1054,11 @@ impl RlsTask {
 
         let sti = self.sti;
         for rlc_pdu in rlc_pdus {
+            // Downlink half of the cell-load measurement (#455), in the same unit
+            // as the uplink half in `handle_uplink_data`: RLC PDU octets including
+            // the header, counted per PDU so a segmented SDU counts as the PDUs
+            // the radio carries rather than as the SDU GTP delivered.
+            self.load_window_octets += rlc_pdu.len() as u64;
             let transmission = RlsPduTransmission {
                 sti,
                 pdu_type: PduType::Data,
@@ -2650,12 +2657,28 @@ mod tests {
         assert_eq!(throughput_mbps, Some(0.0), "the window must have reset");
     }
 
+    /// Receives every RLS PDU transmission that reaches `socket` until it goes
+    /// quiet, and returns the RLC PDU octets each one carried.
+    async fn recv_rlc_pdu_lens(socket: &UdpSocket) -> Vec<u64> {
+        let mut lens = Vec::new();
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        while let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(500), socket.recv(&mut buf)).await
+        {
+            if let Ok(RlsProtocolMessage::PduTransmission(pdu)) =
+                codec::decode(&Bytes::copy_from_slice(&buf[..len]))
+            {
+                lens.push(pdu.pdu.len() as u64);
+            }
+        }
+        lens
+    }
+
     #[tokio::test]
-    async fn user_plane_octets_are_counted_in_both_directions() {
+    async fn uplink_rlc_pdu_octets_are_counted() {
         let (mut task, _nwdaf_rx) = rls_task_with_nwdaf();
         assert_eq!(task.load_window_octets, 0);
 
-        // Uplink: an RLC PDU arriving over RLS.
         let psi = 1;
         let mut rlc = RlcEntity::new(RlcMode::UnacknowledgedMode, SnSize::Sn12);
         rlc.submit_sdu(vec![0x42; 40]);
@@ -2666,21 +2689,66 @@ mod tests {
             pdu_type: PduType::Data,
             pdu_id: 0,
             payload: psi as u32,
-            pdu: Bytes::from(pdu_bytes.clone()),
+            pdu: Bytes::from(pdu_bytes),
             c_rnti: None,
         };
         task.handle_uplink_data(1, &pdu).await;
-        assert_eq!(task.load_window_octets, uplink_len, "uplink counted");
+        assert_eq!(task.load_window_octets, uplink_len);
+    }
 
-        // Downlink: a PDU sent to a known UE.
+    /// #455: downlink user data, driven through `handle_downlink_data` (the
+    /// `DownlinkData` arm's handler), grows the window by exactly the RLC PDU
+    /// octets that reached the UE. The SDU is three and a bit grants long, so it
+    /// is segmented, and the expected sum comes from the PDUs on the wire, header
+    /// octets included, rather than from the SDU length.
+    #[tokio::test]
+    async fn downlink_rlc_pdu_octets_are_counted_once_each() {
+        let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
+        let mut task = broadcasting_task().await;
+        task.ue_addresses.insert(1, ue.local_addr().unwrap());
+
+        let sdu_len = 3 * MAC_GRANT_BYTES + 100;
+        task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&vec![0x5A; sdu_len]))
+            .await;
+
+        let on_the_wire = recv_rlc_pdu_lens(&ue).await;
+        assert!(
+            on_the_wire.len() >= 4,
+            "the SDU must have been segmented, got {} PDU(s)",
+            on_the_wire.len()
+        );
+        let sent: u64 = on_the_wire.iter().sum();
+        assert!(
+            sent > sdu_len as u64,
+            "the RLC headers are part of what the radio carries"
+        );
+        // Equal, not at least: a second count on another path would double it.
+        assert_eq!(task.load_window_octets, sent);
+    }
+
+    #[tokio::test]
+    async fn downlink_data_for_an_unknown_ue_is_not_counted() {
+        let mut task = broadcasting_task().await;
+
+        task.handle_downlink_data(99, 1, 1, OctetString::from_slice(&[0x11; 64]))
+            .await;
+
+        assert_eq!(task.load_window_octets, 0);
+    }
+
+    /// STATUS PDUs and AM retransmissions go out through `send_rlc_pdu`, which
+    /// counts them; to an unknown UE nothing is sent and nothing is counted.
+    #[tokio::test]
+    async fn status_and_retransmission_pdus_are_counted_when_sent() {
+        let (mut task, _nwdaf_rx) = rls_task_with_nwdaf();
+
+        task.send_rlc_pdu(1, 1, vec![0x00; 3]).await;
+        assert_eq!(task.load_window_octets, 0, "unknown UE: nothing sent");
+
         task.ue_addresses
             .insert(1, "127.0.0.1:1000".parse().unwrap());
-        task.send_rlc_pdu(1, psi, pdu_bytes.clone()).await;
-        assert_eq!(
-            task.load_window_octets,
-            uplink_len * 2,
-            "downlink counted too"
-        );
+        task.send_rlc_pdu(1, 1, vec![0x00; 3]).await;
+        assert_eq!(task.load_window_octets, 3);
     }
 
     #[tokio::test]
