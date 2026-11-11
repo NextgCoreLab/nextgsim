@@ -300,7 +300,9 @@ jobs:
       # depending on the event-bus job continuing to exist. Issue #18's work
       # (nwdaf/task.rs and the rls/task.rs forwarding) lands here.
       - name: cargo test (6g alone)
-        run: cargo test -p nextgsim-gnb --features 6g
+        run: |
+          cargo test -p nextgsim-gnb --features 6g
+          cargo test -p nextgsim-ue --features 6g
       # The 6G end-to-end tests (tests/src/sixg_task_integration.rs) only compile
       # under the integration crate's `6g` feature. No job built them, so they
       # stopped compiling in September and nobody saw it (#319).
@@ -309,6 +311,7 @@ jobs:
       - name: cargo clippy
         run: |
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
+          cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:
@@ -935,6 +938,196 @@ jobs:
           docker compose logs --tail=100 amf || true
           docker compose logs --tail=100 gnb || true
           docker compose logs --tail=100 ue || true
+
+      - name: Teardown
+        if: always()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose down -v || true
+
+  # ====================================================================
+  # #460: the LIVE 6G nightly. A 6G-featured gNB and UE run against nextgcore.
+  #
+  # The `sixg` job above tests the 6G tasks in process. This one runs the real
+  # binaries, built with `--features 6g` on both nodes and started with the 6G
+  # config flags on, through registration and a PDU session. It then asserts the
+  # 6G message paths the enabler issues made live:
+  #
+  #   * RLS -> gNB NWDAF cell load (#452). Before #452 the RLS task held
+  #     `sixg: None` and never sent one, so this line is the revert check.
+  #   * RLS heartbeat -> gNB NWDAF UE measurement, recorded with RSRP only (#453).
+  #   * UE RRC cycle -> UE NWDAF reporter, and RLS -> gNB Agent observation
+  #     (#459).
+  #
+  # The DEFAULT-build nightly (`interop-e2e` above) is untouched. This job builds
+  # its own images under the same local tags, in its own runner, and publishes
+  # nothing. The 6G flags are switched on in this runner's checkout of
+  # `config/`, so no shipped config changes. Nothing listens beyond the compose
+  # network, and no port is published.
+  #
+  # The asserted strings are the exact text the code emits, grepped from the
+  # source:
+  #   nextgsim-gnb/src/wiring.rs             "NWDAF task spawned", "Agent task spawned"
+  #   nextgsim-gnb/src/nwdaf/task.rs         "NWDAF: Cell ", " load - occupancy="
+  #                                          "NWDAF: UE ", " measurement - RSRP="
+  #   nextgsim-gnb/src/agent/task.rs         "Agent: first cell observation"
+  #   nextgsim-ue/src/nwdaf_reporter/task.rs "NWDAF Reporter: first serving-cell measurement"
+  # ====================================================================
+  sixg-live-e2e:
+    name: 6G live E2E (6G-featured gNB and UE against nextgcore)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      GRAFANA_ADMIN_PASSWORD: ci-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          path: nextgsim
+
+      - name: Checkout nextgcore
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgcore
+          ref: main
+          path: nextgcore
+
+      - name: Record the pair under test
+        run: |
+          set -euo pipefail
+          sim=$(git -C nextgsim rev-parse HEAD)
+          core=$(git -C nextgcore rev-parse HEAD)
+          echo "### 6G live pair" >> "$GITHUB_STEP_SUMMARY"
+          echo "| repo | commit |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nextgsim (this repo, HEAD, \`--features 6g\`) | \`${sim}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| nextgcore (main) | \`${core}\` |" >> "$GITHUB_STEP_SUMMARY"
+
+      # The 5GC binaries come from nextgcore's builder, exactly as in
+      # interop-e2e. Its nr-gnb/nr-ue are default builds, so they are replaced
+      # below.
+      - name: Build the 5GC via nextgcore's builder
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
+          cd ../..
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+
+      # Built inside the same pinned toolchain image nextgcore's builder uses
+      # (bookworm glibc, matching the bookworm-slim runtime images), with the
+      # 6G umbrella on BOTH nodes.
+      - name: Build the 6G-featured gNB and UE
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$GITHUB_WORKSPACE/nextgsim:/src" -w /src \
+            -e CARGO_TARGET_DIR=/src/target-6g \
+            rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 \
+            cargo build --release --locked -p nextgsim-gnb -p nextgsim-ue \
+              --features nextgsim-gnb/6g,nextgsim-ue/6g --bin nr-gnb --bin nr-ue
+          mkdir -p nextgsim/binaries
+          cp nextgsim/target-6g/release/nr-gnb nextgsim/target-6g/release/nr-ue nextgsim/binaries/
+
+      - name: Build the 5GC images and the 6G gNB/UE images (not published)
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest .
+          done
+          docker build -f ../../../nextgsim/Dockerfile.gnb-local \
+            -t nextgsim-gnb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.ue-local \
+            -t nextgsim-ue:latest ../../../nextgsim
+
+      # The compose file mounts this checkout's config/ into both containers.
+      # Only this runner's copy is edited; every flag is asserted afterwards, so
+      # a renamed key cannot leave the job silently testing a 5G-only run.
+      - name: Turn the 6G config flags on (this runner's checkout only)
+        run: |
+          set -euo pipefail
+          cd nextgsim/config
+          for key in nwdaf_enabled agent_enabled; do
+            sed -i "s/^${key}: false/${key}: true/" gnb.yaml
+            grep -qE "^${key}: true" gnb.yaml || { echo "::error::gnb.yaml has no ${key}"; exit 1; }
+          done
+          for key in ai_ml_enabled; do
+            sed -i "s/^${key}: false/${key}: true/" ue.yaml
+            grep -qE "^${key}: true" ue.yaml || { echo "::error::ue.yaml has no ${key}"; exit 1; }
+          done
+
+      - name: Start the 5GC
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose up -d mongodb nrf
+          sleep 5
+          docker compose up -d ausf udm udr pcf nssf bsf
+          sleep 5
+          docker compose up -d amf smf upf
+          sleep 10
+          docker compose ps
+
+      # Logs go to a file that is then grepped, never `docker logs | grep -q`:
+      # under pipefail, grep -q's early exit SIGPIPEs docker logs and turns a
+      # match into a failure (the rule interop-e2e records).
+      - name: Register and establish a PDU session with 6G on
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose up -d gnb ue
+          wait_for() { # <service> <fixed string> <tries>
+            for _ in $(seq 1 "$3"); do
+              docker compose logs "$1" > "/tmp/$1.log" 2>&1 || true
+              if grep -qF "$2" "/tmp/$1.log"; then return 0; fi
+              sleep 2
+            done
+            echo "::error::$1 never logged: $2"; tail -80 "/tmp/$1.log"; return 1
+          }
+          wait_for gnb 'NWDAF task spawned' 15
+          wait_for gnb 'Agent task spawned' 5
+          wait_for gnb 'Received NG Setup Response' 60
+          wait_for ue 'Received Registration Accept' 60
+          wait_for ue 'is now ACTIVE' 60
+          echo "Registered with a PDU session, 6G-featured gNB and UE."
+
+      - name: Assert the live 6G message paths
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          check() { # <service> <regex> <what>
+            for _ in $(seq 1 30); do
+              docker compose logs "$1" > "/tmp/$1.log" 2>&1 || true
+              if grep -qE "$2" "/tmp/$1.log"; then
+                echo "live: $3"; grep -E "$2" "/tmp/$1.log" | head -2; return 0
+              fi
+              sleep 2
+            done
+            echo "::error::not live: $3"; tail -80 "/tmp/$1.log"; return 1
+          }
+          # #452: RLS -> NWDAF. The revert check: dead while RLS held sixg: None.
+          check gnb 'NWDAF: Cell -?[0-9]+ load - occupancy=' 'RLS -> gNB NWDAF cell load (#452)'
+          # #453: an RSRP-only heartbeat measurement is recorded.
+          check gnb 'NWDAF: UE -?[0-9]+ measurement - RSRP=' 'RLS -> gNB NWDAF UE measurement (#453)'
+          # #459: the production producers.
+          check gnb 'Agent: first cell observation' 'RLS -> gNB Agent observation (#459)'
+          check ue 'NWDAF Reporter: first serving-cell measurement' 'UE RRC -> UE NWDAF reporter (#459)'
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          cd nextgcore/docker/rust
+          docker compose logs --tail=100 amf || true
+          docker compose logs --tail=150 gnb || true
+          docker compose logs --tail=150 ue || true
 
       - name: Teardown
         if: always()

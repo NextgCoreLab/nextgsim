@@ -9,6 +9,19 @@ description = "5G UE (User Equipment) simulator binary"
 
 [features]
 default = []
+# Umbrella feature enabling the UE's five optional 6G / AI-native tasks at once
+# (#460), matching the gNB's `6g`: the SHE client, NWDAF reporter, ISAC sensor,
+# FL participant and semantic codec. Off by default, so `cargo build -p
+# nextgsim-ue` stays a lean 5G UE. The UE has no Agent or NKEF task, so those two
+# optional crates are not part of it. There is no frozen 3GPP Rel-20/6G Stage-3
+# spec behind these crates. Each task still needs its `*_enabled` config flag.
+6g = [
+    "nextgsim-she",
+    "nextgsim-nwdaf",
+    "nextgsim-isac",
+    "nextgsim-fl",
+    "nextgsim-semantic",
+]
 # Test-only accessors (the AS security context and its keys) for other crates'
 # tests, such as the in-process cross-end test in nextgsim-integration-tests.
 # Not part of the production API (#348 review).
