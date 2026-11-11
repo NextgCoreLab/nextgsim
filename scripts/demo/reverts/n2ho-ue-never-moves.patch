@@ -1,0 +1,22 @@
+Revert arm of scripts/demo/n2ho-check.sh (#456): the UE keeps its start position
+(no sim_movement), so gnb-east never beats gnb-west by the A3 margin, gnb-west
+never sends Handover Required, and the check must fail at amf step 1/6.
+
+  scripts/demo/revert-run.sh --expect "[amf] step 1/6 missing" \
+      scripts/demo/reverts/n2ho-ue-never-moves.patch -- scripts/demo/n2ho-check.sh
+
+diff --git a/config/ue-n2ho.yaml b/config/ue-n2ho.yaml
+index ceecde4..3c083af 100644
+--- a/config/ue-n2ho.yaml
++++ b/config/ue-n2ho.yaml
+@@ -104,10 +104,6 @@ gnb_search_list:
+ # metre, so the second gNB's cell passes the first's by the A3 margin (3 dB
+ # offset plus 1 dB hysteresis) past x 62, some 11 s into the walk.
+ sim_position: { x: 35, y: 0, z: 0 }
+-sim_movement:
+-  target: { x: 85, y: 0, z: 0 }
+-  speed_mps: 2.5
+-  start_after_secs: 20
+ 
+ # Default PDU sessions to establish after registration
+ sessions:
