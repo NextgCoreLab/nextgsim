@@ -1074,7 +1074,7 @@ mod tests {
             collector.report_ue_measurement(crate::UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: crate::Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -1173,7 +1173,7 @@ mod tests {
         collector.report_ue_measurement(crate::UeMeasurement {
             ue_id: 1,
             rsrp: -80.0,
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: crate::Vector3::new(0.0, 0.0, 0.0),
             velocity: None,
@@ -1201,7 +1201,7 @@ mod tests {
         collector.report_ue_measurement(crate::UeMeasurement {
             ue_id: 1,
             rsrp: -80.0,
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: None,
             position: crate::Vector3::new(0.0, 0.0, 0.0),
             velocity: None,

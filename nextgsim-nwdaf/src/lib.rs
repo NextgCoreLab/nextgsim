@@ -160,8 +160,16 @@ pub struct UeMeasurement {
     pub ue_id: i32,
     /// Reference Signal Received Power (dBm)
     pub rsrp: f32,
-    /// Reference Signal Received Quality (dB)
-    pub rsrq: f32,
+    /// Reference Signal Received Quality (dB), or `None` when the producer has
+    /// none (#453).
+    ///
+    /// Optional because RSRQ cannot be derived honestly from what every
+    /// producer has: TS 38.215 §5.1.3 defines it as N×RSRP/RSSI, and the
+    /// simulator's RLS channel model yields one received power and no RSSI. A
+    /// filler value would be invented data. Readers that would use it define
+    /// their behaviour without it; see `anlf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsrq: Option<f32>,
     /// Signal to Interference plus Noise Ratio (dB)
     pub sinr: Option<f32>,
     /// UE position
@@ -703,7 +711,7 @@ mod tests {
             history.add(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0 + i as f32,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -725,7 +733,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -747,7 +755,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, i as f64 * 5.0, 0.0),
                 velocity: None,
@@ -776,7 +784,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -831,7 +839,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -844,7 +852,7 @@ mod tests {
         manager.record_measurement(UeMeasurement {
             ue_id: 1,
             rsrp: -30.0, // huge spike
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: Vector3::new(30.0, 0.0, 0.0),
             velocity: None,
@@ -892,7 +900,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, i as f64 * 5.0, 0.0),
                 velocity: None,
