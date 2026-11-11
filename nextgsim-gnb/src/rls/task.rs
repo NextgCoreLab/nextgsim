@@ -119,6 +119,11 @@ pub struct RlsTask {
     nwdaf_drop_logged_at: Option<Instant>,
     /// Agent observations dropped because its inbox was full (#459).
     agent_dropped: u64,
+    /// Off the air (nextgsim#483): no heartbeat is answered, so no UE detects the
+    /// cell. Set by an energy-saving agent's switch-off, never cleared.
+    off_air: bool,
+    /// Heartbeats dropped while off the air.
+    off_air_dropped: u64,
     /// When an Agent drop was last logged, for rate limiting.
     agent_drop_logged_at: Option<Instant>,
     /// The MAC grant ceiling in force for one UE, in octets, for those UEs whose
@@ -177,6 +182,8 @@ impl RlsTask {
             nwdaf_dropped: 0,
             nwdaf_drop_logged_at: None,
             agent_dropped: 0,
+            off_air: false,
+            off_air_dropped: 0,
             agent_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
@@ -212,6 +219,8 @@ impl RlsTask {
             nwdaf_dropped: 0,
             nwdaf_drop_logged_at: None,
             agent_dropped: 0,
+            off_air: false,
+            off_air_dropped: 0,
             agent_drop_logged_at: None,
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
@@ -578,6 +587,17 @@ impl RlsTask {
         source: SocketAddr,
         heartbeat: &nextgsim_rls::RlsHeartbeat,
     ) {
+        if self.off_air {
+            // Not even tracked: a cell that is off the air hears nothing.
+            self.off_air_dropped += 1;
+            if self.off_air_dropped == 1 || self.off_air_dropped % 20 == 0 {
+                info!(
+                    "[demo:d446a-agent-conflict] off the air: {} heartbeat(s) dropped",
+                    self.off_air_dropped
+                );
+            }
+            return;
+        }
         let (ack, events) = self.cell_tracker.process_heartbeat(sti, source, heartbeat);
 
         // Process tracker events
@@ -715,10 +735,18 @@ impl RlsTask {
         self.offer_to_nwdaf(msg);
         // The same measured window is the Agent's periodic observation (#459):
         // its production producer, on the same tick.
+        // Served UEs: those with a user-plane bearer (an RLC entity). Every UE in
+        // radio range heartbeats this cell, so `connected_ues` counts UEs that
+        // merely hear it; an agent that asks "does this cell carry anyone?" needs
+        // the served ones (#483).
+        let mut served_ue_ids: Vec<i32> = self.rlc_entities.keys().map(|(ue, _)| *ue).collect();
+        served_ue_ids.sort_unstable();
+        served_ue_ids.dedup();
         self.offer_to_agent(AgentMessage::CellObservation {
             cell_id,
             connected_ues,
             throughput_mbps,
+            served_ue_ids,
         });
     }
 
@@ -1389,6 +1417,10 @@ impl Task for RlsTask {
                                     self.set_ue_grant_ceiling(ue_id, grant_octets);
                                 }
                                 RlsMessage::RebindUe { from, to } => self.rebind_ue(from, to),
+                                RlsMessage::SetOffAir => {
+                                    warn!("[demo:d446a-agent-conflict] RLS: off the air, UE heartbeats are no longer answered");
+                                    self.off_air = true;
+                                }
                                 RlsMessage::SignalDetected { ue_id } => {
                                     debug!("Signal detected notification for UE[{}]", ue_id);
                                 }
@@ -2165,6 +2197,33 @@ mod tests {
         assert!((measured - 50.0).abs() < 1e-9, "{measured}");
     }
 
+    /// nextgsim#483: once an energy-saving switch-off put the cell off the air,
+    /// a UE heartbeat is neither tracked nor answered, and each one is counted.
+    #[tokio::test]
+    async fn an_off_air_cell_answers_no_heartbeat() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 32);
+        let mut task = RlsTask::new(task_base);
+        let hb = |sti| nextgsim_rls::RlsHeartbeat {
+            sti,
+            sim_pos: SimCoord::new(30, 40, 0),
+        };
+        let src: SocketAddr = "127.0.0.1:4997".parse().unwrap();
+        task.handle_heartbeat(0xA1, src, &hb(0xA1)).await;
+        assert_eq!(task.ue_addresses.len(), 1, "on the air: the UE is detected");
+
+        task.off_air = true;
+        let other: SocketAddr = "127.0.0.1:4998".parse().unwrap();
+        task.handle_heartbeat(0xB2, other, &hb(0xB2)).await;
+        task.handle_heartbeat(0xB2, other, &hb(0xB2)).await;
+        assert_eq!(
+            task.ue_addresses.len(),
+            1,
+            "off the air: no new UE detected"
+        );
+        assert_eq!(task.off_air_dropped, 2);
+    }
+
     #[tokio::test]
     async fn a_late_segment_cannot_complete_an_sdu_t_reassembly_abandoned() {
         let ue = UdpSocket::bind("127.0.0.1:0").await.expect("UE socket");
@@ -2895,12 +2954,17 @@ mod tests {
             cell_id,
             connected_ues,
             throughput_mbps,
+            served_ue_ids,
         })) = sixg.agent_rx.try_recv().ok()
         else {
             panic!("the load tick must observe the cell for the Agent");
         };
         assert_eq!(cell_id, test_config().cell_id() as i32);
         assert_eq!(connected_ues, 1);
+        assert!(
+            served_ue_ids.is_empty(),
+            "#483: heard, but no bearer: not served"
+        );
         let mbps = throughput_mbps.expect("measured throughput");
         assert!((0.9..1.2).contains(&mbps), "got {mbps}");
 

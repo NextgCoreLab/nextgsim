@@ -1,0 +1,13 @@
+--- a/nextgsim-gnb/src/agent/d446a.rs
++++ b/nextgsim-gnb/src/agent/d446a.rs
+@@ -409,7 +409,9 @@
+     /// The tie-breaker for a `Cell:<booster>` load-balancing vs energy contest:
+     /// the operator's policy (the demo mode), not the priorities.
+     fn inbound_wins(&self, mode: &str, _inbound: &Intent, _energy: &Intent) -> bool {
+-        mode == "load-balancing"
++        // 446-policy-toggle revert: the mode is ignored, the fixed priorities decide.
++        let _ = mode;
++        _inbound.priority >= _energy.priority
+     }
+ 
+     /// Audits an actuation outcome from NGAP.

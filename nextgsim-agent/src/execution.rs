@@ -419,6 +419,12 @@ impl IntentExecutor for TriggerHandoverExecutor {
 
                 output.insert("source_cell".to_string(), source_cell);
                 output.insert("target_cell".to_string(), tc);
+                // nextgsim#483: what the gNB's forwarder needs to act on it.
+                output.insert("ue_id".to_string(), ue_id.to_string());
+                output.insert("intent_id".to_string(), intent.id.clone());
+                if let Some(cause) = intent.parameters.get("cause") {
+                    output.insert("cause".to_string(), cause.clone());
+                }
                 output.insert("best_rsrp".to_string(), format!("{best_rsrp:.1}"));
 
                 IntentExecutionResult {

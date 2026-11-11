@@ -525,6 +525,13 @@ pub struct GnbConfig {
     /// AI Agent Framework task enabled (Rel-20)
     #[serde(default)]
     pub agent_enabled: bool,
+    /// The rule-based agents the Agent task runs (nextgsim#483, demo D446A).
+    ///
+    /// Read only by a gNB built with the `demo-d446a-agent-conflict` feature and
+    /// with that demo active (`demo.enabled` and `demo.d446a-agent-conflict.enabled`);
+    /// otherwise the list is ignored. Empty by default.
+    #[serde(default)]
+    pub agents: Vec<AgentRuleConfig>,
     /// Federated Learning Aggregator task enabled (Rel-20)
     #[serde(default)]
     pub federated_learning_enabled: bool,
@@ -668,6 +675,7 @@ impl Default for GnbConfig {
             isac_ekf_process_noise_accel: None,
             isac_anchors: default_isac_anchors(),
             agent_enabled: false,
+            agents: Vec::new(),
             federated_learning_enabled: false,
             quic_enabled: false,
             sctp_backend: SctpBackendKind::Userspace,
@@ -746,6 +754,80 @@ impl SimMovement {
             y: (f64::from(start.y) + dy * f).round() as i32,
             z: (f64::from(start.z) + dz * f).round() as i32,
         }
+    }
+}
+
+/// What a configured rule-based agent optimises (nextgsim#483).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRuleKind {
+    /// Moves a UE off this gNB's loaded cell into `cell` (a neighbour's), with
+    /// cause "Reduce load in serving cell" (TS 38.413 §9.3.1.2).
+    LoadBalancing,
+    /// Switches this gNB's own `cell` off the air once it has carried no UE for
+    /// `grace_s` (TS 38.300 §15.4.2.1 context; the policy is non-normative).
+    EnergySaving,
+}
+
+/// A remote agent whose inbound handovers this gNB can name in its audit
+/// (nextgsim#483): the HANDOVER REQUEST names only a cause, so the source gNB ID
+/// (from the UE History Information) is mapped to the agent configured for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPeerConfig {
+    /// The source gNB ID.
+    pub gnb_id: u32,
+    /// The agent on that gNB, e.g. `lb-1`.
+    pub agent: String,
+}
+
+/// One rule-based agent of the Agent task (nextgsim#483).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRuleConfig {
+    /// The agent's id, e.g. `lb-1`, `energy-1`.
+    pub id: String,
+    /// What it optimises.
+    pub kind: AgentRuleKind,
+    /// The NR Cell Identity it acts on: the target cell for `load-balancing`,
+    /// this gNB's own cell for `energy-saving`.
+    pub cell: u64,
+    /// Intent priority (1..10). Absent: 8 for load balancing, 5 for energy saving.
+    #[serde(default)]
+    pub priority: Option<u8>,
+    /// `load-balancing`: the connected-UE count at which the serving cell counts
+    /// as loaded (load is measured as a UE count).
+    #[serde(default = "default_agent_load_threshold_ues")]
+    pub load_threshold_ues: u32,
+    /// `energy-saving`: seconds the switch-off stays Pending before it executes.
+    #[serde(default = "default_agent_grace_s")]
+    pub grace_s: u64,
+    /// `energy-saving`: seconds an admitted load-balancing UE is not handed back
+    /// to its source cell by an A3 report.
+    #[serde(default = "default_agent_handback_hold_s")]
+    pub handback_hold_s: u64,
+    /// `energy-saving`: remote agents its inbound handovers come from.
+    #[serde(default)]
+    pub peers: Vec<AgentPeerConfig>,
+}
+
+fn default_agent_load_threshold_ues() -> u32 {
+    1
+}
+fn default_agent_grace_s() -> u64 {
+    20
+}
+fn default_agent_handback_hold_s() -> u64 {
+    60
+}
+
+impl AgentRuleConfig {
+    /// The intent priority: the configured one, else the kind's default.
+    pub fn priority(&self) -> u8 {
+        self.priority.unwrap_or(match self.kind {
+            AgentRuleKind::LoadBalancing => 8,
+            AgentRuleKind::EnergySaving => 5,
+        })
     }
 }
 

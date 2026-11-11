@@ -1,0 +1,12 @@
+--- a/nextgsim-gnb/src/rls/task.rs
++++ b/nextgsim-gnb/src/rls/task.rs
+@@ -587,7 +587,8 @@
+         source: SocketAddr,
+         heartbeat: &nextgsim_rls::RlsHeartbeat,
+     ) {
+-        if self.off_air {
++        // 446-switch-off revert: the heartbeats are still answered.
++        if self.off_air && false {
+             // Not even tracked: a cell that is off the air hears nothing.
+             self.off_air_dropped += 1;
+             if self.off_air_dropped == 1 || self.off_air_dropped % 20 == 0 {

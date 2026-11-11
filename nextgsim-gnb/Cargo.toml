@@ -49,6 +49,11 @@ up-security = ["drb-pdcp"]
 # is numbered identically either way.
 sdap-dataplane = []
 
+# Demo D446A (nextgsim#483, convention #458): load-balancing vs energy-saving
+# agents arbitrated over a booster cell. Off by default; demo-only code, and it
+# needs the Agent task. Active only with the demo: block on as well.
+demo-d446a-agent-conflict = ["nextgsim-agent"]
+
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
 # `cargo build -p nextgsim-gnb --features 6g` yields the full build. There is no

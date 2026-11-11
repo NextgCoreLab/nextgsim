@@ -649,8 +649,6 @@ pub struct AgentRegistration {
 pub struct AgentCoordinator {
     /// Registered agents
     agents: HashMap<AgentId, AgentRegistration>,
-    /// Pending intents
-    pending_intents: Vec<Intent>,
     /// Token lifetime
     token_lifetime: Duration,
     /// Next token ID
@@ -676,7 +674,6 @@ impl AgentCoordinator {
     pub fn new() -> Self {
         Self {
             agents: HashMap::new(),
-            pending_intents: Vec::new(),
             token_lifetime: Duration::from_secs(3600), // 1 hour
             next_token_id: 1,
             executor_registry: ExecutorRegistry::new(),
@@ -697,7 +694,6 @@ impl AgentCoordinator {
     ) -> Self {
         Self {
             agents: HashMap::new(),
-            pending_intents: Vec::new(),
             token_lifetime: Duration::from_secs(3600),
             next_token_id: 1,
             executor_registry: ExecutorRegistry::new(),
@@ -877,10 +873,7 @@ impl AgentCoordinator {
 
         // Conflict check via the intent queue.
         match self.intent_queue.enqueue(intent.clone()) {
-            Ok(()) => {
-                self.pending_intents.push(intent);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(notification) => {
                 self.audit_trail.record_blocked(
                     &notification.agent_id,
@@ -914,13 +907,12 @@ impl AgentCoordinator {
     /// 2. Executed through the [`ExecutorRegistry`]
     /// 3. Recorded in the [`AuditTrail`]
     pub fn process_intents_full(&mut self) -> Vec<IntentExecutionResult> {
-        // Sort by priority (highest first)
-        self.pending_intents
-            .sort_by_key(|i| std::cmp::Reverse(i.priority));
-
-        let intents: Vec<Intent> = self.pending_intents.drain(..).collect();
-        // Also drain the intent queue so it stays in sync.
-        let _ = self.intent_queue.drain_ready();
+        // nextgsim#483: execute ONLY what the conflict-checked queue holds. A
+        // second list beside it kept every submitted intent, so an intent the
+        // queue superseded (or a later one blocked by it) still executed.
+        let mut intents: Vec<Intent> = self.intent_queue.drain_ready();
+        // Highest priority first; the stable sort keeps submission order on ties.
+        intents.sort_by_key(|i| std::cmp::Reverse(i.priority));
 
         let mut results = Vec::with_capacity(intents.len());
 
@@ -1293,6 +1285,88 @@ mod tests {
             results[0].output.get("target_cell").map(String::as_str),
             Some("cell/cell-B")
         );
+    }
+
+    /// nextgsim#483: an intent the queue superseded is not executed. Two
+    /// handovers of one UE contest `Ue:ue-1`; the higher-priority one, submitted
+    /// second, supersedes the first, and only it runs.
+    #[test]
+    fn a_superseded_intent_never_executes() {
+        let state = std::sync::Arc::new(InMemoryStateProvider::new());
+        state.insert("ue/ue-1/serving_cell", "32");
+        let mut coordinator = AgentCoordinator::with_config(
+            state,
+            ResolutionStrategy::PriorityBased,
+            SafetyPolicy::default(),
+            1000,
+        );
+        let caps = AgentCapabilities {
+            trigger_actions: true,
+            ..Default::default()
+        };
+        coordinator.register_agent(AgentId::new("low"), AgentType::Mobility, caps.clone());
+        coordinator.register_agent(AgentId::new("high"), AgentType::Mobility, caps);
+        let low = Intent::new(AgentId::new("low"), IntentType::TriggerHandover)
+            .with_target("ue-1")
+            .with_param("target_cell", "16")
+            .with_priority(3);
+        let high = Intent::new(AgentId::new("high"), IntentType::TriggerHandover)
+            .with_target("ue-1")
+            .with_param("target_cell", "48")
+            .with_priority(8);
+        let (low_id, high_id) = (low.id.clone(), high.id.clone());
+        coordinator.submit_intent(low).unwrap();
+        coordinator.submit_intent(high).unwrap();
+        let results = coordinator.process_intents_full();
+        let executed: Vec<&str> = results.iter().map(|r| r.intent_id.as_str()).collect();
+        assert_eq!(
+            executed,
+            vec![high_id.as_str()],
+            "only the winner runs, not {low_id}"
+        );
+        assert_eq!(
+            results[0].output.get("target_cell").map(String::as_str),
+            Some("48")
+        );
+        assert!(
+            coordinator.process_intents_full().is_empty(),
+            "nothing left over"
+        );
+    }
+
+    /// nextgsim#483: a handover result carries what the gNB needs to act on it:
+    /// the UE, the cause and the intent that asked for it.
+    #[test]
+    fn a_handover_result_names_the_ue_the_cause_and_the_intent() {
+        let state = std::sync::Arc::new(InMemoryStateProvider::new());
+        let mut coordinator = AgentCoordinator::with_config(
+            state,
+            ResolutionStrategy::PriorityBased,
+            SafetyPolicy::default(),
+            1000,
+        );
+        coordinator.register_agent(
+            AgentId::new("lb-1"),
+            AgentType::Resource,
+            AgentCapabilities {
+                trigger_actions: true,
+                ..Default::default()
+            },
+        );
+        let intent = Intent::new(AgentId::new("lb-1"), IntentType::TriggerHandover)
+            .with_target("1")
+            .with_param("target_cell", "16")
+            .with_param("cause", "reduce-load-in-serving-cell");
+        let id = intent.id.clone();
+        coordinator.submit_intent(intent).unwrap();
+        let r = &coordinator.process_intents_full()[0];
+        assert_eq!(r.output.get("ue_id").map(String::as_str), Some("1"));
+        assert_eq!(r.output.get("target_cell").map(String::as_str), Some("16"));
+        assert_eq!(
+            r.output.get("cause").map(String::as_str),
+            Some("reduce-load-in-serving-cell")
+        );
+        assert_eq!(r.output.get("intent_id"), Some(&id));
     }
 
     #[test]

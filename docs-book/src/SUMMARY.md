@@ -29,6 +29,7 @@
 
 - [D447A: live-state knowledge exposure](demos/d447a-nkef-live.md)
 - [D440B: verified model loading](demos/d440b-model-verify.md)
+- [D446A: agent conflict over a booster cell](demos/d446a-agent-conflict.md)
 - [D441C: UE Mobility from AMF location events](demos/d441c-amf-mobility.md)
 
 # Community

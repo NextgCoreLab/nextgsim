@@ -1,0 +1,12 @@
+--- a/nextgsim-gnb/src/agent/d446a.rs
++++ b/nextgsim-gnb/src/agent/d446a.rs
+@@ -286,7 +286,8 @@
+         let admit = InboundHandoverVerdict::Admit {
+             handback_hold: None,
+         };
+-        let Some(mode) = mode else {
++        // 446-inbound-arbitration revert: every inbound handover is admitted.
++        let Some(mode) = mode.filter(|_| false) else {
+             return (admit, Vec::new());
+         };
+         let Some(energy) = self.energy.clone() else {

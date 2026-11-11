@@ -331,6 +331,45 @@ pub struct HandoverInitiation {
     pub ue_nr_capability: Option<Vec<u8>>,
     /// How long the UE has been on the source cell, in seconds, for the UE history.
     pub time_in_source_cell_s: u16,
+    /// Why, and on whose behalf, the handover is asked for (nextgsim#483).
+    pub trigger: HandoverTrigger,
+}
+
+/// The cause a HANDOVER REQUIRED carries and, for an agent-driven handover, the
+/// intent that asked for it (nextgsim#483).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoverTrigger {
+    /// TS 38.413 §9.3.1.2. A measurement-driven handover is
+    /// "Handover desirable for radio reasons"; a load-balancing agent's is
+    /// "Reduce load in serving cell".
+    pub cause: nextgsim_ngap::procedures::handover::HandoverCause,
+    /// The agent intent this handover actuates, whose outcome is reported back
+    /// to the Agent task. `None` for a measurement- or NWDAF-driven handover.
+    pub agent_intent_id: Option<String>,
+}
+
+impl Default for HandoverTrigger {
+    fn default() -> Self {
+        Self {
+            cause: nextgsim_ngap::procedures::handover::HandoverCause::RadioNetwork(
+                nextgsim_ngap::procedures::ng_setup::RadioNetworkCause::HandoverDesirableForRadioReason,
+            ),
+            agent_intent_id: None,
+        }
+    }
+}
+
+/// The Agent task's answer to an inbound handover it arbitrated (nextgsim#483).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundHandoverVerdict {
+    /// Admit the UE. `handback_hold` holds the source cell's PCI against an A3
+    /// handback for that long.
+    Admit {
+        /// `(source PCI, hold)`, when the admitted handover is load balancing.
+        handback_hold: Option<(i32, std::time::Duration)>,
+    },
+    /// Refuse it: HANDOVER FAILURE "Cell not available" (TS 38.413 §8.4.2.3).
+    Refuse,
 }
 
 // ============================================================================
@@ -737,6 +776,28 @@ pub enum RrcMessage {
         /// Confidence score (0.0 - 1.0)
         confidence: f32,
     },
+    /// An agent's handover intent to actuate (from the Agent task, nextgsim#483).
+    AgentHandover {
+        /// The UE to move.
+        ue_id: i32,
+        /// The target cell's NR Cell Identity.
+        target_cell: i32,
+        /// The cause and the intent.
+        trigger: HandoverTrigger,
+    },
+    /// Hold `cell` (a PCI) against an A3-triggered handback of `ue_id` for
+    /// `hold` (from NGAP, after admitting a load-balancing handover, nextgsim#483).
+    HandbackHold {
+        /// The admitted UE.
+        ue_id: i32,
+        /// The source cell's PCI.
+        cell: i32,
+        /// For how long.
+        hold: std::time::Duration,
+    },
+    /// An energy-saving agent switched this cell off: bar it until restart
+    /// (from the Agent task, nextgsim#483).
+    EnergySwitchOff,
 }
 
 // ============================================================================
@@ -837,6 +898,9 @@ pub struct PduSessionResource {
 /// Messages for the RLS task.
 #[derive(Debug)]
 pub enum RlsMessage {
+    /// Off the air (nextgsim#483): an energy-saving agent switched the cell off,
+    /// so no UE heartbeat is answered any more and the cell cannot be detected.
+    SetOffAir,
     /// Release every DRB's L2 entities (PDCP, RLC) of one UE (from RRC, #315).
     ///
     /// Sent when the UE's RRC connection is released and when a new one is set
@@ -1323,6 +1387,47 @@ pub enum AgentMessage {
         /// User-plane throughput measured over the window (Mbps), or `None`
         /// when the window had no measurable duration
         throughput_mbps: Option<f32>,
+        /// The UEs this cell serves (those with a user-plane bearer), lowest id
+        /// first (nextgsim#483: an agent that moves a UE has to name one, and
+        /// "empty" means no UE served, not no UE in range).
+        served_ue_ids: Vec<i32>,
+    },
+    /// The UEs with an RRC context on this cell (RRC-connected, being set up,
+    /// or an admitted handover arrival), lowest id first, from the RRC task
+    /// whenever the set changes. Sent only while the D446A demo is active: the
+    /// energy agent's `SwitchOffWithConnectedUes` guardrail counts them, a UE
+    /// silent on its bearer included (nextgsim#483).
+    ConnectedUes {
+        /// The UEs' ids.
+        ue_ids: Vec<i32>,
+    },
+    /// A HANDOVER REQUEST arrived for this (target) gNB; the Agent task decides
+    /// whether to admit it (TS 38.300 §15.5.1.3, nextgsim#483). Sent by NGAP only
+    /// when an arbitrating demo is active.
+    InboundHandover {
+        /// The request's cause (TS 38.413 §9.3.1.2), rendered with `{:?}`.
+        cause: String,
+        /// Whether the cause is "Reduce load in serving cell".
+        load_balancing: bool,
+        /// The source cell's NR Cell Identity, from the UE History Information.
+        source_cell: Option<u64>,
+        /// The source gNB ID derived from that cell, if any.
+        source_gnb_id: Option<u32>,
+        /// The target cell the source asked for (its NR Cell Identity).
+        target_cell: u64,
+        /// Where the verdict goes.
+        reply: tokio::sync::oneshot::Sender<InboundHandoverVerdict>,
+    },
+    /// The outcome of a handover an agent intent asked for (nextgsim#483).
+    ActuationResult {
+        /// The intent.
+        intent_id: String,
+        /// The UE.
+        ue_id: i32,
+        /// Whether the preparation succeeded (HANDOVER COMMAND).
+        success: bool,
+        /// What happened, for the audit.
+        detail: String,
     },
 }
 

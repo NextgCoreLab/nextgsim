@@ -1524,3 +1524,143 @@ jobs:
         if: always()
         run: |
           docker compose -f nextgcore/docker/rust/docker-compose.demo-n2ho.yml down -v --remove-orphans || true
+
+  # ====================================================================
+  # Demo D446A (#483): load-balancing vs energy-saving agents over a booster
+  # cell, on nextgcore's two-gNB stack (#456), scheduled and dispatch only.
+  # One seeded run per mode, the demo-off arm (kill switch), the runtime-switch arm
+  # (nr-cli `set` between two contests flips the second only), then the revert arms
+  # (scripts/demo/d446a-reverts.sh: each patch must fail its named test). The
+  # gNB is built with --features demo-d446a-agent-conflict; the default nightly
+  # jobs and the demo-n2ho job are unchanged.
+  # ====================================================================
+  demo-d446a:
+    name: Demo D446A agent conflict (two gNBs against pinned nextgcore)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      # nextgcore main at #1418's merge (the amfd HandoverRequired source_gnb_id/cause and
+      # HandoverFailure gnb_id log lines this demo asserts).
+      NEXTGCORE_DEMO_REF: ${{ inputs.nextgcore_ref || '5a42e5fadf6d8999f6b002d6b8d8131dc22efa11' }}
+    steps:
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          path: nextgsim
+
+      - name: Checkout nextgcore (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgcore
+          ref: ${{ env.NEXTGCORE_DEMO_REF }}
+          path: nextgcore
+
+      - name: Record the pair under test
+        run: |
+          set -euo pipefail
+          {
+            echo "### Demo D446A pair"
+            echo "| repo | commit |"
+            echo "|---|---|"
+            echo "| nextgsim (this repo, HEAD) | \`$(git -C nextgsim rev-parse HEAD)\` |"
+            echo "| nextgcore (pinned \`${NEXTGCORE_DEMO_REF}\`) | \`$(git -C nextgcore rev-parse HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: The demo stack publishes no port (docker compose config)
+        run: |
+          set -euo pipefail
+          . nextgsim/scripts/demo/lib.sh
+          export NEXTGSIM_DIR="$GITHUB_WORKSPACE/nextgsim"
+          demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml
+          demo_assert_private
+
+      - name: Build the 5GC via nextgcore's builder, the gNB with the demo feature
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
+          cd ../..
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+          cd ../nextgsim
+          # Built in a bookworm container: the images are debian:bookworm-slim
+          # (glibc 2.36), and a binary built on the runner needs GLIBC_2.38.
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
+            'apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
+             cargo build --release -p nextgsim-gnb --features demo-d446a-agent-conflict -p nextgsim-cli'
+          # The container ran as root: hand target/ back to the runner user, or
+          # the revert arms' host cargo cannot create target/debug.
+          sudo chown -R "$(id -u):$(id -g)" target
+          mkdir -p binaries
+          cp target/release/nr-gnb target/release/nr-cli binaries/
+          cp ../nextgcore/docker/rust/binaries/nr-ue binaries/
+
+      - name: Build the 5GC, gNB and UE images (not published)
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest .
+          done
+          docker build -f ../../../nextgsim/Dockerfile.gnb-local -t nextgsim-gnb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.ue-local -t nextgsim-ue:latest ../../../nextgsim
+
+      - name: Main arm (mode load-balancing)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d446a-check.sh load-balancing
+
+      - name: Swap arm (mode energy-saving)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d446a-check.sh energy-saving
+
+      - name: Demo off (kill switch)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d446a-check.sh off
+
+      - name: Runtime switch arm (nr-cli set between two contests)
+        timeout-minutes: 20
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d446a-check.sh runtime-switch
+
+      - name: Revert arms (each patch fails its named test)
+        timeout-minutes: 60
+        run: nextgsim/scripts/demo/d446a-reverts.sh
+
+      - name: The revert arms left the checkout clean
+        if: always()
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          git diff --quiet HEAD -- || { echo "::error::tracked files differ from HEAD"; git status --short; exit 1; }
+
+      - name: Upload the captured logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-d446a-logs
+          path: ${{ runner.temp }}/demo
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f nextgcore/docker/rust/docker-compose.demo-n2ho.yml down -v --remove-orphans || true

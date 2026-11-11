@@ -7,8 +7,8 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::tasks::{
-    GnbTaskBase, GutiMobileIdentity, HandoverInitiation, IsacMessage, NgapMessage, NkefMessage,
-    RlsMessage, RrcMessage, SheMessage, Task, TaskMessage,
+    GnbTaskBase, GutiMobileIdentity, HandoverInitiation, HandoverTrigger, IsacMessage, NgapMessage,
+    NkefMessage, RlsMessage, RrcMessage, SheMessage, Task, TaskMessage,
 };
 use nextgsim_common::frame_clock;
 use nextgsim_common::OctetString;
@@ -175,6 +175,14 @@ const REESTABLISHMENT_SWEEP_PERIOD: Duration = Duration::from_millis(100);
 /// RRC Task for managing UE RRC connections
 pub struct RrcTask {
     task_base: GnbTaskBase,
+    /// UEs admitted by a load-balancing handover, each with the source PCI it is
+    /// held against an A3 handback and until when (nextgsim#483). Empty unless an
+    /// arbitrating demo admitted one.
+    handback_holds: std::collections::HashMap<i32, (i32, std::time::Instant)>,
+    /// The connected-UE set last reported to the Agent task
+    /// (`AgentMessage::ConnectedUes`, nextgsim#483). `None` until the first
+    /// report; never set unless the D446A demo is active.
+    reported_connected_ues: Option<Vec<i32>>,
     ue_manager: RrcUeContextManager,
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
@@ -280,6 +288,8 @@ impl RrcTask {
         // Read before `task_base` moves, same as `own_cell`.
         let task_base_config = task_base.config.clone();
         Self {
+            handback_holds: std::collections::HashMap::new(),
+            reported_connected_ues: None,
             task_base,
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
@@ -1215,6 +1225,43 @@ impl RrcTask {
              unprotected for this UE",
             ue_id, echoed_tid
         );
+    }
+
+    /// The UEs with an RRC context on this cell, lowest id first: every UE
+    /// context (RRC-connected or being set up) and every admitted handover
+    /// arrival not bound yet. A UE silent on its bearer is in it.
+    fn connected_ue_ids(&self) -> Vec<i32> {
+        let mut ids = self.ue_manager.ue_ids();
+        ids.extend(self.pending_handover_arrivals.keys().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Reports the connected-UE set to the Agent task when it changed since the
+    /// last report (nextgsim#483: the energy agent's `SwitchOffWithConnectedUes`
+    /// guardrail). Only while the D446A demo is active, without waiting: a full
+    /// Agent inbox leaves the report pending for the next sweep.
+    fn report_connected_ues_to_agent(&mut self) {
+        if !crate::demo::d446a_active() {
+            return;
+        }
+        let Some(sixg) = self.task_base.sixg.as_ref() else {
+            return;
+        };
+        let ue_ids = self.connected_ue_ids();
+        if self.reported_connected_ues.as_ref() == Some(&ue_ids) {
+            return;
+        }
+        if sixg
+            .agent_tx
+            .try_send(crate::tasks::AgentMessage::ConnectedUes {
+                ue_ids: ue_ids.clone(),
+            })
+            .is_ok()
+        {
+            self.reported_connected_ues = Some(ue_ids);
+        }
     }
 
     /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
@@ -2545,6 +2592,7 @@ impl RrcTask {
                 .await;
         }
         self.ue_manager.delete_ue(ue_id);
+        self.handback_holds.remove(&ue_id);
         self.pending_reestablishment_binds
             .retain(|rls, (context, _)| *context != ue_id && *rls != ue_id);
         self.release_ue_drbs(ue_id).await;
@@ -3267,7 +3315,51 @@ impl RrcTask {
             "RRC: NWDAF-recommended handover for UE {ue_id} to cell {target_cell} \
              (confidence {confidence:.2})"
         );
-        self.execute_handover(ue_id, target_cell).await;
+        self.execute_handover(ue_id, target_cell, HandoverTrigger::default())
+            .await;
+    }
+
+    /// Act on an agent's handover intent (nextgsim#483): the same intra/inter
+    /// choice as every other trigger, with the agent's cause and intent carried to
+    /// the HANDOVER REQUIRED so the outcome can be reported back.
+    async fn handle_agent_handover(
+        &mut self,
+        ue_id: i32,
+        target_cell: i32,
+        trigger: HandoverTrigger,
+    ) {
+        if self.ue_manager.try_find_ue(ue_id).is_none() {
+            warn!("RRC: agent handover for unknown UE {ue_id} to cell {target_cell}; ignored");
+            return;
+        }
+        info!(
+            "RRC: agent handover for UE {ue_id} to cell {target_cell} (cause {:?}, intent {})",
+            trigger.cause,
+            trigger.agent_intent_id.as_deref().unwrap_or("-")
+        );
+        self.execute_handover(ue_id, target_cell, trigger).await;
+    }
+
+    /// Whether an A3 handback of `ue_id` to `pci` is held (nextgsim#483), logging
+    /// the hold when it is. An expired hold is dropped.
+    fn handback_held(&mut self, ue_id: i32, pci: i32) -> bool {
+        let Some(&(cell, until)) = self.handback_holds.get(&ue_id) else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if now >= until {
+            self.handback_holds.remove(&ue_id);
+            return false;
+        }
+        if cell != pci {
+            return false;
+        }
+        info!(
+            "[demo:d446a-agent-conflict] handback hold: A3 report of UE[{ue_id}] for its \
+             source cell PCI {pci} not acted on ({} s of the hold left)",
+            (until - now).as_secs()
+        );
+        true
     }
 
     /// Act on a UE's `MeasurementReport` (TS 38.331 §5.5.5, issue #162).
@@ -3345,7 +3437,11 @@ impl RrcTask {
         };
         if self.task_base.config.scell_phys_cell_id == Some(pci) {
             info!("UE[{ue_id}] measurement-triggered intra-gNB handover to PCI {pci}");
-            self.execute_handover(ue_id, i32::from(pci)).await;
+            self.execute_handover(ue_id, i32::from(pci), HandoverTrigger::default())
+                .await;
+            return;
+        }
+        if self.handback_held(ue_id, i32::from(pci)) {
             return;
         }
         let neighbour = self
@@ -3376,7 +3472,7 @@ impl RrcTask {
     ///
     /// Shared by the NWDAF path and anything else that decides a UE should move, so the
     /// intra/inter choice is made in one place.
-    async fn execute_handover(&mut self, ue_id: i32, target_cell: i32) {
+    async fn execute_handover(&mut self, ue_id: i32, target_cell: i32, trigger: HandoverTrigger) {
         let own_cell = (self.task_base.config.nci & 0xF_FFFF_FFFF) as i32;
 
         // Intra-gNB when the target is a cell this gNB configured as its secondary;
@@ -3442,12 +3538,12 @@ impl RrcTask {
             .copied()
         {
             let gnb_id = neighbour.gnb_id(self.task_base.config.gnb_id_length);
-            self.start_n2_handover(ue_id, gnb_id, neighbour.nci, neighbour.tac)
+            self.start_n2_handover_with(ue_id, gnb_id, neighbour.nci, neighbour.tac, trigger)
                 .await;
             return;
         }
         let tac = self.task_base.config.tac;
-        self.start_n2_handover(ue_id, target_cell as u32, target_cell as u64, tac)
+        self.start_n2_handover_with(ue_id, target_cell as u32, target_cell as u64, tac, trigger)
             .await;
     }
 
@@ -3459,6 +3555,25 @@ impl RrcTask {
         target_gnb_id: u32,
         target_cell_identity: u64,
         target_tac: u32,
+    ) {
+        self.start_n2_handover_with(
+            ue_id,
+            target_gnb_id,
+            target_cell_identity,
+            target_tac,
+            HandoverTrigger::default(),
+        )
+        .await;
+    }
+
+    /// [`Self::start_n2_handover`] with the trigger's cause and intent (nextgsim#483).
+    async fn start_n2_handover_with(
+        &mut self,
+        ue_id: i32,
+        target_gnb_id: u32,
+        target_cell_identity: u64,
+        target_tac: u32,
+        trigger: HandoverTrigger,
     ) {
         // The UE's capability container comes from this context because the NGAP task
         // does not hold it, and the target needs it to configure the UE at all.
@@ -3475,6 +3590,7 @@ impl RrcTask {
             // Time on the source cell is not tracked per UE, so 0 is reported: "no
             // measured dwell time" rather than an invented one.
             time_in_source_cell_s: 0,
+            trigger,
         }));
         if let Err(e) = self.task_base.ngap_tx.send(msg).await {
             error!("RRC: failed to ask NGAP to start the handover: {e}");
@@ -3514,6 +3630,7 @@ impl Task for RrcTask {
                     // Its own clock: the SI timer is parked for an hour when
                     // the broadcast is off (#422 review)
                     self.expire_pending_reestablishments().await;
+                    self.report_connected_ues_to_agent();
                 }
                 _ = si_timer.tick() => {
                     if si_period_ms > 0 {
@@ -3673,6 +3790,25 @@ impl Task for RrcTask {
                                 );
                                 // Initiate handover preparation for the recommended UE
                                 self.handle_nwdaf_handover(ue_id, target_cell, confidence).await;
+                            }
+                            RrcMessage::AgentHandover { ue_id, target_cell, trigger } => {
+                                self.handle_agent_handover(ue_id, target_cell, trigger).await;
+                            }
+                            RrcMessage::HandbackHold { ue_id, cell, hold } => {
+                                info!(
+                                    "[demo:d446a-agent-conflict] handback hold: UE[{ue_id}] is \
+                                     not handed back to its source cell PCI {cell} for {} s",
+                                    hold.as_secs()
+                                );
+                                self.handback_holds
+                                    .insert(ue_id, (cell, std::time::Instant::now() + hold));
+                            }
+                            RrcMessage::EnergySwitchOff => {
+                                warn!(
+                                    "[demo:d446a-agent-conflict] energy switch-off: the cell is \
+                                     barred until restart"
+                                );
+                                self.connection_manager.set_barred(true);
                             }
                         },
                         TaskMessage::Shutdown => {
@@ -4085,6 +4221,73 @@ mod tests {
         assert_eq!(
             request.target_cell_identity, 777,
             "the target the NWDAF named must reach NGAP unchanged"
+        );
+    }
+
+    /// #483: after a load-balancing handover-in, an A3 report naming the source
+    /// cell (PCI 32) does not start a HANDOVER REQUIRED for the hold; another PCI,
+    /// or the same one after the hold, does.
+    /// #483: the energy guardrail's connected set is every UE context plus every
+    /// admitted handover arrival not bound yet, whatever their bearers carry.
+    #[tokio::test]
+    async fn connected_ues_are_contexts_and_admitted_arrivals() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert!(task.connected_ue_ids().is_empty());
+        task.ue_manager.create_ue(7);
+        task.handle_expect_handover_arrival(16_777_216, 1);
+        task.handle_expect_handover_arrival(7, 2);
+        assert_eq!(task.connected_ue_ids(), vec![7, 16_777_216]);
+        task.ue_manager.delete_ue(7);
+        task.pending_handover_arrivals.remove(&7);
+        assert_eq!(task.connected_ue_ids(), vec![16_777_216]);
+    }
+
+    #[tokio::test]
+    async fn a_held_source_cell_is_not_handed_back() {
+        let mut config = test_config();
+        config.handover_neighbours = vec![
+            nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 0x20,
+                tac: 1,
+                gnb_id_length: None,
+            },
+            nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 0x30,
+                tac: 1,
+                gnb_id_length: None,
+            },
+        ];
+        let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        let initiated = |rx: &mut mpsc::Receiver<TaskMessage<NgapMessage>>| {
+            let mut n = 0;
+            while let Ok(m) = rx.try_recv() {
+                if matches!(m, TaskMessage::Message(NgapMessage::InitiateHandover(_))) {
+                    n += 1;
+                }
+            }
+            n
+        };
+        task.handback_holds.insert(
+            1001,
+            (32, std::time::Instant::now() + Duration::from_secs(60)),
+        );
+        task.handover_to_reported_pci(1001, 32).await;
+        assert_eq!(initiated(&mut ngap_rx), 0, "held: no handback");
+        task.handover_to_reported_pci(1001, 48).await;
+        assert_eq!(initiated(&mut ngap_rx), 1, "another cell is not held");
+        task.handback_holds.insert(
+            1001,
+            (32, std::time::Instant::now() - Duration::from_secs(1)),
+        );
+        task.handover_to_reported_pci(1001, 32).await;
+        assert_eq!(
+            initiated(&mut ngap_rx),
+            1,
+            "an expired hold no longer holds"
         );
     }
 
@@ -7176,7 +7379,7 @@ mod tests {
             ctx.set_reestablishment_security(sec.clone());
             ctx.on_as_security_activated();
         }
-        run_async(task.execute_handover(5, i32::from(SCELL_PCI)));
+        run_async(task.execute_handover(5, i32::from(SCELL_PCI), HandoverTrigger::default()));
         let dl = loop {
             match rls_rx.try_recv() {
                 Ok(TaskMessage::Message(crate::tasks::RlsMessage::DownlinkRrc {
