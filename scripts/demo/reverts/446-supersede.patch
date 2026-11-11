@@ -1,11 +1,49 @@
---- a/nextgsim-agent/src/conflict.rs
-+++ b/nextgsim-agent/src/conflict.rs
-@@ -391,7 +391,7 @@
-                     // New intent wins -- remove the existing intent from the queue.
-                     // We need to find and remove it from the actual deque.
-                     let existing_id = existing.id.clone();
--                    self.ready.retain(|i| i.id != existing_id);
-+                    // 446-supersede revert: the superseded intent stays queued.
+--- a/nextgsim-agent/src/lib.rs
++++ b/nextgsim-agent/src/lib.rs
+@@ -649,6 +649,8 @@
+ pub struct AgentCoordinator {
+     /// Registered agents
+     agents: HashMap<AgentId, AgentRegistration>,
++    /// 446-supersede revert: every submitted intent, kept beside the queue.
++    pending_intents: Vec<Intent>,
+     /// Token lifetime
+     token_lifetime: Duration,
+     /// Next token ID
+@@ -674,6 +676,7 @@
+     pub fn new() -> Self {
+         Self {
+             agents: HashMap::new(),
++            pending_intents: Vec::new(),
+             token_lifetime: Duration::from_secs(3600), // 1 hour
+             next_token_id: 1,
+             executor_registry: ExecutorRegistry::new(),
+@@ -694,6 +697,7 @@
+     ) -> Self {
+         Self {
+             agents: HashMap::new(),
++            pending_intents: Vec::new(),
+             token_lifetime: Duration::from_secs(3600),
+             next_token_id: 1,
+             executor_registry: ExecutorRegistry::new(),
+@@ -873,7 +877,10 @@
  
-                     let notification = BlockedIntentNotification {
-                         intent_id: existing_id.clone(),
+         // Conflict check via the intent queue.
+         match self.intent_queue.enqueue(intent.clone()) {
+-            Ok(()) => Ok(()),
++            Ok(()) => {
++                self.pending_intents.push(intent);
++                Ok(())
++            }
+             Err(notification) => {
+                 self.audit_trail.record_blocked(
+                     &notification.agent_id,
+@@ -910,7 +917,8 @@
+         // nextgsim#483: execute ONLY what the conflict-checked queue holds. A
+         // second list beside it kept every submitted intent, so an intent the
+         // queue superseded (or a later one blocked by it) still executed.
+-        let mut intents: Vec<Intent> = self.intent_queue.drain_ready();
++        let mut intents: Vec<Intent> = self.pending_intents.drain(..).collect();
++        let _ = self.intent_queue.drain_ready();
+         // Highest priority first; the stable sort keeps submission order on ties.
+         intents.sort_by_key(|i| std::cmp::Reverse(i.priority));
+ 

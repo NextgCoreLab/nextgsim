@@ -322,6 +322,9 @@ impl D446a {
         let inbound = Intent::new(AgentId::new(&label), IntentType::TriggerHandover)
             .with_param("target_cell", target_cell.to_string())
             .with_param("cause", CAUSE_REDUCE_LOAD)
+            // The HANDOVER REQUEST carries no priority; 8 is the load-balancing
+            // default (AgentRuleConfig::priority). It decides nothing here: the
+            // mode breaks a Cell:<booster> tie (`inbound_wins`).
             .with_priority(8);
         let hold = req.source_cell.map(|nci| {
             (
@@ -355,6 +358,10 @@ impl D446a {
             &label,
             format!("{} vs {} on {}", label, energy.id, contested.join(",")),
         );
+        // PolicyChanged is recorded at the first contest after a mode change, which
+        // is when the change applies. The `set` itself is audited at once by
+        // nextgsim-demo (`[demo:...] audit: mode A -> B from nr-cli`); `by=cli` is
+        // that source, the only way a mode changes at runtime.
         if let Some(previous) = self.last_policy.replace(mode.to_string()) {
             if previous != mode {
                 self.record(

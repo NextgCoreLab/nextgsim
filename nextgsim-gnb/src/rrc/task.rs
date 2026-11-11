@@ -2550,6 +2550,7 @@ impl RrcTask {
                 .await;
         }
         self.ue_manager.delete_ue(ue_id);
+        self.handback_holds.remove(&ue_id);
         self.pending_reestablishment_binds
             .retain(|rls, (context, _)| *context != ue_id && *rls != ue_id);
         self.release_ue_drbs(ue_id).await;

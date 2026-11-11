@@ -4,7 +4,7 @@
 # Each arm applies scripts/demo/reverts/<arm>.patch through revert-run.sh and
 # passes only if the named test then FAILS (and the tree is restored after):
 #
-#   446-supersede            a superseded intent stays queued and executes
+#   446-supersede            every submitted intent executes again (the queue is bypassed)
 #                            -> a_superseded_intent_never_executes
 #   446-cause                lb-1's handover keeps the radio-reason cause
 #                            -> a_loaded_cell_actuates_lb_1_with_the_load_balancing_cause

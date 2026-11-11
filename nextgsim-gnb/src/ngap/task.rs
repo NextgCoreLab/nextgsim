@@ -243,6 +243,10 @@ pub struct NgapTask {
     /// Source side: the agent intent each UE's pending handover preparation
     /// actuates, reported back to the Agent task when the AMF answers (nextgsim#483).
     agent_handover_intents: HashMap<i32, String>,
+    /// Whether an inbound HANDOVER REQUEST is arbitrated by the Agent task
+    /// (nextgsim#483): D446A active and the Agent task on. A field so a test can
+    /// drive the wiring without installing the process-global demo state.
+    inbound_arbitration: fn(&nextgsim_common::config::GnbConfig) -> bool,
     /// Counter for generating downlink TEIDs
     #[allow(dead_code)]
     downlink_teid_counter: u32,
@@ -393,6 +397,7 @@ impl NgapTask {
             ran_ue_ngap_id_counter: 0,
             next_handover_ue_id: FIRST_HANDOVER_UE_ID,
             agent_handover_intents: HashMap::new(),
+            inbound_arbitration: |config| crate::demo::d446a_active() && config.agent_enabled,
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_ngap_sessions: NgapMbsManager::new(),
@@ -3739,6 +3744,14 @@ impl NgapTask {
                          preparation, UE stays on the source cell"
                     );
                     self.send_handover_cancel(ue_id).await;
+                    if let Some(intent) = self.agent_handover_intents.remove(&ue_id) {
+                        self.report_agent_actuation(
+                            intent,
+                            ue_id,
+                            false,
+                            "TNGRELOCprep expired; HANDOVER CANCEL sent".to_string(),
+                        );
+                    }
                 }
                 GuardTimer::RacsMapping { ue_id } => {
                     // TS 38.413 §8.14.3 has no unsuccessful outcome, so an AMF that
@@ -5186,7 +5199,7 @@ impl NgapTask {
         let admit = crate::tasks::InboundHandoverVerdict::Admit {
             handback_hold: None,
         };
-        if !crate::demo::d446a_active() || !self.task_base.config.agent_enabled {
+        if !(self.inbound_arbitration)(&self.task_base.config) {
             return admit;
         }
         let Some(sixg) = &self.task_base.sixg else {
@@ -5223,12 +5236,14 @@ impl NgapTask {
             target_cell,
             reply,
         };
-        if sixg.agent_tx.send(ask).await.is_err() {
-            warn!("NGAP: the Agent task is gone; inbound handover admitted unarbitrated");
-            return admit;
-        }
-        match tokio::time::timeout(INBOUND_ARBITRATION_TIMEOUT, verdict).await {
-            Ok(Ok(v)) => v,
+        // One bound for both the hand-off and the answer: a full Agent inbox
+        // must not stall the NGAP task either.
+        let asked = async {
+            sixg.agent_tx.send(ask).await.ok()?;
+            verdict.await.ok()
+        };
+        match tokio::time::timeout(INBOUND_ARBITRATION_TIMEOUT, asked).await {
+            Ok(Some(v)) => v,
             _ => {
                 warn!(
                     "NGAP: no arbitration verdict from the Agent task; inbound handover admitted"
@@ -8813,6 +8828,65 @@ mod tests {
             ),
         })
         .expect("build the handover request")
+    }
+
+    /// #483: with D446A arbitrating, a refused load-balancing HANDOVER REQUEST is
+    /// answered with HANDOVER FAILURE "Cell not available" and allocates no UE
+    /// context; the Agent task is asked with the request's cause.
+    #[tokio::test]
+    async fn a_refused_inbound_handover_gets_cell_not_available_and_no_context() {
+        use nextgsim_ngap::procedures::handover::parse_handover_failure;
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut sixg = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.inbound_arbitration = |_| true;
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        let asked = tokio::spawn(async move {
+            match sixg.agent_rx.recv().await {
+                Some(TaskMessage::Message(crate::tasks::AgentMessage::InboundHandover {
+                    load_balancing,
+                    reply,
+                    ..
+                })) => {
+                    let _ = reply.send(crate::tasks::InboundHandoverVerdict::Refuse);
+                    load_balancing
+                }
+                _ => panic!("expected InboundHandover"),
+            }
+        });
+        let pdu = handover_request(
+            &[5],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let mut ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        ho_req.cause = HandoverCause::RadioNetwork(RadioNetworkCause::ReduceLoadInServingCell);
+        let before = task.ue_contexts.len();
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        assert!(asked.await.unwrap(), "asked as a load-balancing request");
+        let failure = drain_sctp(&mut sctp_rx)
+            .iter()
+            .find_map(|b| {
+                nextgsim_ngap::codec::decode_ngap_pdu(b)
+                    .ok()
+                    .and_then(|pdu| parse_handover_failure(&pdu).ok())
+            })
+            .expect("a HANDOVER FAILURE");
+        assert_eq!(
+            failure.cause,
+            HandoverCause::RadioNetwork(RadioNetworkCause::CellNotAvailable)
+        );
+        assert_eq!(task.ue_contexts.len(), before, "nothing allocated");
     }
 
     /// #39, criteria 1 and 2: the target admits **each** requested session, allocating a
