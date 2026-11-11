@@ -98,6 +98,9 @@ impl UeStatusInfo {
                 let psi_u8 = *psi as u8;
                 self.pdu_sessions.retain(|&p| p != psi_u8);
             }
+            // The status view lists sessions, not their QoS; the App task's
+            // CLI handler keeps the Session-AMBR (#454).
+            UeStatusUpdate::SessionParametersChanged { .. } => {}
             UeStatusUpdate::CmStateChanged { cm_state } => {
                 self.cm_state = cm_state.to_string();
             }
