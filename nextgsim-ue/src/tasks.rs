@@ -1014,8 +1014,10 @@ pub enum NwdafReporterMessage {
     ReportMeasurement {
         /// Serving cell RSRP (dBm)
         rsrp: f32,
-        /// Serving cell RSRQ (dB)
-        rsrq: f32,
+        /// Serving cell RSRQ (dB), or `None` when unmeasured. Optional for the
+        /// reason the gNB's NWDAF measurement is (#453): TS 38.215 §5.1.3 defines
+        /// RSRQ as N×RSRP/RSSI, and the RLS channel model has no RSSI.
+        rsrq: Option<f32>,
         /// Serving cell SINR (dB)
         sinr: Option<f32>,
         /// UE position (x, y, z) if available
@@ -1901,6 +1903,14 @@ impl UeTaskBase {
             sixg: None,
             rel18,
         }
+    }
+
+    /// The FL participant's inbox: the hook the FL demo attaches its producer
+    /// to (#459). `None` until the 6G handles are installed (see
+    /// [`crate::wiring::UeWiring`]).
+    #[cfg(feature = "nextgsim-fl")]
+    pub fn fl_participant_tx(&self) -> Option<&TaskHandle<FlParticipantMessage>> {
+        self.sixg.as_ref().map(|sixg| &sixg.fl_participant_tx)
     }
 
     /// Initialize 6G task handles and return their receivers.

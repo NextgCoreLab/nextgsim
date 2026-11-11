@@ -1277,6 +1277,18 @@ pub enum AgentMessage {
         /// Participating agents
         agent_ids: Vec<String>,
     },
+    /// A periodic observation of the cell's measured state, from the RLS task
+    /// (#459). Written into the agent framework's state store, where intent
+    /// executors read live network state.
+    CellObservation {
+        /// Cell identifier
+        cell_id: i32,
+        /// UEs with a live radio association
+        connected_ues: u32,
+        /// User-plane throughput measured over the window (Mbps), or `None`
+        /// when the window had no measurable duration
+        throughput_mbps: Option<f32>,
+    },
 }
 
 /// Messages for the Federated Learning Aggregator task.
@@ -1561,6 +1573,17 @@ impl GnbTaskBase {
         };
 
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
+    }
+
+    /// The FL aggregator's inbox: the hook the FL demo attaches its producer to
+    /// (#459).
+    ///
+    /// The FL tasks have no production producer yet because the FL demo
+    /// redesigns them; this is the one place it plugs in. `None` until the 6G
+    /// handles are installed (see [`crate::wiring::GnbWiring`]). A send to it
+    /// when FL is not enabled fails as a closed channel.
+    pub fn fl_aggregator_tx(&self) -> Option<&TaskHandle<FlAggregatorMessage>> {
+        self.sixg.as_ref().map(|sixg| &sixg.fl_tx)
     }
 
     /// Initialize 6G task handles and return their receivers.

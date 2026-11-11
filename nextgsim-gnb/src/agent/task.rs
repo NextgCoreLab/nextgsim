@@ -10,6 +10,8 @@ pub struct AgentTask {
     task_base: GnbTaskBase,
     coordinator: AgentCoordinator,
     agents: HashMap<String, Vec<String>>,
+    /// Cell observations received (#459).
+    observations: u64,
 }
 
 impl AgentTask {
@@ -18,7 +20,48 @@ impl AgentTask {
             task_base,
             coordinator: AgentCoordinator::new(),
             agents: HashMap::new(),
+            observations: 0,
         }
+    }
+
+    /// Records a cell observation in the coordinator's state store, under
+    /// `cell/<id>/connected_ues` and `cell/<id>/throughput_mbps`, so intent
+    /// executors read the cell's measured state. A throughput the producer could
+    /// not measure is left out rather than written as a number.
+    fn record_cell_observation(
+        &mut self,
+        cell_id: i32,
+        connected_ues: u32,
+        throughput_mbps: Option<f32>,
+    ) {
+        if self.observations == 0 {
+            info!(
+                "Agent: first cell observation, cell {} with {} connected UE(s)",
+                cell_id, connected_ues
+            );
+        }
+        self.observations += 1;
+        let state = self.coordinator.state_provider();
+        state.set(
+            &format!("cell/{cell_id}/connected_ues"),
+            &connected_ues.to_string(),
+        );
+        if let Some(mbps) = throughput_mbps {
+            state.set(
+                &format!("cell/{cell_id}/throughput_mbps"),
+                &mbps.to_string(),
+            );
+        }
+    }
+
+    /// Cell observations received so far.
+    pub fn observations(&self) -> u64 {
+        self.observations
+    }
+
+    /// The coordinator, for reading the state the observations wrote.
+    pub fn coordinator(&self) -> &AgentCoordinator {
+        &self.coordinator
     }
 }
 
@@ -83,6 +126,13 @@ impl Task for AgentTask {
                                 warn!("Agent: Intent submission failed: {}", e);
                             }
                         }
+                        AgentMessage::CellObservation {
+                            cell_id,
+                            connected_ues,
+                            throughput_mbps,
+                        } => {
+                            self.record_cell_observation(cell_id, connected_ues, throughput_mbps);
+                        }
                         AgentMessage::CoordinationEvent {
                             event_type,
                             agent_ids,
@@ -145,5 +195,45 @@ impl Task for AgentTask {
             "Agent task stopped, {} registered agents",
             self.agents.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tasks::DEFAULT_CHANNEL_CAPACITY;
+    use nextgsim_common::config::GnbConfig;
+
+    /// #459: a cell observation lands in the coordinator's state store, where
+    /// intent executors read it; an unmeasured throughput is left out.
+    #[tokio::test]
+    async fn a_cell_observation_is_written_to_the_agent_state() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(GnbConfig::default(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = AgentTask::new(task_base);
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TaskMessage::Message(AgentMessage::CellObservation {
+            cell_id: 7,
+            connected_ues: 3,
+            throughput_mbps: Some(1.5),
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Message(AgentMessage::CellObservation {
+            cell_id: 8,
+            connected_ues: 0,
+            throughput_mbps: None,
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        task.run(rx).await;
+
+        let state = task.coordinator().state_provider();
+        assert_eq!(task.observations(), 2);
+        assert_eq!(state.get("cell/7/connected_ues").as_deref(), Some("3"));
+        assert_eq!(state.get("cell/7/throughput_mbps").as_deref(), Some("1.5"));
+        assert_eq!(state.get("cell/8/connected_ues").as_deref(), Some("0"));
+        assert_eq!(state.get("cell/8/throughput_mbps"), None, "not invented");
     }
 }
