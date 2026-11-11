@@ -173,6 +173,47 @@ impl Mtlf {
         Ok(())
     }
 
+    /// Verify the trajectory model at `path` against `manifest` and activate it
+    /// only if every check passes (nextgsim#463).
+    ///
+    /// The model goes through a [`nextgsim_ai::SharedModelRegistry`], and the
+    /// predictor resolves it from there, so the engine that serves predictions
+    /// is the one the golden vectors ran on. On a refusal nothing changes: no
+    /// predictor is installed and predictions keep their fallback.
+    ///
+    /// # Errors
+    /// The registry's [`nextgsim_ai::ModelRefused`].
+    #[cfg(feature = "model-registry")]
+    pub fn load_verified_trajectory_model(
+        &mut self,
+        path: &Path,
+        manifest: &nextgsim_ai::ModelManifest,
+    ) -> Result<nextgsim_ai::VerifiedModel, nextgsim_ai::ModelRefused> {
+        let registry = nextgsim_ai::SharedModelRegistry::new(nextgsim_ai::ExecutionProvider::Cpu);
+        let verified = registry.register_verified(manifest, path)?;
+        let refused = |reason: String| nextgsim_ai::ModelRefused {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            reason: nextgsim_ai::RefusalReason::LoadFailed(reason),
+        };
+        let mut predictor = OnnxPredictor::new().map_err(|e| refused(e.to_string()))?;
+        predictor
+            .resolve_from_registry(&registry, &manifest.id)
+            .map_err(|e| refused(e.to_string()))?;
+        self.register_model(MlModelInfo {
+            model_id: manifest.id.clone(),
+            analytics_id: AnalyticsId::UeMobility,
+            version: manifest.version.clone(),
+            path: path.to_path_buf(),
+            file_size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+            accuracy: None,
+            is_loaded: true,
+            description: format!("Trajectory model, verified sha256={}", verified.sha256),
+        });
+        self.trajectory_predictor = Some(predictor);
+        Ok(verified)
+    }
+
     /// Returns a reference to the trajectory predictor if loaded
     pub fn trajectory_predictor(&self) -> Option<&OnnxPredictor> {
         self.trajectory_predictor.as_ref()

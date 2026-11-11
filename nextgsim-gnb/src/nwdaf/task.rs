@@ -47,6 +47,16 @@ pub struct NwdafTask {
     cell_loads: HashMap<i32, CellLoad>,
     /// Measurement history length
     _max_history_length: usize,
+    /// The process's demo state (nextgsim#458), read for the d440b mode at
+    /// startup and before every served prediction.
+    #[cfg(feature = "model-registry")]
+    demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    /// The d440b mode the last served prediction ran under, to log a switch once.
+    #[cfg(feature = "model-registry")]
+    served_mode: Option<String>,
+    /// Whether the first ONNX / fallback prediction has been logged.
+    #[cfg(feature = "model-registry")]
+    first_served: (bool, bool),
 }
 
 impl NwdafTask {
@@ -57,6 +67,77 @@ impl NwdafTask {
 
     /// Creates a new NWDAF task with specified history length
     pub fn with_history_length(task_base: GnbTaskBase, max_history_length: usize) -> Self {
+        #[cfg(feature = "model-registry")]
+        return Self::with_demo(task_base, max_history_length, nextgsim_demo::installed());
+        #[cfg(not(feature = "model-registry"))]
+        Self::build(task_base, max_history_length)
+    }
+
+    /// The task under an explicit demo state (nextgsim#463): what
+    /// [`Self::with_history_length`] does with the installed one.
+    ///
+    /// With `model_registry` built and `nwdaf_model_path` set, the model is
+    /// activated only after its manifest's checks pass (`NWDAF: model verified`
+    /// or `NWDAF: model refused (<reason>)`). Under the d440b demo in mode
+    /// `fallback` it is neither verified nor activated, and every prediction uses
+    /// the fallback; the demo (either mode) also serves one trajectory
+    /// prediction per recorded UE measurement, which is what moves the
+    /// `nwdaf-status` counters in a live run. With the demo off nothing is served
+    /// and the task behaves as without it.
+    #[cfg(feature = "model-registry")]
+    pub fn with_demo(
+        task_base: GnbTaskBase,
+        max_history_length: usize,
+        demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    ) -> Self {
+        use crate::demo::D440B_KEY;
+        use nextgsim_demo::demo_log;
+
+        let mut nwdaf = NwdafManager::new(max_history_length);
+        let mode = demo.and_then(|d| d.mode(D440B_KEY));
+        match (task_base.config.nwdaf_model_path.as_ref(), mode.as_deref()) {
+            (Some(path), Some("fallback")) => {
+                nwdaf.defer_trajectory_model(path);
+                nwdaf.set_force_fallback(true);
+                demo_log!(
+                    warn,
+                    D440B_KEY,
+                    "mode=fallback: the model at {} is neither verified nor activated; every \
+                     trajectory prediction uses linear extrapolation",
+                    path.display()
+                );
+            }
+            (Some(path), _) => {
+                // The outcome is logged by the manager (`NWDAF: model verified`
+                // / `NWDAF: model refused (<reason>)`) and kept in its state; a
+                // refusal degrades to the fallback rather than failing startup,
+                // as an unloadable model always has.
+                let _ = nwdaf.load_verified_trajectory_model(path);
+            }
+            (None, Some(m)) => {
+                nwdaf.set_force_fallback(m == "fallback");
+                demo_log!(
+                    warn,
+                    D440B_KEY,
+                    "mode={m}: no nwdaf_model_path is configured, so there is no model to \
+                     verify; every trajectory prediction uses linear extrapolation"
+                );
+            }
+            (None, None) => {}
+        }
+        Self {
+            task_base,
+            nwdaf,
+            cell_loads: HashMap::new(),
+            _max_history_length: max_history_length,
+            demo,
+            served_mode: mode,
+            first_served: (false, false),
+        }
+    }
+
+    #[cfg(not(feature = "model-registry"))]
+    fn build(task_base: GnbTaskBase, max_history_length: usize) -> Self {
         let mut nwdaf = NwdafManager::new(max_history_length);
 
         // Load the configured ONNX trajectory model, if any (issue #18). Without
@@ -148,6 +229,73 @@ impl NwdafTask {
                 "NWDAF: Detected {} anomalies for UE {}",
                 anomalies.len(),
                 ue_id
+            );
+        }
+
+        #[cfg(feature = "model-registry")]
+        self.serve_d440b(ue_id);
+    }
+
+    /// Under the d440b demo, serve one trajectory prediction for `ue_id` with
+    /// the mode read now, so a runtime switch applies from this prediction
+    /// (nextgsim#463). Nothing happens with the demo off.
+    #[cfg(feature = "model-registry")]
+    fn serve_d440b(&mut self, ue_id: i32) {
+        use crate::demo::D440B_KEY;
+        use nextgsim_demo::demo_log;
+        use nextgsim_nwdaf::serving::ModelState;
+
+        let Some(mode) = self.demo.and_then(|d| d.mode(D440B_KEY)) else {
+            return;
+        };
+        if self.served_mode.as_deref() != Some(mode.as_str()) {
+            demo_log!(
+                warn,
+                D440B_KEY,
+                "mode is now {mode} (was {}); applies from this prediction",
+                self.served_mode.as_deref().unwrap_or("-")
+            );
+        }
+        match mode.as_str() {
+            "fallback" => self.nwdaf.set_force_fallback(true),
+            _ => {
+                self.nwdaf.set_force_fallback(false);
+                // A model deferred by a `fallback` start is verified on the
+                // first `verify` prediction, never activated unchecked.
+                if let ModelState::Deferred { .. } = self.nwdaf.model_state() {
+                    if let Some(path) = self.task_base.config.nwdaf_model_path.clone() {
+                        let _ = self.nwdaf.load_verified_trajectory_model(&path);
+                    }
+                }
+            }
+        }
+        self.served_mode = Some(mode.clone());
+
+        let before = self.nwdaf.serving_stats().onnx_inferences();
+        let Some(prediction) = self.nwdaf.predict_trajectory(ue_id, 1000) else {
+            return; // too little history yet: no prediction, nothing counted
+        };
+        let by_model = self.nwdaf.serving_stats().onnx_inferences() > before;
+        let method = if by_model { "onnx" } else { "fallback" };
+        let first = if by_model {
+            &mut self.first_served.0
+        } else {
+            &mut self.first_served.1
+        };
+        if !*first {
+            *first = true;
+            demo_log!(
+                info,
+                D440B_KEY,
+                "first trajectory prediction served by {method}: ue={ue_id} mode={mode} \
+                 waypoints={}",
+                prediction.waypoints.len()
+            );
+        } else {
+            demo_log!(
+                debug,
+                D440B_KEY,
+                "trajectory prediction served by {method}: ue={ue_id} mode={mode}"
             );
         }
     }
@@ -390,6 +538,11 @@ impl Task for NwdafTask {
                         confidence,
                     } => {
                         self.handle_handover_recommendation(ue_id, target_cell, confidence);
+                    }
+                    #[cfg(feature = "model-registry")]
+                    NwdafMessage::Status { reply } => {
+                        // A dropped receiver is a CLI that gave up waiting.
+                        let _ = reply.send(self.nwdaf.status().to_json());
                     }
                 },
                 Some(TaskMessage::Shutdown) => {
@@ -737,5 +890,317 @@ mod tests {
         task.handle_handover_recommendation(1, 2, 0.9);
 
         // No assertions - just verify no panic
+    }
+
+    /// nextgsim#463: the d440b demo at the gNB NWDAF task. These need no ONNX
+    /// Runtime except the `ort` module (the model-verify CI job).
+    #[cfg(feature = "model-registry")]
+    mod d440b {
+        use super::*;
+        use crate::demo::{registry, D440B_KEY};
+        use nextgsim_demo::DemoRuntime;
+        use nextgsim_nwdaf::serving::ModelState;
+        use std::io::Write as _;
+        use std::path::PathBuf;
+        use std::sync::{Arc, Mutex};
+
+        fn model_dir() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../tools/d440b-model")
+        }
+
+        /// The shipped model and manifest copied into a temp dir, the model with
+        /// its float 2.0 weight's last byte flipped when `flip`.
+        fn drop_model(flip: bool) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().unwrap();
+            let mut bytes = std::fs::read(model_dir().join("nwdaf-trajectory-cv.onnx")).unwrap();
+            if flip {
+                let at = bytes
+                    .windows(4)
+                    .position(|w| w == [0x00, 0x00, 0x00, 0x40])
+                    .unwrap()
+                    + 3;
+                bytes[at] ^= 0x01;
+            }
+            let path = dir.path().join("nwdaf-trajectory-cv.onnx");
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::copy(
+                model_dir().join("nwdaf-trajectory-cv.manifest.json"),
+                dir.path().join("nwdaf-trajectory-cv.manifest.json"),
+            )
+            .unwrap();
+            (dir, path)
+        }
+
+        /// A demo state for `mode` (None: no demo block), leaked to `'static`
+        /// as the installed one is; never installed, so tests stay independent.
+        fn demo(mode: Option<&str>) -> Option<&'static DemoRuntime> {
+            let yaml = match mode {
+                Some(m) => format!(
+                    "demo:\n  enabled: true\n  {D440B_KEY}:\n    enabled: true\n    mode: {m}\n"
+                ),
+                None => "nci: 16\n".to_string(),
+            };
+            let root: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+            Some(Box::leak(Box::new(
+                DemoRuntime::from_root(&root, registry()).unwrap(),
+            )))
+        }
+
+        fn task(model: Option<PathBuf>, demo: Option<&'static DemoRuntime>) -> NwdafTask {
+            let mut config = test_config();
+            config.nwdaf_model_path = model;
+            let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+            NwdafTask::with_demo(task_base, 100, demo)
+        }
+
+        /// Four measurements of UE 1 along a line.
+        fn walk(task: &mut NwdafTask) {
+            for i in 0..4 {
+                task.handle_ue_measurement(1, Some(-80.0), None, (i as f32, 2.0 * i as f32, 0.0));
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        fn capture_logs<T>(f: impl FnOnce() -> T) -> (T, String) {
+            let sink = Captured::default();
+            let writer = sink.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            let out = tracing::subscriber::with_default(subscriber, f);
+            let mut text = sink.0.lock().unwrap().clone();
+            let _ = text.flush();
+            (out, String::from_utf8(text).unwrap())
+        }
+
+        /// The `consumer` check #462's `onnx` arm makes: a verified model served
+        /// every prediction.
+        fn consumer_check(task: &NwdafTask) -> bool {
+            let s = task.nwdaf.status();
+            s.verified && s.onnx_inferences > 0 && s.fallback_inferences == 0
+        }
+
+        /// Demo off (each of the three shapes): measurements are recorded and
+        /// nothing is served, so no prediction is counted and no demo line is
+        /// logged: the task behaves as it does without the demo.
+        #[test]
+        fn demo_off_serves_nothing() {
+            let off: [Option<&'static DemoRuntime>; 4] = [
+                None,
+                demo(None),
+                {
+                    let root: serde_yaml::Value =
+                        serde_yaml::from_str("demo:\n  enabled: false\n").unwrap();
+                    Some(&*Box::leak(Box::new(
+                        DemoRuntime::from_root(&root, registry()).unwrap(),
+                    )))
+                },
+                {
+                    let root: serde_yaml::Value = serde_yaml::from_str(&format!(
+                        "demo:\n  enabled: false\n  {D440B_KEY}:\n    enabled: true\n    mode: verify\n"
+                    ))
+                    .unwrap();
+                    Some(&*Box::leak(Box::new(
+                        DemoRuntime::from_root(&root, registry()).unwrap(),
+                    )))
+                },
+            ];
+            for d in off {
+                let (mut t, logs) = capture_logs(|| {
+                    let mut t = task(None, d);
+                    walk(&mut t);
+                    t
+                });
+                let s = t.nwdaf.status();
+                assert_eq!(s.measurements_recorded, 4);
+                assert_eq!((s.onnx_inferences, s.fallback_inferences), (0, 0));
+                assert!(!logs.contains("[demo:"), "{logs}");
+                assert!(!s.force_fallback);
+                // An explicit request still predicts, as it always has.
+                t.handle_predict_trajectory(1, 1000, None);
+                assert_eq!(t.nwdaf.status().fallback_inferences, 1);
+            }
+        }
+
+        /// Mode `fallback`: the configured model is neither verified nor
+        /// activated (no `model verified`, no ONNX Runtime touched), every served
+        /// prediction is a fallback, and the consumer check fails.
+        #[test]
+        fn mode_fallback_never_verifies_and_serves_the_fallback() {
+            let (_dir, path) = drop_model(false);
+            let (t, logs) = capture_logs(|| {
+                let mut t = task(Some(path), demo(Some("fallback")));
+                walk(&mut t);
+                t
+            });
+            assert!(!logs.contains("model verified"), "{logs}");
+            assert!(!logs.contains("model refused"), "{logs}");
+            assert!(logs.contains("[demo:d440b-model-verify] mode=fallback: the model at "));
+            assert!(logs.contains(
+                "[demo:d440b-model-verify] first trajectory prediction served by fallback: ue=1 mode=fallback"
+            ), "{logs}");
+            assert!(matches!(t.nwdaf.model_state(), ModelState::Deferred { .. }));
+            let s = t.nwdaf.status();
+            assert!(!s.verified && s.force_fallback);
+            // 4 measurements, the first has too little history: 3 served.
+            assert_eq!((s.onnx_inferences, s.fallback_inferences), (0, 3));
+            assert!(!consumer_check(&t));
+        }
+
+        /// Mode `verify` with the one-byte-flipped copy: refused for its sha256,
+        /// and the same served run is all fallback; the consumer check fails.
+        #[test]
+        fn mode_verify_refuses_a_flipped_model_and_serves_the_fallback() {
+            let (_dir, path) = drop_model(true);
+            let (t, logs) = capture_logs(|| {
+                let mut t = task(Some(path), demo(Some("verify")));
+                walk(&mut t);
+                t
+            });
+            assert!(
+                logs.contains(
+                    "NWDAF: model refused (sha256 mismatch) id=nwdaf-trajectory-cv version=1.0.0"
+                ),
+                "{logs}"
+            );
+            assert!(!logs.contains("model verified"), "{logs}");
+            let s = t.nwdaf.status();
+            assert!(!s.verified);
+            assert!(s.fallback_inferences > 0);
+            assert_eq!(s.onnx_inferences, 0);
+            assert!(!consumer_check(&t));
+        }
+
+        /// A runtime switch applies from the next prediction, and a model a
+        /// `fallback` start deferred is verified then, never activated unchecked:
+        /// here the flipped copy, refused at the first `verify` prediction.
+        #[test]
+        fn switching_to_verify_verifies_the_deferred_model_at_the_next_prediction() {
+            let (_dir, path) = drop_model(true);
+            let rt = demo(Some("fallback")).unwrap();
+            let (t, logs) = capture_logs(|| {
+                let mut t = task(Some(path), Some(rt));
+                walk(&mut t);
+                assert!(matches!(t.nwdaf.model_state(), ModelState::Deferred { .. }));
+                rt.handle_cli("d440b-model-verify set mode=verify", "test")
+                    .unwrap();
+                // Not yet: the switch applies at the next prediction.
+                assert!(matches!(t.nwdaf.model_state(), ModelState::Deferred { .. }));
+                t.handle_ue_measurement(1, Some(-80.0), None, (9.0, 9.0, 0.0));
+                t
+            });
+            assert!(
+                logs.contains("[demo:d440b-model-verify] mode is now verify (was fallback)"),
+                "{logs}"
+            );
+            assert!(
+                logs.contains("NWDAF: model refused (sha256 mismatch)"),
+                "{logs}"
+            );
+            assert!(matches!(
+                t.nwdaf.model_state(),
+                ModelState::Refused { reason, .. } if reason == "sha256 mismatch"
+            ));
+            let s = t.nwdaf.status();
+            assert!(!s.force_fallback);
+            assert_eq!((s.onnx_inferences, s.fallback_inferences), (0, 4));
+        }
+
+        /// The `nwdaf-status` query through the task's own channel.
+        #[tokio::test]
+        async fn the_status_query_answers_json_through_the_channel() {
+            let mut t = task(None, demo(Some("fallback")));
+            let (tx, rx) = mpsc::channel(8);
+            for i in 0..3 {
+                tx.send(TaskMessage::Message(NwdafMessage::UeMeasurement {
+                    ue_id: 2,
+                    rsrp: Some(-90.0),
+                    rsrq: None,
+                    position: (i as f32, 0.0, 0.0),
+                }))
+                .await
+                .unwrap();
+            }
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            tx.send(TaskMessage::Message(NwdafMessage::Status { reply }))
+                .await
+                .unwrap();
+            tx.send(TaskMessage::Shutdown).await.unwrap();
+            t.run(rx).await;
+            let v: serde_json::Value = serde_json::from_str(&answer.await.unwrap()).unwrap();
+            assert_eq!(v["schema"], "nextgsim.nwdaf-status/1");
+            assert_eq!(v["verified"], false);
+            assert_eq!(v["model"]["state"], "not-configured");
+            assert_eq!(v["measurements_recorded"], 3);
+            assert_eq!(v["onnx_inferences"], 0);
+            assert_eq!(v["fallback_inferences"], 2);
+        }
+
+        /// Tests that need ONNX Runtime (the model-verify CI job).
+        mod ort {
+            use super::*;
+
+            fn require_ort() {
+                assert!(
+                    std::env::var_os("ORT_DYLIB_PATH").is_some(),
+                    "this test needs ONNX Runtime: set ORT_DYLIB_PATH to the pinned \
+                     libonnxruntime.so (the model-verify CI job does)"
+                );
+            }
+
+            /// Mode `verify` with the shipped model: `model verified ... golden=ok`,
+            /// then every served prediction is the model's and the consumer check
+            /// passes. Switching to `fallback` flips the next prediction.
+            #[test]
+            #[ignore = "needs ONNX Runtime (ORT_DYLIB_PATH); run by the model-verify CI job"]
+            fn mode_verify_serves_the_verified_model() {
+                require_ort();
+                let (_dir, path) = drop_model(false);
+                let rt = demo(Some("verify")).unwrap();
+                let (mut t, logs) = capture_logs(|| {
+                    let mut t = task(Some(path), Some(rt));
+                    walk(&mut t);
+                    t
+                });
+                assert!(
+                    logs.contains(
+                        "NWDAF: model verified id=nwdaf-trajectory-cv version=1.0.0 \
+                     sha256=90a74d28c8e919ad8fdaa0f487976c8a4e803af3e318c5a30e02afcc3ec1f826"
+                    ),
+                    "{logs}"
+                );
+                assert!(logs.contains("golden=ok"), "{logs}");
+                assert!(logs.contains(
+                    "[demo:d440b-model-verify] first trajectory prediction served by onnx: ue=1 mode=verify waypoints=1"
+                ), "{logs}");
+                let s = t.nwdaf.status();
+                assert_eq!((s.onnx_inferences, s.fallback_inferences), (3, 0));
+                assert!(consumer_check(&t));
+
+                rt.handle_cli("d440b-model-verify set mode=fallback", "test")
+                    .unwrap();
+                t.handle_ue_measurement(1, Some(-80.0), None, (9.0, 9.0, 0.0));
+                let s = t.nwdaf.status();
+                assert_eq!((s.onnx_inferences, s.fallback_inferences), (3, 1));
+                assert!(
+                    !consumer_check(&t),
+                    "the fallback arm must fail the consumer"
+                );
+            }
+        }
     }
 }

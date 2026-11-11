@@ -25,6 +25,10 @@
 - [Gap Analysis: 6G](gaps/6g-gap-analysis.md)
 - [Gap Analysis: Protocols](gaps/gap-protocols.md)
 
+# Demos
+
+- [D440B: verified model loading](demos/d440b-model-verify.md)
+
 # Community
 
 - [Contributing](contributing.md)

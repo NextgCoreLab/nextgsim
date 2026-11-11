@@ -114,6 +114,12 @@ impl OnnxEngine {
 
     /// Creates a session from a file path with the configured execution provider
     fn create_session(&self, path: &Path) -> Result<Session, ModelError> {
+        Ok(self.session_builder()?.commit_from_file(path)?)
+    }
+
+    /// A session builder with this engine's threads, optimisation level and
+    /// execution provider applied.
+    fn session_builder(&self) -> Result<ort::session::builder::SessionBuilder, ModelError> {
         let mut builder = Session::builder()?;
 
         // Set thread count
@@ -159,8 +165,37 @@ impl OnnxEngine {
             }
         }
 
-        let session = builder.commit_from_file(path)?;
-        Ok(session)
+        Ok(builder)
+    }
+
+    /// Loads a model from bytes already in memory, under `name`.
+    ///
+    /// For a caller that has verified the bytes (nextgsim#463): loading the file
+    /// a second time would let it change between the check and the load.
+    ///
+    /// # Errors
+    /// Returns `ModelError` if ONNX Runtime rejects the bytes.
+    #[cfg(feature = "model-registry")]
+    pub fn load_model_from_bytes(&mut self, bytes: &[u8], name: &str) -> Result<(), ModelError> {
+        let session = self.session_builder()?.commit_from_memory(bytes)?;
+        let label = Path::new(name);
+        self.metadata = Self::extract_metadata(&session, label);
+        self.model_info = Some(
+            ModelInfo::new(label, ModelType::Onnx)
+                .with_metadata(self.metadata.clone())
+                .with_file_size(bytes.len() as u64)
+                .mark_ready(),
+        );
+        self.metrics = InferenceMetrics::new(&self.metadata.name);
+        self.session = Some(Mutex::new(session));
+        self.is_ready = true;
+        info!(
+            "Model loaded from memory: {} ({} inputs, {} outputs)",
+            name,
+            self.metadata.num_inputs(),
+            self.metadata.num_outputs()
+        );
+        Ok(())
     }
 
     /// Extracts metadata from a loaded session

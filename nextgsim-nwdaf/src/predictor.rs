@@ -284,12 +284,16 @@ impl OnnxPredictor {
 
         let input = TensorData::float32(flat_data, vec![1i64, num_points as i64, 3]);
 
-        let output = self
-            .engine
-            .infer(&input)
-            .map_err(|e| PredictionError::InferenceFailed {
-                reason: format!("Inference execution failed: {e}"),
-            })?;
+        // The active engine, not `self.engine`: with a registry-resolved model
+        // (nextgsim#463) `self.engine` is the never-loaded owned one, and running
+        // on it fails every inference into the linear fallback while
+        // `has_model()` says a model is serving.
+        let output =
+            self.active_engine()
+                .infer(&input)
+                .map_err(|e| PredictionError::InferenceFailed {
+                    reason: format!("Inference execution failed: {e}"),
+                })?;
 
         // Parse output tensor into waypoints
         let output_data =

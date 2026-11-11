@@ -92,6 +92,9 @@ pub mod mtlf;
 pub mod nkef_bridge;
 pub mod predictor;
 pub mod service;
+/// Verified trajectory-model loading and serving counters (nextgsim#463).
+#[cfg(feature = "model-registry")]
+pub mod serving;
 
 // Re-export key types from new modules for convenience
 pub use analytics_id::AnalyticsId;
@@ -394,6 +397,19 @@ pub struct NwdafManager {
     max_history_length: usize,
     /// Handover confidence threshold
     handover_confidence_threshold: f32,
+    /// Serving counters and latencies (nextgsim#463).
+    #[cfg(feature = "model-registry")]
+    serving: serving::ServingStats,
+    /// Where the configured trajectory model stands (nextgsim#463).
+    #[cfg(feature = "model-registry")]
+    model_state: serving::ModelState,
+    /// The manifest of the verified model, for the inventory.
+    #[cfg(feature = "model-registry")]
+    verified_manifest: Option<nextgsim_ai::ModelManifest>,
+    /// Every prediction uses the linear fallback, verified model or not (the
+    /// d440b `fallback` mode).
+    #[cfg(feature = "model-registry")]
+    force_fallback: bool,
 }
 
 impl NwdafManager {
@@ -405,6 +421,14 @@ impl NwdafManager {
             mtlf: Mtlf::new(),
             max_history_length,
             handover_confidence_threshold: 0.8,
+            #[cfg(feature = "model-registry")]
+            serving: serving::ServingStats::default(),
+            #[cfg(feature = "model-registry")]
+            model_state: serving::ModelState::NotConfigured,
+            #[cfg(feature = "model-registry")]
+            verified_manifest: None,
+            #[cfg(feature = "model-registry")]
+            force_fallback: false,
         }
     }
 
@@ -416,6 +440,8 @@ impl NwdafManager {
         // Feed into anomaly detector before storing
         let _anomalies = self.anlf.process_measurement(&measurement);
         self.data_collector.report_ue_measurement(measurement);
+        #[cfg(feature = "model-registry")]
+        self.serving.record_measurement();
     }
 
     /// Records cell load
@@ -438,7 +464,32 @@ impl NwdafManager {
     ///
     /// If an ONNX model has been loaded via [`NwdafManager::load_trajectory_model`],
     /// uses ML-based prediction. Otherwise falls back to linear extrapolation.
+    ///
+    /// With `model-registry`, every prediction is counted by the method that
+    /// produced it (see [`serving::ServingStats`]), and
+    /// [`NwdafManager::set_force_fallback`] skips the model.
     pub fn predict_trajectory(&self, ue_id: i32, horizon_ms: u32) -> Option<TrajectoryPrediction> {
+        #[cfg(feature = "model-registry")]
+        {
+            let start = std::time::Instant::now();
+            let (prediction, by_model) =
+                self.predict_trajectory_by(ue_id, horizon_ms, !self.force_fallback)?;
+            self.serving.record_inference(by_model, start.elapsed());
+            Some(prediction)
+        }
+        #[cfg(not(feature = "model-registry"))]
+        self.predict_trajectory_by(ue_id, horizon_ms, true)
+            .map(|(prediction, _)| prediction)
+    }
+
+    /// The prediction, and whether the ONNX model produced it. `use_model`
+    /// false goes straight to linear extrapolation.
+    fn predict_trajectory_by(
+        &self,
+        ue_id: i32,
+        horizon_ms: u32,
+        use_model: bool,
+    ) -> Option<(TrajectoryPrediction, bool)> {
         let history = self.data_collector.get_ue_history(ue_id)?;
 
         if history.len() < 2 {
@@ -455,18 +506,22 @@ impl NwdafManager {
         });
 
         // Try MTLF predictor first, then create a temporary fallback
-        let predictor = self.mtlf.trajectory_predictor();
+        let predictor = self.mtlf.trajectory_predictor().filter(|_| use_model);
 
         if let Some(pred) = predictor {
             if let Ok(output) =
                 pred.predict_trajectory(&positions, &timestamps, horizon_ms, current_time)
             {
-                return Some(TrajectoryPrediction {
-                    ue_id,
-                    waypoints: output.waypoints,
-                    confidence: output.confidence,
-                    horizon_ms,
-                });
+                let by_model = output.method == PredictionMethod::OnnxModel;
+                return Some((
+                    TrajectoryPrediction {
+                        ue_id,
+                        waypoints: output.waypoints,
+                        confidence: output.confidence,
+                        horizon_ms,
+                    },
+                    by_model,
+                ));
             }
             // fall through to linear extrapolation
         }
@@ -506,12 +561,15 @@ impl NwdafManager {
 
         let confidence = (history.len() as f32 / self.max_history_length as f32).min(0.9);
 
-        Some(TrajectoryPrediction {
-            ue_id,
-            waypoints,
-            confidence,
-            horizon_ms,
-        })
+        Some((
+            TrajectoryPrediction {
+                ue_id,
+                waypoints,
+                confidence,
+                horizon_ms,
+            },
+            false,
+        ))
     }
 
     /// Generates handover recommendation
@@ -569,6 +627,111 @@ impl NwdafManager {
     /// Returns an error if the model file cannot be loaded.
     pub fn load_trajectory_model(&mut self, path: &std::path::Path) -> Result<(), NwdafError> {
         self.mtlf.load_trajectory_model(path)
+    }
+
+    /// Verify the trajectory model at `path` against its manifest
+    /// (`<stem>.manifest.json` beside it) and activate it only if every check
+    /// passes (nextgsim#463). Logs `NWDAF: model verified ...` or
+    /// `NWDAF: model refused (<reason>) ...`; a refused model leaves predictions
+    /// on the fallback.
+    ///
+    /// # Errors
+    /// The refusal.
+    #[cfg(feature = "model-registry")]
+    pub fn load_verified_trajectory_model(
+        &mut self,
+        path: &std::path::Path,
+    ) -> Result<nextgsim_ai::VerifiedModel, nextgsim_ai::ModelRefused> {
+        let manifest_path = serving::manifest_path(path);
+        let outcome = std::fs::read_to_string(&manifest_path)
+            .map_err(|e| {
+                nextgsim_ai::RefusalReason::ManifestInvalid(format!(
+                    "{}: {e}",
+                    manifest_path.display()
+                ))
+            })
+            .and_then(|text| nextgsim_ai::ModelManifest::from_json(&text))
+            .map_err(|reason| nextgsim_ai::ModelRefused {
+                id: "-".into(),
+                version: "-".into(),
+                reason,
+            })
+            .and_then(|manifest| {
+                self.mtlf
+                    .load_verified_trajectory_model(path, &manifest)
+                    .map(|v| (v, manifest))
+            });
+        match outcome {
+            Ok((verified, manifest)) => {
+                tracing::info!(
+                    "NWDAF: model verified {} path={}; trajectory predictions use the model",
+                    verified.summary(),
+                    path.display()
+                );
+                self.model_state = serving::ModelState::Verified {
+                    id: manifest.id.clone(),
+                    version: manifest.version.clone(),
+                    sha256: verified.sha256.clone(),
+                    opset: manifest.opset,
+                    path: path.display().to_string(),
+                };
+                self.verified_manifest = Some(manifest);
+                Ok(verified)
+            }
+            Err(refused) => {
+                tracing::warn!(
+                    "NWDAF: {refused} path={}; trajectory predictions use linear extrapolation",
+                    path.display()
+                );
+                self.model_state = serving::ModelState::Refused {
+                    id: refused.id.clone(),
+                    version: refused.version.clone(),
+                    reason: refused.reason.label().to_string(),
+                    detail: refused.reason.detail(),
+                    path: path.display().to_string(),
+                };
+                Err(refused)
+            }
+        }
+    }
+
+    /// Record that the model at `path` is configured but neither verified nor
+    /// activated (the d440b `fallback` mode at startup).
+    #[cfg(feature = "model-registry")]
+    pub fn defer_trajectory_model(&mut self, path: &std::path::Path) {
+        self.model_state = serving::ModelState::Deferred {
+            path: path.display().to_string(),
+        };
+    }
+
+    /// Force every prediction onto the linear fallback (`true`), or let a
+    /// verified model serve again (`false`). Applies from the next prediction.
+    #[cfg(feature = "model-registry")]
+    pub fn set_force_fallback(&mut self, force: bool) {
+        self.force_fallback = force;
+    }
+
+    /// Where the configured trajectory model stands.
+    #[cfg(feature = "model-registry")]
+    pub fn model_state(&self) -> &serving::ModelState {
+        &self.model_state
+    }
+
+    /// The serving counters.
+    #[cfg(feature = "model-registry")]
+    pub fn serving_stats(&self) -> &serving::ServingStats {
+        &self.serving
+    }
+
+    /// The `nwdaf-status` answer.
+    #[cfg(feature = "model-registry")]
+    pub fn status(&self) -> serving::NwdafStatus {
+        serving::NwdafStatus::new(
+            &self.serving,
+            &self.model_state,
+            self.verified_manifest.as_ref(),
+            self.force_fallback,
+        )
     }
 
     /// Returns a reference to the underlying data collector
