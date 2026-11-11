@@ -493,6 +493,36 @@ mod tests {
         );
     }
 
+    /// A report that does carry RSRQ keeps it: making RSRQ optional must not
+    /// drop a measured value (#453 review).
+    #[tokio::test]
+    async fn a_report_with_rsrq_keeps_it() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NwdafTask::new(task_base);
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TaskMessage::Message(NwdafMessage::UeMeasurement {
+            ue_id: 4,
+            rsrp: Some(-80.0),
+            rsrq: Some(-10.0),
+            position: (1.0, 2.0, 0.0),
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        task.run(rx).await;
+
+        let sample = task
+            .nwdaf
+            .get_ue_history(4)
+            .and_then(|h| h.latest())
+            .expect("a complete report is recorded");
+        assert_eq!(sample.rsrp, -80.0);
+        assert_eq!(sample.rsrq, Some(-10.0), "the measured RSRQ is kept");
+    }
+
     /// #453: an RSRP-only report -- what the RLS heartbeat forward and the RRC
     /// MeasurementReport path send, because the simulator has no RSSI to derive
     /// RSRQ from -- is recorded, through the task's own message dispatch, with

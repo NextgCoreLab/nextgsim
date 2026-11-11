@@ -2304,6 +2304,7 @@ mod tests {
         for i in 0..15 {
             collector.report_ue_measurement(rsrp_only(1, -70.0, i));
             collector.report_ue_measurement(rsrp_only(2, -100.0, i));
+            collector.report_ue_measurement(rsrp_only(3, -120.0, i));
         }
 
         let verdict = |anlf: &mut Anlf, ue_id| {
@@ -2323,6 +2324,8 @@ mod tests {
         // -100 dBm fails the -90 dBm sustainability bar but is above the
         // -110 dBm poor-link bar, so the loss estimate stays low.
         assert_eq!(verdict(&mut anlf, 2), (false, 0.001));
+        // Below -110 dBm the loss estimate falls back to RSRP and reads poor.
+        assert_eq!(verdict(&mut anlf, 3), (false, 0.02));
     }
 
     #[test]

@@ -694,6 +694,22 @@ impl Default for NwdafManager {
 mod tests {
     use super::*;
 
+    /// `rsrq` is optional on the wire too (#453): a record without it reads as
+    /// `None`, one with it reads back the value, and `None` is not serialised.
+    #[test]
+    fn ue_measurement_rsrq_round_trips_through_serde() {
+        let base = r#"{"ue_id":1,"rsrp":-80.0,"sinr":null,"position":{"x":0.0,"y":0.0,"z":0.0},"velocity":null,"serving_cell_id":1,"timestamp_ms":0"#;
+        let without: UeMeasurement = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert_eq!(without.rsrq, None);
+        let with: UeMeasurement =
+            serde_json::from_str(&format!("{base},\"rsrq\":-10.0}}")).unwrap();
+        assert_eq!(with.rsrq, Some(-10.0));
+        assert!(!serde_json::to_string(&without).unwrap().contains("rsrq"));
+        assert!(serde_json::to_string(&with)
+            .unwrap()
+            .contains("\"rsrq\":-10.0"));
+    }
+
     // --- Original tests (backward compatibility) ---
 
     #[test]
