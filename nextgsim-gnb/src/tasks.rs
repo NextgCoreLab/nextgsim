@@ -1183,6 +1183,13 @@ pub enum NwdafMessage {
         /// Confidence score (0.0 - 1.0)
         confidence: f32,
     },
+    /// The `nr-cli <gnb> nwdaf-status` query (nextgsim#463): the model state,
+    /// the serving counters and the model inventory, as one line of JSON.
+    #[cfg(feature = "model-registry")]
+    Status {
+        /// Where the JSON goes.
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
 }
 
 /// Messages for the Network Knowledge Exposure Function (NKEF) task.

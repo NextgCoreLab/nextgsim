@@ -251,6 +251,23 @@ impl AppTask {
             return;
         }
 
+        // `nwdaf-status` (nextgsim#463) is answered by the NWDAF task over its
+        // channel, so it cannot go through the synchronous command handler.
+        #[cfg(feature = "model-registry")]
+        if cmd.command.split_whitespace().next() == Some("nwdaf-status") {
+            let result = self.nwdaf_status().await;
+            if let Some(server) = &self.cli_server {
+                let sent = match result {
+                    Ok(out) => server.send_result(cmd.client_addr, out).await,
+                    Err(e) => server.send_error(cmd.client_addr, e).await,
+                };
+                if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // Parse the command
         let command = match parse_cli_command(&cmd.command) {
             Ok(parsed) => parsed,
@@ -315,6 +332,46 @@ impl AppTask {
             }
         };
         Some(answer)
+    }
+
+    /// Ask the NWDAF task for its status (nextgsim#463): the model state, the
+    /// serving counters and the inventory, as JSON.
+    ///
+    /// Reaches the task through this task's own copy of the 6G handles, which
+    /// exist here because they are installed before any task clones the base
+    /// (#452).
+    #[cfg(feature = "model-registry")]
+    async fn nwdaf_status(&self) -> Result<String, String> {
+        if !self.task_base.config.nwdaf_enabled {
+            return Err(
+                "nwdaf-status: the NWDAF task is not running (nwdaf_enabled: false)".into(),
+            );
+        }
+        let sixg = self
+            .task_base
+            .sixg
+            .as_ref()
+            .ok_or("nwdaf-status: the 6G tasks are not running in this gNB")?;
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        // Both legs bounded: under the demo the NWDAF queue can be full, and the
+        // App task must answer the CLI rather than park on the send.
+        let wait = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(
+            wait,
+            sixg.nwdaf_tx
+                .send(crate::tasks::NwdafMessage::Status { reply }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("nwdaf-status: the NWDAF task has stopped".into()),
+            Err(_) => return Err("nwdaf-status: the NWDAF task queue stayed full for 2 s".into()),
+        }
+        match tokio::time::timeout(wait, answer).await {
+            Ok(Ok(json)) => Ok(json),
+            Ok(Err(_)) => Err("nwdaf-status: the NWDAF task dropped the request".into()),
+            Err(_) => Err("nwdaf-status: the NWDAF task did not answer within 2 s".into()),
+        }
     }
 
     /// Polls the CLI server for incoming commands.

@@ -26,8 +26,17 @@ pub const D447A_MODES: &[&str] = &["on", "baseline"];
 #[cfg(all(test, feature = "nkef-sba"))]
 pub static D447A_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// D440B, verified OAM-style model loading with serving counters (nextgsim#463).
+/// Registered under the `model-registry` cargo feature.
+pub const D440B_KEY: &str = "d440b-model-verify";
+
+/// D440B's modes. `verify`: the model is checked and activated only on a pass.
+/// `fallback`: no model is activated and every prediction uses the fallback,
+/// reproducing the silent-fallback state a consumer's check must catch.
+pub const D440B_MODES: &[&str] = &["verify", "fallback"];
+
 /// The demos compiled into this binary.
-#[allow(clippy::vec_init_then_push)]
+#[allow(clippy::vec_init_then_push)] // one push per demo feature
 pub fn registry() -> DemoRegistry {
     #[allow(unused_mut)]
     let mut specs: Vec<DemoSpec> = Vec::new();
@@ -35,6 +44,12 @@ pub fn registry() -> DemoRegistry {
     specs.push(DemoSpec {
         key: D447A_KEY,
         modes: D447A_MODES,
+        requires: &[],
+    });
+    #[cfg(feature = "model-registry")]
+    specs.push(DemoSpec {
+        key: D440B_KEY,
+        modes: D440B_MODES,
         requires: &[],
     });
     DemoRegistry::new(&specs)
@@ -55,7 +70,7 @@ mod tests {
     #[test]
     #[cfg(feature = "nkef-sba")]
     fn an_nkef_sba_build_registers_d447a_and_rejects_an_unknown_mode() {
-        assert_eq!(registry().keys(), vec![D447A_KEY]);
+        assert!(registry().keys().contains(&D447A_KEY));
         let root: serde_yaml::Value = serde_yaml::from_str(
             "demo:\n  enabled: true\n  d447a-nkef-live:\n    enabled: true\n    mode: bogus\n",
         )
@@ -78,8 +93,8 @@ mod tests {
 
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
+    #[cfg(not(any(feature = "model-registry", feature = "nkef-sba")))]
     #[test]
-    #[cfg(not(feature = "nkef-sba"))]
     fn a_default_build_rejects_every_demo_key() {
         assert!(registry().is_empty());
         let root: serde_yaml::Value = serde_yaml::from_str(
@@ -95,6 +110,105 @@ mod tests {
             let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
             let rt = DemoRuntime::from_root(&root, registry()).unwrap();
             assert!(rt.snapshot().is_empty());
+        }
+    }
+
+    fn d440b(yaml: &str) -> Result<DemoRuntime, DemoConfigError> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        DemoRuntime::from_root(&root, registry())
+    }
+
+    /// Without `model-registry` the d440b block is an unknown key: a block whose
+    /// cargo feature is not built fails startup.
+    #[cfg(not(feature = "model-registry"))]
+    #[test]
+    fn without_model_registry_the_d440b_block_fails_startup() {
+        let err = d440b(
+            "demo:\n  enabled: true\n  d440b-model-verify:\n    enabled: true\n    mode: verify\n",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, DemoConfigError::UnknownKey { key, .. } if key == D440B_KEY),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "model-registry")]
+    mod d440b {
+        use super::*;
+
+        #[test]
+        fn each_mode_is_accepted_and_active() {
+            for mode in ["verify", "fallback"] {
+                let rt = d440b(&format!(
+                    "demo:\n  enabled: true\n  d440b-model-verify:\n    enabled: true\n    mode: {mode}\n"
+                ))
+                .unwrap();
+                assert_eq!(rt.mode(D440B_KEY).as_deref(), Some(mode));
+                assert_eq!(
+                    rt.snapshot().banner().unwrap(),
+                    format!("DEMO MODE ACTIVE: d440b-model-verify={mode}")
+                );
+            }
+        }
+
+        /// `mode: bogus` fails startup with the named error.
+        #[test]
+        fn an_unknown_mode_fails_startup() {
+            let err = d440b(
+                "demo:\n  enabled: true\n  d440b-model-verify:\n    enabled: true\n    mode: bogus\n",
+            )
+            .unwrap_err();
+            assert_eq!(
+                err,
+                DemoConfigError::UnknownMode {
+                    demo: D440B_KEY.into(),
+                    mode: "bogus".into(),
+                    known: vec!["verify", "fallback"],
+                }
+            );
+        }
+
+        /// The three demo-off shapes leave nothing active, and `demo show` says
+        /// so.
+        #[test]
+        fn every_demo_off_shape_is_inactive() {
+            for yaml in [
+                "nci: 16\n",
+                "demo:\n  enabled: false\n",
+                "demo:\n  enabled: false\n  d440b-model-verify:\n    enabled: true\n    mode: verify\n",
+            ] {
+                let rt = d440b(yaml).unwrap();
+                assert!(rt.snapshot().is_empty(), "{yaml}");
+                assert_eq!(rt.mode(D440B_KEY), None);
+                let show = rt.show(D440B_KEY).unwrap();
+                assert!(show.contains("active=false mode=-"), "{show}");
+                let mut metrics = String::new();
+                rt.render_metrics(&mut metrics);
+                assert!(metrics.is_empty(), "no demo series when off: {metrics}");
+            }
+        }
+
+        /// `set mode=bogus` is rejected and the mode stays; a valid switch is
+        /// applied (and both are audited by the demo crate).
+        #[test]
+        fn a_runtime_switch_is_checked() {
+            let rt = d440b(
+                "demo:\n  enabled: true\n  d440b-model-verify:\n    enabled: true\n    mode: verify\n",
+            )
+            .unwrap();
+            let err = rt
+                .handle_cli("d440b-model-verify set mode=bogus", "test")
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown mode \"bogus\""), "{err}");
+            assert_eq!(rt.mode(D440B_KEY).as_deref(), Some("verify"));
+            rt.handle_cli("d440b-model-verify set mode=fallback", "test")
+                .unwrap();
+            assert_eq!(rt.mode(D440B_KEY).as_deref(), Some("fallback"));
+            let mut metrics = String::new();
+            rt.render_metrics(&mut metrics);
+            assert!(metrics
+                .contains("nextg_demo_enabled{demo=\"d440b-model-verify\",mode=\"fallback\"} 1"));
         }
     }
 }

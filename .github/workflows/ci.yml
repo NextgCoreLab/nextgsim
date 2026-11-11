@@ -326,11 +326,73 @@ jobs:
         run: |
           cargo test -p nextgsim-nwdaf --features model-registry
           cargo test -p nextgsim-semantic --features model-registry
+      # The gNB's `model-registry` (#463, demo d440b-model-verify): the
+      # refusal, fallback, demo-off and runtime-switch arms, which need no ONNX
+      # Runtime. The golden-vector arms run in model-verify below.
+      - name: cargo test (gNB, d440b)
+        run: cargo test -p nextgsim-gnb --features 6g,model-registry
       - name: cargo clippy
         run: |
           cargo clippy -p nextgsim-ai --features model-registry --all-targets
           cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets
           cargo clippy -p nextgsim-semantic --features model-registry --all-targets
+          cargo clippy -p nextgsim-gnb --features 6g,model-registry --all-targets
+
+  model-verify:
+    # nextgsim#463: verified model loading against a pinned ONNX Runtime. The
+    # tests that need the runtime (the golden vectors, "model verified", the
+    # served-by-onnx counters) are #[ignore]d everywhere else and run here with
+    # --include-ignored; each FAILS rather than skips without ORT_DYLIB_PATH.
+    # The golden vectors are valid only on this pinned runtime.
+    name: Model verify (pinned ONNX Runtime)
+    runs-on: ubuntu-latest
+    needs: check
+    env:
+      ORT_VERSION: 1.23.2
+      # sha256 of onnxruntime-linux-x64-1.23.2.tgz, from the GitHub release
+      # asset's digest. A different tarball fails the job before any test.
+      ORT_SHA256: 1fa4dcaef22f6f7d5cd81b28c2800414350c10116f5fdd46a2160082551c5f9b
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: The committed model artefacts are what the generator writes
+        run: python3 -I tools/d440b-model/make_reference_model.py --check
+      - name: Fetch and verify the pinned ONNX Runtime
+        run: |
+          set -euo pipefail
+          tgz="onnxruntime-linux-x64-${ORT_VERSION}.tgz"
+          curl -fsSL --retry 3 -o "/tmp/${tgz}" \
+            "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${tgz}"
+          echo "${ORT_SHA256}  /tmp/${tgz}" | sha256sum -c -
+          mkdir -p /tmp/ort
+          tar -xzf "/tmp/${tgz}" -C /tmp/ort --strip-components=1
+          lib="/tmp/ort/lib/libonnxruntime.so.${ORT_VERSION}"
+          test -f "${lib}"
+          echo "ORT_DYLIB_PATH=${lib}" >> "$GITHUB_ENV"
+      - name: cargo test, the runtime arms included
+        run: |
+          set -euo pipefail
+          # --lib: --include-ignored would also run the crates' `ignore`d
+          # doctests, which are illustrative and do not compile.
+          cargo test -p nextgsim-ai --features model-registry --lib -- --include-ignored
+          cargo test -p nextgsim-nwdaf --features model-registry --lib -- --include-ignored
+          cargo test -p nextgsim-gnb --features 6g,model-registry --lib d440b -- --include-ignored
+      - name: The runtime arms really ran (not filtered or skipped)
+        run: |
+          set -euo pipefail
+          out=$(cargo test -p nextgsim-gnb --features 6g,model-registry --lib d440b::ort -- --include-ignored 2>&1)
+          echo "${out}" | tail -5
+          echo "${out}" | grep -qE 'test result: ok\. [1-9][0-9]* passed; 0 failed'
+      - name: A default gNB build pulls no ONNX Runtime crate
+        run: |
+          set -euo pipefail
+          if cargo tree -p nextgsim-gnb -e normal --prefix none | grep -E '^ort(-sys)? '; then
+            echo "::error::the default gNB build depends on ort"; exit 1
+          fi
+      - name: A 6G build without model-registry needs no ONNX Runtime
+        # The acceptance arm: unset the runtime and the 6G gNB still passes.
+        run: env -u ORT_DYLIB_PATH cargo test -p nextgsim-gnb --features 6g --lib nwdaf
 
   uuaa-mm:
     name: UUAA-MM (feature-gated)
@@ -1015,9 +1077,9 @@ jobs:
       - name: SBI client round trip through the real NRF and nwdafd (#457)
         # nextgsim-sbi-client over h2c: register at the NRF, discover NWDAF,
         # GET Nnwdaf_AnalyticsInfo NF_LOAD (2xx), deregister. It registers as AF
-        # (TS 29.520 §4.3.1.3.2); nextgcore#1412 (AF missing from nwdafd's
-        # allowedNfTypes) hides NWDAF from AF discovery, so NWDAF_URI is the
-        # fallback until it is fixed.
+        # (TS 29.520 §4.3.1.3.2). Since nextgcore#1412 (#1416) nwdafd's
+        # allowedNfTypes lists AF, so the NRF returns the NWDAF to an AF
+        # requester: no NWDAF_URI fallback is passed, and discovery must find it.
         timeout-minutes: 5
         run: |
           set -euo pipefail
@@ -1030,11 +1092,11 @@ jobs:
           net=$(docker inspect nextgcore-nrf -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
           docker run --rm --network "$net" \
             -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
-            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            -e NRF_URI=http://172.23.0.10:7777 \
             ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-plain.txt
           ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-plain.txt \
             'ROUNDTRIP nrf-register status=20' \
-            'ROUNDTRIP nrf-discover status=200' \
+            'ROUNDTRIP nrf-discover status=200 nwdaf-instances=1' \
             'ROUNDTRIP nwdaf-analytics status=20' \
             'ROUNDTRIP nrf-deregister status=20' \
             'ROUNDTRIP OK mode=plain'
@@ -1042,10 +1104,11 @@ jobs:
       - name: SBI client round trip under the OAuth2 profile (#457)
         # nrf and nwdaf recreated with docker-compose.oauth2.yml. A tokenless
         # call must get 401 from nwdafd. The client publishes its CCA key to the
-        # NRF's trusted-keys volume and asks for a token. Until nextgcore#1412
-        # the NRF refuses an AF with unauthorized_client, and the client must
-        # fail closed: no tokenless call. When #1412 lands, set
-        # EXPECT_TOKEN=granted and expect the nwdaf-analytics line.
+        # NRF's trusted-keys volume and asks for a token. Since nextgcore#1412
+        # (#1416) the NRF grants an AF the nnwdaf-analyticsinfo scope (TS 29.520
+        # §4.3.1.3.2), so the AF arm expects the grant and the analytics call;
+        # before it, the NRF answered unauthorized_client and the client failed
+        # closed (EXPECT_TOKEN=refused:<error> still exercises that path).
         # Last step on purpose: the other NFs are not recreated with tokens.
         timeout-minutes: 5
         run: |
@@ -1063,23 +1126,24 @@ jobs:
           test -n "$vol" || { echo "::error::the NRF has no cca-public volume; is the overlay applied?"; exit 1; }
           docker run --rm --network "$net" -v "$vol:/cca-public" \
             -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
-            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=refused:unauthorized_client \
-            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=granted \
+            -e NRF_URI=http://172.23.0.10:7777 \
             ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2.txt
           ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2.txt \
             'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP nrf-discover status=200 nwdaf-instances=1' \
             'ROUNDTRIP tokenless status=401 (expected)' \
-            'ROUNDTRIP token refused status=400 error=unauthorized_client (expected); failed closed' \
+            'ROUNDTRIP token granted target=NWDAF scope=nnwdaf-analyticsinfo' \
+            'ROUNDTRIP nwdaf-analytics status=20' \
             'ROUNDTRIP OK mode=oauth2'
-          # The granted path, proved against the same real NRF and nwdafd: the
-          # client registered as NEF, a type nwdafd allows today (positive
-          # control until #1412 lets the AF arm above expect a grant).
+          # The same granted path for a NEF, the type nwdafd allowed before
+          # #1412 too: a second consumer type through the same real NRF.
           docker run --rm --network "$net" -v "$vol:/cca-public" \
             -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
             -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=granted \
             -e NF_TYPE=NEF -e NF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000457e \
             -e CCA_KEY_FILE=/tmp/nef-cca.key \
-            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            -e NRF_URI=http://172.23.0.10:7777 \
             ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2-granted.txt
           ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2-granted.txt \
             'ROUNDTRIP nrf-register status=20' \
@@ -1087,6 +1151,25 @@ jobs:
             'ROUNDTRIP tokenless status=401 (expected)' \
             'ROUNDTRIP token granted target=NWDAF scope=nnwdaf-analyticsinfo' \
             'ROUNDTRIP nwdaf-analytics status=20' \
+            'ROUNDTRIP OK mode=oauth2'
+
+          # Fail closed against the REAL NRF: a CHF is not a TS 29.520
+          # §4.3.1.3.2 consumer, so the NRF hides the NWDAF from it
+          # (nwdaf-instances=0, hence the NWDAF_URI fallback here only) and
+          # refuses it the scope with unauthorized_client; the client must then
+          # make no tokenless call. The other half of #1416, beside the grants.
+          docker run --rm --network "$net" -v "$vol:/cca-public" \
+            -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
+            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=refused:unauthorized_client \
+            -e NF_TYPE=CHF -e NF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000c4f0 \
+            -e CCA_KEY_FILE=/tmp/chf-cca.key \
+            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2-refused.txt
+          ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2-refused.txt \
+            'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP nrf-discover status=200 nwdaf-instances=0' \
+            'ROUNDTRIP tokenless status=401 (expected)' \
+            'ROUNDTRIP token refused status=400 error=unauthorized_client (expected); failed closed' \
             'ROUNDTRIP OK mode=oauth2'
 
       - name: Collect logs on failure
