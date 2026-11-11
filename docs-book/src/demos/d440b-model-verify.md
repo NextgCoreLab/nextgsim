@@ -138,17 +138,140 @@ ORT_DYLIB_PATH=/path/to/libonnxruntime.so.1.23.2 \
 
 ### EKS
 
-TODO: the EKS overlay (`deploy/eks/overlays/demo-d440b-model-verify/` in
-nextgcore, with a `model-registry` gNB build, the pinned ONNX Runtime and the
-model artefacts) is a follow-up to this ticket. It will be run with
-`k8s/demo-check.sh d440b-model-verify verify` and `... fallback`.
+The overlay is `deploy/eks/overlays/demo-d440b-model-verify/` in nextgcore
+(nextgcore#1427). It adds the pinned model and manifest as the `d440b-model`
+ConfigMap, mounted read-only at `/opt/nextgsim/models` in the gNB, and turns on
+the gNB NWDAF task with `nwdaf_model_path` pointing at it. It adds the demo
+block to `gnb.yaml` only. Nothing in it adds a Service, a port or a listener.
+The gNB image is the demo build (`6g,model-registry`, plus `nr-cli` and the
+pinned ONNX Runtime 1.23.2), made by the overlay's `build-gnb-image.sh` and
+pushed under a new `demo-d440b-model-verify-<sha>` tag to the devtest1 ECR only.
+
+```bash
+# from a nextgcore checkout with nextgsim beside it
+YES=true KUBE_CONTEXT=devtest1 CORE_IMAGE_TAG=cab375953734-6g \
+  SIM_IMAGE_TAG=demo-d440b-model-verify-7179cc1c7237 \
+  k8s/demo-check.sh d440b-model-verify verify      # then: ... fallback
+k8s/demo-check.sh off off                          # the demo-off control
+```
+
+`demo-check.sh` deploys into its own temporary namespace (`nextg-demo`) and
+runs the base e2e. It then runs the overlay's `scenario.sh`, which reads the
+gNB with `nr-cli` through `kubectl exec`, because the CLI socket binds
+127.0.0.1 in the pod. It captures the artefacts into
+`/tmp/eks-val/demos/d440b-model-verify/<mode>/<UTC>/` and deletes the
+namespace afterwards. The scenario's assertions are proved non-vacuous by
+`test-scenario.sh`, which makes each one fail on input missing its line.
 
 ## Results
 
-> **TODO: not yet run.** This section is filled only from the real EKS run
-> artefacts (`/tmp/eks-val/demos/d440b-model-verify/<mode>/`): the log chain,
-> `nwdaf-status` and `demo metrics` for `verify` and `fallback`, and the
-> demo-off control. Nothing here is invented ahead of that run.
+All of the output below is copied from the devtest1 runs of 2026-11-11, with
+the core images at `cab375953734-6g` and the gNB/UE at
+`demo-d440b-model-verify-7179cc1c7237`. That is nextgsim 7179cc1, the #504
+head; its d440b code is identical to the merge commit 817bdcf. The overlay was
+at nextgcore `ee4942d9`. Run directories:
+
+| Arm | Run directory | Verdict |
+|---|---|---|
+| demo-off control | `/tmp/eks-val/demos/off/off/20261111T093238Z/` | PASS: e2e PASS, 0 `DEMO MODE ACTIVE` lines, 0 `[demo:` lines, 0 `nextg_demo_enabled` series |
+| `verify` | `/tmp/eks-val/demos/d440b-model-verify/verify/20261111T095339Z/` | PASS: e2e PASS, scenario 10/10 checks |
+| `fallback` | `/tmp/eks-val/demos/d440b-model-verify/fallback/20261111T100110Z/` | PASS: e2e PASS, scenario 9/9 checks |
+
+### verify vs fallback
+
+From `d440b/nwdaf-status-before-switch.json` (the status once at least 5
+predictions had been served) and `d440b/nwdaf-status.json` (the end of the run):
+
+| | `verify` | `fallback` |
+|---|---|---|
+| `model verified ... golden=ok` logged | yes, pinned sha256 | no |
+| `verified` | `true` | `false` |
+| `model.state` | `verified` | `deferred` |
+| `onnx_inferences` (before switch) | 171 | 0 |
+| `fallback_inferences` (before switch) | 0 | 79 |
+| `models[]` (MLModel NRM-shaped inventory) | 1 entry | empty |
+| onnx latency p50 / p99 (end of run) | 0.082 ms / 0.566 ms | n/a |
+| the #462-style consumer check (`verified && onnx>0 && fallback==0`) | holds | fails, as it must |
+| `nextg_demo_enabled` via `nr-cli demo metrics` | `mode="verify"} 1` | `mode="fallback"} 1` |
+
+**Revert arm (verify run).** The scenario switched to `fallback` at runtime and
+back, and recorded the status each time:
+
+| Snapshot | `force_fallback` | `onnx_inferences` | `fallback_inferences` |
+|---|---|---|---|
+| `nwdaf-status-before-switch.json` | false | 171 | 0 |
+| `nwdaf-status-after-switch.json` (after `set mode=fallback`) | true | 173 | 1 |
+| `nwdaf-status-after-switch-back.json` (after `set mode=verify`) | false | 175 | 2 |
+
+The counters are cumulative, so the run's final `nwdaf-status.json` reads
+`onnx_inferences=178 fallback_inferences=2`. The two fallbacks are the ones
+served while the run was in `fallback` mode; one of them landed after the
+"after-switch" snapshot and before the switch back.
+
+### gNB log chain, verify (`d440b/chain.txt`)
+
+```text
+2026-11-11T09:55:08.982550Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=verify
+2026-11-11T09:55:09.006368Z  INFO nextgsim_nwdaf: NWDAF: model verified id=nwdaf-trajectory-cv version=1.0.0 sha256=90a74d28c8e919ad8fdaa0f487976c8a4e803af3e318c5a30e02afcc3ec1f826 opset=13 inputs=[positions:float32[1, -1, 3]] outputs=[next_position:float32[1, 1, 3]] golden=ok (3 vectors, tolerance 0.00001) path=/opt/nextgsim/models/nwdaf-trajectory-cv.onnx; trajectory predictions use the model
+2026-11-11T09:58:24.860225Z  WARN nextgsim_demo: [demo:d440b-model-verify] audit: mode verify -> fallback from nr-cli; applies to the next decision
+2026-11-11T09:58:24.860234Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=fallback
+2026-11-11T09:58:26.882232Z  WARN nextgsim_demo: [demo:d440b-model-verify] audit: mode fallback -> verify from nr-cli; applies to the next decision
+2026-11-11T09:58:26.882239Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=verify
+2026-11-11T09:58:29.005359Z  WARN nextgsim_demo: [demo:d440b-model-verify] audit: rejected set mode="bogus" from nr-cli: demo config: unknown mode "bogus" for demo "d440b-model-verify" (known modes ["verify", "fallback"]); mode unchanged (verify)
+```
+
+### gNB log, fallback (`d440b/chain.txt` and `d440b/gnb.log`)
+
+```text
+2026-11-11T10:02:32.449813Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d440b-model-verify=fallback
+2026-11-11T10:02:32.450005Z  WARN nextgsim_gnb::nwdaf::task: [demo:d440b-model-verify] mode=fallback: the model at /opt/nextgsim/models/nwdaf-trajectory-cv.onnx is neither verified nor activated; every trajectory prediction uses linear extrapolation
+2026-11-11T10:04:11.101899Z  WARN nextgsim_demo: [demo:d440b-model-verify] audit: rejected set mode="bogus" from nr-cli: demo config: unknown mode "bogus" for demo "d440b-model-verify" (known modes ["verify", "fallback"]); mode unchanged (fallback)
+```
+
+### `nwdaf-status`, verify (`d440b/nwdaf-status.json`, end of run)
+
+```json
+{"schema":"nextgsim.nwdaf-status/1","verified":true,"force_fallback":false,"model":{"state":"verified","id":"nwdaf-trajectory-cv","version":"1.0.0","sha256":"90a74d28c8e919ad8fdaa0f487976c8a4e803af3e318c5a30e02afcc3ec1f826","opset":13,"path":"/opt/nextgsim/models/nwdaf-trajectory-cv.onnx"},"measurements_recorded":181,"onnx_inferences":178,"fallback_inferences":2,"latency":{"onnx":{"count":178,"p50_ms":0.082253,"p99_ms":0.5657289999999999},"fallback":{"count":2,"p50_ms":0.0019690000000000003,"p99_ms":0.0019690000000000003}},"models":[{"id":"nwdaf-trajectory-cv:1.0.0","attributes":{"mLModelId":"nwdaf-trajectory-cv","mLModelVersion":"1.0.0","aIMLInferenceName":"NG_RAN_MOBILITY_OPTIMIZATION","mLTrainingType":"INITIAL_TRAINING"}}]}
+```
+
+### `nwdaf-status`, fallback (`d440b/nwdaf-status.json`, end of run)
+
+```json
+{"schema":"nextgsim.nwdaf-status/1","verified":false,"force_fallback":true,"model":{"state":"deferred","path":"/opt/nextgsim/models/nwdaf-trajectory-cv.onnx"},"measurements_recorded":85,"onnx_inferences":0,"fallback_inferences":84,"latency":{"onnx":{"count":0,"p50_ms":null,"p99_ms":null},"fallback":{"count":84,"p50_ms":0.0019360000000000002,"p99_ms":0.003453}},"models":[]}
+```
+
+### `nr-cli demo metrics` (`metrics/<gnb-pod>-nr-cli.prom`)
+
+```text
+# verify run
+nextg_demo_enabled{demo="d440b-model-verify",mode="verify"} 1
+# fallback run
+nextg_demo_enabled{demo="d440b-model-verify",mode="fallback"} 1
+```
+
+### Runtime switching and an invalid mode (`d440b/*.txt`)
+
+```text
+$ nr-cli <gnb> -e "demo d440b-model-verify set mode=fallback"     # switch-to-fallback.txt
+demo=d440b-model-verify mode=fallback (was verify; applies to the next decision)
+$ nr-cli <gnb> -e "demo d440b-model-verify set mode=verify"       # switch-back.txt
+demo=d440b-model-verify mode=verify (was fallback; applies to the next decision)
+$ nr-cli <gnb> -e "demo d440b-model-verify set mode=bogus"        # set-bogus.txt, exit 1
+ERROR: demo config: unknown mode "bogus" for demo "d440b-model-verify" (known modes ["verify", "fallback"])
+$ nr-cli <gnb> -e "demo d440b-model-verify show"                  # demo-show.txt
+demo=d440b-model-verify active=true mode=verify modes=verify,fallback requires=-
+```
+
+Not exercised on EKS: the refusal arms, such as a flipped byte logging
+`model refused (sha256 mismatch)`. They are covered by the unit and runtime
+tests above, not by this run.
+
+One earlier `verify` run (`verify/20261111T094407Z/`) is recorded as a FAIL.
+Its scenario passed, but the base e2e did not register the UE: the UDR
+container started at 09:47:09, after the UE's attempts from 09:45:45 (UDM to
+UDR connection refused, AUSF 503, Registration Reject #90). That is a startup
+race in the base core, not this demo. The rerun above, on the same images,
+passed.
 
 ## Honesty labels and limitations
 
