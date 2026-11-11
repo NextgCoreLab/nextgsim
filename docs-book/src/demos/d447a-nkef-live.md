@@ -133,6 +133,12 @@ right nextgsim commit.
    mkdir -p binaries && cp /tmp/tgt/release/nr-gnb /tmp/tgt/release/nr-ue binaries/
    TAG=demo-d447a-$(git rev-parse --short=7 HEAD)
    REG=<account>.dkr.ecr.<region>.amazonaws.com
+   # never overwrite a tag: stop if either already exists
+   for r in gnb ue; do
+     aws ecr describe-images --repository-name nextg/$r --image-ids imageTag=$TAG \
+       >/dev/null 2>&1 && { echo "nextg/$r:$TAG exists"; exit 1; }
+   done
+   aws ecr get-login-password | docker login --username AWS --password-stdin $REG
    docker build -f Dockerfile.gnb-local -t d447a-gnb-base:$TAG .
    docker build -f Dockerfile.ue-local -t $REG/nextg/ue:$TAG .
    # one layer on top: nr-cli, which the scenario uses to read the gNB
@@ -176,13 +182,39 @@ All of the output below is copied from the devtest1 runs of 2026-11-11, built fr
 the merge commits: nextgsim `2df55fa` (#508) and nextgcore `6371a57f` (#1426). The
 core images are `demo-d447a-6371a57`, and the gNB/UE images are `demo-d447a-2df55fa`.
 Each run's `verdict.txt` records `core=6371a57faa6a sim=2df55faad37b`, and its
-`images.txt` lists those tags on every NF, gNB and UE pod. Run directories:
+`images.txt` lists those tags on every NF and gNB pod. The `baseline` and off
+`images.txt` also list the UE pod. The `on` one has no UE pod, because the restart
+check had scaled the UE to zero before the capture. Its UE image
+(`nextg/ue:demo-d447a-2df55fa`) is in that run's `events.txt`. Run directories:
 
 | Arm | Run directory | Verdict |
 |---|---|---|
 | `on` | `/tmp/eks-val/demos/d447a-nkef-live/on/20261111T174413Z/` | PASS: e2e PASS, scenario PASS, 1 `DEMO MODE ACTIVE` line, 11 `[demo:` lines, 1 `nextg_demo_enabled` series |
 | `baseline` | `/tmp/eks-val/demos/d447a-nkef-live/baseline/20261111T180425Z/` | PASS: e2e PASS, scenario PASS, 1 `DEMO MODE ACTIVE` line, 1 `[demo:` line, 1 `nextg_demo_enabled` series |
 | demo-off control | `/tmp/eks-val/demos/off/off/20261111T181606Z/` | PASS: e2e PASS, 0 `DEMO MODE ACTIVE` lines, 0 `[demo:` lines, 0 `nextg_demo_enabled` series |
+
+### Acceptance coverage (#488)
+
+The EKS runs prove only some of the criteria. The unit tests and the revert harness
+named below, both in #508, prove the rest, and those were not run on the cluster.
+
+| Criterion | Proven by |
+|---|---|
+| live bundle: `domains=ran,n2,sba consistent=true`, the full path, `ueLocationTimestamp` after the task start, amfd subscription created → removed | EKS `on` (`scenario.log`, `nkef/internal.txt`, `nkef/started-loc.txt`) |
+| the bundle's AMF `nfInstanceId` equals the NRF's | EKS `on` (`nkef/nrf-amf.json`) |
+| expiry within 2 × heartbeat + poll, with no `expired_at` before the cut | EKS `on` (NetworkPolicy cut, not `docker stop`; `nkef/expiry.txt`, `nkef/after-stop.txt`) |
+| external replies: Low at idle, Medium\|High under a ping burst, no identifying field | EKS `on` (`nkef/external-*.txt`) |
+| gNB restarted without the UE → `stale=true` | EKS `on` (`nkef/restart.txt`) |
+| AMF URI unset → no `sba` domain | unit test `without_an_amf_uri_there_is_no_sba_client` (nkef/sba.rs) |
+| UE not started → no `reportList` facts | unit test `an_amfd_report_list_becomes_location_and_cm_facts` (an answer without `reportList` yields no facts) |
+| revert arms `447-spawn-order`, `447-rls-tee`, `447-n2-tee`, `447-projection` | the compose revert harness `scripts/demo/revert-run.sh`, not run on EKS |
+| amfd timestamp removed → `consistent=unknown` | unit test `without_a_timestamped_amf_location_consistency_is_unknown` |
+| modes: `baseline` has no live domain and amfd logs no subscription | EKS `baseline` (`nkef/internal.txt`, `nkef/amf.log`); unit test `a_baseline_store_has_no_live_domain` |
+| kill switch: `demo.enabled: false` does nothing | unit test `an_nkef_sba_build_registers_d447a_and_rejects_an_unknown_mode` (gnb demo.rs) |
+| runtime `set mode=bogus` is rejected, audited, and leaves the mode unchanged | EKS `on` (`nkef/set-bogus.txt`, `nkef/demo-show.txt`, `nkef/gnb.log`) |
+| demo off: base e2e unchanged and no `nextg_demo_enabled` series | EKS demo-off control |
+| invalid mode fails startup with `DemoConfigError::UnknownMode` | unit test `an_nkef_sba_build_registers_d447a_and_rejects_an_unknown_mode` |
+| the page uses the "knowledge exposure" name, the echo caveat and the stand-in placement | this page (see the honesty labels) |
 
 ### on vs baseline
 
