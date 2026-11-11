@@ -14,6 +14,7 @@
 //! - Application task for CLI command handling
 
 pub mod app;
+pub mod demo;
 pub mod nas;
 pub mod rls;
 pub mod rrc;

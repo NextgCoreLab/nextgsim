@@ -195,6 +195,10 @@ fn print_help(node_name: &str) {
     } else {
         println!("  status, info");
     }
+    println!("  Demos (nextgsim#458; a default build registers none):");
+    println!("    demo show | demo metrics        - Every registered demo / the nextg_demo_enabled series");
+    println!("    demo <key> show                 - One demo's state and modes");
+    println!("    demo <key> set mode=<mode>      - Switch an enabled demo's mode (audited)");
     println!("  help, exit");
 }
 

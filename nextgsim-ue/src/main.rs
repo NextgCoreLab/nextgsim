@@ -2102,6 +2102,14 @@ async fn run_ue(options: UeOptions) -> Result<()> {
     // Load and validate configuration
     info!("Loading configuration from: {}", options.config_file);
     let mut base_config = load_and_validate_ue_config(&options.config_file)?;
+    // The demo toggle (nextgsim#458): an unknown demo key or mode fails startup
+    // here. A default build registers no demo, so a config without a `demo:`
+    // block installs an empty state and changes nothing. One state per process,
+    // shared by every UE it runs.
+    let config_text = std::fs::read_to_string(&options.config_file)
+        .with_context(|| format!("Failed to read configuration file: {}", options.config_file))?;
+    nextgsim_ue::demo::init(&config_text)
+        .with_context(|| format!("Invalid demo block in {}", options.config_file))?;
 
     // Apply IMSI override if specified
     if let Some(ref imsi) = options.imsi {
