@@ -46,6 +46,7 @@ use thiserror::Error;
 use crate::config::ExecutionProvider;
 use crate::error::ModelError;
 use crate::inference::{InferenceEngine, OnnxEngine};
+use crate::manifest::{check_golden, check_static, ensure_runtime, ModelManifest, RefusalReason};
 
 /// Why a model could not be resolved.
 #[derive(Debug, Error)]
@@ -100,6 +101,66 @@ impl RegistryError {
     pub fn is_not_provisioned(&self) -> bool {
         matches!(self, RegistryError::NotProvisioned { .. })
     }
+}
+
+/// A model [`SharedModelRegistry::register_verified`] checked and activated.
+#[derive(Clone)]
+pub struct VerifiedModel {
+    /// The manifest it was checked against.
+    pub manifest: ModelManifest,
+    /// The file's sha256, equal to the manifest's.
+    pub sha256: String,
+    /// Where it was read from.
+    pub path: PathBuf,
+    /// The engine the golden vectors ran on, now registered.
+    pub engine: Arc<OnnxEngine>,
+}
+
+impl std::fmt::Debug for VerifiedModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VerifiedModel")
+            .field("id", &self.manifest.id)
+            .field("version", &self.manifest.version)
+            .field("sha256", &self.sha256)
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl VerifiedModel {
+    /// `id=.. version=.. sha256=.. opset=.. inputs=[..] outputs=[..] golden=ok (n vectors)`:
+    /// what a consumer logs after `model verified`.
+    pub fn summary(&self) -> String {
+        let specs = |v: &[crate::manifest::TensorSpec]| {
+            v.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "id={} version={} sha256={} opset={} inputs=[{}] outputs=[{}] golden=ok ({} vectors, tolerance {})",
+            self.manifest.id,
+            self.manifest.version,
+            self.sha256,
+            self.manifest.opset,
+            specs(&self.manifest.inputs),
+            specs(&self.manifest.outputs),
+            self.manifest.golden.len(),
+            self.manifest.tolerance
+        )
+    }
+}
+
+/// A model [`SharedModelRegistry::register_verified`] refused, and why.
+#[derive(Debug, Clone, PartialEq, Error)]
+#[error("model refused ({}) id={id} version={version}: {}", reason.label(), reason.detail())]
+pub struct ModelRefused {
+    /// The manifest's model id.
+    pub id: String,
+    /// The manifest's version.
+    pub version: String,
+    /// The check that failed.
+    pub reason: RefusalReason,
 }
 
 /// One entry of a registry manifest: a model id, its version, and where the file
@@ -276,6 +337,62 @@ impl SharedModelRegistry {
             },
         );
         Ok(())
+    }
+
+    /// Verify a model against its manifest and, only if every check passes,
+    /// register it under the manifest's id and version (nextgsim#463).
+    ///
+    /// The checks run in this order, and the first failure is the refusal:
+    ///
+    /// 1. the manifest is consistent ([`ModelManifest::validate`]);
+    /// 2. the file is read **once**, and everything below checks those bytes;
+    /// 3. sha256, opset, input shapes, output shapes ([`check_static`]), with no
+    ///    ONNX Runtime needed;
+    /// 4. ONNX Runtime loads ([`ensure_runtime`]) and accepts the bytes;
+    /// 5. every golden vector reproduces within the tolerance ([`check_golden`]).
+    ///
+    /// A refused model is not registered, so [`Self::load_by_id`] for its id is
+    /// [`RegistryError::NotProvisioned`] (unless another version was) and the
+    /// consumer keeps its fallback. The engine of a verified model is the one
+    /// the golden vectors ran on, loaded from the checked bytes, so the file
+    /// cannot change between the check and the load.
+    ///
+    /// # Errors
+    /// [`ModelRefused`], carrying the [`RefusalReason`].
+    pub fn register_verified(
+        &self,
+        manifest: &ModelManifest,
+        path: &Path,
+    ) -> Result<VerifiedModel, ModelRefused> {
+        let refused = |reason: RefusalReason| ModelRefused {
+            id: manifest.id.clone(),
+            version: manifest.version.clone(),
+            reason,
+        };
+        manifest.validate().map_err(refused)?;
+        let bytes = std::fs::read(path).map_err(|e| {
+            refused(RefusalReason::Unreadable(format!(
+                "{}: {e}",
+                path.display()
+            )))
+        })?;
+        let report = check_static(manifest, &bytes).map_err(refused)?;
+        ensure_runtime().map_err(refused)?;
+        let mut engine = OnnxEngine::new(self.execution_provider.clone())
+            .map_err(|e| refused(RefusalReason::LoadFailed(e.to_string())))?;
+        engine
+            .load_model_from_bytes(&bytes, &format!("{}-{}", manifest.id, manifest.version))
+            .map_err(|e| refused(RefusalReason::LoadFailed(e.to_string())))?;
+        check_golden(&engine, manifest).map_err(refused)?;
+        let engine = Arc::new(engine);
+        self.register_preloaded(&manifest.id, &manifest.version, path, Arc::clone(&engine))
+            .map_err(|e| refused(RefusalReason::LoadFailed(e.to_string())))?;
+        Ok(VerifiedModel {
+            manifest: manifest.clone(),
+            sha256: report.sha256,
+            path: path.to_path_buf(),
+            engine,
+        })
     }
 
     /// Resolve the **latest** registered version of `id`, loading it once.
@@ -795,5 +912,165 @@ mod tests {
         let reg = registry();
         assert!(reg.versions("nope").is_empty());
         assert!(reg.ids().is_empty());
+    }
+
+    /// `register_verified` (nextgsim#463) against the shipped d440b reference
+    /// model. The checks that need no ONNX Runtime run here; `ort` below needs it.
+    mod verified {
+        use super::*;
+        use crate::manifest::tests::{flipped, shipped};
+        use crate::manifest::{sha256_hex, RefusalReason};
+
+        /// Write `bytes` as a model file in a fresh temp dir.
+        fn model_file(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("nwdaf-trajectory-cv.onnx");
+            std::fs::write(&path, bytes).expect("write model");
+            (dir, path)
+        }
+
+        fn refusal(result: Result<VerifiedModel, ModelRefused>) -> ModelRefused {
+            match result {
+                Err(e) => e,
+                Ok(v) => panic!("expected a refusal, got {}", v.summary()),
+            }
+        }
+
+        /// The flipped-byte arm: refused for its sha256, and NOT registered, so a
+        /// consumer resolving the id gets NotProvisioned and keeps its fallback.
+        #[test]
+        fn a_flipped_byte_is_refused_and_not_registered() {
+            let (m, bytes) = shipped();
+            let (_dir, path) = model_file(&flipped(&bytes));
+            let reg = registry();
+            let err = refusal(reg.register_verified(&m, &path));
+            assert!(
+                matches!(err.reason, RefusalReason::Sha256Mismatch { .. }),
+                "{err}"
+            );
+            let line = err.to_string();
+            assert!(
+                line.starts_with(
+                    "model refused (sha256 mismatch) id=nwdaf-trajectory-cv version=1.0.0: "
+                ),
+                "{line}"
+            );
+            assert!(!line.contains("model verified"));
+            assert!(expect_error(reg.load_by_id(&m.id), "it was refused").is_not_provisioned());
+            assert!(reg.ids().is_empty(), "nothing registered");
+        }
+
+        #[test]
+        fn a_missing_file_is_refused_as_unreadable() {
+            let (m, _) = shipped();
+            let err = refusal(registry().register_verified(&m, Path::new("/nonexistent/m.onnx")));
+            assert_eq!(err.reason.label(), "model unreadable");
+        }
+
+        #[test]
+        fn an_inconsistent_manifest_is_refused_before_the_file_is_read() {
+            let (mut m, _) = shipped();
+            m.golden.clear();
+            let err = refusal(registry().register_verified(&m, Path::new("/nonexistent/m.onnx")));
+            assert_eq!(err.reason.label(), "manifest invalid");
+        }
+
+        /// With no ONNX Runtime the static checks pass and the model is refused
+        /// as `runtime unavailable`: never a panic, never `verified`. Only
+        /// meaningful where no runtime is configured (every job but model-verify).
+        #[test]
+        fn without_onnx_runtime_a_good_model_is_refused_not_panicked() {
+            if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+                return; // the model-verify job: the runtime IS there (see `ort`)
+            }
+            let (m, bytes) = shipped();
+            let (_dir, path) = model_file(&bytes);
+            let reg = registry();
+            let err = refusal(reg.register_verified(&m, &path));
+            assert_eq!(err.reason.label(), "runtime unavailable", "{err}");
+            assert!(reg.ids().is_empty());
+        }
+
+        /// Tests that need ONNX Runtime. `#[ignore]`d, so the default jobs (which
+        /// have none) do not run them; the model-verify job runs them with
+        /// `--include-ignored` and the pinned runtime, and each one FAILS rather
+        /// than skips when `ORT_DYLIB_PATH` is unset.
+        mod ort {
+            use super::*;
+
+            pub(crate) fn require_ort() {
+                assert!(
+                    std::env::var_os("ORT_DYLIB_PATH").is_some(),
+                    "this test needs ONNX Runtime: set ORT_DYLIB_PATH to the pinned \
+                     libonnxruntime.so (the model-verify CI job does)"
+                );
+            }
+
+            #[test]
+            #[ignore = "needs ONNX Runtime (ORT_DYLIB_PATH); run by the model-verify CI job"]
+            fn the_shipped_model_is_verified_and_activated() {
+                require_ort();
+                let (m, bytes) = shipped();
+                let (_dir, path) = model_file(&bytes);
+                let reg = registry();
+                let v = reg
+                    .register_verified(&m, &path)
+                    .expect("the shipped model verifies");
+                let summary = v.summary();
+                assert!(
+                    summary.starts_with(&format!(
+                        "id=nwdaf-trajectory-cv version=1.0.0 sha256={} opset=13 ",
+                        m.sha256
+                    )),
+                    "{summary}"
+                );
+                assert!(summary.contains("golden=ok (3 vectors"), "{summary}");
+                let resolved = reg.load_by_id(&m.id).expect("registered");
+                assert!(
+                    Arc::ptr_eq(&resolved, &v.engine),
+                    "the engine the goldens ran on"
+                );
+                assert!(resolved.is_ready());
+            }
+
+            /// Refusal reason 5/5: a golden vector that does not reproduce.
+            #[test]
+            #[ignore = "needs ONNX Runtime (ORT_DYLIB_PATH); run by the model-verify CI job"]
+            fn a_golden_mismatch_is_refused() {
+                require_ort();
+                let (mut m, bytes) = shipped();
+                m.golden[1].output[0] += 0.5;
+                let (_dir, path) = model_file(&bytes);
+                let reg = registry();
+                let err = refusal(reg.register_verified(&m, &path));
+                assert!(
+                    matches!(&err.reason, RefusalReason::GoldenMismatch { case: 1, .. }),
+                    "{err}"
+                );
+                assert!(err
+                    .to_string()
+                    .starts_with("model refused (golden mismatch) "));
+                assert!(reg.ids().is_empty());
+            }
+
+            /// Why the sha256 matters: re-pin the manifest to the flipped bytes
+            /// (what patching the sha256 check out amounts to) and the golden
+            /// vectors catch the changed weight instead. So the flipped byte is a
+            /// real change to the model, not one the sha256 alone happens to see.
+            #[test]
+            #[ignore = "needs ONNX Runtime (ORT_DYLIB_PATH); run by the model-verify CI job"]
+            fn the_flipped_model_computes_something_else() {
+                require_ort();
+                let (mut m, bytes) = shipped();
+                let bad = flipped(&bytes);
+                m.sha256 = sha256_hex(&bad);
+                let (_dir, path) = model_file(&bad);
+                let err = refusal(registry().register_verified(&m, &path));
+                assert!(
+                    matches!(err.reason, RefusalReason::GoldenMismatch { case: 0, .. }),
+                    "{err}"
+                );
+            }
+        }
     }
 }

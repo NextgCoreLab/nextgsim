@@ -78,6 +78,10 @@ pub mod error;
 pub mod fl_training;
 pub mod inference;
 pub mod isac_pipeline;
+/// Verified model loading (nextgsim#463): a manifest pins a model's sha256,
+/// opset, input/output shapes and golden vectors, checked before activation.
+#[cfg(feature = "model-registry")]
+pub mod manifest;
 pub mod metrics;
 pub mod model;
 pub mod nr_models;
@@ -102,11 +106,14 @@ pub use inference::{InferenceEngine, OnnxEngine};
 pub use isac_pipeline::{
     FusedSensingResult, IsacError, IsacPipeline, IsacPipelineBuilder, PositionEstimate, SensingData,
 };
+#[cfg(feature = "model-registry")]
+pub use manifest::{GoldenVector, ModelManifest, RefusalReason, TensorSpec};
 pub use metrics::{InferenceMetrics, ModelMetrics};
 pub use model::{ModelInfo, ModelMetadata};
 #[cfg(feature = "model-registry")]
 pub use registry::{
-    version_is_newer, RegistryEntry, RegistryError, RegistryManifest, SharedModelRegistry,
+    version_is_newer, ModelRefused, RegistryEntry, RegistryError, RegistryManifest,
+    SharedModelRegistry, VerifiedModel,
 };
 pub use semantic_pipeline::{
     SemanticDecoding, SemanticEncoding, SemanticError, SemanticPipeline, SemanticPipelineBuilder,

@@ -57,6 +57,18 @@ sdap-dataplane = []
     "nextgsim-fl",
 ]
 
+# Verified model loading with serving counters (nextgsim#463, demo
+# `d440b-model-verify`). Off by default. Implies the NWDAF crate (the task still
+# needs `nwdaf_enabled: true`) and forwards to its `model-registry`, so the model
+# at `nwdaf_model_path` is activated only after its manifest's sha256, opset,
+# shapes and golden vectors pass, every trajectory prediction is counted by
+# method, and `nr-cli <gnb> nwdaf-status` answers. Registers the
+# `d440b-model-verify` demo (modes verify, fallback). Golden vectors need ONNX
+# Runtime >= 1.23 at runtime (`ORT_DYLIB_PATH`); without it the model is refused
+# as `runtime unavailable`, never a crash. A build without this feature,
+# `6g` included, is unchanged and needs no libonnxruntime.
+model-registry = ["nextgsim-nwdaf", "nextgsim-nwdaf/model-registry"]
+
 [[bin]]
 name = "nr-gnb"
 path = "src/main.rs"
@@ -99,3 +111,6 @@ serde_yaml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
