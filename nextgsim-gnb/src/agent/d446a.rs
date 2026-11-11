@@ -12,14 +12,18 @@
 //! - **Booster gNB (`energy-saving` agent, e.g. `energy-1`):** when its cell
 //!   serves no UE it queues `OptimizeResources target=<cell> status=inactive`,
 //!   Pending for `grace_s`. At the deadline it switches the cell off the air,
-//!   unless the `SwitchOffWithConnectedUes` guardrail holds it (a UE is served).
+//!   unless the `SwitchOffWithConnectedUes` guardrail holds it: a UE is
+//!   connected to the cell. "Connected" is an RRC context on the cell (the RRC
+//!   task's report), not a bearer that has carried data: a UE that is silent on
+//!   its bearer is still connected, and a switch-off would drop it.
 //! - **Admission control at the booster** (TS 38.300 §15.5.1.3): a
 //!   load-balancing HANDOVER REQUEST becomes an inbound `TriggerHandover` intent
 //!   on `Cell:<target>`. It contests the Pending switch-off on the same
 //!   resource, found by [`ConflictDetector::check_conflict`]. The demo **mode**
 //!   picks the winner: `load-balancing` admits the UE and defers the switch-off;
 //!   `energy-saving` refuses the request (HANDOVER FAILURE "Cell not
-//!   available") and switches off now. Refusing during a Pending state is this
+//!   available") and switches off now, unless the same guardrail holds it (a UE
+//!   admitted by an earlier contest is still connected). Refusing during a Pending state is this
 //!   demo's policy, **non-normative**: TS 38.300 §15.4.2.1 lets a booster refuse
 //!   incoming handovers only during the switch-off time period.
 //!
@@ -104,6 +108,8 @@ pub struct D446a {
     off: bool,
     lb_tried: HashSet<i32>,
     last_policy: Option<String>,
+    /// UEs connected to the cell at the last tick: the guardrail's input.
+    connected: usize,
 }
 
 impl D446a {
@@ -126,6 +132,7 @@ impl D446a {
             off: false,
             lb_tried: HashSet::new(),
             last_policy: None,
+            connected: 0,
         })
     }
 
@@ -178,19 +185,27 @@ impl D446a {
         });
     }
 
-    /// One Agent tick: the cell's served UEs, at `now`, in demo `mode` (`None`
-    /// when the demo is not active: nothing happens).
+    /// One Agent tick, at `now`, in demo `mode` (`None` when the demo is not
+    /// active: nothing happens).
+    ///
+    /// `served_ue_ids` are the UEs whose bearer carries user-plane data on the
+    /// cell (RLS): the load `lb-1` measures and the UEs it may move.
+    /// `connected_ue_ids` are the UEs with an RRC context on the cell (RRC),
+    /// silent ones included: what `energy-1` and its guardrail count.
     pub fn on_tick(
         &mut self,
         now: Instant,
         served_ue_ids: &[i32],
+        connected_ue_ids: &[i32],
         mode: Option<&str>,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         if mode.is_none() {
             return actions;
         }
+        self.connected = connected_ue_ids.len();
         let served = served_ue_ids.len() as u32;
+        let connected = self.connected;
         // Forget UEs that left, so a returning one may be moved again.
         self.lb_tried.retain(|ue| served_ue_ids.contains(ue));
         if let Some(lb) = &self.lb {
@@ -224,21 +239,15 @@ impl D446a {
             let cell = energy.cell & 0xF_FFFF_FFFF;
             match &self.pending {
                 Some(p) if now >= p.deadline => {
-                    if served > 0 {
+                    if connected > 0 {
                         self.pending = None;
-                        self.record(
-                            "GuardrailHold",
-                            &energy.id,
-                            format!(
-                                "SwitchOffWithConnectedUes: ues={served}, cell {cell} stays on"
-                            ),
-                        );
+                        self.guardrail_hold(&energy.id, cell);
                     } else {
                         actions.push(self.switch_off(&energy.id, cell, "grace window over"));
                     }
                 }
                 Some(_) => {}
-                None if served == 0 => {
+                None if connected == 0 => {
                     let intent =
                         Intent::new(AgentId::new(&energy.id), IntentType::OptimizeResources)
                             .with_target(cell.to_string())
@@ -262,6 +271,19 @@ impl D446a {
             }
         }
         actions
+    }
+
+    /// The `SwitchOffWithConnectedUes` guardrail: `cell` stays on while a UE is
+    /// connected to it.
+    fn guardrail_hold(&self, agent: &str, cell: u64) {
+        self.record(
+            "GuardrailHold",
+            agent,
+            format!(
+                "SwitchOffWithConnectedUes: ues={}, cell {cell} stays on",
+                self.connected
+            ),
+        );
     }
 
     fn switch_off(&mut self, agent: &str, cell: u64, why: &str) -> Action {
@@ -408,6 +430,13 @@ impl D446a {
                     energy.id
                 ),
             );
+            // Refused either way; the switch-off itself still answers to the
+            // guardrail (a UE an earlier contest admitted is still here). The
+            // Pending switch-off stays, and its deadline decides again.
+            if self.connected > 0 {
+                self.guardrail_hold(&energy.id, target_cell);
+                return (InboundHandoverVerdict::Refuse, Vec::new());
+            }
             let action = self.switch_off(&energy.id, target_cell, "won the contest");
             (InboundHandoverVerdict::Refuse, vec![action])
         }

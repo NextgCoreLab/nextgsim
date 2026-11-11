@@ -25,6 +25,10 @@ pub struct AgentTask {
     /// Reads D446A's current mode; `None` when the demo is not active.
     #[cfg(feature = "demo-d446a-agent-conflict")]
     d446a_mode: fn() -> Option<String>,
+    /// The UEs with an RRC context on the cell, as the RRC task last reported
+    /// them (`AgentMessage::ConnectedUes`): the energy guardrail's input.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    d446a_connected: Vec<i32>,
 }
 
 #[cfg(feature = "demo-d446a-agent-conflict")]
@@ -44,6 +48,8 @@ impl AgentTask {
             d446a_audit,
             #[cfg(feature = "demo-d446a-agent-conflict")]
             d446a_mode: installed_d446a_mode,
+            #[cfg(feature = "demo-d446a-agent-conflict")]
+            d446a_connected: Vec::new(),
             task_base,
             coordinator: AgentCoordinator::new(),
             agents: HashMap::new(),
@@ -88,7 +94,12 @@ impl AgentTask {
         let Some(d) = self.d446a.as_mut() else {
             return;
         };
-        let actions = d.on_tick(std::time::Instant::now(), served_ue_ids, mode.as_deref());
+        let actions = d.on_tick(
+            std::time::Instant::now(),
+            served_ue_ids,
+            &self.d446a_connected,
+            mode.as_deref(),
+        );
         self.d446a_act(actions).await;
     }
 
@@ -281,6 +292,14 @@ impl Task for AgentTask {
                             self.d446a_tick(&served_ue_ids).await;
                             #[cfg(not(feature = "demo-d446a-agent-conflict"))]
                             let _ = served_ue_ids;
+                        }
+                        AgentMessage::ConnectedUes { ue_ids } => {
+                            #[cfg(feature = "demo-d446a-agent-conflict")]
+                            {
+                                self.d446a_connected = ue_ids;
+                            }
+                            #[cfg(not(feature = "demo-d446a-agent-conflict"))]
+                            let _ = ue_ids;
                         }
                         AgentMessage::InboundHandover {
                             cause,

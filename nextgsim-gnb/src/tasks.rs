@@ -1364,6 +1364,15 @@ pub enum AgentMessage {
         /// "empty" means no UE served, not no UE in range).
         served_ue_ids: Vec<i32>,
     },
+    /// The UEs with an RRC context on this cell (RRC-connected, being set up,
+    /// or an admitted handover arrival), lowest id first, from the RRC task
+    /// whenever the set changes. Sent only while the D446A demo is active: the
+    /// energy agent's `SwitchOffWithConnectedUes` guardrail counts them, a UE
+    /// silent on its bearer included (nextgsim#483).
+    ConnectedUes {
+        /// The UEs' ids.
+        ue_ids: Vec<i32>,
+    },
     /// A HANDOVER REQUEST arrived for this (target) gNB; the Agent task decides
     /// whether to admit it (TS 38.300 §15.5.1.3, nextgsim#483). Sent by NGAP only
     /// when an arbitrating demo is active.

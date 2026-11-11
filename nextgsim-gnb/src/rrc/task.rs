@@ -179,6 +179,10 @@ pub struct RrcTask {
     /// held against an A3 handback and until when (nextgsim#483). Empty unless an
     /// arbitrating demo admitted one.
     handback_holds: std::collections::HashMap<i32, (i32, std::time::Instant)>,
+    /// The connected-UE set last reported to the Agent task
+    /// (`AgentMessage::ConnectedUes`, nextgsim#483). `None` until the first
+    /// report; never set unless the D446A demo is active.
+    reported_connected_ues: Option<Vec<i32>>,
     ue_manager: RrcUeContextManager,
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
@@ -285,6 +289,7 @@ impl RrcTask {
         let task_base_config = task_base.config.clone();
         Self {
             handback_holds: std::collections::HashMap::new(),
+            reported_connected_ues: None,
             task_base,
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
@@ -1220,6 +1225,43 @@ impl RrcTask {
              unprotected for this UE",
             ue_id, echoed_tid
         );
+    }
+
+    /// The UEs with an RRC context on this cell, lowest id first: every UE
+    /// context (RRC-connected or being set up) and every admitted handover
+    /// arrival not bound yet. A UE silent on its bearer is in it.
+    fn connected_ue_ids(&self) -> Vec<i32> {
+        let mut ids = self.ue_manager.ue_ids();
+        ids.extend(self.pending_handover_arrivals.keys().copied());
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Reports the connected-UE set to the Agent task when it changed since the
+    /// last report (nextgsim#483: the energy agent's `SwitchOffWithConnectedUes`
+    /// guardrail). Only while the D446A demo is active, without waiting: a full
+    /// Agent inbox leaves the report pending for the next sweep.
+    fn report_connected_ues_to_agent(&mut self) {
+        if !crate::demo::d446a_active() {
+            return;
+        }
+        let Some(sixg) = self.task_base.sixg.as_ref() else {
+            return;
+        };
+        let ue_ids = self.connected_ue_ids();
+        if self.reported_connected_ues.as_ref() == Some(&ue_ids) {
+            return;
+        }
+        if sixg
+            .agent_tx
+            .try_send(crate::tasks::AgentMessage::ConnectedUes {
+                ue_ids: ue_ids.clone(),
+            })
+            .is_ok()
+        {
+            self.reported_connected_ues = Some(ue_ids);
+        }
     }
 
     /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
@@ -3588,6 +3630,7 @@ impl Task for RrcTask {
                     // Its own clock: the SI timer is parked for an hour when
                     // the broadcast is off (#422 review)
                     self.expire_pending_reestablishments().await;
+                    self.report_connected_ues_to_agent();
                 }
                 _ = si_timer.tick() => {
                     if si_period_ms > 0 {
@@ -4184,6 +4227,23 @@ mod tests {
     /// #483: after a load-balancing handover-in, an A3 report naming the source
     /// cell (PCI 32) does not start a HANDOVER REQUIRED for the hold; another PCI,
     /// or the same one after the hold, does.
+    /// #483: the energy guardrail's connected set is every UE context plus every
+    /// admitted handover arrival not bound yet, whatever their bearers carry.
+    #[tokio::test]
+    async fn connected_ues_are_contexts_and_admitted_arrivals() {
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RrcTask::new(task_base);
+        assert!(task.connected_ue_ids().is_empty());
+        task.ue_manager.create_ue(7);
+        task.handle_expect_handover_arrival(16_777_216, 1);
+        task.handle_expect_handover_arrival(7, 2);
+        assert_eq!(task.connected_ue_ids(), vec![7, 16_777_216]);
+        task.ue_manager.delete_ue(7);
+        task.pending_handover_arrivals.remove(&7);
+        assert_eq!(task.connected_ue_ids(), vec![16_777_216]);
+    }
+
     #[tokio::test]
     async fn a_held_source_cell_is_not_handed_back() {
         let mut config = test_config();

@@ -71,7 +71,7 @@ fn load_balancing_mode_admits_defers_then_holds() {
     let (mut b, audit) = booster();
     let t0 = Instant::now();
     assert!(
-        b.on_tick(t0, &[], Some(LB)).is_empty(),
+        b.on_tick(t0, &[], &[], Some(LB)).is_empty(),
         "Pending, not executed"
     );
     let (verdict, actions) = b.arbitrate(t0 + Duration::from_secs(5), &inbound_lb(), Some(LB));
@@ -84,10 +84,10 @@ fn load_balancing_mode_admits_defers_then_holds() {
     assert!(actions.is_empty());
     // The original deadline (t0+20) passes with the switch-off deferred to t0+25.
     assert!(b
-        .on_tick(t0 + Duration::from_secs(21), &[1001], Some(LB))
+        .on_tick(t0 + Duration::from_secs(21), &[1001], &[1001], Some(LB))
         .is_empty());
     assert!(b
-        .on_tick(t0 + Duration::from_secs(26), &[1001], Some(LB))
+        .on_tick(t0 + Duration::from_secs(26), &[1001], &[1001], Some(LB))
         .is_empty());
     assert!(!b.is_off());
     assert_eq!(
@@ -119,7 +119,7 @@ fn load_balancing_mode_admits_defers_then_holds() {
 fn energy_saving_mode_refuses_and_switches_off() {
     let (mut b, audit) = booster();
     let t0 = Instant::now();
-    b.on_tick(t0, &[], Some(ES));
+    b.on_tick(t0, &[], &[], Some(ES));
     let (verdict, actions) = b.arbitrate(t0, &inbound_lb(), Some(ES));
     assert_eq!(verdict, InboundHandoverVerdict::Refuse);
     assert!(matches!(actions.as_slice(), [Action::SwitchOff]));
@@ -136,7 +136,7 @@ fn energy_saving_mode_refuses_and_switches_off() {
     let (again, _) = b.arbitrate(t0, &inbound_lb(), Some(ES));
     assert_eq!(again, InboundHandoverVerdict::Refuse);
     assert!(b
-        .on_tick(t0 + Duration::from_secs(60), &[], Some(ES))
+        .on_tick(t0 + Duration::from_secs(60), &[], &[], Some(ES))
         .is_empty());
 }
 
@@ -146,7 +146,7 @@ fn energy_saving_mode_refuses_and_switches_off() {
 fn a_mode_change_applies_to_the_next_contest_only() {
     let (mut b, audit) = booster();
     let t0 = Instant::now();
-    b.on_tick(t0, &[], Some(LB));
+    b.on_tick(t0, &[], &[], Some(LB));
     let (first, _) = b.arbitrate(t0, &inbound_lb(), Some(LB));
     assert!(matches!(first, InboundHandoverVerdict::Admit { .. }));
     let (second, _) = b.arbitrate(t0, &inbound_lb(), Some(ES));
@@ -175,7 +175,7 @@ fn a_mode_change_applies_to_the_next_contest_only() {
 #[test]
 fn the_mode_not_the_priority_decides() {
     let (mut b, _) = booster();
-    b.on_tick(Instant::now(), &[], Some(ES));
+    b.on_tick(Instant::now(), &[], &[], Some(ES));
     let (v, _) = b.arbitrate(Instant::now(), &inbound_lb(), Some(ES));
     assert_eq!(v, InboundHandoverVerdict::Refuse);
 }
@@ -211,12 +211,12 @@ fn no_contest_without_a_pending_switch_off() {
 fn an_empty_booster_switches_off_after_the_grace() {
     let (mut b, _) = booster();
     let t0 = Instant::now();
-    b.on_tick(t0, &[], Some(LB));
+    b.on_tick(t0, &[], &[], Some(LB));
     assert!(b
-        .on_tick(t0 + Duration::from_secs(19), &[], Some(LB))
+        .on_tick(t0 + Duration::from_secs(19), &[], &[], Some(LB))
         .is_empty());
     assert!(matches!(
-        b.on_tick(t0 + Duration::from_secs(20), &[], Some(LB))
+        b.on_tick(t0 + Duration::from_secs(20), &[], &[], Some(LB))
             .as_slice(),
         [Action::SwitchOff]
     ));
@@ -227,8 +227,8 @@ fn an_empty_booster_switches_off_after_the_grace() {
 fn an_inactive_demo_does_nothing() {
     let audit = Audit::default();
     let mut b = D446a::from_config(&[energy_rule(), lb_rule()], audit.clone()).unwrap();
-    assert!(b.on_tick(Instant::now(), &[], None).is_empty());
-    assert!(b.on_tick(Instant::now(), &[1], None).is_empty());
+    assert!(b.on_tick(Instant::now(), &[], &[], None).is_empty());
+    assert!(b.on_tick(Instant::now(), &[1], &[1], None).is_empty());
     let (v, a) = b.arbitrate(Instant::now(), &inbound_lb(), None);
     assert_eq!(
         v,
@@ -248,7 +248,7 @@ fn a_loaded_cell_hands_one_ue_to_the_booster_once() {
     let audit = Audit::default();
     let mut a = D446a::from_config(&[lb_rule()], audit.clone()).unwrap();
     let now = Instant::now();
-    let actions = a.on_tick(now, &[1], Some(LB));
+    let actions = a.on_tick(now, &[1], &[1], Some(LB));
     let [Action::Handover(intent)] = actions.as_slice() else {
         panic!("{actions:?}");
     };
@@ -262,7 +262,10 @@ fn a_loaded_cell_hands_one_ue_to_the_booster_once() {
         intent.parameters.get("cause").map(String::as_str),
         Some(CAUSE_REDUCE_LOAD)
     );
-    assert!(a.on_tick(now, &[1], Some(LB)).is_empty(), "not repeated");
+    assert!(
+        a.on_tick(now, &[1], &[1], Some(LB)).is_empty(),
+        "not repeated"
+    );
     a.on_actuation(&intent.id, 1, false, "HANDOVER PREPARATION FAILURE");
     assert_eq!(
         events(&audit),
@@ -273,10 +276,61 @@ fn a_loaded_cell_hands_one_ue_to_the_booster_once() {
 #[test]
 fn the_audit_renders_as_json() {
     let (mut b, audit) = booster();
-    b.on_tick(Instant::now(), &[], Some(LB));
+    b.on_tick(Instant::now(), &[], &[], Some(LB));
     let json = render(&audit.lock().unwrap(), true);
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
     assert_eq!(v[0]["event"], "IntentSubmitted");
     assert_eq!(v[0]["agent"], "energy-1");
     assert!(route_cli("ue-list").is_none());
+}
+
+/// The guardrail counts connected UEs, not UEs whose bearer has carried data:
+/// a UE admitted by the handover that then stays silent (no RLC entity, so not
+/// "served") must still hold the switch-off at the deadline (the revert arm
+/// `446-connected-guardrail`).
+#[test]
+fn a_connected_but_silent_ue_holds_the_switch_off() {
+    let (mut b, audit) = booster();
+    let t0 = Instant::now();
+    b.on_tick(t0, &[], &[], Some(LB));
+    let (verdict, _) = b.arbitrate(t0, &inbound_lb(), Some(LB));
+    assert!(matches!(verdict, InboundHandoverVerdict::Admit { .. }));
+    // Past the deferred deadline (t0+20): connected, but nothing on the bearer.
+    let actions = b.on_tick(t0 + Duration::from_secs(21), &[], &[1001], Some(LB));
+    assert!(actions.is_empty(), "{actions:?}");
+    assert!(!b.is_off(), "a connected UE would have been dropped");
+    let a = audit.lock().unwrap();
+    let hold = a.last().expect("audited");
+    assert_eq!(hold.event, "GuardrailHold");
+    assert!(hold.detail.contains("ues=1"), "{}", hold.detail);
+}
+
+/// After a runtime switch to energy-saving, the second contest is refused, but
+/// the UE the first contest admitted is still connected: the guardrail keeps
+/// the cell on, so the flip changes the second contest only.
+#[test]
+fn an_energy_saving_win_does_not_drop_a_connected_ue() {
+    let (mut b, audit) = booster();
+    let t0 = Instant::now();
+    b.on_tick(t0, &[], &[], Some(LB));
+    let (first, _) = b.arbitrate(t0, &inbound_lb(), Some(LB));
+    assert!(matches!(first, InboundHandoverVerdict::Admit { .. }));
+    b.on_tick(t0 + Duration::from_secs(2), &[], &[1001], Some(ES));
+    let (second, actions) = b.arbitrate(t0 + Duration::from_secs(5), &inbound_lb(), Some(ES));
+    assert_eq!(second, InboundHandoverVerdict::Refuse);
+    assert!(
+        actions.is_empty(),
+        "no switch-off with a UE connected: {actions:?}"
+    );
+    assert!(!b.is_off());
+    let ev = events(&audit);
+    assert_eq!(
+        &ev[ev.len() - 3..],
+        &[
+            "PolicyChanged (d446a-agent-conflict)",
+            "Resolved (lb-1@gnb-2)",
+            "GuardrailHold (energy-1)",
+        ],
+        "{ev:?}"
+    );
 }

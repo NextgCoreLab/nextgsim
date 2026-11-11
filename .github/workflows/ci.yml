@@ -1523,7 +1523,8 @@ jobs:
   # ====================================================================
   # Demo D446A (#483): load-balancing vs energy-saving agents over a booster
   # cell, on nextgcore's two-gNB stack (#456), scheduled and dispatch only.
-  # One seeded run per mode, the demo-off arm (kill switch), then the revert arms
+  # One seeded run per mode, the demo-off arm (kill switch), the runtime-switch arm
+  # (nr-cli `set` between two contests flips the second only), then the revert arms
   # (scripts/demo/d446a-reverts.sh: each patch must fail its named test). The
   # gNB is built with --features demo-d446a-agent-conflict; the default nightly
   # jobs and the demo-n2ho job are unchanged.
@@ -1623,6 +1624,13 @@ jobs:
           NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
           DEMO_ARTEFACTS: ${{ runner.temp }}/demo
         run: nextgsim/scripts/demo/d446a-check.sh off
+
+      - name: Runtime switch arm (nr-cli set between two contests)
+        timeout-minutes: 20
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d446a-check.sh runtime-switch
 
       - name: Revert arms (each patch fails its named test)
         timeout-minutes: 60

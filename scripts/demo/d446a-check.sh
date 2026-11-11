@@ -5,6 +5,7 @@
 #   NEXTGCORE_DIR=../nextgcore scripts/demo/d446a-check.sh load-balancing   # main arm
 #   NEXTGCORE_DIR=../nextgcore scripts/demo/d446a-check.sh energy-saving    # swap arm
 #   NEXTGCORE_DIR=../nextgcore scripts/demo/d446a-check.sh off              # demo off
+#   NEXTGCORE_DIR=../nextgcore scripts/demo/d446a-check.sh runtime-switch   # nr-cli set
 #
 # The stack is nextgcore docker/rust/docker-compose.demo-n2ho.yml (no published
 # port: asserted before `up`), with a staged config directory as NEXTGSIM_DIR:
@@ -13,6 +14,10 @@
 #   ue       = config/demo-agent-energy/ue.yaml, camped on gNB-A
 # Only demo.d446a-agent-conflict.mode differs between the two arms (gNB-B's).
 # `off` stages the same files with `demo.enabled: false` (the kill switch).
+# `runtime-switch` starts in load-balancing; after the first contest it runs
+# `nr-cli <gnb-b> demo d446a-agent-conflict set mode=energy-saving`, then starts
+# a second UE (IMSI 999700000000002, a second nr-ue process in the ue container,
+# its interface uesimtunb0) on gNB-A for the second contest.
 # The gNB image must be built with --features demo-d446a-agent-conflict.
 #
 # Asserted (the strings are the ones the code emits):
@@ -30,6 +35,15 @@
 #                   off the air: N heartbeat(s) dropped; amf: HandoverFailure ...
 #                   gnb_id=1; gnb-east: Handover Preparation Failure -> audit
 #                   ActuationFailed (lb-1); ping through gNB-A 20/20.
+#   runtime-switch  gnb-west: Resolved ... winner lb-1 (policy load-balancing) ->
+#                   the nextgsim-demo set audit (load-balancing -> energy-saving
+#                   from nr-cli) -> PolicyChanged from=load-balancing
+#                   to=energy-saving by=cli -> Resolved ... winner energy-1
+#                   (policy energy-saving): refused -> GuardrailHold ... ues=1
+#                   (UE 1 is still on the booster), and no switch-off; amf: one
+#                   relocation, then HandoverFailure CellNotAvailable gnb_id=1;
+#                   gnb-east: ActuationFailed (lb-1) for the second UE; UE 1
+#                   still pings through the booster.
 #   off             no DEMO MODE ACTIVE, no [demo: line, no HANDOVER REQUIRED
 #                   with ReduceLoadInServingCell, and `demo metrics` empty.
 #
@@ -49,8 +63,8 @@ here="$(cd "$(dirname "$0")" && pwd)"
 
 mode="${1:-}"
 case "$mode" in
-    load-balancing|energy-saving|off) ;;
-    *) echo "usage: $0 load-balancing|energy-saving|off" >&2; exit 2 ;;
+    load-balancing|energy-saving|off|runtime-switch) ;;
+    *) echo "usage: $0 load-balancing|energy-saving|off|runtime-switch" >&2; exit 2 ;;
 esac
 
 sim="$(cd "$here/../.." && pwd)"
@@ -69,9 +83,20 @@ cp "$src/ue.yaml" "$stage/config/ue-n2ho.yaml"
 if [ "$mode" = off ]; then
     sed -E 's/^  enabled: true$/  enabled: false/' "$src/gnb-b.yaml" > "$stage/config/gnb.yaml"
     sed -i -E 's/^  enabled: true$/  enabled: false/' "$stage/config/gnb-n2ho-target.yaml"
+elif [ "$mode" = runtime-switch ]; then
+    cp "$src/gnb-b.yaml" "$stage/config/gnb.yaml"
 else
     sed -E "s/^    mode: load-balancing$/    mode: $mode/" "$src/gnb-b.yaml" > "$stage/config/gnb.yaml"
 fi
+# The second UE (runtime-switch): its own SUPI and IMEI, and its own TUN prefix
+# because it shares the ue container with the first.
+sed -E -e 's/^  value: "999700000000001"$/  value: "999700000000002"/' \
+    -e 's/^imei: "356938035643803"$/imei: "356938035643811"/' \
+    -e 's/^tun_name: "uesimtun"$/tun_name: "uesimtunb"/' \
+    "$src/ue.yaml" > "$stage/config/ue-d446a-2.yaml"
+for want in '"999700000000002"' '"356938035643811"' '"uesimtunb"'; do
+    grep -q "$want" "$stage/config/ue-d446a-2.yaml" || { echo "ue-d446a-2.yaml: $want not staged" >&2; exit 1; }
+done
 cp -r "$stage/config" "$DEMO_ARTEFACTS/config"
 export NEXTGSIM_DIR="$stage"
 
@@ -79,9 +104,14 @@ demo_compose_init "$core/docker/rust/docker-compose.demo-n2ho.yml"
 demo_seed "${DEMO_SEED:-}"
 demo_assert_private
 
+ue2_log() {
+    demo_compose exec -T ue cat /tmp/ue2.log > "$DEMO_ARTEFACTS/ue2.log" 2>/dev/null || true
+}
+
 teardown() {
     local rc=$?
     for s in amf smf upf gnb-west gnb-east ue; do demo_logs "$s" "$DEMO_ARTEFACTS/$s.log"; done
+    [ "$mode" != runtime-switch ] || ue2_log
     if [ "${D446A_KEEP:-0}" != 1 ]; then demo_compose down -v --remove-orphans >/dev/null 2>&1 || true; fi
     rm -r "$stage" 2>/dev/null || true
     exit "$rc"
@@ -117,6 +147,30 @@ case "$mode" in
     off)
         # Long enough for lb-1 to have fired had the kill switch not held it.
         sleep 45 ;;
+    runtime-switch)
+        # Contest 1, in load-balancing: UE 1 moves to the booster.
+        demo_wait_log gnb-west 'audit #[0-9]+: Resolved \(lb-1@gnb-2\) winner lb-1' "$timeout_s"
+        demo_wait_log amf 'UE [0-9]+ relocated to target gNB' 60
+        # The switch, at runtime, inside the 90 s the switch-off is deferred, so
+        # contest 2 still finds it Pending.
+        cli_west "$DEMO_ARTEFACTS/set.txt" demo d446a-agent-conflict set mode=energy-saving
+        cat "$DEMO_ARTEFACTS/set.txt"
+        demo_wait_log gnb-west 'audit: mode load-balancing -> energy-saving from nr-cli' 30
+        # Contest 2: a second UE registers on gNB-A, and its first packets make
+        # it a served UE that lb-1 moves.
+        demo_compose exec -T -d ue sh -c 'exec nr-ue -c /etc/nextgsim/ue-d446a-2.yaml > /tmp/ue2.log 2>&1'
+        for _ in $(seq 120); do
+            demo_compose exec -T ue grep -q 'is now ACTIVE' /tmp/ue2.log 2>/dev/null && break
+            sleep 1
+        done
+        ue2_log
+        grep -q 'is now ACTIVE' "$DEMO_ARTEFACTS/ue2.log" || demo_fail "[ue2] no PDU session within 120 s"
+        demo_info "second UE registered on gnb-east with a PDU session"
+        demo_compose exec -T ue ping -I uesimtunb0 -c 5 -i 0.5 -W 2 10.45.0.1 > "$DEMO_ARTEFACTS/ping-ue2.txt" 2>&1 || true
+        demo_wait_log gnb-west 'audit #[0-9]+: Resolved \(lb-1@gnb-2\) winner energy-1' 60 2>/dev/null \
+            || demo_info "no second contest within 60s"
+        demo_wait_log gnb-west 'audit #[0-9]+: GuardrailHold' 30 2>/dev/null \
+            || demo_info "no GuardrailHold within 30s" ;;
 esac
 for s in amf gnb-west gnb-east ue; do demo_logs "$s" "$DEMO_ARTEFACTS/$s.log"; done
 cli_west "$DEMO_ARTEFACTS/agent-audit.json" agent-audit --json
@@ -179,6 +233,37 @@ energy-saving)
         demo_fail "[amf] a UE was relocated although the booster refused"
     fi
     ping_via_a 20
+    ;;
+runtime-switch)
+    assert_log_order "$west" gnb-west \
+        'audit #[0-9]+: Resolved \(lb-1@gnb-2\) winner lb-1@gnb-2 \(policy load-balancing\)' \
+        'handback hold: UE\[[0-9]+\] is not handed back to its source cell PCI 32' \
+        'audit: mode load-balancing -> energy-saving from nr-cli' \
+        'audit #[0-9]+: InboundIntent \(lb-1@gnb-2\)' \
+        'audit #[0-9]+: ConflictDetected \(lb-1@gnb-2\) .*Cell:16' \
+        'audit #[0-9]+: PolicyChanged \(d446a-agent-conflict\) from=load-balancing to=energy-saving by=cli' \
+        'audit #[0-9]+: Resolved \(lb-1@gnb-2\) winner energy-1 \(policy energy-saving\): refused' \
+        'audit #[0-9]+: GuardrailHold \(energy-1\) SwitchOffWithConnectedUes: ues=1'
+    n="$(grep -cE 'audit #[0-9]+: Resolved ' "$west" || true)"
+    [ "$n" = 2 ] || demo_fail "[gnb-west] $n Resolved audit entries, expected 2 (one per contest)"
+    n="$(grep -cE 'audit #[0-9]+: Executed ' "$west" || true)"
+    [ "$n" = 1 ] || demo_fail "[gnb-west] $n Executed audit entries, expected 1 (contest 1's admission)"
+    if grep -qE 'Agent switch-off' "$west"; then
+        demo_fail "[gnb-west] switched off with UE 1 connected"
+    fi
+    n="$(grep -cE 'UE [0-9]+ relocated to target gNB' "$amf" || true)"
+    [ "$n" = 1 ] || demo_fail "[amf] $n relocations, expected 1 (the second contest refused)"
+    assert_log_order "$amf" amf \
+        "$lb_required" \
+        'UE [0-9]+ relocated to target gNB' \
+        "$lb_required" \
+        'HandoverFailure from association [0-9]+ \(amf_ue_ngap_id=[0-9]+, cause=RadioNetwork\(CellNotAvailable\)\) gnb_id=1'
+    assert_log_order "$east" gnb-east \
+        'audit #[0-9]+: ActuationSucceeded \(lb-1\)' \
+        'Handover Preparation Failure: .*CellNotAvailable' \
+        'audit #[0-9]+: ActuationFailed \(lb-1\)'
+    # UE 1 is still served by the booster, which stayed on.
+    ping_via_a 18
     ;;
 off)
     for f in "$west" "$east"; do

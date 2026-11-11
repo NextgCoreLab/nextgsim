@@ -1,0 +1,14 @@
+--- a/nextgsim-gnb/src/agent/d446a.rs
++++ b/nextgsim-gnb/src/agent/d446a.rs
+@@ -203,7 +203,10 @@
+         if mode.is_none() {
+             return actions;
+         }
+-        self.connected = connected_ue_ids.len();
++        // 446-connected-guardrail revert: the guardrail counts UEs with a bearer that
++        // carried data (RLS), not the connected ones.
++        let _ = connected_ue_ids;
++        self.connected = served_ue_ids.len();
+         let served = served_ue_ids.len() as u32;
+         let connected = self.connected;
+         // Forget UEs that left, so a returning one may be moved again.
