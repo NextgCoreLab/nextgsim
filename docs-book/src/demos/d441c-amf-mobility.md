@@ -113,35 +113,34 @@ handover, then queries nwdafd and the NRF. It captures everything under
 
 ## Results
 
-All of the output below is copied from the devtest1 runs of 2026-11-11. Each
-run directory sits under `/tmp/eks-val/demos/`.
+All of the output below is copied from the devtest1 runs of 2026-11-11. Every
+arm ran on the same images, so only `mode` differs: core and gNB/UE at
+`demo-d441c-e0848a6`, the overlay at nextgcore e0848a62. Each run directory
+sits under `/tmp/eks-val/demos/`.
 
-| Arm | Run directory | Core / gNB+UE images | Verdict |
-|---|---|---|---|
-| demo-off control | `off/off/20261111T155634Z/` | `demo-d441c-64fa1c2` | PASS: e2e PASS, 0 `DEMO MODE ACTIVE` lines, 0 `[demo:` lines, 0 `nextg_demo_enabled` series |
-| `baseline` | `d441c-amf-mobility/baseline/20261111T154755Z/` | `demo-d441c-64fa1c2` | PASS: e2e PASS, scenario PASS |
-| `on` | `d441c-amf-mobility/on/20261111T175711Z/` | `demo-d441c-e0848a6` | PASS: e2e PASS, scenario PASS |
+| Arm | Run directory | Verdict |
+|---|---|---|
+| demo-off control | `off/off/20261111T182101Z/` | PASS: e2e PASS, 0 `DEMO MODE ACTIVE` lines, 0 `[demo:` lines, 0 `nextg_demo_enabled` series |
+| `baseline` | `d441c-amf-mobility/baseline/20261111T180932Z/` | PASS: e2e PASS, scenario PASS |
+| `on` | `d441c-amf-mobility/on/20261111T175711Z/` | PASS: e2e PASS, scenario PASS |
 
-- **Core.** `demo-d441c-64fa1c2` is nextgcore 64fa1c29, the #1425 merge.
-  `demo-d441c-e0848a6` is nextgcore e0848a62, the main that includes
-  nextgcore#1435 and #1436. Both are release builds with the demo profile's
+- **Core.** `demo-d441c-e0848a6` is nextgcore e0848a62, the main that includes
+  nextgcore#1435 and #1436. It is a release build with the demo profile's
   features plus `nextgcore-nwdafd/amf-mobility`.
-- **gNB and UE.** Both tags were built in this page's branch worktree, whose
-  code is nextgsim ffca9c5; the branch adds only this page. The binaries for
-  `64fa1c2` date from 11:20 UTC, before the docs commit, and those for
-  `e0848a6` were rebuilt for the re-run. The `on` run records
-  `sim=ffca9c5550e0` (passed as `SIM_SHA`). The two earlier runs record
-  `sim=86cef79075ac`. That is wrong: demo-check.sh read it from an unrelated
-  checkout, not from the image. nextgcore#1434 fixed this, so a run now records
-  the deployed image references.
-- **Why the `on` arm was re-run.** The first `on` run
-  (`on/20261111T153855Z/`, `demo-d441c-64fa1c2`) FAILED on one assertion:
-  `no amfd delivery to sub-... at or after the cell A ingest`. The delivery
-  had happened: nwdafd ingested both cells and the GET returned 200. But amfd's
-  `Event notification delivered` line was a `debug!`, and a dependency compiled
-  every `debug!` out of release builds (nextgcore#1433). nextgcore#1435 made
-  that line INFO, and #1436 removed the cap. The scenario's assertion was not
-  weakened.
+- **gNB and UE.** These were built in this page's branch worktree, whose code
+  is nextgsim ffca9c5; the branch adds only this page. Each run's
+  `verdict.txt` records `sim=ffca9c5550e0` (passed as `SIM_SHA`) and the
+  deployed `core_image=` and `sim_image=`.
+- **A superseded `on` run.** The first `on` run
+  (`on/20261111T153855Z/`, core `demo-d441c-64fa1c2` = nextgcore 64fa1c29)
+  FAILED on one assertion: `no amfd delivery to sub-... at or after the cell A
+  ingest`. The delivery had happened: nwdafd ingested both cells and the GET
+  returned 200. But amfd's `Event notification delivered` line was a `debug!`,
+  and a dependency compiled every `debug!` out of release builds
+  (nextgcore#1433). nextgcore#1435 made that line INFO, and #1436 removed the
+  cap. The scenario's assertion was not weakened. That run's `verdict.txt`
+  records `sim=86cef79075ac`, which is wrong: demo-check.sh read it from an
+  unrelated checkout. nextgcore#1434 fixed that recording.
 
 ### `on`
 
@@ -225,7 +224,7 @@ From `scenario.log`:
 ```
 
 nwdafd logged `[demo:d441c-amf-mobility] ue-mobility: baseline (no AMF
-subscription; UE_MOBILITY answers 204)`.
+subscription; UE_MOBILITY answers 204)` (18:10:21).
 
 ## Honesty labels and limitations
 
