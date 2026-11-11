@@ -50,10 +50,23 @@ type Handler = Arc<dyn Fn(&Seen) -> Reply + Send + Sync>;
 struct Stub {
     addr: std::net::SocketAddr,
     seen: Arc<StdMutex<Vec<Seen>>>,
+    /// Connections that have ended, and a wake-up when one does.
+    closed: Arc<(AtomicUsize, tokio::sync::Notify)>,
 }
 
 impl Stub {
     async fn start(handler: impl Fn(&Seen) -> Reply + Send + Sync + 'static) -> Self {
+        Self::start_with(false, handler).await
+    }
+
+    /// `one_request_per_conn`: each connection is shut down (GOAWAY) after its
+    /// first request, as a peer closing an idle pooled connection would.
+    async fn start_with(
+        one_request_per_conn: bool,
+        handler: impl Fn(&Seen) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        let closed = Arc::new((AtomicUsize::new(0), tokio::sync::Notify::new()));
+        let closed2 = closed.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -66,11 +79,15 @@ impl Stub {
                 };
                 let handler = handler.clone();
                 let seen = seen2.clone();
+                let closed = closed2.clone();
                 tokio::spawn(async move {
                     let Ok(mut conn) = h2::server::handshake(sock).await else {
                         return;
                     };
                     while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        if one_request_per_conn {
+                            conn.graceful_shutdown();
+                        }
                         let handler = handler.clone();
                         let seen = seen.clone();
                         tokio::spawn(async move {
@@ -103,10 +120,23 @@ impl Stub {
                             let _ = send.send_data(Bytes::from(r.body), true);
                         });
                     }
+                    closed.0.fetch_add(1, Ordering::SeqCst);
+                    closed.1.notify_waiters();
                 });
             }
         });
-        Self { addr, seen }
+        Self { addr, seen, closed }
+    }
+
+    /// Wait until `n` connections have ended.
+    async fn closed_at_least(&self, n: usize) {
+        loop {
+            let notified = self.closed.1.notified();
+            if self.closed.0.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            notified.await;
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -710,4 +740,142 @@ fn form_encoding_escapes_reserved_bytes_and_uses_plus_for_space() {
         oauth::form_encode(&[("scope", "a b"), ("x", "=&+/é")]),
         "scope=a+b&x=%3D%26%2B%2F%C3%A9"
     );
+}
+
+// ---- review fixes: isolation, expiry overflow, a closed pooled connection ----
+
+/// A listener whose accept queue is full and never drained: the kernel drops
+/// further SYNs, so a connect to it hangs, like a blackholed producer.
+fn blackhole() -> (
+    socket2::Socket,
+    Vec<std::net::TcpStream>,
+    std::net::SocketAddr,
+) {
+    let l = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    l.bind(
+        &"127.0.0.1:0"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into(),
+    )
+    .unwrap();
+    l.listen(0).unwrap();
+    let addr = l.local_addr().unwrap().as_socket().unwrap();
+    let mut fill = Vec::new();
+    for _ in 0..8 {
+        if let Ok(s) = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)) {
+            fill.push(s);
+        } else {
+            break;
+        }
+    }
+    (l, fill, addr)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hanging_connect_to_one_producer_does_not_delay_another() {
+    let (_l, _fill, dead) = blackhole();
+    let healthy = Stub::start(|_| Reply::new(201, "{}")).await;
+    let c = Arc::new(SbiClient::new(SbiClientConfig {
+        timeout: Duration::from_millis(1500),
+        retries: 0,
+        ..fast()
+    }));
+    // Precondition: the blackhole really hangs a connect.
+    let c2 = c.clone();
+    let stuck = tokio::spawn(async move {
+        c2.get_json::<serde_json::Value>(&format!("http://{dead}/x"), None)
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = std::time::Instant::now();
+    let r = c
+        .post_json(&healthy.url("/subscriptions"), &serde_json::json!({}), None)
+        .await
+        .expect("the healthy producer answers");
+    let took = t0.elapsed();
+    assert_eq!(r.status, StatusCode::CREATED);
+    assert!(
+        took < Duration::from_millis(500),
+        "the healthy POST waited {took:?} behind the hanging connect"
+    );
+    assert!(matches!(stuck.await.unwrap(), Err(SbiError::Timeout(_))));
+}
+
+#[tokio::test]
+async fn a_huge_expires_in_is_clamped_not_a_panic() {
+    let stub = nrf_and_producer(Reply::new(
+        200,
+        &format!(r#"{{"access_token":"{TOKEN}","token_type":"Bearer","expires_in":18446744073709551615}}"#),
+    ))
+    .await;
+    let c = oauth_client(&stub, &CcaKey::generate());
+    for _ in 0..2 {
+        c.get_json::<serde_json::Value>(&stub.url("/nnwdaf-x"), Some(&nwdaf()))
+            .await
+            .unwrap();
+    }
+    assert_eq!(stub.count(TOKEN_PATH), 1, "cached, not re-fetched");
+    let now = std::time::Instant::now();
+    assert!(oauth::refresh_at(now, u64::MAX) <= now + Duration::from_secs(86_400));
+    // A lifetime inside the refresh margin is not cached at all.
+    assert_eq!(oauth::refresh_at(now, 10), now);
+}
+
+#[tokio::test]
+async fn a_pooled_connection_the_peer_closed_is_replaced_and_a_post_still_goes_once() {
+    let stub = Stub::start_with(true, |_| Reply::new(201, "{}")).await;
+    let c = SbiClient::new(SbiClientConfig {
+        retries: 0,
+        ..fast()
+    });
+    c.get_json::<serde_json::Value>(&stub.url("/first"), None)
+        .await
+        .unwrap();
+    // The peer shut that connection down after its one request.
+    stub.closed_at_least(1).await;
+    let r = c
+        .post_json(&stub.url("/subscriptions"), &serde_json::json!({}), None)
+        .await
+        .expect("a POST on a closed pooled connection reconnects; nothing was sent yet");
+    assert_eq!(r.status, StatusCode::CREATED);
+    assert_eq!(stub.count("/subscriptions"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slow_token_fetch_for_one_scope_does_not_delay_another() {
+    let stub = Stub::start(|s| {
+        if s.path == TOKEN_PATH {
+            let slow = std::str::from_utf8(&s.body).unwrap().contains("scope=slow");
+            granted().delayed(if slow {
+                Duration::from_millis(800)
+            } else {
+                Duration::ZERO
+            })
+        } else {
+            Reply::new(200, "{}")
+        }
+    })
+    .await;
+    let c = Arc::new(SbiClient::new(SbiClientConfig {
+        timeout: Duration::from_secs(2),
+        ..oauth_client(&stub, &CcaKey::generate()).config().clone()
+    }));
+    let c2 = c.clone();
+    let url = stub.url("/p");
+    let slow = tokio::spawn(async move {
+        c2.get_json::<serde_json::Value>(&url, Some(&Scope::new("NWDAF", "slow")))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let t0 = std::time::Instant::now();
+    c.get_json::<serde_json::Value>(&stub.url("/p"), Some(&nwdaf()))
+        .await
+        .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        t0.elapsed()
+    );
+    slow.await.unwrap().unwrap();
 }

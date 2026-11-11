@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -46,6 +47,10 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(30);
 
 /// `expires_in` when the NRF omits it (RFC 6749 §5.1 makes it optional).
 const DEFAULT_EXPIRES_IN: u64 = 3600;
+
+/// The longest a token is cached, whatever `expires_in` says (nextgcore issues
+/// 3600 s). Also keeps `Instant` arithmetic far from overflow.
+const MAX_CACHE_SECS: u64 = 86_400;
 
 /// An ES256 (P-256) CCA signing key. `Debug` never shows the key.
 #[derive(Clone)]
@@ -253,11 +258,15 @@ struct Cached {
     refresh_at: Instant,
 }
 
-/// Tokens by scope. The lock is held across a fetch, so concurrent calls for
-/// one scope cause one token request, not several.
+type TokenSlot = Arc<Mutex<Option<Cached>>>;
+
+/// Tokens by scope. Each scope has its own lock, held across its fetch, so
+/// concurrent calls for one scope cause one token request, and a slow fetch
+/// for one scope never delays another.
 #[derive(Default)]
 pub(crate) struct TokenCache {
-    entries: Mutex<HashMap<Scope, Cached>>,
+    /// Held only to find or insert a slot, never across an await.
+    slots: std::sync::Mutex<HashMap<Scope, TokenSlot>>,
 }
 
 /// `application/x-www-form-urlencoded` (WHATWG URL §5.2): space as `+`.
@@ -292,28 +301,41 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// When to refresh a token that lives `expires_in` seconds from `now`.
+pub(crate) fn refresh_at(now: Instant, expires_in: u64) -> Instant {
+    let lifetime = Duration::from_secs(expires_in.min(MAX_CACHE_SECS));
+    now.checked_add(lifetime.saturating_sub(REFRESH_MARGIN))
+        .unwrap_or(now)
+}
+
 impl TokenCache {
+    fn slot(&self, scope: &Scope) -> TokenSlot {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(scope.clone())
+            .or_default()
+            .clone()
+    }
+
     pub(crate) async fn get(
         &self,
         client: &SbiClient,
         cfg: &OAuth2Config,
         scope: &Scope,
     ) -> SbiResult<AccessToken> {
-        let mut entries = self.entries.lock().await;
-        if let Some(c) = entries.get(scope) {
+        let slot = self.slot(scope);
+        let mut cached = slot.lock().await;
+        if let Some(c) = cached.as_ref() {
             if Instant::now() < c.refresh_at {
                 return Ok(c.token.clone());
             }
         }
         let (token, expires_in) = fetch(client, cfg, scope).await?;
-        let lifetime = Duration::from_secs(expires_in);
-        entries.insert(
-            scope.clone(),
-            Cached {
-                token: token.clone(),
-                refresh_at: Instant::now() + lifetime.saturating_sub(REFRESH_MARGIN),
-            },
-        );
+        *cached = Some(Cached {
+            token: token.clone(),
+            refresh_at: refresh_at(Instant::now(), expires_in),
+        });
         tracing::debug!(
             "NRF granted a token for {} / {} (expires in {expires_in} s)",
             scope.target_nf_type,
@@ -323,7 +345,8 @@ impl TokenCache {
     }
 
     pub(crate) async fn invalidate(&self, scope: &Scope) {
-        self.entries.lock().await.remove(scope);
+        let slot = self.slot(scope);
+        *slot.lock().await = None;
     }
 }
 

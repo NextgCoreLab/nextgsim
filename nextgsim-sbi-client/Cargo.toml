@@ -35,5 +35,6 @@ tracing.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+socket2.workspace = true
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber.workspace = true

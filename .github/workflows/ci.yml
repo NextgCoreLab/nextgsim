@@ -1007,6 +1007,23 @@ jobs:
             'ROUNDTRIP tokenless status=401 (expected)' \
             'ROUNDTRIP token refused status=400 error=unauthorized_client (expected); failed closed' \
             'ROUNDTRIP OK mode=oauth2'
+          # The granted path, proved against the same real NRF and nwdafd: the
+          # client registered as NEF, a type nwdafd allows today (positive
+          # control until #1412 lets the AF arm above expect a grant).
+          docker run --rm --network "$net" -v "$vol:/cca-public" \
+            -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
+            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=granted \
+            -e NF_TYPE=NEF -e NF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000457e \
+            -e CCA_KEY_FILE=/tmp/nef-cca.key \
+            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2-granted.txt
+          ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2-granted.txt \
+            'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP nrf-discover status=200 nwdaf-instances=1' \
+            'ROUNDTRIP tokenless status=401 (expected)' \
+            'ROUNDTRIP token granted target=NWDAF scope=nnwdaf-analyticsinfo' \
+            'ROUNDTRIP nwdaf-analytics status=20' \
+            'ROUNDTRIP OK mode=oauth2'
 
       - name: Collect logs on failure
         if: failure()

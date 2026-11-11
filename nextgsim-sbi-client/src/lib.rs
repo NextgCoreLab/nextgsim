@@ -27,6 +27,7 @@
 pub mod oauth;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -187,11 +188,16 @@ fn retryable_status(s: StatusCode) -> bool {
     matches!(s.as_u16(), 502..=504)
 }
 
+/// One producer authority's pooled connection. Each authority has its own
+/// lock, so a connect that hangs on one producer never delays calls to another.
+type ConnSlot = Arc<Mutex<Option<SendRequest<Bytes>>>>;
+
 /// The h2c SBI client. One HTTP/2 connection per producer authority is reused
 /// across calls and replaced after a transport error.
 pub struct SbiClient {
     config: SbiClientConfig,
-    conns: Mutex<HashMap<String, SendRequest<Bytes>>>,
+    /// Held only to find or insert a slot, never across an await.
+    conns: std::sync::Mutex<HashMap<String, ConnSlot>>,
     tokens: oauth::TokenCache,
 }
 
@@ -236,7 +242,7 @@ impl SbiClient {
     pub fn new(config: SbiClientConfig) -> Self {
         Self {
             config,
-            conns: Mutex::new(HashMap::new()),
+            conns: std::sync::Mutex::new(HashMap::new()),
             tokens: oauth::TokenCache::default(),
         }
     }
@@ -357,14 +363,14 @@ impl SbiClient {
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(e)) => {
                     // A transport failure may have left the connection unusable.
-                    self.conns.lock().await.remove(&target.authority);
+                    self.evict(&target.authority).await;
                     if last || !transient(&e) {
                         return Err(e);
                     }
                     e.to_string()
                 }
                 Err(_) => {
-                    self.conns.lock().await.remove(&target.authority);
+                    self.evict(&target.authority).await;
                     if last {
                         return Err(SbiError::Timeout(self.config.timeout));
                     }
@@ -380,10 +386,26 @@ impl SbiClient {
         }
     }
 
-    async fn connection(&self, authority: &str) -> SbiResult<SendRequest<Bytes>> {
-        let mut conns = self.conns.lock().await;
-        if let Some(c) = conns.get(authority) {
-            return Ok(c.clone());
+    fn slot(&self, authority: &str) -> ConnSlot {
+        self.conns
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(authority.to_string())
+            .or_default()
+            .clone()
+    }
+
+    async fn evict(&self, authority: &str) {
+        let slot = self.slot(authority);
+        *slot.lock().await = None;
+    }
+
+    /// The pooled connection to `authority`, or a new one; `true` when pooled.
+    async fn connection(&self, authority: &str) -> SbiResult<(SendRequest<Bytes>, bool)> {
+        let slot = self.slot(authority);
+        let mut pooled = slot.lock().await;
+        if let Some(c) = pooled.as_ref() {
+            return Ok((c.clone(), true));
         }
         let tcp = TcpStream::connect(authority)
             .await
@@ -398,8 +420,8 @@ impl SbiClient {
                 tracing::debug!("SBI h2c connection closed: {e}");
             }
         });
-        conns.insert(authority.to_string(), send.clone());
-        Ok(send)
+        *pooled = Some(send.clone());
+        Ok((send, false))
     }
 
     async fn send_once(
@@ -410,8 +432,22 @@ impl SbiClient {
         content_type: Option<HeaderValue>,
         token: Option<&AccessToken>,
     ) -> SbiResult<SbiResponse> {
-        let send = self.connection(&target.authority).await?;
-        let mut send = send.ready().await?;
+        let (send, pooled) = self.connection(&target.authority).await?;
+        let mut send = match send.ready().await {
+            Ok(s) => s,
+            // A pooled connection the peer has since closed: nothing was sent
+            // on it, so one fresh connection is safe even for a POST.
+            Err(e) if pooled => {
+                tracing::debug!(
+                    "SBI pooled connection to {} is gone ({e}); reconnecting",
+                    target.authority
+                );
+                self.evict(&target.authority).await;
+                let (fresh, _) = self.connection(&target.authority).await?;
+                fresh.ready().await?
+            }
+            Err(e) => return Err(e.into()),
+        };
         let mut req = Request::builder()
             .method(method.clone())
             .uri(target.uri.clone())
