@@ -91,6 +91,13 @@ assert_log_order "$DEMO_ARTEFACTS/upf.log" upf \
     'Updated data plane session: .*gNB=172\.23\.0\.100:2152' \
     'Updated data plane session: .*gNB=172\.23\.0\.102:2152'
 
+# No core NF restarted to get here (compose's restart: on-failure would hide a crash).
+for s in amf smf upf; do
+    n="$(docker inspect -f '{{.RestartCount}}' "$(demo_compose ps -q "$s")")"
+    [ "$n" = 0 ] || demo_fail "[$s] restarted $n time(s) during the run"
+done
+demo_info "amf, smf and upf: no restart"
+
 # And it carries traffic through the target: a ping from the UE after the handover.
 demo_compose exec -T ue ping -I uesimtun0 -c 10 -i 0.5 -W 2 10.45.0.1 > "$DEMO_ARTEFACTS/ping.txt" 2>&1 || true
 cat "$DEMO_ARTEFACTS/ping.txt"

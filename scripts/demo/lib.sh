@@ -6,7 +6,8 @@
 #
 # What it gives a check:
 #   demo_seed [SEED]           seeded runs: export DEMO_SEED (given, $DEMO_SEED, or
-#                              fresh) and record it, so a run can be repeated.
+#                              fresh) and record it to the artefacts. A demo that
+#                              randomises passes it on; n2ho-check.sh only records it.
 #   demo_compose_init FILE     run every compose call below against FILE, under
 #                              project $DEMO_PROJECT (default: the file's own name:).
 #   demo_assert_private        fail if the stack publishes a host port or uses host

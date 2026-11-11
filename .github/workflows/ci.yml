@@ -1194,8 +1194,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      # nextgcore with docker/rust/docker-compose.demo-n2ho.yml (nextgcore#1414).
-      NEXTGCORE_DEMO_REF: ${{ inputs.nextgcore_ref || 'e0896e75979005c84e6e6d0864938c47d3e4abd8' }}
+      # nextgcore main at #1414's merge: the first commit with docker/rust/docker-compose.demo-n2ho.yml.
+      NEXTGCORE_DEMO_REF: ${{ inputs.nextgcore_ref || '9d50cb9ccb5caca31da40cf631d96c2750e1af33' }}
     steps:
       - name: Checkout nextgsim
         uses: actions/checkout@v4
