@@ -195,8 +195,8 @@ check had scaled the UE to zero before the capture. Its UE image
 
 ### Acceptance coverage (#488)
 
-The EKS runs prove only some of the criteria. The unit tests and the revert harness
-named below, both in #508, prove the rest, and those were not run on the cluster.
+The EKS runs prove only some of the criteria. The #508 unit tests named below cover
+the rest, offline. They were not run on the cluster.
 
 | Criterion | Proven by |
 |---|---|
@@ -207,7 +207,7 @@ named below, both in #508, prove the rest, and those were not run on the cluster
 | gNB restarted without the UE → `stale=true` | EKS `on` (`nkef/restart.txt`) |
 | AMF URI unset → no `sba` domain | unit test `without_an_amf_uri_there_is_no_sba_client` (nkef/sba.rs) |
 | UE not started → no `reportList` facts | unit test `an_amfd_report_list_becomes_location_and_cm_facts` (an answer without `reportList` yields no facts) |
-| revert arms `447-spawn-order`, `447-rls-tee`, `447-n2-tee`, `447-projection` | the compose revert harness `scripts/demo/revert-run.sh`, not run on EKS |
+| revert arms `447-spawn-order`, `447-rls-tee`, `447-n2-tee`, `447-projection` | offline only. `447-rls-tee` and `447-n2-tee` fail unit test `the_tees_feed_one_bundle_per_question`. `447-projection` fails that test and `an_external_consumer_gets_area_congestion_and_nothing_identifying`. `447-spawn-order` fails no test, but `the_tees_feed_one_bundle_per_question` asserts its offline counterpart: an App base without the 6G handles answers `NKEF task not running`. The live revert harness (`scripts/demo/revert-run.sh`) was not run. |
 | amfd timestamp removed → `consistent=unknown` | unit test `without_a_timestamped_amf_location_consistency_is_unknown` |
 | modes: `baseline` has no live domain and amfd logs no subscription | EKS `baseline` (`nkef/internal.txt`, `nkef/amf.log`); unit test `a_baseline_store_has_no_live_domain` |
 | kill switch: `demo.enabled: false` does nothing | unit test `an_nkef_sba_build_registers_d447a_and_rejects_an_unknown_mode` (gnb demo.rs) |
