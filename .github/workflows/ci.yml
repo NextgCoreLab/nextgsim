@@ -1586,6 +1586,9 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
             'apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
              cargo build --release -p nextgsim-gnb --features demo-d446a-agent-conflict -p nextgsim-cli'
+          # The container ran as root: hand target/ back to the runner user, or
+          # the revert arms' host cargo cannot create target/debug.
+          sudo chown -R "$(id -u):$(id -g)" target
           mkdir -p binaries
           cp target/release/nr-gnb target/release/nr-cli binaries/
           cp ../nextgcore/docker/rust/binaries/nr-ue binaries/
