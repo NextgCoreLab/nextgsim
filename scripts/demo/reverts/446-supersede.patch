@@ -1,0 +1,11 @@
+--- a/nextgsim-agent/src/conflict.rs
++++ b/nextgsim-agent/src/conflict.rs
+@@ -391,7 +391,7 @@
+                     // New intent wins -- remove the existing intent from the queue.
+                     // We need to find and remove it from the actual deque.
+                     let existing_id = existing.id.clone();
+-                    self.ready.retain(|i| i.id != existing_id);
++                    // 446-supersede revert: the superseded intent stays queued.
+ 
+                     let notification = BlockedIntentNotification {
+                         intent_id: existing_id.clone(),

@@ -1,0 +1,13 @@
+--- a/nextgsim-gnb/src/agent/task.rs
++++ b/nextgsim-gnb/src/agent/task.rs
+@@ -154,9 +154,7 @@
+             ..Default::default()
+         };
+         if out.get("cause").map(String::as_str) == Some(super::d446a::CAUSE_REDUCE_LOAD) {
+-            trigger.cause = nextgsim_ngap::procedures::handover::HandoverCause::RadioNetwork(
+-                nextgsim_ngap::procedures::ng_setup::RadioNetworkCause::ReduceLoadInServingCell,
+-            );
++            // 446-cause revert: the radio-reason default stays.
+         }
+         let msg = RrcMessage::AgentHandover {
+             ue_id,

@@ -19,6 +19,10 @@
 - [PDU Sessions & the User-Plane Data Path](concepts/pdu-session-userplane.md)
 - [The AI & 6G Simulation Stack](concepts/ai-6g-stack.md)
 
+# Demos
+
+- [D446A: agent conflict over a booster cell](demos/d446a-agent-conflict.md)
+
 # Reference
 
 - [Features & APIs](reference.md)

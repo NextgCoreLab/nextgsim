@@ -227,7 +227,9 @@ fn spawn_6g_tasks(task_base: &GnbTaskBase, sixg: GnbSixgReceivers) {
 
     #[cfg(feature = "nextgsim-agent")]
     if config.agent_enabled {
-        spawn_task(crate::agent::AgentTask::new(task_base.clone()), agent_rx);
+        let agent = crate::agent::AgentTask::new(task_base.clone());
+        agent.install_cli();
+        spawn_task(agent, agent_rx);
         info!("Agent task spawned");
     }
 

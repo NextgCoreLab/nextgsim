@@ -235,6 +235,21 @@ impl AppTask {
             return;
         }
 
+        // `agent-audit [--json]` (nextgsim#483): the D446A demo's agent audit.
+        #[cfg(feature = "demo-d446a-agent-conflict")]
+        if let Some(result) = crate::agent::d446a::route_cli(&cmd.command) {
+            if let Some(server) = &self.cli_server {
+                let sent = match result {
+                    Ok(out) => server.send_result(cmd.client_addr, out).await,
+                    Err(e) => server.send_error(cmd.client_addr, e).await,
+                };
+                if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // Parse the command
         let command = match parse_cli_command(&cmd.command) {
             Ok(parsed) => parsed,

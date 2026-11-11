@@ -1,0 +1,13 @@
+--- a/nextgsim-gnb/src/rrc/task.rs
++++ b/nextgsim-gnb/src/rrc/task.rs
+@@ -3398,9 +3398,7 @@
+                 .await;
+             return;
+         }
+-        if self.handback_held(ue_id, i32::from(pci)) {
+-            return;
+-        }
++        // 446-handback-hold revert: no hold.
+         let neighbour = self
+             .task_base
+             .config

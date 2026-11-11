@@ -1,6 +1,10 @@
 //! AI Agent Framework Task for gNB
 
-use crate::tasks::{AgentMessage, GnbTaskBase, RrcMessage, Task, TaskMessage};
+use crate::tasks::{
+    AgentMessage, GnbTaskBase, InboundHandoverVerdict, RrcMessage, Task, TaskMessage,
+};
+#[cfg(feature = "demo-d446a-agent-conflict")]
+use crate::tasks::{HandoverTrigger, RlsMessage};
 use nextgsim_agent::{AgentCapabilities, AgentCoordinator, AgentId, AgentType, Intent, IntentType};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
@@ -12,15 +16,155 @@ pub struct AgentTask {
     agents: HashMap<String, Vec<String>>,
     /// Cell observations received (#459).
     observations: u64,
+    /// Demo D446A's agents (nextgsim#483), when the config names any.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    d446a: Option<super::d446a::D446a>,
+    /// Where D446A's audit lives.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    d446a_audit: super::d446a::Audit,
+    /// Reads D446A's current mode; `None` when the demo is not active.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    d446a_mode: fn() -> Option<String>,
+}
+
+#[cfg(feature = "demo-d446a-agent-conflict")]
+fn installed_d446a_mode() -> Option<String> {
+    nextgsim_demo::active_mode(crate::demo::D446A_KEY)
 }
 
 impl AgentTask {
     pub fn new(task_base: GnbTaskBase) -> Self {
-        Self {
+        #[cfg(feature = "demo-d446a-agent-conflict")]
+        let d446a_audit = super::d446a::Audit::default();
+        #[allow(unused_mut)]
+        let mut task = Self {
+            #[cfg(feature = "demo-d446a-agent-conflict")]
+            d446a: super::d446a::D446a::from_config(&task_base.config.agents, d446a_audit.clone()),
+            #[cfg(feature = "demo-d446a-agent-conflict")]
+            d446a_audit,
+            #[cfg(feature = "demo-d446a-agent-conflict")]
+            d446a_mode: installed_d446a_mode,
             task_base,
             coordinator: AgentCoordinator::new(),
             agents: HashMap::new(),
             observations: 0,
+        };
+        #[cfg(feature = "demo-d446a-agent-conflict")]
+        {
+            let regs = task
+                .d446a
+                .as_ref()
+                .map(|d| d.registrations())
+                .unwrap_or_default();
+            for (id, caps) in regs {
+                let kinds: Vec<String> = Vec::new();
+                task.coordinator
+                    .register_agent(AgentId::new(&id), AgentType::Resource, caps);
+                task.agents.insert(id, kinds);
+            }
+        }
+        task
+    }
+
+    /// Makes this task's D446A audit the one `nr-cli agent-audit` shows
+    /// (production wiring only; nextgsim#483).
+    pub fn install_cli(&self) {
+        #[cfg(feature = "demo-d446a-agent-conflict")]
+        super::d446a::D446a::install_cli_audit(&self.d446a_audit);
+    }
+
+    /// Overrides where D446A's mode is read (tests).
+    #[cfg(all(test, feature = "demo-d446a-agent-conflict"))]
+    fn with_d446a_mode(mut self, mode: fn() -> Option<String>) -> Self {
+        self.d446a_mode = mode;
+        self
+    }
+
+    /// D446A's tick: the decisions of this gNB's demo agents, then their
+    /// actuation (nextgsim#483).
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    async fn d446a_tick(&mut self, served_ue_ids: &[i32]) {
+        let mode = (self.d446a_mode)();
+        let Some(d) = self.d446a.as_mut() else {
+            return;
+        };
+        let actions = d.on_tick(std::time::Instant::now(), served_ue_ids, mode.as_deref());
+        self.d446a_act(actions).await;
+    }
+
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    async fn d446a_act(&mut self, actions: Vec<super::d446a::Action>) {
+        use super::d446a::Action;
+        for action in actions {
+            match action {
+                Action::SwitchOff => {
+                    if let Err(e) = self.task_base.rls_tx.send(RlsMessage::SetOffAir).await {
+                        warn!("Agent: switch-off not delivered to RLS: {e}");
+                    }
+                    if let Err(e) = self
+                        .task_base
+                        .rrc_tx
+                        .send(RrcMessage::EnergySwitchOff)
+                        .await
+                    {
+                        warn!("Agent: switch-off not delivered to RRC: {e}");
+                    }
+                }
+                Action::Handover(intent) => {
+                    let id = intent.id.clone();
+                    let ue = intent.target.clone().unwrap_or_default();
+                    if let Err(e) = self.coordinator.submit_intent(intent) {
+                        if let Some(d) = self.d446a.as_mut() {
+                            d.on_actuation(&id, ue.parse().unwrap_or(-1), false, &e);
+                        }
+                        continue;
+                    }
+                    // Executed only from the conflict-checked queue (#483).
+                    for result in self.coordinator.process_intents_full() {
+                        self.forward_agent_handover(&result).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hands an executed handover intent to RRC with its cause and intent id.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    async fn forward_agent_handover(&mut self, result: &nextgsim_agent::IntentExecutionResult) {
+        if result.status != nextgsim_agent::IntentStatus::Success {
+            if let Some(d) = self.d446a.as_mut() {
+                d.on_actuation(
+                    &result.intent_id,
+                    -1,
+                    false,
+                    result.message.as_deref().unwrap_or("not executed"),
+                );
+            }
+            return;
+        }
+        let out = &result.output;
+        let (Some(ue_id), Some(target_cell)) = (
+            out.get("ue_id").and_then(|v| v.parse::<i32>().ok()),
+            out.get("target_cell").and_then(|v| v.parse::<i32>().ok()),
+        ) else {
+            return;
+        };
+        let mut trigger = HandoverTrigger {
+            agent_intent_id: Some(result.intent_id.clone()),
+            ..Default::default()
+        };
+        if out.get("cause").map(String::as_str) == Some(super::d446a::CAUSE_REDUCE_LOAD) {
+            trigger.cause = nextgsim_ngap::procedures::handover::HandoverCause::RadioNetwork(
+                nextgsim_ngap::procedures::ng_setup::RadioNetworkCause::ReduceLoadInServingCell,
+            );
+        }
+        let msg = RrcMessage::AgentHandover {
+            ue_id,
+            target_cell,
+            trigger,
+        };
+        if let Err(e) = self.task_base.rrc_tx.send(msg).await {
+            warn!("Agent: handover action not delivered to RRC: {e}");
         }
     }
 
@@ -130,8 +274,74 @@ impl Task for AgentTask {
                             cell_id,
                             connected_ues,
                             throughput_mbps,
+                            served_ue_ids,
                         } => {
                             self.record_cell_observation(cell_id, connected_ues, throughput_mbps);
+                            #[cfg(feature = "demo-d446a-agent-conflict")]
+                            self.d446a_tick(&served_ue_ids).await;
+                            #[cfg(not(feature = "demo-d446a-agent-conflict"))]
+                            let _ = served_ue_ids;
+                        }
+                        AgentMessage::InboundHandover {
+                            cause,
+                            load_balancing,
+                            source_cell,
+                            source_gnb_id,
+                            target_cell,
+                            reply,
+                        } => {
+                            #[cfg(feature = "demo-d446a-agent-conflict")]
+                            {
+                                let mode = (self.d446a_mode)();
+                                let req = super::d446a::Inbound {
+                                    cause,
+                                    load_balancing,
+                                    source_cell,
+                                    source_gnb_id,
+                                    target_cell,
+                                };
+                                let (verdict, actions) = match self.d446a.as_mut() {
+                                    Some(d) => d.arbitrate(
+                                        std::time::Instant::now(),
+                                        &req,
+                                        mode.as_deref(),
+                                    ),
+                                    None => (
+                                        InboundHandoverVerdict::Admit {
+                                            handback_hold: None,
+                                        },
+                                        Vec::new(),
+                                    ),
+                                };
+                                let _ = reply.send(verdict);
+                                self.d446a_act(actions).await;
+                            }
+                            #[cfg(not(feature = "demo-d446a-agent-conflict"))]
+                            {
+                                let _ = (
+                                    cause,
+                                    load_balancing,
+                                    source_cell,
+                                    source_gnb_id,
+                                    target_cell,
+                                );
+                                let _ = reply.send(InboundHandoverVerdict::Admit {
+                                    handback_hold: None,
+                                });
+                            }
+                        }
+                        AgentMessage::ActuationResult {
+                            intent_id,
+                            ue_id,
+                            success,
+                            detail,
+                        } => {
+                            #[cfg(feature = "demo-d446a-agent-conflict")]
+                            if let Some(d) = self.d446a.as_mut() {
+                                d.on_actuation(&intent_id, ue_id, success, &detail);
+                            }
+                            #[cfg(not(feature = "demo-d446a-agent-conflict"))]
+                            let _ = (intent_id, ue_id, success, detail);
                         }
                         AgentMessage::CoordinationEvent {
                             event_type,
@@ -216,6 +426,7 @@ mod tests {
             cell_id: 7,
             connected_ues: 3,
             throughput_mbps: Some(1.5),
+            served_ue_ids: vec![],
         }))
         .await
         .unwrap();
@@ -223,6 +434,7 @@ mod tests {
             cell_id: 8,
             connected_ues: 0,
             throughput_mbps: None,
+            served_ue_ids: vec![],
         }))
         .await
         .unwrap();
@@ -235,5 +447,59 @@ mod tests {
         assert_eq!(state.get("cell/7/throughput_mbps").as_deref(), Some("1.5"));
         assert_eq!(state.get("cell/8/connected_ues").as_deref(), Some("0"));
         assert_eq!(state.get("cell/8/throughput_mbps"), None, "not invented");
+    }
+
+    /// #483: on a loaded cell, lb-1's intent is executed from the queue and
+    /// reaches RRC as an AgentHandover with the load-balancing cause and the
+    /// intent id, so NGAP can carry the cause and report the outcome.
+    #[cfg(feature = "demo-d446a-agent-conflict")]
+    #[tokio::test]
+    async fn a_loaded_cell_actuates_lb_1_with_the_load_balancing_cause() {
+        use nextgsim_common::config::{AgentRuleConfig, AgentRuleKind};
+        let config = GnbConfig {
+            agents: vec![AgentRuleConfig {
+                id: "lb-1".into(),
+                kind: AgentRuleKind::LoadBalancing,
+                cell: 0x10,
+                priority: None,
+                load_threshold_ues: 1,
+                grace_s: 20,
+                handback_hold_s: 60,
+                peers: vec![],
+            }],
+            ..GnbConfig::default()
+        };
+        let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task =
+            AgentTask::new(task_base).with_d446a_mode(|| Some("load-balancing".to_string()));
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TaskMessage::Message(AgentMessage::CellObservation {
+            cell_id: 0,
+            connected_ues: 1,
+            throughput_mbps: None,
+            served_ue_ids: vec![1],
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        task.run(rx).await;
+
+        let Some(TaskMessage::Message(RrcMessage::AgentHandover {
+            ue_id,
+            target_cell,
+            trigger,
+        })) = rrc_rx.try_recv().ok()
+        else {
+            panic!("lb-1's handover must reach RRC");
+        };
+        assert_eq!((ue_id, target_cell), (1, 16));
+        assert_eq!(
+            trigger.cause,
+            nextgsim_ngap::procedures::handover::HandoverCause::RadioNetwork(
+                nextgsim_ngap::procedures::ng_setup::RadioNetworkCause::ReduceLoadInServingCell
+            )
+        );
+        assert!(trigger.agent_intent_id.is_some());
     }
 }
