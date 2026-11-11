@@ -187,6 +187,10 @@ pub enum DemoConfigError {
         /// What is wrong, naming the path.
         detail: String,
     },
+    /// [`init_from_yaml`] ran a second time in this process: a programming
+    /// error, not a config error (the state is write-once).
+    #[error("demo config: demo state is already installed for this process")]
+    AlreadyInstalled,
 }
 
 fn malformed(detail: impl Into<String>) -> DemoConfigError {
@@ -676,7 +680,7 @@ pub fn init_from_yaml(
     let root: Value = serde_yaml::from_str(yaml)
         .map_err(|e| malformed(format!("config is not valid YAML: {e}")))?;
     let runtime = DemoRuntime::from_root(&root, registry)?;
-    install(runtime).map_err(|e| malformed(e.to_string()))
+    install(runtime).map_err(|AlreadyInstalled| DemoConfigError::AlreadyInstalled)
 }
 
 /// The installed state, or `None` before [`install`].
