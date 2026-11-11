@@ -324,14 +324,19 @@ mod tests {
     }
 
     /// nextgsim#488, end to end inside the gNB: the real tee functions feed the
-    /// running NKEF task over its channel, `nkef-query` gets one bundle back on
-    /// a oneshot, the external consumer gets congestion only, and a runtime
-    /// switch to `baseline` answers with nothing live (a bogus mode is refused
+    /// running NKEF task over its channel, `nkef-query` routed through the App
+    /// task's `route_nkef_cli` gets one bundle back on a oneshot (an App task
+    /// whose base lacks the 6G handles answers "NKEF task not running"), the
+    /// external consumer gets congestion only, and a runtime switch to `baseline` answers with nothing live (a bogus mode is refused
     /// and leaves `on` in place).
     ///
     /// REVERT-VERIFIED: with `offer_cell_load` / `offer_ng_setup` returning
     /// early the header loses `ran` / `n2`; with the external projection
-    /// replaced by the internal bundle the leak assertions fail.
+    /// replaced by the internal bundle the leak assertions fail; with
+    /// `route_nkef_cli` seeing no 6G handles (the `sixg: None` the
+    /// 447-spawn-order arm gives the App task), the first ask fails. That arm
+    /// itself is in `GnbWiring::spawn`, which this test does not run: it stays a
+    /// live-run arm, and the `sixg: None` answer here is what that arm produces.
     #[cfg(feature = "nkef-sba")]
     #[tokio::test]
     async fn the_tees_feed_one_bundle_per_question() {
@@ -376,20 +381,37 @@ mod tests {
         live::offer_ue_n2(&base, 1, 0, 7);
 
         let nkef = base.sixg.as_ref().expect("handles").nkef_tx.clone();
+        // Every question goes the way `nr-cli` sends it: through the App task's
+        // own `route_nkef_cli`, on the App task's clone of the base (review m5).
+        let app = crate::app::AppTask::new_without_cli(base.clone());
         let ask = |consumer| {
-            let nkef = nkef.clone();
+            let command = match consumer {
+                Consumer::Internal => {
+                    "nkef-query is my route congested and which core functions serve me?"
+                }
+                Consumer::External => {
+                    "nkef-query --as external is my route congested and which core functions serve me?"
+                }
+            };
+            let app = &app;
             async move {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                nkef.send(NkefMessage::Query {
-                    question: "is my route congested and which core functions serve me?".into(),
-                    consumer,
-                    reply: tx,
-                })
-                .await
-                .expect("sent");
-                rx.await.expect("answered").expect("a bundle")
+                app.route_nkef_cli(command)
+                    .await
+                    .expect("an nkef command")
+                    .expect("a bundle")
             }
         };
+        // An App task whose base holds no 6G handles (the 447-spawn-order arm)
+        // gets no bundle at all.
+        let mut bare = base.clone();
+        bare.sixg = None;
+        let refused = crate::app::AppTask::new_without_cli(bare)
+            .route_nkef_cli("nkef-query is my route congested?")
+            .await;
+        assert!(
+            matches!(&refused, Some(Err(e)) if e.starts_with("NKEF task not running")),
+            "{refused:?}"
+        );
         let internal = ask(Consumer::Internal).await;
         let header = internal.lines().next().unwrap();
         assert!(

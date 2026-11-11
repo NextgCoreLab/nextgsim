@@ -288,7 +288,7 @@ impl AppTask {
     /// Run an `nkef-query` or `nkef-status` command against the NKEF task, or
     /// `None` if `command` is neither.
     #[cfg(feature = "nextgsim-nkef")]
-    async fn route_nkef_cli(&self, command: &str) -> Option<Result<String, String>> {
+    pub(crate) async fn route_nkef_cli(&self, command: &str) -> Option<Result<String, String>> {
         let request = match parse_nkef_cli(command)? {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
