@@ -449,17 +449,35 @@ impl D446a {
     }
 
     /// Audits an actuation outcome from NGAP.
-    pub fn on_actuation(&mut self, intent_id: &str, ue_id: i32, success: bool, detail: &str) {
+    ///
+    /// `retry_ue`: the failure happened before anything was signalled (no
+    /// HANDOVER REQUIRED went out, e.g. the UE's PDU session resources were not
+    /// set up yet when its first packet made it a served UE), so lb-1 may pick
+    /// the UE again at a later tick. A refusal by the network is final.
+    pub fn on_actuation(
+        &mut self,
+        intent_id: &str,
+        ue_id: i32,
+        success: bool,
+        retry_ue: bool,
+        detail: &str,
+    ) {
         let agent = self.lb.as_ref().map_or("-".to_string(), |l| l.id.clone());
         let event = if success {
             "ActuationSucceeded"
         } else {
             "ActuationFailed"
         };
+        let retry = if retry_ue {
+            self.lb_tried.remove(&ue_id);
+            "; not signalled, the UE may be retried"
+        } else {
+            ""
+        };
         self.record(
             event,
             &agent,
-            format!("intent {intent_id} ue={ue_id}: {detail}"),
+            format!("intent {intent_id} ue={ue_id}: {detail}{retry}"),
         );
     }
 }

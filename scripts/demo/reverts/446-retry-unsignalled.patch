@@ -1,0 +1,11 @@
+--- a/nextgsim-gnb/src/agent/d446a.rs
++++ b/nextgsim-gnb/src/agent/d446a.rs
+@@ -469,7 +469,7 @@
+             "ActuationFailed"
+         };
+         let retry = if retry_ue {
+-            self.lb_tried.remove(&ue_id);
++            // 446-retry-unsignalled revert: the UE stays tried, so lb-1 never picks it again.
+             "; not signalled, the UE may be retried"
+         } else {
+             ""
