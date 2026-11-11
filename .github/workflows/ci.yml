@@ -172,6 +172,42 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+  sbi-client:
+    # nextgsim-sbi-client (#457): its h2c stub tests, strict clippy, and the
+    # default-build check. A default gNB / UE build (with or without 6g) must
+    # pull in no HTTP/2 stack; the `sbi-client` arm is the positive control,
+    # so the grep cannot pass vacuously.
+    name: SBI client (feature-gated)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test -p nextgsim-sbi-client
+      - name: cargo clippy
+        run: cargo clippy -p nextgsim-sbi-client --no-deps --all-targets --features roundtrip -- -D warnings
+      - name: A default gNB / UE build has no h2 or hyper
+        run: |
+          set -euo pipefail
+          # Each crate's default, then its 6G set (gNB: the 6g umbrella; UE: the
+          # optional 6G crates it forwards).
+          for arm in "nextgsim-gnb:" "nextgsim-gnb:6g" "nextgsim-ue:" \
+                     "nextgsim-ue:nextgsim-she,nextgsim-nwdaf,nextgsim-nkef,nextgsim-isac,nextgsim-agent,nextgsim-fl,nextgsim-semantic"; do
+            c=${arm%%:*}; f=${arm#*:}
+            tree=$(cargo tree -p "$c" -e normal ${f:+--features "$f"} --prefix none)
+            if grep -E '^(h2|hyper|nextgsim-sbi-client) ' <<<"$tree"; then
+              echo "::error::$c ${f:-default} pulls in an HTTP/2 stack; it must stay behind the sbi-client feature"; exit 1
+            fi
+          done
+          for c in nextgsim-gnb nextgsim-ue; do
+            cargo tree -p "$c" -e normal --features sbi-client --prefix none | grep -qE '^h2 ' \
+              || { echo "::error::$c --features sbi-client shows no h2: the check above is vacuous"; exit 1; }
+          done
+
   release-images:
     # nextgcore #420: release.yml publishes exactly docker/release-images.json.
     # A new binary, Dockerfile or deployed image that is not in that list (or
@@ -813,7 +849,8 @@ jobs:
           # Only the NFs a registration touches, not all 24: this job is the RAN
           # contract, and every extra image is build minutes that assert nothing
           # about it.
-          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+          # nwdafd for the nextgsim-sbi-client round trip (#457).
+          for nf in amfd ausfd bsfd nrfd nssfd nwdafd pcfd smfd udmd udrd upfd; do
             docker build -f Dockerfile.nf \
               --build-arg CORE_IMAGE=nextgcore-core:latest \
               --build-arg NF_NAME=nextgcore-${nf} \
@@ -935,10 +972,95 @@ jobs:
                  tail -60 /tmp/ue.log; exit 1; }
           echo "Idle-mode Service Request accepted by nextgcore."
 
+      - name: Build the SBI client round trip (#457)
+        # On the runner, then run in ubuntu:24.04 (the runner's own OS, so the
+        # same glibc) on the compose network. No port is published.
+        working-directory: nextgsim
+        run: cargo build --release -p nextgsim-sbi-client --features roundtrip --bin sbi-roundtrip
+
+      - name: SBI client round trip through the real NRF and nwdafd (#457)
+        # nextgsim-sbi-client over h2c: register at the NRF, discover NWDAF,
+        # GET Nnwdaf_AnalyticsInfo NF_LOAD (2xx), deregister. It registers as AF
+        # (TS 29.520 §4.3.1.3.2); nextgcore#1412 (AF missing from nwdafd's
+        # allowedNfTypes) hides NWDAF from AF discovery, so NWDAF_URI is the
+        # fallback until it is fixed.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose up -d nwdaf
+          for _ in $(seq 1 30); do
+            docker compose logs nwdaf 2>&1 | grep -qF 'NWDAF registered with NRF' && break
+            sleep 2
+          done
+          net=$(docker inspect nextgcore-nrf -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+          docker run --rm --network "$net" \
+            -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
+            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-plain.txt
+          ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-plain.txt \
+            'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP nrf-discover status=200' \
+            'ROUNDTRIP nwdaf-analytics status=20' \
+            'ROUNDTRIP nrf-deregister status=20' \
+            'ROUNDTRIP OK mode=plain'
+
+      - name: SBI client round trip under the OAuth2 profile (#457)
+        # nrf and nwdaf recreated with docker-compose.oauth2.yml. A tokenless
+        # call must get 401 from nwdafd. The client publishes its CCA key to the
+        # NRF's trusted-keys volume and asks for a token. Until nextgcore#1412
+        # the NRF refuses an AF with unauthorized_client, and the client must
+        # fail closed: no tokenless call. When #1412 lands, set
+        # EXPECT_TOKEN=granted and expect the nwdaf-analytics line.
+        # Last step on purpose: the other NFs are not recreated with tokens.
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker compose -f docker-compose.yml -f docker-compose.oauth2.yml \
+            up -d --force-recreate --no-deps nrf nwdaf
+          for _ in $(seq 1 30); do
+            docker compose logs nwdaf 2>&1 | grep -qF 'OAuth2 enforcement enabled' && \
+              docker compose logs nwdaf 2>&1 | grep -qF 'NWDAF registered with NRF' && break
+            sleep 2
+          done
+          net=$(docker inspect nextgcore-nrf -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}')
+          vol=$(docker inspect nextgcore-nrf -f '{{range .Mounts}}{{if eq .Destination "/etc/nextgcore/cca-public"}}{{.Name}}{{end}}{{end}}')
+          test -n "$vol" || { echo "::error::the NRF has no cca-public volume; is the overlay applied?"; exit 1; }
+          docker run --rm --network "$net" -v "$vol:/cca-public" \
+            -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
+            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=refused:unauthorized_client \
+            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2.txt
+          ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2.txt \
+            'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP tokenless status=401 (expected)' \
+            'ROUNDTRIP token refused status=400 error=unauthorized_client (expected); failed closed' \
+            'ROUNDTRIP OK mode=oauth2'
+          # The granted path, proved against the same real NRF and nwdafd: the
+          # client registered as NEF, a type nwdafd allows today (positive
+          # control until #1412 lets the AF arm above expect a grant).
+          docker run --rm --network "$net" -v "$vol:/cca-public" \
+            -v "$GITHUB_WORKSPACE/nextgsim/target/release/sbi-roundtrip:/usr/local/bin/sbi-roundtrip:ro" \
+            -e MODE=oauth2 -e CCA_PUBLIC_JWK_DIR=/cca-public -e EXPECT_TOKEN=granted \
+            -e NF_TYPE=NEF -e NF_INSTANCE_ID=6b1d7e3c-0000-4000-8000-00000000457e \
+            -e CCA_KEY_FILE=/tmp/nef-cca.key \
+            -e NRF_URI=http://172.23.0.10:7777 -e NWDAF_URI=http://172.23.0.30:7777 \
+            ubuntu:24.04 /usr/local/bin/sbi-roundtrip | tee /tmp/sbi-oauth2-granted.txt
+          ../../../nextgsim/scripts/assert-ordered.sh /tmp/sbi-oauth2-granted.txt \
+            'ROUNDTRIP nrf-register status=20' \
+            'ROUNDTRIP nrf-discover status=200 nwdaf-instances=1' \
+            'ROUNDTRIP tokenless status=401 (expected)' \
+            'ROUNDTRIP token granted target=NWDAF scope=nnwdaf-analyticsinfo' \
+            'ROUNDTRIP nwdaf-analytics status=20' \
+            'ROUNDTRIP OK mode=oauth2'
+
       - name: Collect logs on failure
         if: failure()
         run: |
           cd nextgcore/docker/rust
+          docker compose logs --tail=100 nrf || true
+          docker compose logs --tail=100 nwdaf || true
           docker compose logs --tail=100 amf || true
           docker compose logs --tail=100 gnb || true
           docker compose logs --tail=100 ue || true

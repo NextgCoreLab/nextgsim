@@ -11,6 +11,11 @@ description = "5G gNB (gNodeB) simulator binary"
 workspace = true
 
 [features]
+# The h2c SBI client a 6G task uses to call nextgcore NFs (#457). Off by default,
+# so a default build has no HTTP/2 stack; CI checks that with cargo tree. The
+# first consumer (the RAN -> nwdafd demo) wires it in.
+sbi-client = ["dep:nextgsim-sbi-client"]
+
 # In-process topic pub/sub bus for cross-cutting 6G observations (issue #16).
 # Off by default; forwards to nextgsim-common's own feature.
 event-bus = ["nextgsim-common/event-bus"]
@@ -67,6 +72,7 @@ path = "src/lib.rs"
 
 [dependencies]
 nextgsim-common.workspace = true
+nextgsim-sbi-client = { workspace = true, optional = true }
 nextgsim-demo.workspace = true
 nextgsim-crypto.workspace = true
 nextgsim-ngap.workspace = true
