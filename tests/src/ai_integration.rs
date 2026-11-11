@@ -140,7 +140,7 @@ fn test_nwdaf_measurement_collection() {
     manager.record_measurement(UeMeasurement {
         ue_id: 1,
         rsrp: -80.0,
-        rsrq: -10.0,
+        rsrq: Some(-10.0),
         sinr: Some(15.0),
         position: NwdafVector3::new(0.0, 0.0, 0.0),
         velocity: Some(NwdafVector3::new(10.0, 5.0, 0.0)),
@@ -151,7 +151,7 @@ fn test_nwdaf_measurement_collection() {
     manager.record_measurement(UeMeasurement {
         ue_id: 1,
         rsrp: -82.0,
-        rsrq: -11.0,
+        rsrq: Some(-11.0),
         sinr: Some(14.0),
         position: NwdafVector3::new(1.0, 0.5, 0.0),
         velocity: Some(NwdafVector3::new(10.0, 5.0, 0.0)),
@@ -162,7 +162,7 @@ fn test_nwdaf_measurement_collection() {
     manager.record_measurement(UeMeasurement {
         ue_id: 1,
         rsrp: -84.0,
-        rsrq: -12.0,
+        rsrq: Some(-12.0),
         sinr: Some(13.0),
         position: NwdafVector3::new(2.0, 1.0, 0.0),
         velocity: Some(NwdafVector3::new(10.0, 5.0, 0.0)),
@@ -217,7 +217,7 @@ fn test_nwdaf_handover_recommendation() {
     manager.record_measurement(UeMeasurement {
         ue_id: 1,
         rsrp: -100.0, // Very weak signal
-        rsrq: -18.0,
+        rsrq: Some(-18.0),
         sinr: Some(2.0),
         position: NwdafVector3::new(0.0, 0.0, 0.0),
         velocity: None,

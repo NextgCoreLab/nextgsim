@@ -442,13 +442,14 @@ impl Anlf {
             ts,
         ));
 
-        // Check RSRQ
-        anomalies.extend(self.anomaly_detector.check(
-            "rsrq",
-            &entity_id,
-            f64::from(measurement.rsrq),
-            ts,
-        ));
+        // Check RSRQ if available. A measurement without one adds nothing to
+        // the RSRQ series rather than a placeholder that would skew it (#453).
+        if let Some(rsrq) = measurement.rsrq {
+            anomalies.extend(
+                self.anomaly_detector
+                    .check("rsrq", &entity_id, f64::from(rsrq), ts),
+            );
+        }
 
         // Check SINR if available
         if let Some(sinr) = measurement.sinr {
@@ -824,13 +825,16 @@ impl Anlf {
                 // Derive metrics from RSRP/RSRQ
                 let avg_rsrp =
                     history.all().iter().map(|m| m.rsrp).sum::<f32>() / history.len() as f32;
+                // RSRQ over the samples that carry one (#453). With none, the
+                // loss estimate falls back to RSRP, which every sample has.
+                let rsrqs: Vec<f32> = history.all().iter().filter_map(|m| m.rsrq).collect();
                 let avg_rsrq =
-                    history.all().iter().map(|m| m.rsrq).sum::<f32>() / history.len() as f32;
+                    (!rsrqs.is_empty()).then(|| rsrqs.iter().sum::<f32>() / rsrqs.len() as f32);
 
                 // Better signal -> lower latency, higher throughput
                 let latency = 20.0 + ((-avg_rsrp - 60.0).max(0.0) / 2.0);
                 let throughput = (100.0 + avg_rsrp).max(10.0);
-                let loss = if avg_rsrq < -15.0 { 0.02 } else { 0.001 };
+                let loss = packet_loss_estimate(avg_rsrq, avg_rsrp);
                 let success = 1.0 - loss;
 
                 (latency, throughput, loss, success)
@@ -1177,12 +1181,14 @@ impl Anlf {
 
                 let current_qos = QosMetrics {
                     avg_latency_ms: 20.0 + ((-avg_rsrp - 60.0).max(0.0) / 2.0),
-                    packet_loss_rate: if latest.rsrq < -15.0 { 0.02 } else { 0.001 },
+                    packet_loss_rate: packet_loss_estimate(latest.rsrq, latest.rsrp),
                     throughput_mbps: (100.0 + avg_rsrp).max(10.0),
                 };
 
                 // QoS sustainable if signal quality is good
-                let sustainable = latest.rsrp > -90.0 && latest.rsrq > -12.0;
+                // Without RSRQ (#453) the judgement rests on RSRP alone.
+                let sustainable =
+                    latest.rsrp > -90.0 && latest.rsrq.is_none_or(|rsrq| rsrq > -12.0);
                 let remaining_time_ms = if !sustainable {
                     Some(180_000) // 3 minutes
                 } else {
@@ -1557,6 +1563,30 @@ impl Default for Anlf {
 }
 
 /// Simple linear trend extrapolation for load values
+/// RSRQ (dB) below which the loss heuristic treats the link as poor.
+const POOR_RSRQ_DB: f32 = -15.0;
+
+/// RSRP (dBm) below which the loss heuristic treats the link as poor when no
+/// RSRQ is available (#453): roughly the cell edge, and the same "poor" band the
+/// RSRQ threshold stands for. A heuristic, like the latency and throughput
+/// mappings beside it, not a 3GPP figure.
+const POOR_RSRP_DBM: f32 = -110.0;
+
+/// The packet-loss heuristic: 2% on a poor link, 0.1% otherwise. RSRQ decides
+/// when there is one; without it (#453) RSRP does, since every measurement
+/// carries RSRP and none may carry RSRQ.
+fn packet_loss_estimate(rsrq_db: Option<f32>, rsrp_dbm: f32) -> f32 {
+    let poor = match rsrq_db {
+        Some(rsrq) => rsrq < POOR_RSRQ_DB,
+        None => rsrp_dbm < POOR_RSRP_DBM,
+    };
+    if poor {
+        0.02
+    } else {
+        0.001
+    }
+}
+
 fn simple_load_trend(values: &[f32], steps: usize) -> Vec<f32> {
     if values.len() < 2 {
         return vec![values.last().copied().unwrap_or(0.0); steps];
@@ -1592,7 +1622,7 @@ mod tests {
             let meas = UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -1606,7 +1636,7 @@ mod tests {
         let meas = UeMeasurement {
             ue_id: 1,
             rsrp: -80.0,
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: Vector3::new(20.0, 0.0, 0.0),
             velocity: None,
@@ -1626,7 +1656,7 @@ mod tests {
             let meas = UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -1640,7 +1670,7 @@ mod tests {
         let meas = UeMeasurement {
             ue_id: 1,
             rsrp: -30.0, // huge spike from baseline of -80
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: Vector3::new(30.0, 0.0, 0.0),
             velocity: None,
@@ -1662,7 +1692,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, i as f64 * 5.0, 0.0),
                 velocity: None,
@@ -1743,7 +1773,7 @@ mod tests {
             let meas = UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(0.0, 0.0, 0.0),
                 velocity: None,
@@ -1757,7 +1787,7 @@ mod tests {
         let meas = UeMeasurement {
             ue_id: 1,
             rsrp: -30.0,
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: Vector3::new(0.0, 0.0, 0.0),
             velocity: None,
@@ -1788,7 +1818,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -1865,7 +1895,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -75.0,
-                rsrq: -9.0,
+                rsrq: Some(-9.0),
                 sinr: Some(18.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -2119,7 +2149,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -70.0,
-                rsrq: -8.0,
+                rsrq: Some(-8.0),
                 sinr: Some(20.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -2157,7 +2187,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -110.0,
-                rsrq: -18.0,
+                rsrq: Some(-18.0),
                 sinr: Some(2.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -2182,6 +2212,120 @@ mod tests {
         } else {
             panic!("Expected QosSustainability payload");
         }
+    }
+
+    /// A UE measurement with only RSRP, as the simulator's RLS produces (#453).
+    fn rsrp_only(ue_id: i32, rsrp: f32, i: u64) -> UeMeasurement {
+        UeMeasurement {
+            ue_id,
+            rsrp,
+            rsrq: None,
+            sinr: None,
+            position: Vector3::new(i as f64, 0.0, 0.0),
+            velocity: None,
+            serving_cell_id: 1,
+            timestamp_ms: i * 100,
+        }
+    }
+
+    /// #453: without RSRQ the anomaly check runs on RSRP alone. An RSRP spike
+    /// is still caught, and no RSRQ series is fed with a placeholder.
+    #[test]
+    fn an_rsrq_less_series_is_checked_on_rsrp_alone() {
+        let mut anlf = Anlf::new();
+        for i in 0..30 {
+            let _ = anlf.process_measurement(&rsrp_only(1, -80.0, i));
+        }
+        let anomalies = anlf.process_measurement(&rsrp_only(1, -30.0, 30));
+        assert!(
+            anomalies.iter().any(|a| a.metric_name == "rsrp"),
+            "the RSRP spike is still detected: {anomalies:?}"
+        );
+        assert!(anomalies.iter().all(|a| a.metric_name != "rsrq"));
+    }
+
+    /// #453: service experience without RSRQ takes its loss estimate from RSRP,
+    /// so a cell-edge UE is not reported with a good link's loss.
+    #[test]
+    fn service_experience_without_rsrq_takes_loss_from_rsrp() {
+        let mut anlf = Anlf::new();
+        let mut collector = DataCollector::new(100);
+        for i in 0..10 {
+            collector.report_ue_measurement(rsrp_only(1, -75.0, i));
+            collector.report_ue_measurement(rsrp_only(2, -120.0, i));
+        }
+
+        let success = |anlf: &mut Anlf, ue_id| {
+            let result = anlf
+                .analyze_service_experience(&AnalyticsTarget::Ue { ue_id }, &collector)
+                .expect("RSRP-only history is enough");
+            match result.payload {
+                AnalyticsPayload::ServiceExperience { metrics, .. } => metrics.success_rate,
+                other => panic!("expected ServiceExperience, got {other:?}"),
+            }
+        };
+        assert_eq!(success(&mut anlf, 1), 1.0 - 0.001, "good RSRP, good link");
+        assert_eq!(
+            success(&mut anlf, 2),
+            1.0 - 0.02,
+            "cell-edge RSRP, poor link"
+        );
+    }
+
+    /// #453: RSRQ is averaged over the samples that carry it, never over
+    /// placeholders. One poor-RSRQ sample among RSRQ-less ones decides.
+    #[test]
+    fn service_experience_averages_rsrq_over_the_samples_that_have_it() {
+        let mut anlf = Anlf::new();
+        let mut collector = DataCollector::new(100);
+        for i in 0..9 {
+            collector.report_ue_measurement(rsrp_only(1, -75.0, i));
+        }
+        collector.report_ue_measurement(UeMeasurement {
+            rsrq: Some(-18.0),
+            ..rsrp_only(1, -75.0, 9)
+        });
+
+        let result = anlf
+            .analyze_service_experience(&AnalyticsTarget::Ue { ue_id: 1 }, &collector)
+            .expect("should succeed");
+        let AnalyticsPayload::ServiceExperience { metrics, .. } = result.payload else {
+            panic!("expected ServiceExperience");
+        };
+        assert_eq!(metrics.success_rate, 1.0 - 0.02);
+    }
+
+    /// #453: QoS sustainability without RSRQ is judged on RSRP alone.
+    #[test]
+    fn qos_sustainability_without_rsrq_is_judged_on_rsrp() {
+        let mut anlf = Anlf::new();
+        let mut collector = DataCollector::new(100);
+        let mtlf = Mtlf::new();
+        for i in 0..15 {
+            collector.report_ue_measurement(rsrp_only(1, -70.0, i));
+            collector.report_ue_measurement(rsrp_only(2, -100.0, i));
+            collector.report_ue_measurement(rsrp_only(3, -120.0, i));
+        }
+
+        let verdict = |anlf: &mut Anlf, ue_id| {
+            let result = anlf
+                .analyze_qos_sustainability(&AnalyticsTarget::Ue { ue_id }, &collector, &mtlf)
+                .expect("RSRP-only history is enough");
+            match result.payload {
+                AnalyticsPayload::QosSustainability {
+                    sustainable,
+                    current_qos,
+                    ..
+                } => (sustainable, current_qos.packet_loss_rate),
+                other => panic!("expected QosSustainability, got {other:?}"),
+            }
+        };
+        assert_eq!(verdict(&mut anlf, 1), (true, 0.001));
+        // -100 dBm fails the -90 dBm sustainability bar but is above the
+        // -110 dBm poor-link bar, so the loss estimate stays low.
+        assert_eq!(verdict(&mut anlf, 2), (false, 0.001));
+        // Below -110 dBm the loss estimate falls back to RSRP and reads poor.
+        assert_eq!(verdict(&mut anlf, 3), (false, 0.02));
     }
 
     #[test]
@@ -2219,7 +2363,7 @@ mod tests {
             collector.report_ue_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: None,
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,

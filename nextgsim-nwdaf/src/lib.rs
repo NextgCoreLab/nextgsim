@@ -160,8 +160,16 @@ pub struct UeMeasurement {
     pub ue_id: i32,
     /// Reference Signal Received Power (dBm)
     pub rsrp: f32,
-    /// Reference Signal Received Quality (dB)
-    pub rsrq: f32,
+    /// Reference Signal Received Quality (dB), or `None` when the producer has
+    /// none (#453).
+    ///
+    /// Optional because RSRQ cannot be derived honestly from what every
+    /// producer has: TS 38.215 §5.1.3 defines it as N×RSRP/RSSI, and the
+    /// simulator's RLS channel model yields one received power and no RSSI. A
+    /// filler value would be invented data. Readers that would use it define
+    /// their behaviour without it; see `anlf`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rsrq: Option<f32>,
     /// Signal to Interference plus Noise Ratio (dB)
     pub sinr: Option<f32>,
     /// UE position
@@ -686,6 +694,22 @@ impl Default for NwdafManager {
 mod tests {
     use super::*;
 
+    /// `rsrq` is optional on the wire too (#453): a record without it reads as
+    /// `None`, one with it reads back the value, and `None` is not serialised.
+    #[test]
+    fn ue_measurement_rsrq_round_trips_through_serde() {
+        let base = r#"{"ue_id":1,"rsrp":-80.0,"sinr":null,"position":{"x":0.0,"y":0.0,"z":0.0},"velocity":null,"serving_cell_id":1,"timestamp_ms":0"#;
+        let without: UeMeasurement = serde_json::from_str(&format!("{base}}}")).unwrap();
+        assert_eq!(without.rsrq, None);
+        let with: UeMeasurement =
+            serde_json::from_str(&format!("{base},\"rsrq\":-10.0}}")).unwrap();
+        assert_eq!(with.rsrq, Some(-10.0));
+        assert!(!serde_json::to_string(&without).unwrap().contains("rsrq"));
+        assert!(serde_json::to_string(&with)
+            .unwrap()
+            .contains("\"rsrq\":-10.0"));
+    }
+
     // --- Original tests (backward compatibility) ---
 
     #[test]
@@ -703,7 +727,7 @@ mod tests {
             history.add(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0 + i as f32,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -725,7 +749,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -747,7 +771,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, i as f64 * 5.0, 0.0),
                 velocity: None,
@@ -776,7 +800,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, 0.0, 0.0),
                 velocity: None,
@@ -831,7 +855,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64, 0.0, 0.0),
                 velocity: None,
@@ -844,7 +868,7 @@ mod tests {
         manager.record_measurement(UeMeasurement {
             ue_id: 1,
             rsrp: -30.0, // huge spike
-            rsrq: -10.0,
+            rsrq: Some(-10.0),
             sinr: Some(15.0),
             position: Vector3::new(30.0, 0.0, 0.0),
             velocity: None,
@@ -892,7 +916,7 @@ mod tests {
             manager.record_measurement(UeMeasurement {
                 ue_id: 1,
                 rsrp: -80.0,
-                rsrq: -10.0,
+                rsrq: Some(-10.0),
                 sinr: Some(15.0),
                 position: Vector3::new(i as f64 * 10.0, i as f64 * 5.0, 0.0),
                 velocity: None,

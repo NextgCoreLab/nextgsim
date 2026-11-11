@@ -92,12 +92,18 @@ impl NwdafTask {
 
     /// Handles a UE measurement report.
     ///
-    /// A report without RSRP/RSRQ is **not** recorded as a measurement. The
-    /// analytics layer's `UeMeasurement` requires both as `f32`, so recording a
-    /// position-only report means inventing values, and there is no safe filler:
-    /// 0.0 reads as an implausibly strong signal, and any "typical" constant
-    /// makes the series artificially stable so the z-score anomaly detector can
-    /// never fire. Such reports are logged and dropped instead.
+    /// A report without RSRP is **not** recorded as a measurement: RSRP is what
+    /// every analytics reader needs, and there is no safe filler for it. 0.0
+    /// reads as an implausibly strong signal, and any "typical" constant makes
+    /// the series artificially stable so the z-score anomaly detector can never
+    /// fire. Such reports (the ISAC task's position-only ones) are logged and
+    /// dropped.
+    ///
+    /// RSRQ is optional (#453). No live producer has one: TS 38.215 §5.1.3
+    /// defines it as N×RSRP/RSSI and the RLS channel model has no RSSI, so the
+    /// RLS and RRC reports carry `None`. The analytics layer defines its own
+    /// behaviour without it, so the report is recorded with `rsrq: None` rather
+    /// than dropped or filled in.
     fn handle_ue_measurement(
         &mut self,
         ue_id: i32,
@@ -105,9 +111,9 @@ impl NwdafTask {
         rsrq: Option<f32>,
         position: (f32, f32, f32),
     ) {
-        let (Some(rsrp), Some(rsrq)) = (rsrp, rsrq) else {
+        let Some(rsrp) = rsrp else {
             debug!(
-                "NWDAF: UE {ue_id} report carries no RSRP/RSRQ (pos=({}, {}, {})); \
+                "NWDAF: UE {ue_id} report carries no RSRP (pos=({}, {}, {})); \
                  not recording a radio measurement",
                 position.0, position.1, position.2
             );
@@ -115,7 +121,7 @@ impl NwdafTask {
         };
 
         debug!(
-            "NWDAF: UE {} measurement - RSRP={} dBm, RSRQ={} dB, pos=({}, {}, {})",
+            "NWDAF: UE {} measurement - RSRP={} dBm, RSRQ={:?} dB, pos=({}, {}, {})",
             ue_id, rsrp, rsrq, position.0, position.1, position.2
         );
 
@@ -465,14 +471,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_position_only_report_is_not_recorded_as_a_measurement() {
-        // Regression: the ISAC task is the only live producer of UeMeasurement
-        // and it has no serving-cell RSRP/RSRQ. It used to send 0.0 for both,
-        // so the analytics layer recorded a constant 0 dBm series -- physically
-        // implausible AND perfectly stable, meaning the z-score anomaly detector
-        // could never fire while appearing to have real data to work on.
-        //
-        // A report with no radio measurement must not become a measurement.
+    async fn a_report_without_rsrp_is_not_recorded_as_a_measurement() {
+        // Regression: the ISAC task sends position-only reports. It used to send
+        // 0.0 for RSRP, so the analytics layer recorded a constant 0 dBm series
+        // -- physically implausible AND perfectly stable, so the z-score anomaly
+        // detector could never fire. A report without RSRP must not become a
+        // measurement, whether or not it carries RSRQ.
         let config = test_config();
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
@@ -481,25 +485,76 @@ mod tests {
 
         // Position-only, exactly what ISAC forwards.
         task.handle_ue_measurement(7, None, None, (10.0, 20.0, 0.0));
+        // RSRQ alone is no better: there is no RSRP series to put it beside.
+        task.handle_ue_measurement(7, None, Some(-10.0), (10.0, 20.0, 0.0));
         assert!(
             task.nwdaf.get_ue_history(7).is_none(),
-            "a report without RSRP/RSRQ must not be recorded as a measurement"
+            "a report without RSRP must not be recorded as a measurement"
         );
+    }
 
-        // A partial report is equally unusable.
-        task.handle_ue_measurement(7, Some(-80.0), None, (10.0, 20.0, 0.0));
-        assert!(
-            task.nwdaf.get_ue_history(7).is_none(),
-            "a report missing RSRQ must not be recorded either"
-        );
+    /// A report that does carry RSRQ keeps it: making RSRQ optional must not
+    /// drop a measured value (#453 review).
+    #[tokio::test]
+    async fn a_report_with_rsrq_keeps_it() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NwdafTask::new(task_base);
 
-        // A complete report still is.
-        task.handle_ue_measurement(7, Some(-80.0), Some(-10.0), (10.0, 20.0, 0.0));
-        assert_eq!(
-            task.nwdaf.get_ue_history(7).map(|h| h.len()),
-            Some(1),
-            "a complete report must be recorded"
-        );
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TaskMessage::Message(NwdafMessage::UeMeasurement {
+            ue_id: 4,
+            rsrp: Some(-80.0),
+            rsrq: Some(-10.0),
+            position: (1.0, 2.0, 0.0),
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        task.run(rx).await;
+
+        let sample = task
+            .nwdaf
+            .get_ue_history(4)
+            .and_then(|h| h.latest())
+            .expect("a complete report is recorded");
+        assert_eq!(sample.rsrp, -80.0);
+        assert_eq!(sample.rsrq, Some(-10.0), "the measured RSRQ is kept");
+    }
+
+    /// #453: an RSRP-only report -- what the RLS heartbeat forward and the RRC
+    /// MeasurementReport path send, because the simulator has no RSSI to derive
+    /// RSRQ from -- is recorded, through the task's own message dispatch, with
+    /// the RSRP and position it carried and `rsrq: None`.
+    #[tokio::test]
+    async fn an_rsrp_only_report_is_recorded_with_no_rsrq() {
+        let config = test_config();
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NwdafTask::new(task_base);
+
+        let (tx, rx) = mpsc::channel(4);
+        tx.send(TaskMessage::Message(NwdafMessage::UeMeasurement {
+            ue_id: 3,
+            rsrp: Some(-87.0),
+            rsrq: None,
+            position: (10.0, 20.0, 0.0),
+        }))
+        .await
+        .unwrap();
+        tx.send(TaskMessage::Shutdown).await.unwrap();
+        task.run(rx).await;
+
+        let history = task
+            .nwdaf
+            .get_ue_history(3)
+            .expect("the RSRP-only report must be recorded");
+        assert_eq!(history.len(), 1);
+        let sample = history.latest().expect("one sample");
+        assert_eq!(sample.rsrp, -87.0);
+        assert_eq!(sample.rsrq, None, "no RSRQ invented");
+        assert_eq!((sample.position.x, sample.position.y), (10.0, 20.0));
     }
 
     #[tokio::test]
