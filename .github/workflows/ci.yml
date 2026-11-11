@@ -375,11 +375,16 @@ jobs:
       # The 6G end-to-end tests (tests/src/sixg_task_integration.rs) only compile
       # under the integration crate's `6g` feature. No job built them, so they
       # stopped compiling in September and nobody saw it (#319).
+      # Demo d447a-nkef-live (#488): the NKEF live tees, SBA client and bundle
+      # are behind `nkef-sba`, which no other job enables.
+      - name: cargo test (6g + nkef-sba)
+        run: cargo test -p nextgsim-gnb --features 6g,nkef-sba
       - name: cargo test (6g end to end)
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
         run: |
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
+          cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 

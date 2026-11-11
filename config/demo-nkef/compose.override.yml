@@ -1,0 +1,18 @@
+# Demo d447a-nkef-live (nextgsim#488): an override of nextgcore's standalone
+# docker/rust/docker-compose.demo-n2ho.yml, used only by scripts/demo/nkef-check.sh:
+#
+#   docker compose -f $NEXTGCORE/docker/rust/docker-compose.demo-n2ho.yml \
+#                  -f config/demo-nkef/compose.override.yml up -d
+#
+# One gNB (gnb-west, with this directory's gnb.yaml: NKEF on, the demo block, the
+# nkef_live block) and the stationary UE of config/ue.yaml. gnb-east is parked
+# behind a profile, so nothing hands over. It adds no port and no network: the
+# stack stays on the n2ho file's internal bridge, which the check asserts on the
+# rendered model. The gNB image must be built with `--features 6g,nkef-sba`.
+services:
+  gnb-west:
+    command: ["-c", "/etc/nextgsim/demo-nkef/gnb.yaml"]
+  gnb-east:
+    profiles: ["n2ho"]
+  ue:
+    command: ["-c", "/etc/nextgsim/ue.yaml"]

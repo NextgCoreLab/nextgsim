@@ -653,6 +653,8 @@ impl RlsTask {
         let Some(&ue_id) = self.sti_to_ue_id.get(&sti) else {
             return;
         };
+        #[cfg(feature = "nextgsim-nkef")]
+        crate::nkef::live::offer_ue_radio(&self.task_base, ue_id as i32, ack.dbm as i32);
 
         let msg = NwdafMessage::UeMeasurement {
             ue_id,
@@ -701,6 +703,9 @@ impl RlsTask {
 
         let cell_id = self.task_base.config.cell_id() as i32;
         let connected_ues = self.ue_addresses.len() as u32;
+        // RLS tee of demo d447a-nkef-live (nextgsim#488): the same measured window.
+        #[cfg(feature = "nextgsim-nkef")]
+        crate::nkef::live::offer_cell_load(&self.task_base, connected_ues, throughput_mbps);
         let msg = NwdafMessage::CellLoad {
             cell_id,
             prb_usage: None,

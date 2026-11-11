@@ -62,6 +62,12 @@ sdap-dataplane = []
     "nextgsim-fl",
 ]
 
+# Demo d447a-nkef-live (nextgsim#488): NKEF's live RLS / N2 tees, its h2c SBA
+# client toward amfd and the NRF, and the bundle answer to `nr-cli nkef-query`.
+# Off by default, and inert unless the config's `demo.d447a-nkef-live` block
+# also enables it (the #458 toggle convention).
+nkef-sba = ["nextgsim-nkef", "sbi-client"]
+
 [[bin]]
 name = "nr-gnb"
 path = "src/main.rs"

@@ -25,6 +25,10 @@
 - [Gap Analysis: 6G](gaps/6g-gap-analysis.md)
 - [Gap Analysis: Protocols](gaps/gap-protocols.md)
 
+# Demos
+
+- [D447A: live-state knowledge exposure](demos/d447a-nkef-live.md)
+
 # Community
 
 - [Contributing](contributing.md)

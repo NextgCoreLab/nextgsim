@@ -1213,6 +1213,34 @@ pub enum NkefMessage {
         /// Maximum context tokens
         max_tokens: u32,
     },
+    /// A live fact from a tee (RLS, NGAP) or the SBA client (nextgsim#488).
+    #[cfg(feature = "nextgsim-nkef")]
+    LiveFact(nextgsim_nkef::live::Fact),
+    /// One NRF discovery poll: the instances it returned, at `at_ms`. Any
+    /// instance an earlier poll returned and this one did not expires.
+    #[cfg(feature = "nextgsim-nkef")]
+    NrfPoll {
+        /// The NF instance facts this poll returned.
+        facts: Vec<nextgsim_nkef::live::Fact>,
+        /// When the poll answered, ms since the epoch.
+        at_ms: u64,
+    },
+    /// `nr-cli nkef-query`: answer `question` for `consumer` on `reply`.
+    #[cfg(feature = "nextgsim-nkef")]
+    Query {
+        /// The question.
+        question: String,
+        /// Who asks.
+        consumer: nextgsim_nkef::live::Consumer,
+        /// The bundle, or why there is none.
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// `nr-cli nkef-status`.
+    #[cfg(feature = "nextgsim-nkef")]
+    Status {
+        /// The status line.
+        reply: tokio::sync::oneshot::Sender<String>,
+    },
 }
 
 /// Messages for the Integrated Sensing and Communication (ISAC) task.
