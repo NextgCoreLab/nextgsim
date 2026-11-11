@@ -8873,7 +8873,11 @@ mod tests {
 
         task.handle_handover_request(1, 8, ho_req).await;
 
-        assert!(asked.await.unwrap(), "asked as a load-balancing request");
+        let asked = tokio::time::timeout(std::time::Duration::from_secs(5), asked)
+            .await
+            .expect("NGAP must ask the Agent task before admitting")
+            .unwrap();
+        assert!(asked, "asked as a load-balancing request");
         let failure = drain_sctp(&mut sctp_rx)
             .iter()
             .find_map(|b| {
