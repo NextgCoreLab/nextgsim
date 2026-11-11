@@ -340,11 +340,8 @@ mod tests {
         use nextgsim_ngap::procedures::{Guami, NgSetupResponseData, ServedGuamiItem};
         use nextgsim_nkef::live::Consumer;
 
-        let _ = crate::demo::init(
-            "demo:\n  enabled: true\n  d447a-nkef-live:\n    enabled: true\n    mode: \"on\"\n",
-        );
-        let rt = nextgsim_demo::installed().expect("installed");
-        assert_eq!(rt.mode(D447A_KEY).as_deref(), Some("on"));
+        let _lock = crate::demo::D447A_TEST_LOCK.lock().await;
+        let rt = demo_on();
 
         let config = GnbConfig {
             nkef_enabled: true,
@@ -426,5 +423,220 @@ mod tests {
 
         nkef.shutdown().await.ok();
         handle.await.unwrap();
+    }
+
+    /// Install d447a-nkef-live in mode `on` (once per process) and return it.
+    #[cfg(feature = "nkef-sba")]
+    fn demo_on() -> &'static nextgsim_demo::DemoRuntime {
+        let _ = crate::demo::init(
+            "demo:\n  enabled: true\n  d447a-nkef-live:\n    enabled: true\n    mode: \"on\"\n",
+        );
+        let rt = nextgsim_demo::installed().expect("installed");
+        assert_eq!(rt.mode(crate::demo::D447A_KEY).as_deref(), Some("on"));
+        rt
+    }
+
+    #[cfg(feature = "nkef-sba")]
+    fn nf(id: &str, ty: &str) -> nextgsim_nkef::live::Fact {
+        use nextgsim_nkef::live::{Domain, Fact, FactKind};
+        Fact::new(
+            Domain::Sba,
+            FactKind::NfInstance,
+            "nrf",
+            format!("nf-{id}"),
+            now_ms(),
+        )
+        .with("nfInstanceId", id)
+        .with("nfType", ty)
+        .with("nfStatus", "REGISTERED")
+    }
+
+    /// nextgsim#488 review M1: the running task expires an NF the NRF poll no
+    /// longer returns (with an RFC 3339 `expired_at`), keeps it, and makes it live
+    /// again when a later poll returns it.
+    ///
+    /// REVERT-VERIFIED: emptying the `expire_missing` loop in `handle_nrf_poll`
+    /// fails the second assertion.
+    #[cfg(feature = "nkef-sba")]
+    #[tokio::test]
+    async fn an_nrf_poll_that_drops_an_nf_expires_its_fact() {
+        use nextgsim_nkef::live::Consumer;
+        let _lock = crate::demo::D447A_TEST_LOCK.lock().await;
+        demo_on();
+        let mut task = NkefTask::new(GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY).0);
+        let bsf_line = |text: &str| {
+            text.lines()
+                .find(|l| l.contains("nfType=BSF"))
+                .unwrap_or_else(|| panic!("no BSF fact: {text}"))
+                .to_string()
+        };
+        task.handle_nrf_poll(vec![nf("amf-1", "AMF"), nf("bsf-1", "BSF")], now_ms());
+        let before = task.handle_query("bsf", Consumer::Internal).await.unwrap();
+        assert!(!bsf_line(&before).contains("expired_at"), "{before}");
+        task.handle_nrf_poll(vec![nf("amf-1", "AMF")], now_ms());
+        let after = task.handle_query("bsf", Consumer::Internal).await.unwrap();
+        let line = bsf_line(&after);
+        assert!(
+            line.contains("expired_at=20") && line.ends_with('Z'),
+            "the dropped BSF expires: {after}"
+        );
+        assert!(!after
+            .lines()
+            .find(|l| l.contains("nfType=AMF"))
+            .unwrap()
+            .contains("expired_at"));
+        task.handle_nrf_poll(vec![nf("amf-1", "AMF"), nf("bsf-1", "BSF")], now_ms());
+        let back = task.handle_query("bsf", Consumer::Internal).await.unwrap();
+        assert!(
+            !bsf_line(&back).contains("expired_at"),
+            "back is live again: {back}"
+        );
+    }
+
+    /// A fake h2c amfd: answers a subscribe with 201, a Location and `answer`, a
+    /// DELETE with 204, and records (method, path, body) of every request.
+    #[cfg(feature = "nkef-sba")]
+    async fn fake_amfd(
+        answer: serde_json::Value,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let seen = seen2.clone();
+                let answer = answer.clone();
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(sock).await else {
+                        return;
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        // Each request on its own task: the connection is only
+                        // driven while `accept` is polled.
+                        let seen = seen.clone();
+                        let answer = answer.clone();
+                        tokio::spawn(async move {
+                            let (parts, mut body) = req.into_parts();
+                            let mut buf = Vec::new();
+                            while let Some(Ok(chunk)) = body.data().await {
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                                buf.extend_from_slice(&chunk);
+                            }
+                            let method = parts.method.to_string();
+                            seen.lock().unwrap().push((
+                                method.clone(),
+                                parts.uri.path().to_string(),
+                                String::from_utf8_lossy(&buf).into_owned(),
+                            ));
+                            let (status, out) = if method == "POST" {
+                                (201, serde_json::to_vec(&answer).unwrap())
+                            } else {
+                                (204, Vec::new())
+                            };
+                            let resp = http::Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .header("location", "/namf-evts/v1/subscriptions/488")
+                                .body(())
+                                .unwrap();
+                            let empty = out.is_empty();
+                            let Ok(mut stream) = respond.send_response(resp, empty) else {
+                                return;
+                            };
+                            if !empty {
+                                let _ = stream.send_data(bytes::Bytes::from(out), true);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    #[cfg(feature = "nkef-sba")]
+    fn report_list(with_timestamp: bool) -> serde_json::Value {
+        let mut nr = serde_json::json!({
+            "tai": { "plmnId": { "mcc": "999", "mnc": "70" }, "tac": "000001" },
+            "ncgi": { "plmnId": { "mcc": "999", "mnc": "70" }, "nrCellId": "000000010" }
+        });
+        if with_timestamp {
+            nr["ueLocationTimestamp"] =
+                serde_json::json!(nextgsim_nkef::live::rfc3339_ms(now_ms() + 1_000));
+        }
+        serde_json::json!({ "subscriptionId": "488", "reportList": [
+            { "type": "LOCATION_REPORT", "location": { "nrLocation": nr } },
+            { "type": "CONNECTIVITY_STATE_REPORT",
+              "cmInfoList": [{ "cmState": "CONNECTED", "accessType": "3GPP_ACCESS" }] }
+        ]})
+    }
+
+    /// nextgsim#488 review M2: a query refreshes the AMF's reports through the
+    /// real SBA client against an h2c amfd: one POST asking immediate reports
+    /// for both events at the closed notify URI, then a DELETE of the Location,
+    /// and the bundle reads them (`sba`, `consistent=true`, `cm=CONNECTED`,
+    /// `stale=false`). Without a `ueLocationTimestamp` consistency is
+    /// `unknown`; without an `amf_sbi_uri` there is no `sba` at all.
+    ///
+    /// REVERT-VERIFIED: replacing `sba.amf_reports()` in `handle_query` with an
+    /// empty list fails the header assertion.
+    #[cfg(feature = "nkef-sba")]
+    #[tokio::test]
+    async fn a_query_reads_the_amfs_immediate_reports_and_unsubscribes() {
+        use nextgsim_nkef::live::Consumer;
+        let _lock = crate::demo::D447A_TEST_LOCK.lock().await;
+        demo_on();
+        for with_ts in [true, false] {
+            let (uri, seen) = fake_amfd(report_list(with_ts)).await;
+            let mut config = test_config();
+            config.nkef_live.amf_sbi_uri = Some(uri);
+            config.nkef_live.supi = Some("imsi-999700000000001".into());
+            let mut task = NkefTask::new(GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY).0);
+            let text = task
+                .handle_query("route", Consumer::Internal)
+                .await
+                .unwrap();
+            let header = text.lines().next().unwrap();
+            if with_ts {
+                assert!(
+                    header
+                        .starts_with("NKEF bundle consumer=internal domains=sba consistent=true ")
+                        && header.contains(" cm=CONNECTED stale=false "),
+                    "{text}"
+                );
+            } else {
+                assert!(header.contains(" consistent=unknown "), "{text}");
+            }
+            let seen = seen.lock().unwrap().clone();
+            assert_eq!(seen.len(), 2, "{seen:?}");
+            assert_eq!(
+                (seen[0].0.as_str(), seen[0].1.as_str()),
+                ("POST", "/namf-evts/v1/subscriptions")
+            );
+            let body: serde_json::Value = serde_json::from_str(&seen[0].2).unwrap();
+            let sub = &body["subscription"];
+            assert_eq!(sub["eventNotifyUri"], crate::nkef::sba::CLOSED_NOTIFY_URI);
+            let events = sub["eventList"].as_array().unwrap();
+            assert_eq!(events.len(), 2);
+            assert!(events.iter().all(|e| e["immediateFlag"] == true), "{body}");
+            assert_eq!(
+                (seen[1].0.as_str(), seen[1].1.as_str()),
+                ("DELETE", "/namf-evts/v1/subscriptions/488")
+            );
+        }
+        // No AMF URI: no SBA client, no sba domain.
+        let mut task = NkefTask::new(GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY).0);
+        let text = task
+            .handle_query("route", Consumer::Internal)
+            .await
+            .unwrap();
+        assert!(
+            text.starts_with("NKEF bundle consumer=internal domains=none "),
+            "{text}"
+        );
     }
 }

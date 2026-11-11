@@ -61,6 +61,9 @@ pub fn ngap_guami_key(plmn: [u8; 3], region: u8, set: u16, pointer: u8) -> Strin
 
 /// RLS tee: the cell's measured load over the last window.
 pub fn offer_cell_load(base: &GnbTaskBase, connected_ues: u32, throughput_mbps: Option<f32>) {
+    if !tees_on() {
+        return;
+    }
     let nci = base.config.nci;
     offer(
         base,
@@ -81,6 +84,9 @@ pub fn offer_cell_load(base: &GnbTaskBase, connected_ues: u32, throughput_mbps: 
 
 /// RLS tee: a UE's serving cell and received power.
 pub fn offer_ue_radio(base: &GnbTaskBase, ue_id: i32, rsrp_dbm: i32) {
+    if !tees_on() {
+        return;
+    }
     offer(
         base,
         Fact::new(
@@ -101,6 +107,9 @@ pub fn offer_ng_setup(
     amf_id: i32,
     response: &nextgsim_ngap::procedures::NgSetupResponseData,
 ) {
+    if !tees_on() {
+        return;
+    }
     let now = now_ms();
     offer(
         base,
@@ -139,6 +148,9 @@ pub fn offer_ng_setup(
 
 /// N2 tee: a UE's association with the AMF.
 pub fn offer_ue_n2(base: &GnbTaskBase, ue_id: i32, amf_ctx_id: i32, amf_ue_ngap_id: i64) {
+    if !tees_on() {
+        return;
+    }
     offer(
         base,
         Fact::new(

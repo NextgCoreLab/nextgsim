@@ -34,6 +34,9 @@ use crate::tasks::{NkefMessage, TaskHandle};
 /// notification can reach anything and NKEF needs no listener.
 pub const CLOSED_NOTIFY_URI: &str = "http://127.0.0.1:9/nkef-notify";
 
+/// The whole amfd round (subscribe, unsubscribe) gets at most this long.
+pub const AMF_REPORTS_DEADLINE: Duration = Duration::from_secs(3);
+
 /// The requester type NKEF discovers as: it stands in for an operator-side
 /// exposure function.
 pub const REQUESTER_NF_TYPE: &str = "NEF";
@@ -53,15 +56,29 @@ impl Sba {
         Some(Self {
             client: Arc::new(SbiClient::new(SbiClientConfig {
                 timeout: Duration::from_secs(2),
-                retries: 1,
+                retries: 0,
                 ..SbiClientConfig::default()
             })),
             config: config.clone(),
         })
     }
 
-    /// Subscribe with `immediateFlag`, read the `reportList`, unsubscribe.
+    /// Subscribe with `immediateFlag`, read the `reportList`, unsubscribe, all
+    /// within [`AMF_REPORTS_DEADLINE`], so a blackholed amfd cannot stall the
+    /// query (and the CLI) past it.
     pub async fn amf_reports(&self) -> Vec<Fact> {
+        match tokio::time::timeout(AMF_REPORTS_DEADLINE, self.amf_reports_inner()).await {
+            Ok(facts) => facts,
+            Err(_) => {
+                warn!(
+                    "[demo:{D447A_KEY}] NKEF: amfd did not answer within {AMF_REPORTS_DEADLINE:?}"
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    async fn amf_reports_inner(&self) -> Vec<Fact> {
         let (Some(amf), Some(supi)) = (&self.config.amf_sbi_uri, &self.config.supi) else {
             return Vec::new();
         };

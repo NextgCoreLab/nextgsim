@@ -1707,6 +1707,8 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "h2",
+ "http",
  "log",
  "nextgsim-agent",
  "nextgsim-common",

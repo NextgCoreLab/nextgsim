@@ -111,3 +111,10 @@ serde_yaml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bytes.workspace = true
+
+[dev-dependencies]
+# A fake h2c amfd for the NKEF SBA tests (nextgsim#488); already in the lock
+# through nextgsim-sbi-client.
+h2 = "0.4"
+http = "1"
+bytes.workspace = true

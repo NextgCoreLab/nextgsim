@@ -21,6 +21,11 @@ pub const D447A_KEY: &str = "d447a-nkef-live";
 /// `internal` / `external` are per-query consumers, not modes.
 pub const D447A_MODES: &[&str] = &["on", "baseline"];
 
+/// Held by every test that reads or switches D447A's process-global mode, so a
+/// test that switches it to `baseline` cannot race one that expects `on`.
+#[cfg(all(test, feature = "nkef-sba"))]
+pub static D447A_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// The demos compiled into this binary.
 #[allow(clippy::vec_init_then_push)]
 pub fn registry() -> DemoRegistry {

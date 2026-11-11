@@ -44,8 +44,11 @@ sequenceDiagram
   deletes the subscription at once. The notify URI is a closed loopback port. NKEF
   also polls NRF discovery every `nrf_poll_secs`.
 - **Expiry.** The NRF returns only REGISTERED instances. When an NF stops
-  heartbeating, the NRF suspends it, the next poll no longer returns it, and its fact
-  gets `expired_at`. The fact is kept, so a consumer sees that the NF went away.
+  heartbeating, the NRF suspends it (`missed heartbeat, marking SUSPENDED`), the next
+  poll no longer returns it, and its fact gets `expired_at`. The fact is kept, so a
+  consumer sees that the NF went away, and it is live again if the NF comes back. The
+  checks kill the NF (SIGKILL): a graceful stop makes it NFDeregister, which also
+  expires the fact but is a different path from the suspension shown here.
 - **The join.** The path is `ue>cell>gnb>amf>nf-instance`: the UE's serving cell, this
   gNB, the AMF reached over N2, and the NRF instance whose `amfInfo.guamiList` holds
   that AMF's GUAMI.
@@ -101,7 +104,8 @@ port.
 ### EKS
 
 `deploy/eks/overlays/demo-d447a-nkef-live` in nextgcore (ClusterIP only), then
-`k8s/demo-check.sh d447a-nkef-live <on|baseline|off>`.
+`k8s/demo-check.sh d447a-nkef-live on`, `k8s/demo-check.sh d447a-nkef-live baseline`,
+and the demo-off control `k8s/demo-check.sh off off`.
 
 ## Results
 

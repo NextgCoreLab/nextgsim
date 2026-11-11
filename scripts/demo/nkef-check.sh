@@ -21,9 +21,9 @@
 #     burst, and no `imsi-`, `ncgi`, `nrCellId`, `tac`, `nci`, `ngap_id`,
 #     `172.23.` or UUID in either;
 #   - a runtime `set mode=bogus` is refused and audited, the mode stays `on`;
-#   - expiry: BSF has no `expired_at`; after `docker compose stop bsf` the NRF
-#     stops returning it and its fact shows `expired_at` within
-#     NKEF_EXPIRY_TIMEOUT seconds (the elapsed time is recorded);
+#   - expiry: BSF has no `expired_at`; after a SIGKILL of bsf (no graceful
+#     NFDeregister) the NRF logs `missed heartbeat, marking SUSPENDED` for it and
+#     its fact shows `expired_at` within 2 x heartBeatTimer + the 5 s poll;
 #   - restart: with the UE stopped and the gNB restarted, the bundle says
 #     `stale=true`.
 # Mode `baseline` switches the mode with nr-cli before any query and asserts the
@@ -33,7 +33,6 @@
 #   NEXTGCORE_DIR        nextgcore checkout (default ../nextgcore beside this repo)
 #   NR_CLI               an nr-cli binary for the gNB container (default target/release/nr-cli)
 #   DEMO_ARTEFACTS       where logs go (default /tmp/demo-artefacts/nkef/<mode>)
-#   NKEF_EXPIRY_TIMEOUT  seconds to wait for the stopped NF's expiry (default 90)
 #   NKEF_KEEP=1          leave the stack running
 # Exit status: 0 when every assertion holds, 1 otherwise (DEMO CHECK FAILED: ...).
 # `cond && ok || demo_fail ...` throughout: demo_fail is the else arm.
@@ -52,7 +51,6 @@ export NEXTGSIM_DIR="$sim"
 demo_artefacts "${DEMO_ARTEFACTS:-/tmp/demo-artefacts}/nkef/$mode"
 nr_cli="${NR_CLI:-$sim/target/release/nr-cli}"
 [ -x "$nr_cli" ] || { demo_fail "no nr-cli at $nr_cli (set NR_CLI)"; exit 1; }
-expiry_timeout="${NKEF_EXPIRY_TIMEOUT:-90}"
 key=d447a-nkef-live
 question='is my route congested and which core functions serve me?'
 
@@ -175,19 +173,31 @@ grep -q 'mode=on\|mode: on\|"on"\| on' "$DEMO_ARTEFACTS/show.txt" || demo_fail "
 demo_logs gnb-west "$DEMO_ARTEFACTS/gnb-west.log"
 grep -E '\[demo:d447a-nkef-live\] audit:.*bogus' "$DEMO_ARTEFACTS/gnb-west.log" || demo_fail "[demo] the refused set was not audited"
 
-# Expiry: the BSF before and after it stops heartbeating.
+# Expiry: the BSF before and after it stops heartbeating. SIGKILL, not `stop`:
+# a graceful bsfd shutdown NFDeregisters (bsfd lib.rs), which would prove
+# deregistration instead of the NRF's no-heartbeat suspension.
 ask before-stop.txt bsf instance
-grep -E 'nfType=BSF' "$DEMO_ARTEFACTS/before-stop.txt" | grep -q 'expired_at' && demo_fail "[expiry] BSF expired before the stop"
-grep -qE 'nfType=BSF' "$DEMO_ARTEFACTS/before-stop.txt" || demo_fail "[expiry] no BSF fact before the stop"
+bsf_line="$(grep -E 'nfType=BSF' "$DEMO_ARTEFACTS/before-stop.txt" | head -1)"
+[ -n "$bsf_line" ] || demo_fail "[expiry] no BSF fact before the stop"
+printf '%s\n' "$bsf_line" | grep -q 'expired_at' && demo_fail "[expiry] BSF expired before the stop"
+bsf_id="$(printf '%s\n' "$bsf_line" | grep -oE 'nfInstanceId=[0-9a-f-]+' | cut -d= -f2)"
+docker run --rm --network "$net" curlimages/curl:8.11.1 -s --http2-prior-knowledge \
+    "http://172.23.0.10:7777/nnrf-nfm/v1/nf-instances/$bsf_id" > "$DEMO_ARTEFACTS/nrf-bsf.json"
+hb="$(jq -r '.heartBeatTimer // empty' "$DEMO_ARTEFACTS/nrf-bsf.json")"
+[ -n "$hb" ] || demo_fail "[expiry] the NRF profile of $bsf_id has no heartBeatTimer"
+poll=5
+bound=$((2 * hb + poll))
 t0="$(date +%s)"
-demo_compose stop bsf
-demo_wait_log gnb-west '\[demo:d447a-nkef-live\] NKEF fact expired subject=nf-' "$expiry_timeout"
+docker kill --signal KILL "$(demo_compose ps -q bsf)" >/dev/null
+demo_wait_log nrf "NF instance $bsf_id missed heartbeat, marking SUSPENDED" $((bound + 30))
+demo_wait_log gnb-west "\\[demo:d447a-nkef-live\\] NKEF fact expired subject=nf-$bsf_id " $((bound + 30))
 t1="$(date +%s)"
 ask after-stop.txt bsf instance
-grep -E 'nfType=BSF' "$DEMO_ARTEFACTS/after-stop.txt" | grep -qE 'expired_at=[0-9]{4}-' \
-    || demo_fail "[expiry] the BSF fact has no expired_at after the stop"
-echo "$((t1 - t0))" > "$DEMO_ARTEFACTS/expiry-seconds"
-demo_info "[expiry] BSF expired $((t1 - t0))s after docker stop"
+grep -E "nfInstanceId=$bsf_id" "$DEMO_ARTEFACTS/after-stop.txt" | grep -qE 'expired_at=[0-9]{4}-' \
+    || demo_fail "[expiry] the BSF fact has no expired_at after the kill"
+printf 'elapsed=%s heartBeatTimer=%s poll=%s bound=%s\n' "$((t1 - t0))" "$hb" "$poll" "$bound" > "$DEMO_ARTEFACTS/expiry.txt"
+[ "$((t1 - t0))" -le "$bound" ] || demo_fail "[expiry] $((t1 - t0))s > 2 x heartBeatTimer ($hb) + poll ($poll)"
+demo_info "[expiry] BSF $bsf_id suspended by the NRF and expired $((t1 - t0))s after the kill (bound ${bound}s)"
 
 # Restart without the UE: the AMF's location predates this run.
 demo_compose stop ue
