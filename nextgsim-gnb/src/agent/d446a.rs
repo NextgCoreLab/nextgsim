@@ -43,6 +43,11 @@ use serde::Serialize;
 use crate::demo::D446A_KEY;
 use crate::tasks::InboundHandoverVerdict;
 
+/// How often lb-1 tries a UE again after a failure that signalled nothing.
+/// The race this covers (a UE served before its PDU session resources are set
+/// up) clears within one tick; a persistent local failure must not loop.
+pub const MAX_UNSIGNALLED_RETRIES: u32 = 3;
+
 /// The `cause` parameter value of a load-balancing intent.
 pub const CAUSE_REDUCE_LOAD: &str = "reduce-load-in-serving-cell";
 
@@ -107,6 +112,10 @@ pub struct D446a {
     pending: Option<Pending>,
     off: bool,
     lb_tried: HashSet<i32>,
+    /// Unsignalled actuation failures per UE: bounded by
+    /// [`MAX_UNSIGNALLED_RETRIES`], so a UE that can never be handed over
+    /// (no AMF UE NGAP ID, an encode failure) is not retried every tick.
+    lb_unsignalled: std::collections::HashMap<i32, u32>,
     last_policy: Option<String>,
     /// UEs connected to the cell at the last tick: the guardrail's input.
     connected: usize,
@@ -131,6 +140,7 @@ impl D446a {
             pending: None,
             off: false,
             lb_tried: HashSet::new(),
+            lb_unsignalled: std::collections::HashMap::new(),
             last_policy: None,
             connected: 0,
         })
@@ -208,6 +218,8 @@ impl D446a {
         let connected = self.connected;
         // Forget UEs that left, so a returning one may be moved again.
         self.lb_tried.retain(|ue| served_ue_ids.contains(ue));
+        self.lb_unsignalled
+            .retain(|ue, _| served_ue_ids.contains(ue));
         if let Some(lb) = &self.lb {
             if served >= lb.load_threshold_ues {
                 if let Some(&ue) = served_ue_ids.iter().find(|ue| !self.lb_tried.contains(ue)) {
@@ -469,10 +481,16 @@ impl D446a {
             "ActuationFailed"
         };
         let retry = if retry_ue {
-            self.lb_tried.remove(&ue_id);
-            "; not signalled, the UE may be retried"
+            let n = self.lb_unsignalled.entry(ue_id).or_insert(0);
+            *n += 1;
+            if *n <= MAX_UNSIGNALLED_RETRIES {
+                self.lb_tried.remove(&ue_id);
+                format!("; not signalled, retry {n}/{MAX_UNSIGNALLED_RETRIES}")
+            } else {
+                "; not signalled, retries exhausted".to_string()
+            }
         } else {
-            ""
+            String::new()
         };
         self.record(
             event,
