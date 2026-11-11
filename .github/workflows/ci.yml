@@ -1247,8 +1247,9 @@ jobs:
           mkdir -p docker/rust/binaries
           docker cp builder:/out/. docker/rust/binaries/
           docker rm builder
-          test -f docker/rust/binaries/nr-gnb && test -f docker/rust/binaries/nr-ue \
-            || { echo "::error::nr-gnb or nr-ue missing from the builder output"; ls -la docker/rust/binaries/; exit 1; }
+          if [ ! -f docker/rust/binaries/nr-gnb ] || [ ! -f docker/rust/binaries/nr-ue ]; then
+            echo "::error::nr-gnb or nr-ue missing from the builder output"; ls -la docker/rust/binaries/; exit 1
+          fi
 
       - name: Build the 5GC, gNB and UE images (not published)
         run: |

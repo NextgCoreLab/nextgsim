@@ -62,7 +62,7 @@ rm -f /tmp/revert-run.$$
 applied=0
 pid=""
 out="$(mktemp)"
-# shellcheck disable=SC2317  # reached through the traps below
+# shellcheck disable=SC2317,SC2329  # reached through the traps below
 restore() {
     local rc=$?
     trap - EXIT INT TERM HUP
