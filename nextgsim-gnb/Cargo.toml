@@ -62,6 +62,12 @@ sdap-dataplane = []
     "nextgsim-fl",
 ]
 
+# Demo d447a-nkef-live (nextgsim#488): NKEF's live RLS / N2 tees, its h2c SBA
+# client toward amfd and the NRF, and the bundle answer to `nr-cli nkef-query`.
+# Off by default, and inert unless the config's `demo.d447a-nkef-live` block
+# also enables it (the #458 toggle convention).
+nkef-sba = ["nextgsim-nkef", "sbi-client"]
+
 # Verified model loading with serving counters (nextgsim#463, demo
 # `d440b-model-verify`). Off by default. Implies the NWDAF crate (the task still
 # needs `nwdaf_enabled: true`) and forwards to its `model-registry`, so the model
@@ -119,4 +125,9 @@ serde_json.workspace = true
 bytes.workspace = true
 
 [dev-dependencies]
+# A fake h2c amfd for the NKEF SBA tests (nextgsim#488); already in the lock
+# through nextgsim-sbi-client.
+h2 = "0.4"
+http = "1"
+bytes.workspace = true
 tempfile = "3"

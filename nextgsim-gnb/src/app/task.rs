@@ -235,6 +235,22 @@ impl AppTask {
             return;
         }
 
+        // `nkef-query` / `nkef-status` (nextgsim#488) are answered by the NKEF
+        // task over a oneshot, never by the gNB command set.
+        #[cfg(feature = "nextgsim-nkef")]
+        if let Some(result) = self.route_nkef_cli(&cmd.command).await {
+            if let Some(server) = &self.cli_server {
+                let sent = match result {
+                    Ok(out) => server.send_result(cmd.client_addr, out).await,
+                    Err(e) => server.send_error(cmd.client_addr, e).await,
+                };
+                if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // `nwdaf-status` (nextgsim#463) is answered by the NWDAF task over its
         // channel, so it cannot go through the synchronous command handler.
         #[cfg(feature = "model-registry")]
@@ -267,6 +283,55 @@ impl AppTask {
         // Handle the command
         self.handle_cli_command(command, Some(cmd.client_addr))
             .await;
+    }
+
+    /// Run an `nkef-query` or `nkef-status` command against the NKEF task, or
+    /// `None` if `command` is neither.
+    #[cfg(feature = "nextgsim-nkef")]
+    pub(crate) async fn route_nkef_cli(&self, command: &str) -> Option<Result<String, String>> {
+        let request = match parse_nkef_cli(command)? {
+            Ok(r) => r,
+            Err(e) => return Some(Err(e)),
+        };
+        let Some(sixg) = &self.task_base.sixg else {
+            return Some(Err(
+                "NKEF task not running (nkef_enabled: false)".to_string()
+            ));
+        };
+        let answer = match request {
+            NkefCli::Status => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                if sixg
+                    .nkef_tx
+                    .send(crate::tasks::NkefMessage::Status { reply: tx })
+                    .await
+                    .is_err()
+                {
+                    return Some(Err("NKEF task not running".to_string()));
+                }
+                tokio::time::timeout(NKEF_CLI_TIMEOUT, rx)
+                    .await
+                    .map_err(|_| "NKEF did not answer".to_string())
+                    .and_then(|r| r.map_err(|_| "NKEF dropped the request".to_string()))
+            }
+            NkefCli::Query { consumer, question } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let msg = crate::tasks::NkefMessage::Query {
+                    question,
+                    consumer,
+                    reply: tx,
+                };
+                if sixg.nkef_tx.send(msg).await.is_err() {
+                    return Some(Err("NKEF task not running".to_string()));
+                }
+                tokio::time::timeout(NKEF_CLI_TIMEOUT, rx)
+                    .await
+                    .map_err(|_| "NKEF did not answer".to_string())
+                    .and_then(|r| r.map_err(|_| "NKEF dropped the request".to_string()))
+                    .and_then(|r| r)
+            }
+        };
+        Some(answer)
     }
 
     /// Ask the NWDAF task for its status (nextgsim#463): the model state, the
@@ -376,6 +441,69 @@ impl AppTask {
     /// Removes an AMF context.
     pub fn remove_amf_context(&mut self, amf_id: i32) {
         self.amf_contexts.remove(&amf_id);
+    }
+}
+
+/// How long the CLI waits for NKEF: a query may first refresh the AMF reports.
+#[cfg(feature = "nextgsim-nkef")]
+const NKEF_CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// A parsed `nkef-*` command.
+#[cfg(feature = "nextgsim-nkef")]
+#[derive(Debug, PartialEq)]
+pub(crate) enum NkefCli {
+    /// `nkef-status`
+    Status,
+    /// `nkef-query [--as internal|external] <question>`
+    Query {
+        consumer: nextgsim_nkef::live::Consumer,
+        question: String,
+    },
+}
+
+/// Parse `nkef-status` / `nkef-query [--as internal|external] <question>`;
+/// `None` for any other command.
+#[cfg(feature = "nextgsim-nkef")]
+pub(crate) fn parse_nkef_cli(command: &str) -> Option<Result<NkefCli, String>> {
+    use nextgsim_nkef::live::Consumer;
+    let trimmed = command.trim();
+    let (word, rest) = trimmed
+        .split_once(char::is_whitespace)
+        .unwrap_or((trimmed, ""));
+    match word {
+        "nkef-status" => Some(if rest.trim().is_empty() {
+            Ok(NkefCli::Status)
+        } else {
+            Err("usage: nkef-status".to_string())
+        }),
+        "nkef-query" => {
+            let mut rest = rest.trim();
+            let mut consumer = Consumer::Internal;
+            if let Some(after) = rest.strip_prefix("--as") {
+                let after = after.trim_start();
+                let (who, tail) = after.split_once(char::is_whitespace).unwrap_or((after, ""));
+                consumer = match Consumer::parse(who) {
+                    Some(c) => c,
+                    None => {
+                        return Some(Err(format!(
+                            "nkef-query: --as takes internal or external, not {who:?}"
+                        )))
+                    }
+                };
+                rest = tail.trim();
+            }
+            let question = rest.trim_matches(|c| c == '"' || c == '\'').trim();
+            if question.is_empty() {
+                return Some(Err(
+                    "usage: nkef-query [--as internal|external] <question>".to_string()
+                ));
+            }
+            Some(Ok(NkefCli::Query {
+                consumer,
+                question: question.to_string(),
+            }))
+        }
+        _ => None,
     }
 }
 
@@ -619,5 +747,36 @@ mod tests {
         let port = task.init_cli_server("test-gnb".to_string()).await.unwrap();
         assert_eq!(port, 0);
         assert_eq!(task.cli_port(), 0);
+    }
+
+    /// nextgsim#488: `nkef-query` / `nkef-status` are recognised here and nothing
+    /// else is; `--as` takes only the two consumers.
+    #[cfg(feature = "nextgsim-nkef")]
+    #[test]
+    fn nkef_cli_commands_parse() {
+        use super::{parse_nkef_cli, NkefCli};
+        use nextgsim_nkef::live::Consumer;
+        assert_eq!(parse_nkef_cli("nkef-status"), Some(Ok(NkefCli::Status)));
+        assert_eq!(
+            parse_nkef_cli("nkef-query \"is my route congested?\""),
+            Some(Ok(NkefCli::Query {
+                consumer: Consumer::Internal,
+                question: "is my route congested?".into()
+            }))
+        );
+        assert_eq!(
+            parse_nkef_cli("nkef-query --as external is my route congested?"),
+            Some(Ok(NkefCli::Query {
+                consumer: Consumer::External,
+                question: "is my route congested?".into()
+            }))
+        );
+        assert!(matches!(
+            parse_nkef_cli("nkef-query --as admin q"),
+            Some(Err(_))
+        ));
+        assert!(matches!(parse_nkef_cli("nkef-query"), Some(Err(_))));
+        assert_eq!(parse_nkef_cli("ue-list"), None);
+        assert_eq!(parse_nkef_cli("demo show"), None);
     }
 }

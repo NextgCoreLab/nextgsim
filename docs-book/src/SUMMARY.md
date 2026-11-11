@@ -27,6 +27,7 @@
 
 # Demos
 
+- [D447A: live-state knowledge exposure](demos/d447a-nkef-live.md)
 - [D440B: verified model loading](demos/d440b-model-verify.md)
 
 # Community

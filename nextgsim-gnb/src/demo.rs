@@ -12,6 +12,20 @@
 
 use nextgsim_demo::{DemoConfigError, DemoRegistry, DemoRuntime, DemoSpec};
 
+/// D447A, live-state knowledge exposure (nextgsim#488). Registered under the
+/// `nkef-sba` cargo feature.
+pub const D447A_KEY: &str = "d447a-nkef-live";
+
+/// D447A's modes. `on`: the RLS, N2 and SBA tees feed NKEF and a query answers
+/// from them. `baseline`: today's NKEF, tees off, so nothing live is returned.
+/// `internal` / `external` are per-query consumers, not modes.
+pub const D447A_MODES: &[&str] = &["on", "baseline"];
+
+/// Held by every test that reads or switches D447A's process-global mode, so a
+/// test that switches it to `baseline` cannot race one that expects `on`.
+#[cfg(all(test, feature = "nkef-sba"))]
+pub static D447A_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// D440B, verified OAM-style model loading with serving counters (nextgsim#463).
 /// Registered under the `model-registry` cargo feature.
 pub const D440B_KEY: &str = "d440b-model-verify";
@@ -26,6 +40,12 @@ pub const D440B_MODES: &[&str] = &["verify", "fallback"];
 pub fn registry() -> DemoRegistry {
     #[allow(unused_mut)]
     let mut specs: Vec<DemoSpec> = Vec::new();
+    #[cfg(feature = "nkef-sba")]
+    specs.push(DemoSpec {
+        key: D447A_KEY,
+        modes: D447A_MODES,
+        requires: &[],
+    });
     #[cfg(feature = "model-registry")]
     specs.push(DemoSpec {
         key: D440B_KEY,
@@ -45,9 +65,35 @@ pub fn init(config_yaml: &str) -> Result<&'static DemoRuntime, DemoConfigError> 
 mod tests {
     use super::*;
 
+    /// nextgsim#488: an `nkef-sba` build knows d447a-nkef-live with its two
+    /// modes, and an unknown mode fails startup with no fallback.
+    #[test]
+    #[cfg(feature = "nkef-sba")]
+    fn an_nkef_sba_build_registers_d447a_and_rejects_an_unknown_mode() {
+        assert!(registry().keys().contains(&D447A_KEY));
+        let root: serde_yaml::Value = serde_yaml::from_str(
+            "demo:\n  enabled: true\n  d447a-nkef-live:\n    enabled: true\n    mode: bogus\n",
+        )
+        .unwrap();
+        match DemoRuntime::from_root(&root, registry()) {
+            Err(DemoConfigError::UnknownMode { demo, mode, .. }) => {
+                assert_eq!((demo.as_str(), mode.as_str()), (D447A_KEY, "bogus"));
+            }
+            other => panic!("expected UnknownMode, got {other:?}"),
+        }
+        // The kill switch off: nothing is active even with the key enabled.
+        let root: serde_yaml::Value = serde_yaml::from_str(
+            "demo:\n  enabled: false\n  d447a-nkef-live:\n    enabled: true\n    mode: \"on\"\n",
+        )
+        .unwrap();
+        let rt = DemoRuntime::from_root(&root, registry()).unwrap();
+        assert!(rt.snapshot().is_empty());
+        assert_eq!(rt.mode(D447A_KEY), None);
+    }
+
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
-    #[cfg(not(feature = "model-registry"))]
+    #[cfg(not(any(feature = "model-registry", feature = "nkef-sba")))]
     #[test]
     fn a_default_build_rejects_every_demo_key() {
         assert!(registry().is_empty());

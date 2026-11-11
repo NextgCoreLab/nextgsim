@@ -91,6 +91,51 @@ fn default_nrppa_trp_ids() -> Vec<u16> {
     vec![1]
 }
 
+/// The NKEF live tees' settings (nextgsim#488).
+///
+/// - `supi`: the subscriber NKEF asks amfd about. It comes from this config, not
+///   from the network: an AMF answer about it is a round trip, not an
+///   independent identification (the demo's echo caveat).
+/// - `amf_sbi_uri`: amfd's SBI root (`http://host:port`, h2c). Unset: no `sba`
+///   domain at all, the NRF poll included.
+/// - `nrf_uri`: the NRF's SBI root, polled every `nrf_poll_secs` for
+///   `nf_types`.
+/// - `budget_tokens`: the hard cap on one bundle.
+///
+/// NKEF opens no listener: amfd's notify URI points at a closed loopback port,
+/// because only the subscribe answer's `reportList` is read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct NkefLiveConfig {
+    /// The subscriber NKEF asks amfd about.
+    pub supi: Option<String>,
+    /// amfd's SBI root.
+    pub amf_sbi_uri: Option<String>,
+    /// The NRF's SBI root.
+    pub nrf_uri: Option<String>,
+    /// Seconds between NRF discovery polls.
+    pub nrf_poll_secs: u64,
+    /// The NF types the NRF poll discovers.
+    pub nf_types: Vec<String>,
+    /// The hard token cap on one bundle.
+    pub budget_tokens: usize,
+}
+
+impl Default for NkefLiveConfig {
+    fn default() -> Self {
+        Self {
+            supi: None,
+            amf_sbi_uri: None,
+            nrf_uri: None,
+            nrf_poll_secs: 5,
+            nf_types: ["AMF", "SMF", "AUSF", "UDM", "PCF", "NSSF", "BSF"]
+                .map(String::from)
+                .to_vec(),
+            budget_tokens: 400,
+        }
+    }
+}
+
 /// gNB (gNodeB) configuration.
 ///
 /// Contains all configuration parameters for a 5G base station.
@@ -441,6 +486,12 @@ pub struct GnbConfig {
     /// Network Knowledge Exposure Function (NKEF) task enabled (Rel-20)
     #[serde(default)]
     pub nkef_enabled: bool,
+    /// What the NKEF task's live tees read (nextgsim#488, demo d447a-nkef-live).
+    ///
+    /// Read only while that demo is active in mode `on`; otherwise ignored, so
+    /// the block is inert in a default build and a default config.
+    #[serde(default)]
+    pub nkef_live: NkefLiveConfig,
     /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
     #[serde(default)]
     pub isac_enabled: bool,
@@ -611,6 +662,7 @@ impl Default for GnbConfig {
             nwdaf_enabled: false,
             nwdaf_model_path: None,
             nkef_enabled: false,
+            nkef_live: NkefLiveConfig::default(),
             isac_enabled: false,
             isac_ekf_tracking: false,
             isac_ekf_process_noise_accel: None,
