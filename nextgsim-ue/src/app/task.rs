@@ -735,6 +735,24 @@ mod tests {
         assert_eq!(task.cli_handler.session_ambr(5), None);
     }
 
+    /// A session re-established on a PSI does not inherit the old session's
+    /// network-set AMBR, even if the release update never arrived.
+    #[test]
+    fn a_new_session_on_a_psi_starts_without_the_old_ambr() {
+        use nextgsim_nas::messages::sm::IeSessionAmbr;
+        let task_base = create_task_base();
+        let mut task = AppTask::new(task_base);
+
+        task.handle_status_update(UeStatusUpdate::SessionEstablishment { psi: 5 });
+        task.handle_status_update(UeStatusUpdate::SessionParametersChanged {
+            psi: 5,
+            session_ambr: IeSessionAmbr::new(0x06, 300, 0x06, 100),
+        });
+        // No SessionRelease: the new establishment alone must clear it.
+        task.handle_status_update(UeStatusUpdate::SessionEstablishment { psi: 5 });
+        assert_eq!(task.cli_handler.session_ambr(5), None);
+    }
+
     #[test]
     fn test_state_setters() {
         let task_base = create_task_base();

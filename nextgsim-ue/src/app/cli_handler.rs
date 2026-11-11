@@ -643,6 +643,9 @@ impl CliHandler {
         if !self.active_sessions.contains(&psi) {
             self.active_sessions.push(psi);
         }
+        // A new session on this PSI starts with no network-set AMBR, even if a
+        // release update for the old one was missed (#454 review).
+        self.session_ambrs.remove(&psi);
     }
 
     /// Marks a PDU session as released.
