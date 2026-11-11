@@ -308,8 +308,10 @@ jobs:
       - name: cargo test, the runtime arms included
         run: |
           set -euo pipefail
-          cargo test -p nextgsim-ai --features model-registry -- --include-ignored
-          cargo test -p nextgsim-nwdaf --features model-registry -- --include-ignored
+          # --lib: --include-ignored would also run the crates' `ignore`d
+          # doctests, which are illustrative and do not compile.
+          cargo test -p nextgsim-ai --features model-registry --lib -- --include-ignored
+          cargo test -p nextgsim-nwdaf --features model-registry --lib -- --include-ignored
           cargo test -p nextgsim-gnb --features 6g,model-registry --lib d440b -- --include-ignored
       - name: The runtime arms really ran (not filtered or skipped)
         run: |
