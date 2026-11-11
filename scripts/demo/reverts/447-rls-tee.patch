@@ -1,5 +1,5 @@
 diff --git a/nextgsim-gnb/src/nkef/live.rs b/nextgsim-gnb/src/nkef/live.rs
-index 27c4761..3d0bf94 100644
+index e0a7bee..6c23153 100644
 --- a/nextgsim-gnb/src/nkef/live.rs
 +++ b/nextgsim-gnb/src/nkef/live.rs
 @@ -61,6 +61,8 @@ pub fn ngap_guami_key(plmn: [u8; 3], region: u8, set: u16, pointer: u8) -> Strin
@@ -8,15 +8,15 @@ index 27c4761..3d0bf94 100644
  pub fn offer_cell_load(base: &GnbTaskBase, connected_ues: u32, throughput_mbps: Option<f32>) {
 +    #[allow(clippy::needless_return)]
 +    return; // REVERT ARM 447-rls-tee
-     let nci = base.config.nci;
-     offer(
-         base,
-@@ -81,6 +83,8 @@ pub fn offer_cell_load(base: &GnbTaskBase, connected_ues: u32, throughput_mbps:
+     if !tees_on() {
+         return;
+     }
+@@ -84,6 +86,8 @@ pub fn offer_cell_load(base: &GnbTaskBase, connected_ues: u32, throughput_mbps:
  
  /// RLS tee: a UE's serving cell and received power.
  pub fn offer_ue_radio(base: &GnbTaskBase, ue_id: i32, rsrp_dbm: i32) {
 +    #[allow(clippy::needless_return)]
 +    return; // REVERT ARM 447-rls-tee
-     offer(
-         base,
-         Fact::new(
+     if !tees_on() {
+         return;
+     }
