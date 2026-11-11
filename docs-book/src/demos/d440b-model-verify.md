@@ -154,9 +154,11 @@ model artefacts) is a follow-up to this ticket. It will be run with
 
 - **Non-normative.** TS 28.105 §6.4.1.1 says "The way for loading the ML model
   is not in scope of the present document". The manifest and its checks are an
-  implementation choice, and the inventory is shaped like `MLModel-Single`, not
-  a conformant MnS. `Top` (TS 28.623) is not vendored, so only the local
-  attributes are validated.
+  implementation choice.
+- **The `nwdaf-status` inventory is MLModel NRM-shaped, not TS 28.105
+  conformant.** It emits only `mLModelId`, `mLModelVersion`, `aIMLInferenceName`
+  and `mLTrainingType`, and only those local properties are validated, because
+  `Top` (TS 28.623) is not vendored.
 - **The trainer is a file drop standing in for OAM**, not an MnS producer, and
   no training happens. The reference "model" is a fixed constant-velocity graph
   (`next = 2*last - prev`, one sample step ahead), which the predictor stamps at

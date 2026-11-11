@@ -22,8 +22,9 @@ pub const D440B_KEY: &str = "d440b-model-verify";
 pub const D440B_MODES: &[&str] = &["verify", "fallback"];
 
 /// The demos compiled into this binary.
+#[allow(clippy::vec_init_then_push)] // one push per demo feature
 pub fn registry() -> DemoRegistry {
-    #[allow(unused_mut, clippy::vec_init_then_push)]
+    #[allow(unused_mut)]
     let mut specs: Vec<DemoSpec> = Vec::new();
     #[cfg(feature = "model-registry")]
     specs.push(DemoSpec {

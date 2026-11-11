@@ -288,11 +288,21 @@ impl AppTask {
             .as_ref()
             .ok_or("nwdaf-status: the 6G tasks are not running in this gNB")?;
         let (reply, answer) = tokio::sync::oneshot::channel();
-        sixg.nwdaf_tx
-            .send(crate::tasks::NwdafMessage::Status { reply })
-            .await
-            .map_err(|_| "nwdaf-status: the NWDAF task has stopped".to_string())?;
-        match tokio::time::timeout(std::time::Duration::from_secs(2), answer).await {
+        // Both legs bounded: under the demo the NWDAF queue can be full, and the
+        // App task must answer the CLI rather than park on the send.
+        let wait = std::time::Duration::from_secs(2);
+        match tokio::time::timeout(
+            wait,
+            sixg.nwdaf_tx
+                .send(crate::tasks::NwdafMessage::Status { reply }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("nwdaf-status: the NWDAF task has stopped".into()),
+            Err(_) => return Err("nwdaf-status: the NWDAF task queue stayed full for 2 s".into()),
+        }
+        match tokio::time::timeout(wait, answer).await {
             Ok(Ok(json)) => Ok(json),
             Ok(Err(_)) => Err("nwdaf-status: the NWDAF task dropped the request".into()),
             Err(_) => Err("nwdaf-status: the NWDAF task did not answer within 2 s".into()),
