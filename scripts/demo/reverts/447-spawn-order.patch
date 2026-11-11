@@ -1,0 +1,15 @@
+diff --git a/nextgsim-gnb/src/wiring.rs b/nextgsim-gnb/src/wiring.rs
+index c7dbd91..5f5fa66 100644
+--- a/nextgsim-gnb/src/wiring.rs
++++ b/nextgsim-gnb/src/wiring.rs
+@@ -121,7 +121,9 @@ impl GnbWiring {
+             rel18,
+             sixg,
+         } = self;
+-        let task_base = task_manager.task_base();
++        // REVERT ARM 447-spawn-order: every task gets a base without the 6G handles.
++        let mut task_base = task_manager.task_base();
++        task_base.sixg = None;
+ 
+         // App task (status updates and CLI commands)
+         let app_task_base = task_base.clone();

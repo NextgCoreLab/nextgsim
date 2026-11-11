@@ -1,0 +1,22 @@
+diff --git a/nextgsim-gnb/src/nkef/live.rs b/nextgsim-gnb/src/nkef/live.rs
+index e0a7bee..3bcdfbd 100644
+--- a/nextgsim-gnb/src/nkef/live.rs
++++ b/nextgsim-gnb/src/nkef/live.rs
+@@ -107,6 +107,8 @@ pub fn offer_ng_setup(
+     amf_id: i32,
+     response: &nextgsim_ngap::procedures::NgSetupResponseData,
+ ) {
++    #[allow(clippy::needless_return)]
++    return; // REVERT ARM 447-n2-tee
+     if !tees_on() {
+         return;
+     }
+@@ -148,6 +150,8 @@ pub fn offer_ng_setup(
+ 
+ /// N2 tee: a UE's association with the AMF.
+ pub fn offer_ue_n2(base: &GnbTaskBase, ue_id: i32, amf_ctx_id: i32, amf_ue_ngap_id: i64) {
++    #[allow(clippy::needless_return)]
++    return; // REVERT ARM 447-n2-tee
+     if !tees_on() {
+         return;
+     }

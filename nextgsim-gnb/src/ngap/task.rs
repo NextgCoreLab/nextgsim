@@ -894,6 +894,10 @@ impl NgapTask {
                     .cancel(GuardTimer::NgSetupResponse { amf_id });
                 self.guard_timers
                     .cancel(GuardTimer::NgSetupRetry { amf_id });
+                // N2 tee of demo d447a-nkef-live (nextgsim#488): a no-op unless
+                // that demo is on.
+                #[cfg(feature = "nextgsim-nkef")]
+                crate::nkef::live::offer_ng_setup(&self.task_base, amf_id, &response);
                 if let Some(ctx) = self.amf_contexts.get_mut(&amf_id) {
                     ctx.on_ng_setup_response(response);
                 }
@@ -1367,6 +1371,13 @@ impl NgapTask {
                 }
                 // Transition UE state
                 ctx.on_initial_context_setup();
+                #[cfg(feature = "nextgsim-nkef")]
+                crate::nkef::live::offer_ue_n2(
+                    &self.task_base,
+                    ctx.ue_id,
+                    ctx.amf_ctx_id,
+                    ics_req.amf_ue_ngap_id as i64,
+                );
                 info!(
                     "UE context updated: ue_id={}, state={}, amf_ue_ngap_id={}",
                     ctx.ue_id, ctx.state, ics_req.amf_ue_ngap_id
