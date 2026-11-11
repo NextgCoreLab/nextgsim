@@ -80,6 +80,10 @@
       ]
     },
     {
+      "bin": "sbi-roundtrip",
+      "reason": "#457 SBI client round-trip test tool, run by the nightly from the build tree (target/release); no image is defined for it"
+    },
+    {
       "bin": "nr-loadtest",
       "reason": "load-test command-line tool; no image is defined for it"
     }
