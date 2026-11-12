@@ -816,6 +816,7 @@ pub fn advertisable(addr: &SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     #[test]
     fn a_gpsi_names_its_monitoring_member() {
@@ -889,6 +890,63 @@ mod tests {
             route(&Method::POST, &path, &ids),
             Err(StatusCode::NOT_FOUND)
         );
+    }
+
+    fn held(r: &mut Registry, octet: u8, opening: bool) -> Arc<Notify> {
+        r.next += 1;
+        let evict = Arc::new(Notify::new());
+        r.held.push(Held {
+            id: r.next,
+            source: IpAddr::from([127, 0, 0, octet]),
+            busy: Arc::new(AtomicUsize::new(0)),
+            opening: Arc::new(AtomicBool::new(opening)),
+            last_active: Arc::new(Mutex::new(Instant::now())),
+            evict: evict.clone(),
+        });
+        std::thread::sleep(Duration::from_millis(1));
+        evict
+    }
+
+    async fn evicted(n: &Notify) -> bool {
+        tokio::time::timeout(Duration::from_millis(5), n.notified())
+            .await
+            .is_ok()
+    }
+
+    /// The eviction rules, deterministically. nefd's one connection is the
+    /// oldest idle one in a full listener, yet a newcomer never evicts it: at
+    /// the total cap the victim comes from the source holding the most, and
+    /// a source at its own cap evicts only its own, never one still opening.
+    #[tokio::test]
+    async fn eviction_takes_from_the_largest_source_and_never_the_nefs_one() {
+        let mut r = Registry::default();
+        let nef = held(&mut r, 2, false);
+        let flood: Vec<_> = (0..MAX_CALLBACK_CONNECTIONS - 1)
+            .map(|i| held(&mut r, 20 + (i % 9) as u8, false))
+            .collect();
+        assert_eq!(r.held.len(), MAX_CALLBACK_CONNECTIONS);
+        // A fresh source at the total cap: room is made, not from nefd.
+        assert!(r.make_room(IpAddr::from([127, 0, 0, 50])));
+        assert!(!evicted(&nef).await, "nefd's connection was evicted");
+        let mut gone = 0;
+        for n in &flood {
+            gone += usize::from(evicted(n).await);
+        }
+        assert_eq!(gone, 1);
+        // A source at its own cap evicts its own oldest, and refuses the new
+        // connection when all of its own are still opening.
+        let mut r = Registry::default();
+        let other = held(&mut r, 2, false);
+        let own: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|_| held(&mut r, 30, false))
+            .collect();
+        assert!(r.make_room(IpAddr::from([127, 0, 0, 30])));
+        assert!(evicted(&own[0]).await && !evicted(&other).await);
+        let mut r = Registry::default();
+        let _opening: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|_| held(&mut r, 30, true))
+            .collect();
+        assert!(!r.make_room(IpAddr::from([127, 0, 0, 30])));
     }
 
     /// A connection from `127.0.0.octet` to `addr`.
@@ -980,8 +1038,9 @@ mod tests {
         churn_against_notifications(1).await;
     }
 
-    /// The same with the flood spread over 20 source addresses, more than the
-    /// listener holds in all: the fair-share rule keeps the notifier's slot.
+    /// The same with the flood spread over 20 source addresses (160 tasks,
+    /// far more than the listener holds in all), so it sits at its total cap:
+    /// the fair-share rule keeps the notifier's slot.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_churning_flood_from_many_sources_cannot_evict_a_notification() {
         churn_against_notifications(20).await;
@@ -990,19 +1049,46 @@ mod tests {
     async fn churn_against_notifications(sources: u8) {
         let (addr, id, mut rx) = listener().await;
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flood: Vec<_> = (0..64u8)
-            .map(|t| {
-                let stop = stop.clone();
-                tokio::spawn(async move {
+        // Each task connects raw TCP, holds the connection until the listener
+        // drops it (or for 100-300 ms), and connects again: the listener is
+        // kept at its caps and evicting all the time. The flood runs on its own
+        // runtime, as another host would, so it loads the listener and not the
+        // test's own scheduler.
+        let tasks = 64u16.max(8 * u16::from(sources));
+        let flooding = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            for t in 0..tasks {
+                let stop = flooding.clone();
+                let octet = 20 + (t % u16::from(sources)) as u8;
+                rt.spawn(async move {
                     while !stop.load(Ordering::Relaxed) {
-                        if let Ok(s) = tcp_from(20 + t % sources, addr).await {
-                            tokio::time::sleep(Duration::from_millis(u64::from(t % 7))).await;
-                            drop(s);
+                        if let Ok(mut s) = tcp_from(octet, addr).await {
+                            let mut buf = [0u8; 64];
+                            let hold = Duration::from_millis(100 + u64::from(t % 200));
+                            let _ = tokio::time::timeout(hold, async {
+                                while !matches!(s.read(&mut buf).await, Ok(0) | Err(_)) {}
+                            })
+                            .await;
                         }
+                        // Paced (about 1000 connects/s in all), so the flood
+                        // loads the listener's slots, not the kernel's SYN
+                        // queue: a SYN flood is the kernel's to absorb.
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
-                })
-            })
-            .collect();
+                });
+            }
+            rt.block_on(async {
+                while !flooding.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            rt.shutdown_background();
+        });
         tokio::time::sleep(Duration::from_millis(200)).await;
         let mut failed = Vec::new();
         for n in 0..200 {
@@ -1012,9 +1098,7 @@ mod tests {
             }
         }
         stop.store(true, Ordering::Relaxed);
-        for f in flood {
-            let _ = f.await;
-        }
+        flood.join().unwrap();
         assert!(
             failed.is_empty(),
             "{} of 200 failed: {failed:?}",

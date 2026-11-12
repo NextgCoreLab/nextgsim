@@ -116,7 +116,7 @@ The gNB has no FL task: its aggregator was removed (nextgsim#480). Federated lea
   - At 64 connections in all, an eviction takes from the source holding the most, and only if that source holds at least two more than the newcomer's source. A peer holding one connection is never evicted by a newcomer.
   - A connection with a request in flight is never evicted. A connection still opening (accept, h2 handshake, first request, at most 2 s) is not evicted by its own source.
 
-  So one flooding or churning host, or a flood spread over many addresses, cannot evict nefd's one-notification connection. Both cases are tested with 200 notifications and no loss. Filling every slot with fair shares takes more than 64 hosts, each sitting on its own connection.
+  So one flooding or churning host, or a flood spread over many addresses, cannot evict nefd's one-notification connection. Both cases are tested with 200 notifications and no loss, and the eviction rules have a deterministic test of their own. Filling every slot with fair shares takes more than 64 hosts, each sitting on its own connection. A raw SYN flood is below this layer and is the kernel's to absorb (SYN cookies).
 - With `nef.oauth2` every NEF call carries an NRF token for an `AF`-typed consumer, or is not sent. The scopes `nnef-ueid` and `nnef-eventexposure` are nextgcore's NRF OAuth2 policy, not 3GPP surface: the 3GPP OpenAPI defines no scopes for these northbound APIs, and TS 23.222 / TS 33.122 put them behind CAPIF.
 
 Modes (`demo.d445a-fl-t8.mode`, default `t8-exclusion` in the overlay):
