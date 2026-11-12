@@ -159,8 +159,202 @@ images:
 
 ## Results
 
-Not yet run. This section is filled in from the captured EKS artefacts after
-validation; nothing here is invented.
+**The demo does not pass on EKS yet.** On devtest1, all three demo arms FAIL and the
+demo-off control PASSES. The loop runs from end to end on the control plane: gNB
+report, nwdafd, pcfd, smfd, upfd, UE-B, then the restore. But the success signal
+(UE-V's p95 flat while UE-B is throttled, against a no-loop baseline that queues) was
+not observed. Three defects, diagnosed below from the artefacts and **not patched
+here**, stand in the way. One is the open upfd defect nextgcore#1475; the fixes
+for the other two belong in nextgcore PRs, through review.
+
+Everything below is copied from the run artefacts under `/tmp/eks-val/demos/` on the
+operator host. Nothing is reconstructed. The code blocks are selected lines, with
+the kubelet timestamp prefix and the ANSI colour codes trimmed; `…` marks a line cut
+short.
+
+### How it was run
+
+```bash
+# images: nextgcore and nextgsim built at their main commits, pushed under NEW tags only
+#   core NFs (incl. nwdaf): the demo profile's 6G features plus
+#     nextgcore-nwdafd/demo-d441a-congestion-loop nextgcore-pcfd/demo-d441a-congestion-loop
+#   gnb: --features nextgsim-gnb/demo-d441a-congestion-loop; ue: nr-ue + nr-cli
+# each arm under the program lock, one arm per hold, in this order:
+for arm in "off off" "d441a-congestion-loop no-loop" \
+           "d441a-congestion-loop statistics" "d441a-congestion-loop prediction"; do
+  flock /tmp/eks-nextg-demo.lock env YES=true KEEP=true KUBE_CONTEXT=devtest1 \
+    CORE_IMAGE_TAG=demo-d441a-ff97da6b0185 SIM_IMAGE_TAG=demo-d441a-ec4c32d4e524 \
+    SIM_SHA=ec4c32d4e524 k8s/demo-check.sh $arm
+  # KEEP=true: the wrapper reads UE-B's post-run Session-AMBR state (post/), then
+  # deletes the nextg-demo namespace the run created
+done
+```
+
+### What ran
+
+| arm | artefacts (`/tmp/eks-val/demos/…`) | VERDICT | UE-V p95 |
+|---|---|---|---|
+| `off off` (demo-off control) | `off/off/20261112T125433Z` | PASS | n/a |
+| `d441a-congestion-loop no-loop` | `d441a-congestion-loop/no-loop/20261112T130714Z` | FAIL | 4.3 ms |
+| `d441a-congestion-loop statistics` | `d441a-congestion-loop/statistics/20261112T132223Z` | FAIL | 3.8 ms |
+| `d441a-congestion-loop prediction` | `d441a-congestion-loop/prediction/20261112T133557Z` | FAIL | 3.7 ms |
+
+- **Harness:** nextgcore `ff97da6b0185` (#1467 merge, so #1447, #1461 and #1467 are all in).
+- **Images** (devtest1 ECR, new tags only):
+  - `nextg/{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf,nwdaf}:demo-d441a-ff97da6b0185`;
+  - `nextg/{gnb,ue}:demo-d441a-ec4c32d4e524` (nextgsim `ec4c32d`, which includes #516).
+- **e2e.** Every arm's base e2e (`e2e-internet.sh`, PROFILE=demo) passed: `e2e_rc=0`.
+- **Demo-off control:** `demo_banner_lines=0 demo_prefix_lines=0 nextg_demo_enabled_series=0`.
+- **Demo arms:** each scrape has its mode's series, for example
+  `nextg_demo_enabled{demo="d441a-congestion-loop",mode="prediction"} 1`, and
+  `demo_banner_lines=2` (nwdafd and pcfd). The gNB's banner is not in any capture;
+  see defect 3.
+- **Not run:** the runtime `nr-cli … set mode=` switch, and a compose arm (none ships).
+
+### Baseline vs mode
+
+| | no-loop | statistics | prediction |
+|---|---|---|---|
+| exporter token / ingest | no ingest (every UDC GET 204; the gNB `export: off` line was lost, defect 3) | ingested (`nwdaf_ran_cell_reports_total{result="ingested"} 182`) | ingested |
+| peak measured occupancy | n/a (204s) | 74.3 % | 73.9 % |
+| peak UDC `congLevel` served | 204 | 74 (statistics) | 91 (prediction, `confidence=34`) |
+| pcfd | `hold(no-ran-data)` | holds only, no throttle | one throttle, one restore of UE-B |
+| smfd PCF-updated policy | none | none | 1 Mbps, then back to 1 Gbps |
+| UE-B actually policed at 1 Mbps | n/a | n/a | **no** (`qer_gate` drops 0; nextgcore#1475) |
+| UE-V p95 | 4.3 ms | 3.8 ms | 3.7 ms |
+| tokenless POST | 401 | 401 | 401 |
+
+### What failed, and why
+
+**1. The load never reaches C, so no arm builds a queue.** UE-B's ramp asks for 1 to
+10 Mbps of 1400-byte echoes. From the 3 to 4 Mbps steps on, ping sends about 1090 to 1260
+echoes per 4 s whatever `-i` asks for, about one per RTT. That is roughly 3.0 to
+3.5 Mbps of replies, under C = 5 Mbps (no-loop `scenario/ue-b-ramp.txt`, one summary
+line per step):
+
+```
+283 packets transmitted, 283 received, 0% packet loss, time 3996ms
+801 packets transmitted, 800 received, 0.124844% packet loss, time 3998ms
+1096 packets transmitted, 1095 received, 0.0912409% packet loss, time 3997ms
+1114 packets transmitted, 1113 received, 0.0897666% packet loss, time 3998ms
+1091 packets transmitted, 1090 received, 0.091659% packet loss, time 3999ms
+3296 packets transmitted, 3295 received, 0.0303398% packet loss, time 11999ms
+```
+
+(trimmed: steps 5 to 9 omitted; all are 1091 to 1108.)
+
+- The gNB measured at most 74 % (statistics `scenario/nwdaf-chain.txt`):
+
+  ```
+  [2026-11-12T13:26:34.792Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] ran-ingest cell=99970-000000010 tai=99970-000001 occupancy=74.3% served_kbps=3715/5000 connected_ues=2 amf_ues_in_area=2 from=6b1d7e3c-0000-4000-8000-00000000465a
+  [2026-11-12T13:26:35.327Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] udc GET USER_DATA_CONGESTION kind=statistics cell=000000010 congLevel=74 → 200
+  ```
+
+- So the no-loop baseline is 4.3 ms, not ≥ 100 ms. The statistics arm never crosses
+  `throttle_at: 80` (statistics `scenario/pcf-chain.txt`, holds logged on change):
+
+  ```
+  [2026-11-12T13:26:18.327Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=16(ran-user-data-congestion) action=hold(within-band) throttled=0
+  ```
+
+- Every arm's p95 assertion compares against that invalid baseline.
+- The cause of the per-RTT pacing has not been isolated. The candidates are iputils
+  ping's pacing without `-l` preload, UE-B's 500m CPU limit, and the `kubectl exec`
+  path. This is the "UE-B downlink echo throttling" risk the builder listed.
+
+**2. The installed 1 Mbps QER does not police UE-B (nextgcore#1475).** In the prediction arm the
+gNB's least-squares prediction crossed 80 % on the ramp, and the full chain ran
+(`scenario.log`):
+
+```
+[scenario] chain: ingest 2026-11-12 13:39:15.525672 → udc 2026-11-12 13:39:16.164905 → throttle 2026-11-12 13:39:51.207030 → smf 2026-11-12 13:39:51.216243 → upf 2026-11-12 13:39:51.216626 → ue-b 2026-11-12 13:40:44.232618 → restore 2026-11-12 13:40:44.165269
+[scenario] connected_ues=2 amf_ues_in_area=2
+```
+
+```
+[2026-11-12T13:39:50.535Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] ran-ingest cell=99970-000000010 tai=99970-000001 occupancy=72.1% served_kbps=3603/5000 connected_ues=2 amf_ues_in_area=2 predicted=91.3% conf=34 horizon_ms=5000 from=6b1d7e3c-0000-4000-8000-00000000465a
+[2026-11-12T13:39:51.164Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] udc GET USER_DATA_CONGESTION kind=prediction cell=000000010 congLevel=91 confidence=34 → 200
+[2026-11-12T13:39:51.206Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=91 confidence=34(ran-user-data-congestion) action=throttle(supi=imsi-999700000000002) sm_policy_id=a705b07b-b72f-4917-9e17-f38e88431ae0 ambr=1000000/1000000 bps (subscribed 1000000000/1000000000 bps, floor 500 kbps)
+[2026-11-12T13:39:51.216Z INFO  nextgcore_smfd] Applying PCF-updated policy to ref=2: AMBR UL/DL=1000000/1000000 bps, 5QI=9
+[2026-11-12T13:39:51.216Z INFO  nextgcore_upfd] Installed 1 QERs for SEID=0x2
+```
+
+The throttle was a prediction: measured occupancy was 72.1 % at the time, and it
+never reached 80 % in this arm. While the cap was in place, though, UE-B's traffic
+went on at the same rate:
+- the measured occupancy stayed at 72 to 74 %;
+- the ramp's echo counts and loss did not change (1243 to 1262 per 4 s step, 0.08 % loss, before and after the throttle alike);
+- upfd's DL counter rose by 11,006,748 B in the 30 s after the throttle, about
+  2.9 Mbps through a 1 Mbps QER (`logs/upf-*_upf.log`);
+- `upf_dataplane_dropped_packets_by_reason_total{reason="qer_gate"} 0`.
+
+```
+[2026-11-12T13:39:49.212Z INFO  nextgcore_upfd::data_plane] Data plane stats: UL=2915 pkts/1961661 B, DL=2913 pkts/1966179 B, dropped=6 (spoofed=0, oversize=0, dl_ipv6=6)
+[2026-11-12T13:40:19.212Z INFO  nextgcore_upfd::data_plane] Data plane stats: UL=18382 pkts/12968409 B, DL=18380 pkts/12972927 B, dropped=6 (spoofed=0, oversize=0, dl_ipv6=6)
+```
+
+This is nextgcore#1475 (open): upfd reads the PFCP MBR 1000× too high.
+- `parse_create_qer`, which also parses Update QER, multiplies the kbit/s field by
+  1000 (`saturating_mul(1000)`).
+- The QER's `ul_mbr`/`dl_mbr` are kbit/s, and `set_mbr` arms the token bucket from
+  them as kbit/s.
+
+So smfd's 1000 kbit/s cap is policed at about 1 Gbit/s. The control-plane chain
+(pcfd UpdateNotify, then smfd, then the PFCP Update QER) is correct. The missing
+policing is #1475's, not a D441A defect, and it is not patched around here.
+
+**3. Scenario and capture defects** (`deploy/eks/overlays/demo-d441a-congestion-loop/scenario.sh`):
+- The scenario's own tokenless POST logs `ran-ingest refused (401)`. Two checks match
+  that line by mistake:
+  - the no-loop check `grep -q 'ran-ingest'` takes it for an ingest, giving the
+    false `FAIL: no-loop: nwdafd ingested a cell report`;
+  - the prediction lead-time code parses `occupancy=` from every `ran-ingest` line,
+    so it raised `AttributeError: 'NoneType' object has no attribute 'group'` and no
+    lead time was recorded.
+
+  ```
+  [2026-11-12T13:12:36.093Z WARN  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] ran-ingest refused (401): Unauthorized("missing or malformed Bearer [REDACTED]"); nothing ingested
+  ```
+
+- The gNB and UE pods log every packet at DEBUG, so kubelet rotates their logs within
+  the run and `kubectl logs` returns only the newest file. As a result:
+  - no gNB banner or `export: off (mode=no-loop)` line survives (no-loop:
+    `FAIL: no-loop: no 'export: off' gNB line`; the gNB log starts at 13:12:16,
+    after UE-B stopped);
+  - in the prediction arm the throttle's N1 Session-AMBR at UE-B was lost. The UE
+    line the chain matched is the restore's (13:40:44.232, after the restore at
+    13:40:44.165).
+
+### What worked
+
+- **NRF tokens and the trusted-key sync.** The NRF issued the exporter a CCA token,
+  and the trusted-key ConfigMap synced in time. Both loop arms ingested within the
+  scenario's wait.
+- **Ingest auth.** The tokenless POST was `401` in every arm
+  (`nwdaf_ran_cell_reports_total{result="unauthorized"} 1`), with no throttle after it.
+- **The AMF cross-check** held: `connected_ues=2 amf_ues_in_area=2`.
+- **The no-loop arm's controller side** behaved as specified. Every UDC GET was 204,
+  pcfd logged `hold(no-ran-data)`, and smfd applied no policy update:
+
+  ```
+  [2026-11-12T13:08:02.223Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] udc GET USER_DATA_CONGESTION kind=statistics → 204 (no fresh cell report in the area)
+  [2026-11-12T13:08:02.223Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=unavailable(ran-user-data-congestion) action=hold(no-ran-data) throttled=0
+  ```
+
+- **UE-B's Session-AMBR was restored** (prediction `post/`). There was one throttle
+  and one restore, none of UE-V. smfd re-applied the subscribed 1 Gbps, upfd
+  installed the QER, the UE took it, and pcfd's durable state holds no cap
+  (`demo_ambr_cap occurrences (non-null): 0`):
+
+  ```
+  [2026-11-12T13:40:44.165Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=0 confidence=82(ran-user-data-congestion) action=restore(supi=imsi-999700000000002) sm_policy_id=a705b07b-b72f-4917-9e17-f38e88431ae0 reason=below-threshold
+  [2026-11-12T13:40:44.175Z INFO  nextgcore_smfd] Applying PCF-updated policy to ref=2: AMBR UL/DL=1000000000/1000000000 bps, 5QI=9
+  [2026-11-12T13:40:44.176Z INFO  nextgcore_upfd] Installed 1 QERs for SEID=0x2
+  2026-11-12T13:40:44.232099Z  INFO nextgsim_ue::app::task: PDU session 1: network set Session-AMBR DL 1 (unit 11) / UL 1 (unit 11)
+  ```
+
+- **Cleanup.** Every arm's namespace was deleted after capture: `namespace gone` in
+  each `post/wrapper.txt`.
 
 ## Honesty labels and limitations
 
