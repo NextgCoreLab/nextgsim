@@ -187,6 +187,13 @@ validation; nothing here is invented.
 - **One prediction horizon.** nwdafd answers a prediction request with the
   gNB's single prediction at its own `prediction_horizon_ms`, whatever future
   window `ana-req` names; `timeIntev` echoes the requested window.
-- **pcfd restart.** A cap is recorded with the session. A restarted pcfd
-  re-notifies the subscribed Session-AMBR for every capped session, so a
-  throttle does not outlive the process (or the demo).
+- **pcfd restart.** A cap is recorded with the session in pcfd's durable
+  state. A restarted pcfd **with durable state configured** (`--state-file` /
+  `NEXTGCORE_PCF_STATE_FILE`) re-notifies the subscribed Session-AMBR for every
+  capped session, retrying with backoff, and clears the record only once the
+  SMF confirms it (2xx, or 404 for an association it no longer has). Without
+  durable state there is no record and nothing is undone. **On EKS** the
+  overlay keeps the state file on the pod's emptyDir (devtest1 has no usable
+  StorageClass): it survives a container restart, not a pod re-creation. After
+  a pcfd pod is re-created mid-throttle, redeploy the arm (smfd included) or
+  re-authorise UE-B.
