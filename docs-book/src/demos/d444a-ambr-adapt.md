@@ -84,4 +84,6 @@ Not yet run on devtest1. This section is filled from the captured artefacts (`/t
 - The accuracy gap is the pinned generator's spectrum. The datagram carries the sample's ground-truth label so the sink can score it.
 - "Raw is policed at 64 kbps" is arithmetic, a QER control, not a finding.
 - The UE application staying under its Session-AMBR is an application choice, not the UE's UL Session-AMBR enforcement (TS 23.501 §5.7.2.6), which nextgsim does not implement.
+- The stream starts at keep 128 and learns the Session-AMBR only from a PDU SESSION MODIFICATION COMMAND, not from the establishment accept. After a re-establishment it keeps the last modified keep until the next change. The demo's flow starts at the provisioned 1 Gbps, so this does not affect it.
+- Below about 30 kbit/s the floor of 8 features (60 B per datagram, 24 kbit/s at 50 Hz) is above the 80 % target, although the log still prints the target.
 - The throttle source: until nextgsim#465's pcfd controller merges, the EKS scenario lowers the subscriber's session AMBR in the UDR and re-authorises the SM policy association (TS 29.512 §4.2.3.2). That pcfd startup check (`MissingDependency` on `d441a-congestion-loop`) lands with #465's pcfd demo registry.

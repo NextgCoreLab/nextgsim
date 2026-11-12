@@ -86,6 +86,10 @@
     {
       "bin": "nr-loadtest",
       "reason": "load-test command-line tool; no image is defined for it"
+    },
+    {
+      "bin": "semantic-sink",
+      "reason": "demo-only: demo D444A (#477, feature demo-d444a-ambr-adapt); ships inside the demo UE image built by nextgcore's demo-d444a-ambr-adapt overlay, never published"
     }
   ]
 }

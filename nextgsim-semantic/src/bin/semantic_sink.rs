@@ -28,7 +28,7 @@ use std::net::SocketAddr;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use nextgsim_demo::{demo_log, DemoRegistry, DemoSpec};
+use nextgsim_demo::{demo_log, DemoRegistry, DemoRuntime, DemoSpec};
 use nextgsim_semantic::rate_adapt::{
     D444aModel, EpochScorer, FeatureDatagram, D444A_KEY, D444A_MODES, DEFAULT_SEED,
 };
@@ -97,17 +97,28 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<(), String> {
-    let path = config_path()?;
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
-    let config: SinkConfig = serde_yaml::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
-    nextgsim_demo::init_from_yaml(&text, registry()).map_err(|e| format!("{path}: {e}"))?;
-    if nextgsim_demo::active_mode(D444A_KEY).is_none() {
+/// Parse the sink's config and check its demo gate, without installing
+/// anything: the config, and the demo state [`run`] installs. Fails unless
+/// demo d444a-ambr-adapt is enabled (both `demo.enabled` and
+/// `demo.d444a-ambr-adapt.enabled`): the sink is demo-only.
+fn prepare(text: &str) -> Result<(SinkConfig, DemoRuntime), String> {
+    let config: SinkConfig = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let root: serde_yaml::Value = serde_yaml::from_str(text).map_err(|e| e.to_string())?;
+    let runtime = DemoRuntime::from_root(&root, registry()).map_err(|e| e.to_string())?;
+    if runtime.mode(D444A_KEY).is_none() {
         return Err(format!(
-            "{path}: semantic-sink runs only with demo {D444A_KEY} enabled (demo.enabled and \
+            "semantic-sink runs only with demo {D444A_KEY} enabled (demo.enabled and \
              demo.{D444A_KEY}.enabled)"
         ));
     }
+    Ok((config, runtime))
+}
+
+async fn run() -> Result<(), String> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let (config, runtime) = prepare(&text).map_err(|e| format!("{path}: {e}"))?;
+    nextgsim_demo::install(runtime).map_err(|e| format!("{path}: {e}"))?;
     let socket = bind_when_available(config.listen).await?;
     let scorer = EpochScorer::new(
         D444aModel::new(config.seed),
@@ -167,7 +178,11 @@ async fn serve(
                     demo_log!(info, D444A_KEY, "{row} (closed after {idle:?} idle)");
                 }
             }
-            Ok(Err(e)) => return Err(format!("recv: {e}")),
+            Ok(Err(e)) => {
+                // An unconnected UDP socket's errors are per datagram (an ICMP
+                // error, a truncated read): log and keep serving the run.
+                tracing::warn!("[demo:{D444A_KEY}] recv: {e}");
+            }
             Ok(Ok((len, from))) => match FeatureDatagram::decode(&buf[..len]) {
                 Ok(d) => {
                     if let Some(row) = scorer.on_datagram(&d, len, &mode) {
@@ -182,5 +197,43 @@ async fn serve(
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ON: &str =
+        "demo:\n  enabled: true\n  d444a-ambr-adapt:\n    enabled: true\n    mode: semantic\n";
+
+    /// The sink is demo-only: with no `demo:` block, with the kill switch off,
+    /// or with the demo's own flag off, it refuses to start.
+    #[test]
+    fn the_sink_refuses_to_start_unless_the_demo_is_enabled() {
+        for text in [
+            "seed: 444\n",
+            "demo:\n  enabled: false\n  d444a-ambr-adapt:\n    enabled: true\n    mode: semantic\n",
+            "demo:\n  enabled: true\n  d444a-ambr-adapt:\n    enabled: false\n    mode: semantic\n",
+        ] {
+            let err = prepare(text).expect_err(text);
+            assert!(
+                err.contains("runs only with demo d444a-ambr-adapt enabled"),
+                "{err}"
+            );
+        }
+        let err = prepare(&ON.replace("semantic", "bogus")).expect_err("bogus mode");
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    /// Without `listen:` the sink binds loopback, never a wildcard address.
+    #[test]
+    fn the_default_listen_address_is_loopback_5444() {
+        let (config, runtime) = prepare(ON).unwrap();
+        assert_eq!(config.listen, SocketAddr::from(([127, 0, 0, 1], 5444)));
+        assert!(config.listen.ip().is_loopback());
+        assert_eq!(runtime.mode(D444A_KEY).as_deref(), Some("semantic"));
+        let (config, _) = prepare(&format!("listen: 10.45.0.1:5444\n{ON}")).unwrap();
+        assert_eq!(config.listen, SocketAddr::from(([10, 45, 0, 1], 5444)));
     }
 }

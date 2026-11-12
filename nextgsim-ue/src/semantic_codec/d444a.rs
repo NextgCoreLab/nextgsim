@@ -31,18 +31,18 @@ use tokio::net::UdpSocket;
 /// The unit names are decimal: 1 Kbps is 1 000 bit/s, 1 Mbps 1 000 000 (as
 /// nextgcore's smfd encodes them). Units 1-5 are 1/4/16/64/256 Kbps, 6-10 the
 /// same in Mbps, then Gbps, Tbps and Pbps; values above 25 read as 256 Pbps.
-/// Unit 0 is "value is not used": `None`.
-pub fn session_ambr_uplink_bps(ambr: &IeSessionAmbr) -> Option<u64> {
+/// Unit 0 is listed as "value is not used", but the table's NOTE says a
+/// receiver in this release "shall" read it as multiples of 1 Kbps
+/// (24501-k00_5 l.18424-18428), which is what the NAS's own
+/// `ambr_rates_kbps` does too.
+pub fn session_ambr_uplink_bps(ambr: &IeSessionAmbr) -> u64 {
     bit_rate(ambr.uplink_unit, ambr.uplink)
 }
 
-fn bit_rate(unit: u8, value: u16) -> Option<u64> {
-    if unit == 0 {
-        return None;
-    }
-    let unit = u32::from(unit.min(25)) - 1;
+fn bit_rate(unit: u8, value: u16) -> u64 {
+    let unit = u32::from(unit.clamp(1, 25)) - 1;
     let multiple = 4u64.pow(unit % 5) * 1000u64.pow(unit / 5 + 1);
-    Some(u64::from(value).saturating_mul(multiple))
+    u64::from(value).saturating_mul(multiple)
 }
 
 /// What `semantic-status` reports.
@@ -126,12 +126,12 @@ impl D444aStream {
     }
 
     /// The network changed PDU session `psi`'s Session-AMBR. Returns the demo
-    /// log line, or `None` for another session or an unusable value.
+    /// log line, or `None` for another session.
     pub fn on_session_ambr(&mut self, psi: u8, ambr: &IeSessionAmbr) -> Option<String> {
         if psi != self.config.psi {
             return None;
         }
-        self.ul_ambr_bps = Some(session_ambr_uplink_bps(ambr)?);
+        self.ul_ambr_bps = Some(session_ambr_uplink_bps(ambr));
         Some(self.replan(""))
     }
 
@@ -343,15 +343,19 @@ mod tests {
     #[test]
     fn the_uplink_session_ambr_reads_the_unit_table_in_decimal() {
         let bps = |u, v| session_ambr_uplink_bps(&IeSessionAmbr::new(6, 1, u, v));
-        assert_eq!(bps(1, 64), Some(64_000));
-        assert_eq!(bps(6, 2), Some(2_000_000));
-        assert_eq!(bps(2, 3), Some(12_000));
-        assert_eq!(bps(5, 1), Some(256_000));
-        assert_eq!(bps(7, 1), Some(4_000_000));
-        assert_eq!(bps(11, 1), Some(1_000_000_000));
-        assert_eq!(bps(21, 1), Some(1_000_000_000_000_000));
+        assert_eq!(bps(1, 64), 64_000);
+        assert_eq!(bps(6, 2), 2_000_000);
+        assert_eq!(bps(2, 3), 12_000);
+        assert_eq!(bps(5, 1), 256_000);
+        assert_eq!(bps(7, 1), 4_000_000);
+        assert_eq!(bps(11, 1), 1_000_000_000);
+        assert_eq!(bps(21, 1), 1_000_000_000_000_000);
         assert_eq!(bps(25, 1), bps(200, 1), "units above 25 read as 256 Pbps");
-        assert_eq!(bps(0, 64), None, "unit 0: value is not used");
+        assert_eq!(
+            bps(0, 64),
+            64_000,
+            "unit 0 reads as 1 Kbps (Table 9.11.4.14.1 NOTE)"
+        );
     }
 
     /// The success signal: a 2 Mbps -> 64 kbps throttle in mode `semantic`
