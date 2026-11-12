@@ -79,7 +79,7 @@ to the next contest and is audited as `PolicyChanged`. Read the audit with
     `demo-d446a-<sha>` tags; never overwrite an existing tag.
   - Run, one arm at a time:
     `YES=true KUBE_CONTEXT=devtest1 CORE_IMAGE_TAG=demo-d446a-<core sha>
-    SIM_IMAGE_TAG=demo-d446a-<sim sha> NR_CLI=<nr-cli> k8s/demo-check.sh
+    SIM_IMAGE_TAG=demo-d446a-<sim sha> SIM_SHA=<sim sha> NR_CLI=<nr-cli> k8s/demo-check.sh
     d446a-agent-conflict load-balancing|energy-saving`, then `k8s/demo-check.sh off off`.
 
 ## Results
@@ -87,7 +87,8 @@ to the next contest and is audited as `PolicyChanged`. Read the audit with
 Captured on EKS (devtest1) with `k8s/demo-check.sh`, one arm at a time, each in its
 own temporary `nextg-demo` namespace that the run deleted afterwards. Everything below
 is copied from the run artefacts under `/tmp/eks-val/demos/` on the operator host.
-Nothing is reconstructed.
+Nothing is reconstructed. The code blocks are selected lines. The gNB lines have their
+timestamp and module path trimmed.
 
 **What ran.**
 
@@ -101,10 +102,14 @@ Nothing is reconstructed.
   - `nextg/{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf}:demo-d446a-111febc`: nextgcore at #1423's merge, built with the demo profile's 6G features;
   - `nextg/gnb:demo-d446a-65496cc`: nextgsim at #507's merge, built with `--features 6g,demo-d446a-agent-conflict`, plus an `nr-cli` layer;
   - `nextg/ue:demo-d446a-65496cc`.
-- **energy-saving harness.** The energy-saving arm ran with nextgcore `216c1a3`. That commit (#1437) only fixes the scenario's log capture: it reads gNB-A's container `gnb`, not `gnb-a`. The first energy-saving run read an empty gNB-A log and failed on its gNB-A assertions. That run is not counted. Since #1437, an empty capture is a failure in its own right. The pod images were unchanged.
+- **energy-saving harness.** The energy-saving arm ran with nextgcore `216c1a3`, the #1437 merge. Two harness changes since `111febc` matter here:
+  - #1437 makes the scenario read gNB-A's container `gnb`, not `gnb-a`, and makes an empty capture a failure in its own right.
+  - #1434 makes `demo-check.sh` record the deployed images (`core_image=`, `sim_image=`) and take `sim=` only from `SIM_SHA`. This run's verdict says `sim=unrecorded`. Its nextgsim provenance is `sim_image=…/nextg/gnb:demo-d446a-65496cc` and `images.txt`.
+
+  The first energy-saving run (`d446a-agent-conflict/energy-saving/20261111T232759Z`, harness `111febc`) read an empty gNB-A log and failed: `scenario_rc=1`, `[gnb-a] step 1/3 missing: Sent Handover Required`. That run is not counted. The pod images were the same in both runs.
 - **#513 is not in these images.** nextgsim #513 (lb-1 retries a UE whose handover never left the gNB, at most 3 times; a startup race) merged after these runs. In both demo arms, lb-1's first attempt sent a HANDOVER REQUIRED (gNB-A audit #1, then #2 `ActuationSucceeded` or `ActuationFailed … HANDOVER PREPARATION FAILURE`). The race did not occur in these runs.
 - **e2e.** Every arm's base e2e (`e2e-internet.sh`, PROFILE=demo) passed.
-- **The demo-off control** ran the same demo-built gNB image without any `demo:` block. Its summary: `demo_banner_lines=0 demo_prefix_lines=0 nextg_demo_enabled_series=0`.
+- **The demo-off control** ran the same demo-built gNB image without any `demo:` block. Its summary: `demo_banner_lines=0 demo_prefix_lines=0 nextg_demo_enabled_series=0`. The gNB-side evidence is the banner and prefix counts: the gNB pod log (`logs/gnb-d4c4bcd94-qk984_gnb.log`) has no `DEMO MODE ACTIVE` and no `[demo:` line. `nextg_demo_enabled_series=0` covers only the 10 NF scrapes. The gNB has no `/metrics` listener, and the scenario that reads `nr-cli demo metrics` does not run in off mode, so the gNB was not scraped.
 
 ### Baseline vs mode
 
@@ -114,7 +119,7 @@ Nothing is reconstructed.
 | UE relocated to gNB-B | yes (`UE 1 relocated to target gNB`) | no: `HandoverFailure … CellNotAvailable` | n/a (one gNB, no handover) |
 | gNB-B audit winner | `lb-1@gnb-2 (policy load-balancing)` | `energy-1 (policy energy-saving): refused, CellNotAvailable` | no audit |
 | gNB-B cell | stays on: `GuardrailHold … ues=1` | off the air: RRC barred, heartbeats dropped | on |
-| `nextg_demo_enabled` | `{demo="d446a-agent-conflict",mode="load-balancing"} 1` | `{…,mode="energy-saving"} 1` | no series |
+| `nextg_demo_enabled` | `{demo="d446a-agent-conflict",mode="load-balancing"} 1` | `{…,mode="energy-saving"} 1` | gNB not scraped (no `/metrics`); no series in the 10 NF scrapes |
 
 ### load-balancing: amfd (`d446a/amf.log`)
 
@@ -138,7 +143,8 @@ Nothing is reconstructed.
 
 The gNB-B log has the same chain. The admission happens at 23:22:46.866, followed by
 `handback hold: UE[16777216] is not handed back to its source cell PCI 32 for 600 s`.
-From then on, every A3 report for PCI 32 is logged as `not acted on`. The guardrail
+From then on, all eight A3 reports for PCI 32 (the last at 23:23:07.226) are logged as
+`not acted on`. The guardrail
 holds at 23:24:16.871, 90 s after the deferral.
 
 gNB-A's lines come from the pod log that `demo-check.sh` collects
@@ -189,10 +195,20 @@ nextg_demo_enabled{demo="d446a-agent-conflict",mode="energy-saving"} 1    # ener
 ### Runtime switch
 
 The EKS scenario runs one mode per arm. The runtime `nr-cli … set` between two
-contests is shown by the compose `runtime-switch` arm (nightly `demo-d446a`; green
-in dispatch run 43066719429): `Resolved (winner lb-1)`, the `set` audit,
-`PolicyChanged from=load-balancing to=energy-saving by=cli`, `Resolved (winner
-energy-1): refused`, `GuardrailHold ues=1`.
+contests is covered by the compose `runtime-switch` arm (the `demo-d446a` job). Its
+dispatch history is mixed:
+
+- Run 43066719429, on `8283e31`, passed. That commit is a #507 branch head from before
+  the squash merge, not the `65496cc` the images were built from. Its log has
+  `Resolved (winner lb-1)`, the `set` audit, `PolicyChanged
+  from=load-balancing to=energy-saving by=cli`, `Resolved (winner energy-1): refused`,
+  and `GuardrailHold ues=1`.
+- Run 43111285607, on #507's final head `7666889`, failed in the `demo-d446a` job.
+  Its log shows only `[amf] step 1/3 missing: HandoverRequired`. Per #513's
+  diagnosis, that is the lb-1 startup race #513 fixes.
+- Run 43122816181, on #513's head `4dfe875`, passed all four arms of the `demo-d446a`
+  job, including `D446A runtime-switch: every assertion holds`. The run as a whole
+  failed, on its `6G live E2E` job.
 
 ## Honesty labels and limitations
 
