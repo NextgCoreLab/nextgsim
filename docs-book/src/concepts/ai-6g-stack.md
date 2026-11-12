@@ -92,7 +92,7 @@ placeholder). "Drives a live path?" is answered for a *default* build/run.
 |---|---|---|---|---|
 | ONNX inference engine | `nextgsim-ai` (`inference.rs` `OnnxEngine`) | full (as a wrapper) | Only if a task is enabled *and* a model is loaded; **no model ships** | unit tests |
 | AI/ML NR air-interface models | `nextgsim-ai/src/nr_models.rs` | illustrative stub (lifecycle mgmt only) | No — library types, not wired to PHY | unit tests |
-| Federated learning | `nextgsim-fl` + gNB `fl/task.rs`, UE `fl_participant/` | partial (FedAvg/FedProx/Byzantine/DP real) | No — off by default | unit tests + integration test |
+| Federated learning | `nextgsim-fl` (library + the `nr-fl-server` AF), UE `fl_participant/`; no gNB task since nextgsim#480 | partial (FedAvg/FedProx/Byzantine/DP real) | No — off by default | unit tests + integration test |
 | — "SecAgg" secure aggregation | `nextgsim-fl` `AggregationAlgorithm::MaskedSumDemo` | **illustrative stub** (masking demo, NOT Bonawitz) | No | unit tests |
 | Semantic codec | `nextgsim-semantic` + UE `semantic_codec/` | illustrative stub (mean-pool / nearest-neighbour) | No — UE crate optional+off | unit tests (incl. honesty guard) |
 | ISAC (sensing) | `nextgsim-isac` + gNB `isac/task.rs`, UE `isac_sensor/` | partial (fusion core) / stub (ML, SaaS) | No — off by default | unit tests + integration test |

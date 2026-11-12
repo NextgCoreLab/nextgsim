@@ -170,11 +170,6 @@ async fn test_agent_register_then_submit_intent() {
 }
 
 // ============================================================================
-// Test 3: (removed) the gNB FL aggregator is gone since nextgsim#480; federated
-// learning is the nr-fl-server AF on the N6 side (nextgsim-fl).
-// ============================================================================
-
-// ============================================================================
 // Test 4: ISAC sensing pipeline
 // ============================================================================
 
