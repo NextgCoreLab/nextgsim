@@ -91,6 +91,12 @@ pub mod she_integration;
 
 /// Conceptual adapter onto the TS 28.105 AI/ML training-management IOCs
 pub mod mns_adapter;
+// nextgsim#480: the D445A demo library (no runtime effect on its own).
+pub mod frame;
+pub mod mlp;
+pub mod seeded;
+pub mod sim;
+pub mod synthetic;
 
 // ---------------------------------------------------------------------------
 // Core data structures
@@ -1036,16 +1042,17 @@ impl FederatedAggregator {
             return Vec::new();
         }
 
-        let dim = updates
-            .values()
-            .next()
-            .map(|u| u.gradients.len())
-            .unwrap_or(0);
-        let total_samples: u64 = updates.values().map(|u| u.num_samples).sum();
+        // nextgsim#480: sorted-member order. `f32` addition is not associative, so
+        // summing in HashMap order (which varies from run to run) gave a
+        // different result each run for the same updates.
+        let mut sorted: Vec<&ModelUpdate> = updates.values().collect();
+        sorted.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
+        let dim = sorted.first().map(|u| u.gradients.len()).unwrap_or(0);
+        let total_samples: u64 = sorted.iter().map(|u| u.num_samples).sum();
 
         let mut aggregated = vec![0.0f32; dim];
 
-        for update in updates.values() {
+        for update in sorted {
             let weight = update.num_samples as f32 / total_samples as f32;
             for (i, g) in update.gradients.iter().enumerate() {
                 if i < aggregated.len() {
@@ -2107,10 +2114,71 @@ pub enum ByzantineRobustAlgorithm {
     Median,
 }
 
+/// Sample-weighted FedAvg over `(delta or weights, samples)` per member, summed in
+/// member order (the `BTreeMap`'s), so the same inputs give the same bits every run
+/// (nextgsim#480). Members whose vector length differs from the first member's are
+/// ignored past the shorter length, as in [`FederatedAggregator`].
+pub fn fedavg_sorted(updates: &std::collections::BTreeMap<String, (Vec<f32>, u64)>) -> Vec<f32> {
+    let Some((first, _)) = updates.values().next() else {
+        return Vec::new();
+    };
+    let total: u64 = updates.values().map(|(_, n)| n).sum();
+    let mut out = vec![0.0f32; first.len()];
+    if total == 0 {
+        return out;
+    }
+    for (v, n) in updates.values() {
+        let w = *n as f32 / total as f32;
+        for (o, x) in out.iter_mut().zip(v) {
+            *o += w * x;
+        }
+    }
+    out
+}
+
+/// What Krum chose (nextgsim#480): the selected update, its index, and every
+/// update's score (the sum of distances to its nearest neighbours), so a caller
+/// can name the member Krum trusts least.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KrumSelection {
+    /// The selected update (empty when there were none).
+    pub weights: Vec<f32>,
+    /// Its index in the input, `None` when there were no updates.
+    pub selected: Option<usize>,
+    /// Each update's Krum score; the selected one has the smallest.
+    pub scores: Vec<f32>,
+}
+
+impl KrumSelection {
+    /// The index with the LARGEST score, the update farthest from its neighbours.
+    /// Ties go to the lower index.
+    pub fn worst(&self) -> Option<usize> {
+        self.scores
+            .iter()
+            .enumerate()
+            .fold(None, |best: Option<(usize, f32)>, (i, s)| match best {
+                Some((_, b)) if *s <= b => best,
+                _ => Some((i, *s)),
+            })
+            .map(|(i, _)| i)
+    }
+}
+
 /// Krum aggregation: selects the gradient closest to its k-1 neighbors
 pub fn krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize) -> Vec<f32> {
+    krum_select(updates, num_byzantine).weights
+}
+
+/// Krum (Blanchard et al. 2017), returning which update it selected and every
+/// score (nextgsim#480). [`krum_aggregate`] is this, weights only. The selection
+/// is the minimum score; ties go to the lower index.
+pub fn krum_select(updates: &[Vec<f32>], num_byzantine: usize) -> KrumSelection {
     if updates.is_empty() {
-        return vec![];
+        return KrumSelection {
+            weights: vec![],
+            selected: None,
+            scores: vec![],
+        };
     }
 
     let n = updates.len();
@@ -2140,7 +2208,11 @@ pub fn krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize) -> Vec<f32> {
         .map(|(idx, _)| idx)
         .unwrap_or(0);
 
-    updates[best_idx].clone()
+    KrumSelection {
+        weights: updates[best_idx].clone(),
+        selected: Some(best_idx),
+        scores,
+    }
 }
 
 /// Multi-Krum: averages the top-m Krum selections
@@ -3133,6 +3205,79 @@ mod tests {
         assert_eq!(result.len(), 3);
         // Should select one of the first three (not the outlier)
         assert!(result[0] < 5.0);
+    }
+
+    /// nextgsim#480: `krum_select` names what it chose and who scored worst;
+    /// `krum_aggregate` is the same choice, weights only.
+    #[test]
+    fn krum_select_reports_the_selection_and_the_outlier() {
+        let updates = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![1.1, 2.1, 3.1],
+            vec![1.2, 1.9, 3.2],
+            vec![10.0, 10.0, 10.0],
+        ];
+        let k = krum_select(&updates, 1);
+        let selected = k.selected.expect("one selected");
+        assert!(selected < 3, "an honest update is selected");
+        assert_eq!(k.weights, updates[selected]);
+        assert_eq!(k.worst(), Some(3), "the outlier scores worst");
+        assert_eq!(k.scores.len(), 4);
+        assert_eq!(krum_aggregate(&updates, 1), k.weights);
+        let empty = krum_select(&[], 1);
+        assert_eq!((empty.selected, empty.worst()), (None, None));
+    }
+
+    /// nextgsim#480: FedAvg sums in sorted-member order, so the same updates give
+    /// the same bits whatever order a HashMap visits them in. The values are chosen
+    /// so `f32` summation order changes the result.
+    #[test]
+    fn fedavg_is_independent_of_map_order() {
+        let values = [1.0e7f32, 1.0, -1.0e7, 3.3, 0.7, -2.2, 5.5e6, -0.3];
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let mut agg = FederatedAggregator::new(AggregationAlgorithm::FedAvg, values.len());
+            agg.initialize_model(vec![0.0]);
+            for (i, _) in values.iter().enumerate() {
+                agg.register_participant(format!("ue-{i}"), 100);
+            }
+            agg.start_round().expect("round");
+            for (i, v) in values.iter().enumerate() {
+                agg.submit_update(ModelUpdate {
+                    participant_id: format!("ue-{i}"),
+                    base_version: 1,
+                    gradients: vec![*v],
+                    num_samples: 100,
+                    loss: 0.1,
+                    timestamp_ms: 0,
+                })
+                .expect("accept");
+            }
+            let model = agg.aggregate().expect("aggregate");
+            seen.insert(
+                model
+                    .weights
+                    .iter()
+                    .map(|w| w.to_bits())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        assert_eq!(seen.len(), 1, "one result, not {}", seen.len());
+
+        let map: std::collections::BTreeMap<String, (Vec<f32>, u64)> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (format!("ue-{i}"), (vec![*v], 100)))
+            .collect();
+        let once = fedavg_sorted(&map);
+        assert_eq!(fedavg_sorted(&map), once);
+        let weighted: std::collections::BTreeMap<String, (Vec<f32>, u64)> = [
+            ("a".to_string(), (vec![1.0], 1)),
+            ("b".to_string(), (vec![4.0], 3)),
+        ]
+        .into();
+        assert_eq!(fedavg_sorted(&weighted), vec![3.25], "sample-weighted");
+        assert!(fedavg_sorted(&Default::default()).is_empty());
     }
 
     #[test]
