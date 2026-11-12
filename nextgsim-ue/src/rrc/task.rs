@@ -2803,6 +2803,22 @@ impl RrcTask {
             return;
         }
 
+        // TS 38.304 §5.2.5 (camped normally) and §7.1: the UE monitors the
+        // paging channel OF THE CELL IT CAMPS ON (issue #514). PCCH reaches
+        // every UE in radio range of a gNB (it is an RLS broadcast), so a page
+        // from a neighbour is heard here and must not be acted on: answering it
+        // would start the service request towards a cell this UE is not camped
+        // on, and would make page-all and targeted paging (TS 23.502 §4.2.3.3)
+        // indistinguishable. With no camped cell ("any cell selection") there
+        // is no paging channel to monitor, so that page is dropped too.
+        if !self.is_active_cell(cell_id) {
+            debug!(
+                "PCCH Paging from cell {cell_id} ignored: not the camped cell ({:?})",
+                self.serving_cell_id
+            );
+            return;
+        }
+
         let records = match decode_paging(pdu.data()) {
             Ok(records) => records,
             Err(e) => {
@@ -9501,6 +9517,25 @@ mod tests {
 
     const PAGING_CELL: i32 = 1;
 
+    /// A cell in radio range that this UE is NOT camped on (issue #514).
+    const NEIGHBOUR_CELL: i32 = 2;
+
+    /// Camps an idle UE on `cell` through the real detection + selection path
+    /// (TS 38.304 §5.2), the precondition for monitoring that cell's paging
+    /// channel at all (§5.2.5, issue #514).
+    fn camp_on(task: &mut RrcTask, cell: i32) {
+        run_async(async {
+            task.handle_signal_changed(cell, -60).await;
+            task.perform_cycle().await;
+        });
+        assert_eq!(
+            task.serving_cell_id,
+            Some(cell),
+            "precondition: the UE camps on cell {cell}"
+        );
+        assert_eq!(task.state_machine.state(), RrcState::Idle);
+    }
+
     fn pcch_paging(identities: &[[u8; 6]]) -> OctetString {
         let records: Vec<PagingRecordParams> = identities
             .iter()
@@ -9527,6 +9562,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
@@ -9549,6 +9585,7 @@ mod tests {
     fn a_paging_record_for_another_subscriber_is_not_reported() {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.set_paging_identity(Some(OWN_S_TMSI));
 
         run_async(async {
@@ -9582,6 +9619,7 @@ mod tests {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
             UeTaskBase::new(config.clone(), 16);
         let mut probe = RrcTask::new(task_base);
+        camp_on(&mut probe, PAGING_CELL);
         probe.set_paging_identity(Some(own));
         let outside = (0u16..1024)
             .find(|sfn| !probe.is_own_paging_occasion_at(*sfn))
@@ -9604,6 +9642,7 @@ mod tests {
         // it the assertion above would pass for a UE that reports nothing at all.
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
         run_async(async {
@@ -9625,6 +9664,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
@@ -9666,6 +9706,7 @@ mod tests {
         let own = s_tmsi_paged_in_the_pinned_frame(&config);
         let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config.clone(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.pin_sfn(PINNED_SFN);
         task.set_paging_identity(Some(own));
 
@@ -9708,6 +9749,7 @@ mod tests {
     fn a_connected_ue_ignores_its_own_paging_record() {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.set_paging_identity(Some(OWN_S_TMSI));
         task.state_machine
             .transition(crate::rrc::state::RrcStateTransition::SetupComplete)
@@ -9730,6 +9772,7 @@ mod tests {
     fn a_ue_without_a_paging_identity_reports_nothing() {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
 
         run_async(async {
             task.handle_downlink_rrc(
@@ -9751,6 +9794,7 @@ mod tests {
     fn a_cleared_paging_identity_stops_matching() {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.set_paging_identity(Some(OWN_S_TMSI));
         task.set_paging_identity(None);
 
@@ -9766,6 +9810,7 @@ mod tests {
     fn an_undecodable_pcch_pdu_is_dropped_without_reporting() {
         let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(test_config(), 16);
         let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
         task.set_paging_identity(Some(OWN_S_TMSI));
 
         run_async(async {
@@ -9778,6 +9823,114 @@ mod tests {
         });
 
         assert!(try_take_paging(&mut nas_rx).is_none());
+    }
+
+    /// **#514**, TS 38.304 §5.2.5: a UE camped normally monitors the paging
+    /// channel of the cell it camps on, not of every cell it hears. PCCH is an
+    /// RLS broadcast, so the neighbour's page reaches this UE; acting on it
+    /// would make page-all and targeted paging (TS 23.502 §4.2.3.3) measure
+    /// the same.
+    ///
+    /// Both cells are in range and both carry the identical, matching record
+    /// in the UE's own occasion, so the camped cell is the only difference
+    /// between the two outcomes.
+    #[test]
+    fn a_page_is_acted_on_only_from_the_camped_cell_not_from_a_neighbour() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, PAGING_CELL);
+        run_async(async {
+            // The neighbour is detected (weaker), so the UE stays camped on PAGING_CELL.
+            task.handle_signal_changed(NEIGHBOUR_CELL, -80).await;
+        });
+        assert_eq!(task.serving_cell_id, Some(PAGING_CELL), "still camped");
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+
+        // The neighbour's page: heard, not acted on.
+        run_async(async {
+            task.handle_downlink_rrc(NEIGHBOUR_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "a page from cell {NEIGHBOUR_CELL} must not reach NAS while the UE camps on \
+             cell {PAGING_CELL} (TS 38.304 §5.2.5)"
+        );
+
+        // POSITIVE CONTROL: the same bytes from the camped cell are acted on.
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "the camped cell's page must reach NAS"
+        );
+    }
+
+    /// #514, the mirror image: camped on the OTHER cell, the roles swap, so the
+    /// filter follows the camped cell rather than favouring a particular id.
+    #[test]
+    fn the_paging_filter_follows_the_camped_cell() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        camp_on(&mut task, NEIGHBOUR_CELL);
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "camped on cell {NEIGHBOUR_CELL}, a page from cell {PAGING_CELL} is ignored"
+        );
+
+        run_async(async {
+            task.handle_downlink_rrc(NEIGHBOUR_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(try_take_paging(&mut nas_rx), Some(vec![own]));
+    }
+
+    /// #514: with no camped cell (TS 38.304 "any cell selection") there is no
+    /// paging channel to monitor, so a page is not acted on until the UE camps.
+    #[test]
+    fn a_ue_with_no_camped_cell_acts_on_no_page_until_it_camps() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+        assert!(task.serving_cell_id.is_none(), "precondition: not camped");
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "an uncamped UE monitors no paging channel"
+        );
+
+        camp_on(&mut task, PAGING_CELL);
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "once camped, the same page is acted on"
+        );
     }
 
     // ========================================================================

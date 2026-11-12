@@ -218,6 +218,22 @@ fn try_take_ue_paging(rx: &mut mpsc::Receiver<UeTaskMessage<NasMessage>>) -> Opt
     None
 }
 
+/// A cell in range of the UE that it is NOT camped on (issue #514).
+const NEIGHBOUR_CELL_ID: i32 = 2;
+
+/// Camps the idle UE on `cell` through the real detection + selection path
+/// (TS 38.304 §5.2). Required since #514: a UE monitors only the paging
+/// channel of the cell it camps on (§5.2.5).
+async fn camp(ue_rrc: &mut UeRrcTask, cell: i32) {
+    ue_rrc.handle_signal_changed(cell, -60).await;
+    ue_rrc.perform_cycle().await;
+    assert_eq!(
+        ue_rrc.serving_cell_id(),
+        Some(cell),
+        "precondition: the UE camps on cell {cell}"
+    );
+}
+
 /// The whole chain: an AMF Paging PDU reaches an idle UE as a NAS paging
 /// indication for its own 5G-S-TMSI.
 #[tokio::test]
@@ -288,6 +304,7 @@ async fn an_amf_paging_reaches_the_idle_ue_as_a_nas_paging_indication() {
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, CELL_ID).await;
     // What the UE's NAS plane hands down once a 5G-GUTI is assigned
     // (`RrcMessage::PagingIdentity`).
     ue_rrc.set_paging_identity(Some(PAGED_S_TMSI));
@@ -340,6 +357,7 @@ async fn a_ue_with_a_different_5g_s_tmsi_is_not_paged_by_the_same_broadcast() {
     let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, CELL_ID).await;
     ue_rrc.set_paging_identity(Some(OTHER_S_TMSI));
     // Received in the frame the gNB transmitted it in (issue #299), so the only
     // thing that can keep this UE silent is the identity mismatch under test.
@@ -450,6 +468,7 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
     let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, CELL_ID).await;
     ue_rrc.pin_sfn(PINNED_SFN);
     ue_rrc.set_paging_identity(Some(off_occasion));
     ue_rrc
@@ -467,6 +486,7 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
     let (ue_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) =
         UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
     let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, CELL_ID).await;
     ue_rrc.pin_sfn(PINNED_SFN);
     ue_rrc.set_paging_identity(Some(at_occasion));
     ue_rrc
@@ -476,5 +496,71 @@ async fn a_matching_record_outside_the_ues_paging_occasion_starts_no_service_req
         try_take_ue_paging(&mut nas_rx),
         Some(vec![at_occasion]),
         "a record delivered in this UE's own paging occasion must be acted on"
+    );
+}
+
+/// **#514**, TS 38.304 §5.2.5: the REAL gNB's PCCH broadcast, heard by an idle
+/// UE camped on a different cell, starts no service request; the same bytes
+/// from the camped cell do. PCCH is an RLS broadcast to every UE in range, so
+/// without this a neighbour's page woke the UE and page-all paging looked the
+/// same as paging only the camped gNB.
+#[tokio::test]
+async fn the_gnb_broadcast_is_acted_on_only_by_a_ue_camped_on_that_cell() {
+    let (mut ngap, mut gnb_rrc_rx) = ngap_task_with_ready_amf().await;
+    ngap.handle_ngap_pdu(
+        AMF_CLIENT_ID,
+        NGAP_STREAM,
+        OctetString::from_slice(&amf_paging_pdu(served_tai())),
+    )
+    .await;
+    let (ue_paging_tmsi, tai_list, _drx) =
+        try_take_rrc_paging(&mut gnb_rrc_rx).expect("RRC Paging");
+
+    let (gnb_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, mut gnb_rls_rx, _sctp_rx) =
+        GnbTaskBase::new(gnb_config(), 32);
+    let mut gnb_rrc = GnbRrcTask::new(gnb_base);
+    let schedule = gnb_rrc
+        .handle_paging(ue_paging_tmsi, tai_list, Some(PAGING_DRX_FRAMES))
+        .await
+        .expect("a well-formed 5G-S-TMSI is scheduled, not dropped");
+    let (_, pcch_pdu) =
+        await_broadcast(&mut gnb_rls_rx, schedule.delay + Duration::from_millis(300))
+            .await
+            .expect("PCCH broadcast");
+
+    // The paged UE camps on the NEIGHBOUR; the paging gNB's cell (CELL_ID) is
+    // also in range but weaker, so it is heard and not camped on.
+    let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
+    let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, NEIGHBOUR_CELL_ID).await;
+    ue_rrc.handle_signal_changed(CELL_ID, -90).await;
+    assert_eq!(ue_rrc.serving_cell_id(), Some(NEIGHBOUR_CELL_ID));
+    ue_rrc.set_paging_identity(Some(PAGED_S_TMSI));
+    ue_rrc.pin_sfn(schedule.paging_frame);
+
+    ue_rrc
+        .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, pcch_pdu.clone())
+        .await;
+    assert!(
+        try_take_ue_paging(&mut ue_nas_rx).is_none(),
+        "a page from a cell the UE is not camped on must not start a service request"
+    );
+
+    // POSITIVE CONTROL: a UE camped on the paging gNB's cell acts on the very
+    // same broadcast.
+    let (ue_base, _ue_app_rx, mut ue_nas_rx, _ue_rrc_rx, _ue_rls_rx) =
+        UeTaskBase::new(ue_config_matching_gnb_paging(), 32);
+    let mut ue_rrc = UeRrcTask::new(ue_base);
+    camp(&mut ue_rrc, CELL_ID).await;
+    ue_rrc.set_paging_identity(Some(PAGED_S_TMSI));
+    ue_rrc.pin_sfn(schedule.paging_frame);
+    ue_rrc
+        .handle_downlink_rrc(CELL_ID, RrcChannel::Pcch, pcch_pdu)
+        .await;
+    assert_eq!(
+        try_take_ue_paging(&mut ue_nas_rx),
+        Some(vec![PAGED_S_TMSI]),
+        "the camped cell's page must reach NAS"
     );
 }
