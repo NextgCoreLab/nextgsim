@@ -2212,15 +2212,8 @@ impl RrcTask {
             // selector's camp is stale in that case too, so it is cleared: the next
             // selection then reports its pick as a change and rewrites the serving cell.
             CellChangeEvent::CellLost(id) if self.serving_cell_id == Some(id) => {
-                warn!(
-                    "Serving cell lost: cell_id={id} (the cell selector camped elsewhere), \
-                     triggering cell selection"
-                );
-                self.measurement_manager.remove_measurement(id);
                 self.cell_selector.clear_camp();
-                self.serving_cell_id = None;
-                self.measurement_manager.set_serving_cell(None);
-                self.last_cell_selection = None;
+                self.on_serving_cell_lost(id);
             }
             CellChangeEvent::CellLost(id) => {
                 debug!("Cell lost: cell_id={}", id);
@@ -2228,13 +2221,14 @@ impl RrcTask {
                 self.measurement_manager.remove_measurement(id);
             }
             CellChangeEvent::ActiveCellLost(cell_info) => {
-                // The selector's camp is gone either way, so it selects again.
-                self.last_cell_selection = None;
-                // But only the loss of the SERVING cell takes the serving cell away. After
-                // a handover the selector still camps on the source, and the source
-                // fading must not leave a UE connected to the target with no serving
-                // cell (#518 review): every DL-DCCH from the target would be dropped.
-                if self.serving_cell_id != Some(cell_info.cell_id) {
+                if self.serving_cell_id == Some(cell_info.cell_id) {
+                    self.on_serving_cell_lost(cell_info.cell_id);
+                } else {
+                    // Only the loss of the SERVING cell takes the serving cell away.
+                    // After a handover the selector still camps on the source, and the
+                    // source fading must not leave a UE connected to the target with no
+                    // serving cell (#518 review). The selector's camp is gone, so it
+                    // selects again.
                     debug!(
                         "Cell {} lost: the cell selector camped on it, but the serving cell \
                          is {:?}; reselecting",
@@ -2242,14 +2236,8 @@ impl RrcTask {
                     );
                     self.measurement_manager
                         .remove_measurement(cell_info.cell_id);
-                    return;
+                    self.last_cell_selection = None;
                 }
-                warn!(
-                    "Active cell lost: cell_id={}, triggering cell selection",
-                    cell_info.cell_id
-                );
-                self.serving_cell_id = None;
-                self.measurement_manager.set_serving_cell(None);
             }
             CellChangeEvent::SignalUpdated(id, dbm) => {
                 debug!("Signal updated: cell_id={}, dbm={}", id, dbm);
@@ -2261,6 +2249,33 @@ impl RrcTask {
             }
             CellChangeEvent::None => {}
         }
+    }
+
+    /// The serving cell has dropped below the lost threshold.
+    ///
+    /// Its measurement goes in every state. What else happens depends on the state:
+    ///
+    /// - **RRC_IDLE / RRC_INACTIVE:** the UE is no longer camped (TS 38.304 §5.2.5), so
+    ///   `serving_cell_id` is cleared and an immediate cell selection is forced.
+    /// - **RRC_CONNECTED:** `serving_cell_id` is the network's PCell, not an idle-mode
+    ///   camp, and losing it is a radio link failure. It is kept, so radio link
+    ///   monitoring finds no sample for it, raises out-of-sync, and T310 runs to RLF
+    ///   (TS 38.331 §5.3.10.1, §5.3.10.3; #518 review round 2). Clearing it made
+    ///   `evaluate_radio_link_quality` return early, so T310 never started and the UE
+    ///   stayed CONNECTED to nothing.
+    fn on_serving_cell_lost(&mut self, cell_id: i32) {
+        self.measurement_manager.remove_measurement(cell_id);
+        if self.state_machine.state() == RrcState::Connected {
+            warn!(
+                "Serving cell {cell_id} lost in RRC_CONNECTED: left to radio link monitoring \
+                 (T310, TS 38.331 §5.3.10)"
+            );
+            return;
+        }
+        warn!("Serving cell lost: cell_id={cell_id}, triggering cell selection");
+        self.serving_cell_id = None;
+        self.measurement_manager.set_serving_cell(None);
+        self.last_cell_selection = None;
     }
 
     /// Provide simulated system information for a cell.
@@ -10126,15 +10141,84 @@ mod tests {
         );
         assert_eq!(task.state_machine.state(), RrcState::Connected);
 
-        // POSITIVE CONTROL: losing the target itself, the serving cell, does clear it,
-        // although the selector never camped on the target.
+        // POSITIVE CONTROL: losing the target itself, the serving cell, is seen,
+        // although the selector never camped on the target: its measurement is gone,
+        // which is what radio link monitoring reads. The serving cell stays, because
+        // in RRC_CONNECTED its loss is a radio link failure (see the test below).
         run_async(async {
             task.handle_signal_changed(NEIGHBOUR_CELL, -125).await;
         });
+        assert_eq!(task.serving_cell_id, Some(NEIGHBOUR_CELL));
         assert_eq!(
-            task.serving_cell_id, None,
-            "losing the serving cell must clear it, whatever the selector camped on"
+            task.measurement_manager.rsrp(NEIGHBOUR_CELL),
+            None,
+            "losing the serving cell must remove its measurement"
         );
+    }
+
+    /// #518 review round 2, the same gap without a handover: the selector camps on the
+    /// serving cell, so its loss arrives as `ActiveCellLost`. That arm also cleared
+    /// `serving_cell_id` in RRC_CONNECTED, and T310 never started either.
+    #[test]
+    fn a_connected_ue_that_loses_its_only_cell_runs_t310() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(PAGING_CELL, -125).await;
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+            for _ in 0..10 {
+                task.perform_cycle().await;
+                if task.rlf_detector.t310_is_running() {
+                    break;
+                }
+            }
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "losing the serving cell in RRC_CONNECTED must start T310 (§5.3.10.3)"
+            );
+        });
+    }
+
+    /// **#518 review round 2**: a CONNECTED UE that loses its handover target must
+    /// declare radio link failure. The target's loss arrives as `CellLost` (the
+    /// selector still camps on the source). Clearing `serving_cell_id` there made
+    /// `evaluate_radio_link_quality` return early, so T310 never started and the UE
+    /// stayed CONNECTED to nothing, ignoring every page. TS 38.331 §5.3.10.3: no
+    /// sample of the serving cell is out-of-sync, N310 of them start T310, and its
+    /// expiry is RLF, which re-establishes on a keyed UE (§5.3.7.2).
+    #[test]
+    fn a_connected_ue_that_loses_its_handover_target_runs_t310_to_rlf() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            handed_over_to_the_neighbour(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(NEIGHBOUR_CELL, -125).await;
+            assert_eq!(task.state_machine.state(), RrcState::Connected);
+            assert!(!task.rlf_detector.t310_is_running(), "precondition");
+
+            // N310 out-of-sync indications from the production cycle, without the test
+            // touching the detector's counters.
+            for _ in 0..10 {
+                task.perform_cycle().await;
+                if task.rlf_detector.t310_is_running() {
+                    break;
+                }
+            }
+            assert!(
+                task.rlf_detector.t310_is_running(),
+                "the lost serving cell gives no sample, which is out-of-sync, so T310 must \
+                 start (TS 38.331 §5.3.10.3)"
+            );
+
+            task.rlf_detector.expire_t310_for_test();
+            task.check_guard_timers().await;
+            assert!(
+                task.reestablishment_proc.is_in_progress(),
+                "T310 expiry is a radio link failure, and a keyed UE re-establishes \
+                 (§5.3.7.2) instead of staying CONNECTED to nothing"
+            );
+        });
     }
 
     /// **#518 review, MINOR 2**, #514 in RRC_INACTIVE: a suspended UE answers a page
