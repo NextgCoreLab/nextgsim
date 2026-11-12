@@ -1426,6 +1426,10 @@ pub enum AgentMessage {
         ue_id: i32,
         /// Whether the preparation succeeded (HANDOVER COMMAND).
         success: bool,
+        /// Whether a HANDOVER REQUIRED went out for it. `false` when nothing
+        /// reached the network (e.g. the UE's PDU session resources were not set
+        /// up yet), so the agent may pick the UE again.
+        signalled: bool,
         /// What happened, for the audit.
         detail: String,
     },

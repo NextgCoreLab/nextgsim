@@ -1,0 +1,11 @@
+--- a/nextgsim-gnb/src/agent/d446a.rs
++++ b/nextgsim-gnb/src/agent/d446a.rs
+@@ -484,7 +484,7 @@
+             let n = self.lb_unsignalled.entry(ue_id).or_insert(0);
+             *n += 1;
+             if *n <= MAX_UNSIGNALLED_RETRIES {
+-                self.lb_tried.remove(&ue_id);
++                // 446-retry-unsignalled revert: the UE stays tried, so lb-1 never picks it again.
+                 format!("; not signalled, retry {n}/{MAX_UNSIGNALLED_RETRIES}")
+             } else {
+                 "; not signalled, retries exhausted".to_string()

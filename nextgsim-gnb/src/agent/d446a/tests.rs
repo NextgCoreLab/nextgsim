@@ -266,7 +266,7 @@ fn a_loaded_cell_hands_one_ue_to_the_booster_once() {
         a.on_tick(now, &[1], &[1], Some(LB)).is_empty(),
         "not repeated"
     );
-    a.on_actuation(&intent.id, 1, false, "HANDOVER PREPARATION FAILURE");
+    a.on_actuation(&intent.id, 1, false, false, "HANDOVER PREPARATION FAILURE");
     assert_eq!(
         events(&audit),
         vec!["IntentSubmitted (lb-1)", "ActuationFailed (lb-1)"]
@@ -332,5 +332,74 @@ fn an_energy_saving_win_does_not_drop_a_connected_ue() {
             "GuardrailHold (energy-1)",
         ],
         "{ev:?}"
+    );
+}
+
+/// A UE whose first packet makes it served before its PDU session resources
+/// are set up: lb-1's handover is refused locally (no HANDOVER REQUIRED was
+/// sent). That UE must be tried again at a later tick, not dropped for good
+/// (the revert arm `446-retry-unsignalled`); a network refusal stays final.
+#[test]
+fn an_unsignalled_handover_failure_is_retried() {
+    let audit = Audit::default();
+    let mut a = D446a::from_config(&[lb_rule()], audit.clone()).unwrap();
+    let now = Instant::now();
+    let actions = a.on_tick(now, &[1], &[1], Some(LB));
+    let [Action::Handover(first)] = actions.as_slice() else {
+        panic!("lb-1 must fire");
+    };
+    let first = first.id.clone();
+    a.on_actuation(&first, 1, false, true, "no HANDOVER REQUIRED was sent");
+    let again = a.on_tick(now + Duration::from_secs(1), &[1], &[1], Some(LB));
+    let [Action::Handover(second)] = again.as_slice() else {
+        panic!("the UE must be tried again: {again:?}");
+    };
+    assert_eq!(second.target.as_deref(), Some("1"));
+    let second = second.id.clone();
+    // Refused by the network this time: final.
+    a.on_actuation(&second, 1, false, false, "HANDOVER PREPARATION FAILURE");
+    assert!(a
+        .on_tick(now + Duration::from_secs(2), &[1], &[1], Some(LB))
+        .is_empty());
+    let a = audit.lock().unwrap();
+    let failed: Vec<&str> = a
+        .iter()
+        .filter(|r| r.event == "ActuationFailed")
+        .map(|r| r.detail.as_str())
+        .collect();
+    assert!(
+        failed[0].ends_with("not signalled, retry 1/3"),
+        "{failed:?}"
+    );
+}
+
+/// A UE that can never be handed over (a persistent local failure) is tried
+/// at most MAX_UNSIGNALLED_RETRIES + 1 times, not at every tick.
+#[test]
+fn a_persistently_unsignalled_ue_is_retried_a_bounded_number_of_times() {
+    let audit = Audit::default();
+    let mut a = D446a::from_config(&[lb_rule()], audit.clone()).unwrap();
+    let now = Instant::now();
+    let mut tries = 0;
+    for t in 0..20 {
+        for action in a.on_tick(now + Duration::from_secs(t), &[1], &[1], Some(LB)) {
+            let Action::Handover(intent) = action else {
+                continue;
+            };
+            tries += 1;
+            a.on_actuation(&intent.id, 1, false, true, "no HANDOVER REQUIRED was sent");
+        }
+    }
+    assert_eq!(tries, MAX_UNSIGNALLED_RETRIES + 1);
+    let a = audit.lock().unwrap();
+    let last = a
+        .iter()
+        .rev()
+        .find(|r| r.event == "ActuationFailed")
+        .unwrap();
+    assert!(
+        last.detail.ends_with("retries exhausted"),
+        "{}",
+        last.detail
     );
 }
