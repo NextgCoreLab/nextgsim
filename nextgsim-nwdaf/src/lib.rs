@@ -156,6 +156,16 @@ use std::collections::VecDeque;
 
 pub use nextgsim_common::Vector3;
 
+/// A trajectory prediction must be more confident than this for a handover
+/// recommendation to be classed [`HandoverReason::PredictedMobility`].
+pub const PREDICTED_MOBILITY_CONFIDENCE: f32 = 0.7;
+
+/// The confidence of a [`HandoverReason::SignalBased`] recommendation: the
+/// neighbour was measured 3 dB above the serving cell, which no prediction
+/// qualifies, so it is a fixed value (the 0.85 every recommendation carried
+/// before nextgsim#467).
+pub const SIGNAL_BASED_HANDOVER_CONFIDENCE: f32 = 0.85;
+
 /// UE measurement data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UeMeasurement {
@@ -393,8 +403,6 @@ pub struct NwdafManager {
     anlf: Anlf,
     /// Model Training Logical Function
     mtlf: Mtlf,
-    /// Maximum history length (kept for backward compat)
-    max_history_length: usize,
     /// Handover confidence threshold
     handover_confidence_threshold: f32,
     /// Serving counters and latencies (nextgsim#463).
@@ -419,7 +427,6 @@ impl NwdafManager {
             data_collector: DataCollector::new(max_history_length),
             anlf: Anlf::new(),
             mtlf: Mtlf::new(),
-            max_history_length,
             handover_confidence_threshold: 0.8,
             #[cfg(feature = "model-registry")]
             serving: serving::ServingStats::default(),
@@ -526,40 +533,15 @@ impl NwdafManager {
             // fall through to linear extrapolation
         }
 
-        // Linear extrapolation fallback (same algorithm as original)
-        let n = positions.len();
-        let p1 = &positions[n - 2];
-        let p2 = &positions[n - 1];
-
-        let dt = if timestamps.len() >= 2 {
-            let t1 = timestamps[timestamps.len() - 2];
-            let t2 = timestamps[timestamps.len() - 1];
-            if t2 > t1 {
-                (t2 - t1) as f64 / 1000.0
-            } else {
-                0.1
-            }
-        } else {
-            0.1
-        };
-
-        let vx = (p2.x - p1.x) / dt;
-        let vy = (p2.y - p1.y) / dt;
-        let vz = (p2.z - p1.z) / dt;
-
-        let num_waypoints = 10u32;
-        let step_ms = horizon_ms / num_waypoints;
-
-        let waypoints: Vec<(Vector3, u64)> = (1..=num_waypoints)
-            .map(|i| {
-                let t = (f64::from(i) * f64::from(step_ms)) / 1000.0;
-                let pos = Vector3::new(p2.x + vx * t, p2.y + vy * t, p2.z + vz * t);
-                let timestamp = current_time + (u64::from(i) * u64::from(step_ms));
-                (pos, timestamp)
-            })
-            .collect();
-
-        let confidence = (history.len() as f32 / self.max_history_length as f32).min(0.9);
+        // The least-squares fallback, the same one the predictor runs without a
+        // model (nextgsim#467), so both paths report the same R² confidence.
+        let output = crate::predictor::least_squares_trajectory(
+            &positions,
+            &timestamps,
+            horizon_ms,
+            current_time,
+        );
+        let (waypoints, confidence) = (output.waypoints, output.confidence);
 
         Some((
             TrajectoryPrediction {
@@ -591,14 +573,20 @@ impl NwdafManager {
             })?;
 
         // Check if trajectory prediction suggests handover
+        // A prediction confident enough to call it mobility carries its own
+        // confidence (nextgsim#467). A signal-based recommendation rests on the
+        // measured 3 dB margin above, not on a prediction, and keeps the fixed
+        // SIGNAL_BASED_HANDOVER_CONFIDENCE.
         let prediction = self.predict_trajectory(ue_id, 1000);
-        let reason = if prediction.map(|p| p.confidence > 0.7).unwrap_or(false) {
-            HandoverReason::PredictedMobility
-        } else {
-            HandoverReason::SignalBased
+        let (reason, confidence) = match prediction {
+            Some(p) if p.confidence > PREDICTED_MOBILITY_CONFIDENCE => {
+                (HandoverReason::PredictedMobility, p.confidence)
+            }
+            _ => (
+                HandoverReason::SignalBased,
+                SIGNAL_BASED_HANDOVER_CONFIDENCE,
+            ),
         };
-
-        let confidence = 0.85; // Would be computed by ML model
 
         Some(HandoverRecommendation {
             ue_id,
@@ -1196,5 +1184,56 @@ mod tests {
 
         let analytics = result.expect("should succeed");
         assert_eq!(analytics.analytics_id, AnalyticsId::QosSustainability);
+    }
+
+    /// nextgsim#467: the manager's own fallback is the least-squares fit, and
+    /// recommend_handover classes a confident prediction as PredictedMobility
+    /// with the prediction's confidence, instead of a fixed 0.85 behind a test
+    /// the 0.7 cap made unreachable. A scattered track stays SignalBased with
+    /// the fixed signal-based confidence.
+    #[test]
+    fn recommend_handover_carries_the_least_squares_confidence() {
+        let record = |manager: &mut NwdafManager, zigzag: bool| {
+            for i in 0..10 {
+                let y = if zigzag {
+                    if i % 2 == 0 {
+                        15.0
+                    } else {
+                        -15.0
+                    }
+                } else {
+                    0.0
+                };
+                manager.record_measurement(UeMeasurement {
+                    ue_id: 1,
+                    rsrp: -80.0,
+                    rsrq: None,
+                    sinr: None,
+                    position: Vector3::new((35.0 + 2.5 * f64::from(i)).round(), y, 0.0),
+                    velocity: None,
+                    serving_cell_id: 1,
+                    timestamp_ms: 1_000 + i as u64 * 1_000,
+                });
+            }
+        };
+
+        let mut clean = NwdafManager::new(20);
+        record(&mut clean, false);
+        let traj = clean.predict_trajectory(1, 1000).expect("predicts");
+        assert!(traj.confidence > 0.7, "confidence {}", traj.confidence);
+        let ho = clean
+            .recommend_handover(1, &[(2, -70.0)])
+            .expect("a 10 dB better neighbour");
+        assert_eq!(ho.reason, HandoverReason::PredictedMobility);
+        assert_eq!(ho.confidence, traj.confidence);
+
+        let mut noisy = NwdafManager::new(20);
+        record(&mut noisy, true);
+        assert!(noisy.predict_trajectory(1, 1000).unwrap().confidence < 0.7);
+        let ho = noisy
+            .recommend_handover(1, &[(2, -70.0)])
+            .expect("a 10 dB better neighbour");
+        assert_eq!(ho.reason, HandoverReason::SignalBased);
+        assert_eq!(ho.confidence, SIGNAL_BASED_HANDOVER_CONFIDENCE);
     }
 }

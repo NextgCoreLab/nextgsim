@@ -601,16 +601,21 @@ impl Anlf {
             .trajectory_predictor()
             .or(self.fallback_predictor.as_ref());
 
-        let reason = if let Some(pred) = predictor {
-            match pred.predict_trajectory(&positions, &timestamps, 1000, current_time) {
-                Ok(output) if output.confidence > 0.7 => HandoverReason::PredictedMobility,
-                _ => HandoverReason::SignalBased,
+        // As NwdafManager::recommend_handover (nextgsim#467): a confident
+        // prediction carries its own confidence; a signal-based one the fixed
+        // value.
+        let (reason, confidence) = match predictor.and_then(|pred| {
+            pred.predict_trajectory(&positions, &timestamps, 1000, current_time)
+                .ok()
+        }) {
+            Some(output) if output.confidence > crate::PREDICTED_MOBILITY_CONFIDENCE => {
+                (HandoverReason::PredictedMobility, output.confidence)
             }
-        } else {
-            HandoverReason::SignalBased
+            _ => (
+                HandoverReason::SignalBased,
+                crate::SIGNAL_BASED_HANDOVER_CONFIDENCE,
+            ),
         };
-
-        let confidence = 0.85;
         let recommendation = HandoverRecommendation {
             ue_id,
             target_cell_id: best_neighbor.0,
@@ -1837,6 +1842,10 @@ mod tests {
         assert!(rec.is_some());
         let ho = rec.expect("should have recommendation");
         assert_eq!(ho.target_cell_id, 2);
+        // nextgsim#467: ten samples on a straight line fit perfectly, so the
+        // fallback predictor's R² clears 0.7 and the recommendation carries it.
+        assert_eq!(ho.reason, HandoverReason::PredictedMobility);
+        assert!(ho.confidence > 0.99, "confidence {}", ho.confidence);
     }
 
     #[test]

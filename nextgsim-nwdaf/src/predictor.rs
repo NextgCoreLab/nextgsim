@@ -1,8 +1,9 @@
 //! Trajectory and load prediction (linear extrapolation; optional ONNX)
 //!
 //! OPERATIONAL PATH: the simulator ships no ONNX model, so `OnnxPredictor` runs
-//! linear extrapolation (`predict_linear`) — it fits a line through the recent
-//! position/time samples and projects forward. It wraps the `nextgsim-ai`
+//! least-squares linear extrapolation (`least_squares_trajectory`) — it fits a
+//! line through the recent position/time samples, projects forward, and reports
+//! the fit's R² as its confidence. It wraps the `nextgsim-ai`
 //! `InferenceEngine` and will use a learned model if one is loaded, but since
 //! none is shipped, linear extrapolation is what actually runs.
 
@@ -37,7 +38,7 @@ pub struct PredictionOutput {
 /// Predictor with optional ONNX support; linear extrapolation is operational.
 ///
 /// OPERATIONAL PATH: no ONNX model ships, so this runs `predict_linear` (a
-/// constant-velocity linear extrapolation over the recent samples). It wraps
+/// least-squares constant-velocity fit over the recent samples, R² confidence). It wraps
 /// the `nextgsim-ai` `InferenceEngine` and will run a learned model if one is
 /// loaded, but since none is shipped, linear extrapolation is what executes.
 ///
@@ -340,11 +341,8 @@ impl OnnxPredictor {
         })
     }
 
-    /// OPERATIONAL ALGORITHM: linear extrapolation (the path that actually runs,
-    /// since no ONNX model ships).
-    ///
-    /// Uses the last two position/timestamp pairs to compute velocity,
-    /// then projects forward for the given horizon.
+    /// OPERATIONAL ALGORITHM: least-squares linear extrapolation (the path that
+    /// actually runs, since no ONNX model ships). See [`least_squares_trajectory`].
     fn predict_linear(
         &self,
         positions: &[Vector3],
@@ -352,49 +350,7 @@ impl OnnxPredictor {
         horizon_ms: u32,
         current_time_ms: u64,
     ) -> PredictionOutput {
-        let n = positions.len();
-        let p1 = &positions[n - 2];
-        let p2 = &positions[n - 1];
-
-        // Compute time delta between last two samples
-        let dt_ms = if timestamps.len() >= 2 {
-            let t1 = timestamps[timestamps.len() - 2];
-            let t2 = timestamps[timestamps.len() - 1];
-            if t2 > t1 {
-                t2 - t1
-            } else {
-                100
-            } // default 100ms if timestamps are not ordered
-        } else {
-            100 // assume 100ms interval
-        };
-
-        let dt_s = dt_ms as f64 / 1000.0;
-        let vx = (p2.x - p1.x) / dt_s;
-        let vy = (p2.y - p1.y) / dt_s;
-        let vz = (p2.z - p1.z) / dt_s;
-
-        let num_waypoints: u32 = 10;
-        let step_ms = horizon_ms / num_waypoints;
-
-        let waypoints: Vec<(Vector3, u64)> = (1..=num_waypoints)
-            .map(|i| {
-                let t = (f64::from(i) * f64::from(step_ms)) / 1000.0;
-                let pos = Vector3::new(p2.x + vx * t, p2.y + vy * t, p2.z + vz * t);
-                let timestamp = current_time_ms + (u64::from(i) * u64::from(step_ms));
-                (pos, timestamp)
-            })
-            .collect();
-
-        // Confidence based on how many samples we have (more history = more confident)
-        // Cap at 0.7 for linear extrapolation (lower than ML model)
-        let confidence = (n as f32 / 20.0).min(0.7);
-
-        PredictionOutput {
-            waypoints,
-            confidence,
-            method: PredictionMethod::LinearExtrapolation,
-        }
+        least_squares_trajectory(positions, timestamps, horizon_ms, current_time_ms)
     }
 
     /// Predicts future load given a history of load values
@@ -476,6 +432,121 @@ impl OnnxPredictor {
     }
 }
 
+/// The most recent samples a least-squares fit uses (nextgsim#467). At the
+/// 1 s RLS heartbeat that is the last 10 s of movement: long enough to average
+/// out integer-metre position rounding, short enough that a turning UE is fitted
+/// by its current heading rather than where it was going a minute ago.
+pub const LSQ_WINDOW: usize = 10;
+
+/// Samples a fit needs for full confidence (nextgsim#467). A line through two
+/// points always fits perfectly (R² = 1) and says nothing, so the confidence is
+/// R² scaled by `(n - 2) / (LSQ_FULL_CONFIDENCE_SAMPLES - 2)`, capped at 1: two
+/// samples give 0, three a third, five or more the full R².
+pub const LSQ_FULL_CONFIDENCE_SAMPLES: usize = 5;
+
+/// Least-squares constant-velocity trajectory prediction (nextgsim#467).
+///
+/// Fits `p(t) = a + b·t` per axis by ordinary least squares over the last
+/// [`LSQ_WINDOW`] samples (time in seconds, anchored at the newest sample) and
+/// projects ten waypoints over `horizon_ms` from `current_time_ms`.
+///
+/// The confidence is the fit's R² over all three axes together
+/// (`1 - SS_res / SS_tot`), scaled down for short histories as
+/// [`LSQ_FULL_CONFIDENCE_SAMPLES`] describes, and clamped to `0..=1`:
+/// - a UE on a straight track at a steady speed scores close to 1;
+/// - a UE whose positions scatter around the line (turning, stop-and-go,
+///   noisy positions) scores low, because most of the movement is residual;
+/// - a UE that did not move at all (`SS_tot` = 0) is predicted to stay, with the
+///   fit's full confidence, since there is no variance left unexplained;
+/// - samples that all carry one timestamp give no velocity and confidence 0.
+///
+/// This replaces a two-sample velocity whose confidence was the sample count
+/// capped at 0.7, which the `> 0.7` mobility test could never pass.
+///
+/// `timestamps` normally has one entry per position; when it does not, a
+/// 100 ms spacing ending at the newest sample is assumed (the old default).
+/// `positions` must not be empty.
+pub fn least_squares_trajectory(
+    positions: &[Vector3],
+    timestamps: &[u64],
+    horizon_ms: u32,
+    current_time_ms: u64,
+) -> PredictionOutput {
+    let n_all = positions.len();
+    let n = n_all.min(LSQ_WINDOW);
+    let pos = &positions[n_all - n..];
+    // Seconds relative to the newest sample (<= 0).
+    let t: Vec<f64> = if timestamps.len() == n_all {
+        let ts = &timestamps[n_all - n..];
+        let last = ts[n - 1] as f64;
+        ts.iter().map(|&x| (x as f64 - last) / 1000.0).collect()
+    } else {
+        (0..n).map(|i| (i as f64 - (n - 1) as f64) * 0.1).collect()
+    };
+    let t_last_ms = if timestamps.len() == n_all {
+        timestamps[n_all - 1]
+    } else {
+        current_time_ms
+    };
+
+    let nf = n as f64;
+    let t_mean = t.iter().sum::<f64>() / nf;
+    let sxx: f64 = t.iter().map(|ti| (ti - t_mean).powi(2)).sum();
+    let axis = |get: fn(&Vector3) -> f64| {
+        let mean = pos.iter().map(get).sum::<f64>() / nf;
+        let slope = if sxx > 0.0 {
+            t.iter()
+                .zip(pos)
+                .map(|(ti, p)| (ti - t_mean) * (get(p) - mean))
+                .sum::<f64>()
+                / sxx
+        } else {
+            0.0
+        };
+        let intercept = mean - slope * t_mean;
+        let ss_tot: f64 = pos.iter().map(|p| (get(p) - mean).powi(2)).sum();
+        let ss_res: f64 = t
+            .iter()
+            .zip(pos)
+            .map(|(ti, p)| (get(p) - (intercept + slope * ti)).powi(2))
+            .sum();
+        (intercept, slope, ss_tot, ss_res)
+    };
+    let (ax, bx, tot_x, res_x) = axis(|p| p.x);
+    let (ay, by, tot_y, res_y) = axis(|p| p.y);
+    let (az, bz, tot_z, res_z) = axis(|p| p.z);
+
+    let ss_tot = tot_x + tot_y + tot_z;
+    let ss_res = res_x + res_y + res_z;
+    let r2 = if sxx <= 0.0 {
+        0.0
+    } else if ss_tot <= 1e-9 {
+        1.0
+    } else {
+        (1.0 - ss_res / ss_tot).clamp(0.0, 1.0)
+    };
+    let history_factor =
+        (n.saturating_sub(2) as f64 / (LSQ_FULL_CONFIDENCE_SAMPLES - 2) as f64).min(1.0);
+    let confidence = (r2 * history_factor) as f32;
+
+    let num_waypoints: u32 = 10;
+    let step_ms = horizon_ms / num_waypoints;
+    let offset_s = (current_time_ms as f64 - t_last_ms as f64) / 1000.0;
+    let waypoints = (1..=num_waypoints)
+        .map(|i| {
+            let dt = offset_s + f64::from(i * step_ms) / 1000.0;
+            let p = Vector3::new(ax + bx * dt, ay + by * dt, az + bz * dt);
+            (p, current_time_ms + u64::from(i * step_ms))
+        })
+        .collect();
+
+    PredictionOutput {
+        waypoints,
+        confidence,
+        method: PredictionMethod::LinearExtrapolation,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,7 +575,9 @@ mod tests {
         let output = result.expect("should predict");
         assert_eq!(output.method, PredictionMethod::LinearExtrapolation);
         assert!(!output.waypoints.is_empty());
-        assert!(output.confidence > 0.0 && output.confidence <= 0.7);
+        // Three clean samples: a perfect fit, but only a third of the credit a
+        // five-sample history earns.
+        assert!(output.confidence > 0.0 && output.confidence < 0.7);
 
         // First waypoint should continue the linear trend
         let (first_pos, _first_ts) = &output.waypoints[0];
@@ -594,6 +667,134 @@ mod tests {
         let debug_str = format!("{predictor:?}");
         assert!(debug_str.contains("OnnxPredictor"));
         assert!(debug_str.contains("model_loaded: false"));
+    }
+
+    // ---- least-squares predictor (nextgsim#467) ----
+
+    /// A track sampled at the 1 s heartbeat, with integer-metre positions as
+    /// the RLS `sim_pos` carries them.
+    fn track(f: impl Fn(f64) -> (f64, f64), n: usize) -> (Vec<Vector3>, Vec<u64>) {
+        let positions = (0..n)
+            .map(|i| {
+                let (x, y) = f(i as f64);
+                Vector3::new(x.round(), y.round(), 0.0)
+            })
+            .collect();
+        let timestamps = (0..n).map(|i| 1_000 + i as u64 * 1_000).collect();
+        (positions, timestamps)
+    }
+
+    /// The ticket's unit criterion, first half: a clean track (2.5 m/s along
+    /// x, as `config/ue-n2ho.yaml` walks) scores above the 0.7 mobility
+    /// threshold, which the old 0.7 cap made unreachable.
+    #[test]
+    fn a_clean_track_is_confident_above_the_mobility_threshold() {
+        let (p, t) = track(|i| (35.0 + 2.5 * i, 0.0), 10);
+        let out = least_squares_trajectory(&p, &t, 1000, *t.last().unwrap());
+        assert!(out.confidence > 0.7, "confidence {}", out.confidence);
+        assert!(out.confidence > 0.99, "R² of a rounded straight line is ~1");
+        // 100 ms after the last fix, the fit is ~0.25 m further along x (within
+        // half a metre: the positions are rounded to whole metres).
+        let (first, ts) = out.waypoints[0];
+        assert_eq!(ts, t[9] + 100);
+        assert!(
+            (first.x - (35.0 + 2.5 * 9.0 + 0.25)).abs() < 0.5,
+            "x {}",
+            first.x
+        );
+        let (last, _) = out.waypoints[9];
+        assert!((last.x - (35.0 + 2.5 * 10.0)).abs() < 0.5, "x {}", last.x);
+    }
+
+    /// Second half: positions scattered around the line (a zig-zag of ±15 m
+    /// on a 2.5 m/s walk) leave most of the movement unexplained, so the fit
+    /// stays below 0.7 however many samples there are.
+    #[test]
+    fn high_residuals_keep_the_confidence_below_the_threshold() {
+        let (p, t) = track(
+            |i| {
+                (
+                    35.0 + 2.5 * i,
+                    if (i as i64) % 2 == 0 { 15.0 } else { -15.0 },
+                )
+            },
+            10,
+        );
+        let out = least_squares_trajectory(&p, &t, 1000, *t.last().unwrap());
+        assert!(out.confidence < 0.7, "confidence {}", out.confidence);
+    }
+
+    /// It is a least-squares fit, not the last two samples: one jittered final
+    /// fix barely moves the velocity, where a two-point velocity would read it
+    /// as a 14 m/s jump.
+    #[test]
+    fn the_fit_uses_the_window_not_the_last_two_samples() {
+        let (mut p, t) = track(|i| (10.0 * i, 0.0), 6);
+        p[5].x = 54.0; // 50 expected; two-point velocity (54-40)/1 s = 14 m/s
+        let out = least_squares_trajectory(&p, &t, 1000, t[5]);
+        let (last, _) = out.waypoints[9];
+        // The OLS line through the six points: slope 185/17.5 = 10.571 m/s,
+        // value at the newest sample 52.095 m, so one second later 62.667 m
+        // (the two-point velocity would give 68).
+        assert!((last.x - 62.667).abs() < 0.01, "x {}", last.x);
+    }
+
+    /// Only the last LSQ_WINDOW samples count: an old leg in another direction
+    /// does not bend the current heading.
+    #[test]
+    fn samples_older_than_the_window_are_ignored() {
+        let (mut p, t) = track(|i| (5.0 * i, 0.0), LSQ_WINDOW + 5);
+        for q in p.iter_mut().take(5) {
+            q.y = 500.0; // a different leg, outside the window
+        }
+        let out = least_squares_trajectory(&p, &t, 1000, *t.last().unwrap());
+        assert!(out.confidence > 0.99, "confidence {}", out.confidence);
+        assert!(out.waypoints.iter().all(|(w, _)| w.y.abs() < 1e-9));
+    }
+
+    /// Two samples always fit perfectly and earn nothing; credit grows to the
+    /// full R² at LSQ_FULL_CONFIDENCE_SAMPLES.
+    #[test]
+    fn short_histories_earn_proportionally_less_confidence() {
+        let conf = |n| {
+            let (p, t) = track(|i| (2.0 * i, 0.0), n);
+            least_squares_trajectory(&p, &t, 1000, *t.last().unwrap()).confidence
+        };
+        assert_eq!(conf(2), 0.0);
+        assert!((conf(3) - 1.0 / 3.0).abs() < 1e-6);
+        assert!((conf(4) - 2.0 / 3.0).abs() < 1e-6);
+        assert!((conf(LSQ_FULL_CONFIDENCE_SAMPLES) - 1.0).abs() < 1e-6);
+    }
+
+    /// A UE that has not moved is predicted to stay, with full confidence; one
+    /// whose samples share a timestamp has no velocity and no confidence.
+    #[test]
+    fn a_stationary_ue_stays_and_a_zero_time_span_has_no_confidence() {
+        let (p, t) = track(|_| (40.0, 7.0), 6);
+        let out = least_squares_trajectory(&p, &t, 1000, *t.last().unwrap());
+        assert!((out.confidence - 1.0).abs() < 1e-6);
+        assert!(out
+            .waypoints
+            .iter()
+            .all(|(w, _)| (w.x - 40.0).abs() < 1e-9 && (w.y - 7.0).abs() < 1e-9));
+
+        let (p, _) = track(|i| (3.0 * i, 0.0), 6);
+        let same = vec![5_000u64; 6];
+        let out = least_squares_trajectory(&p, &same, 1000, 5_000);
+        assert_eq!(out.confidence, 0.0);
+        assert!(out.waypoints.iter().all(|(w, _)| w.x.is_finite()));
+    }
+
+    /// The predictor's fallback is exactly this fit.
+    #[test]
+    fn the_predictor_fallback_is_the_least_squares_fit() {
+        let predictor = OnnxPredictor::new().expect("should create");
+        let (p, t) = track(|i| (35.0 + 2.5 * i, 1.0 * i), 8);
+        let a = predictor.predict_trajectory(&p, &t, 1000, t[7]).unwrap();
+        let b = least_squares_trajectory(&p, &t, 1000, t[7]);
+        assert_eq!(a.confidence, b.confidence);
+        assert_eq!(a.waypoints, b.waypoints);
+        assert!(a.confidence > 0.7);
     }
 }
 
