@@ -92,7 +92,9 @@ congestion_export:
   nrf_uri: http://nrf:7777       # required
   # nwdaf_uri: http://nwdaf:7777 # optional, skips discovery
   nf_instance_id: 6b1d7e3c-0000-4000-8000-00000000465a
-  cca_key_file: /tmp/d441a-cca/exporter.key   # created 0600 if absent
+  cca_key_file: /tmp/d441a-cca/exporter.key   # created 0600 if absent; an existing file
+                                              # must be a regular file, mode 0600, owned
+                                              # by the gNB's uid, or startup fails
   cca_public_jwk_dir: /tmp/d441a-cca          # writes <nf_instance_id>.jwk
 ```
 
@@ -179,3 +181,12 @@ validation; nothing here is invented.
   token-less notifies (TS 33.501 §13.4.1; nextgcore#1421).
 - **Lead time.** The prediction's lead time over statistics is reported, not
   asserted.
+- **UE-B's load is ICMP echo.** `scenario.sh` makes UE-B's downlink with large
+  echo requests whose replies are the downlink, not an application flow. A
+  throttle also polices the requests on the uplink.
+- **One prediction horizon.** nwdafd answers a prediction request with the
+  gNB's single prediction at its own `prediction_horizon_ms`, whatever future
+  window `ana-req` names; `timeIntev` echoes the requested window.
+- **pcfd restart.** A cap is recorded with the session. A restarted pcfd
+  re-notifies the subscribed Session-AMBR for every capped session, so a
+  throttle does not outlive the process (or the demo).
