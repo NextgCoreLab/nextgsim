@@ -423,7 +423,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The gNB's 6G surface -- NWDAF, ISAC, SHE, NKEF, agent, FL -- lives behind
+      # The gNB's 6G surface -- NWDAF, ISAC, SHE, NKEF, agent -- lives behind
       # the `6g` umbrella, so the default-feature jobs above compile none of it.
       # It is not entirely uncovered: the event-bus job tests it in the
       # `event-bus,6g` COMBINATION. This job covers `6g` on its own, which is the

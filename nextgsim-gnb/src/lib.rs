@@ -88,8 +88,6 @@ pub mod wiring;
 // feature so a lean `cargo build -p nextgsim-gnb` excludes them).
 #[cfg(feature = "nextgsim-agent")]
 pub mod agent;
-#[cfg(feature = "nextgsim-fl")]
-pub mod fl;
 #[cfg(feature = "nextgsim-isac")]
 pub mod isac;
 #[cfg(feature = "nextgsim-nkef")]
@@ -154,8 +152,6 @@ pub use wiring::{GnbCoreReceivers, GnbWiring};
 // optional module declarations above).
 #[cfg(feature = "nextgsim-agent")]
 pub use agent::AgentTask;
-#[cfg(feature = "nextgsim-fl")]
-pub use fl::FlAggregatorTask;
 #[cfg(feature = "nextgsim-isac")]
 pub use isac::IsacTask;
 #[cfg(feature = "nextgsim-nkef")]

@@ -62,8 +62,10 @@ demo-d446a-agent-conflict = ["nextgsim-agent"]
 # enables `d441a-congestion-loop`.
 demo-d441a-congestion-loop = ["6g", "sbi-client"]
 
-# Umbrella feature enabling all six optional 6G / AI-native research crates at
-# once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
+# Umbrella feature enabling the five optional 6G / AI-native research crates at
+# once. (The gNB FL aggregator was removed in nextgsim#480: federated learning
+# is an application-layer AF, `nr-fl-server`, on the N6 side, not a gNB task.)
+# Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
 # `cargo build -p nextgsim-gnb --features 6g` yields the full build. There is no
 # frozen 3GPP Rel-20/6G Stage-3 spec behind these crates.
 6g = [
@@ -72,7 +74,6 @@ demo-d441a-congestion-loop = ["6g", "sbi-client"]
     "nextgsim-nkef",
     "nextgsim-isac",
     "nextgsim-agent",
-    "nextgsim-fl",
 ]
 
 # Demo d447a-nkef-live (nextgsim#488): NKEF's live RLS / N2 tees, its h2c SBA
@@ -121,7 +122,6 @@ nextgsim-nwdaf = { workspace = true, optional = true }
 nextgsim-nkef = { workspace = true, optional = true }
 nextgsim-isac = { workspace = true, optional = true }
 nextgsim-agent = { workspace = true, optional = true }
-nextgsim-fl = { workspace = true, optional = true }
 
 log.workspace = true
 tracing-log.workspace = true

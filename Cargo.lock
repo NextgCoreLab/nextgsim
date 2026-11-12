@@ -1717,7 +1717,6 @@ dependencies = [
  "nextgsim-common",
  "nextgsim-crypto",
  "nextgsim-demo",
- "nextgsim-fl",
  "nextgsim-gtp",
  "nextgsim-isac",
  "nextgsim-ngap",

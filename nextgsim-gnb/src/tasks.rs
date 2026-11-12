@@ -105,8 +105,6 @@ pub enum TaskId {
     Isac,
     /// AI Agent Framework (AAF) task
     Agent,
-    /// Federated Learning Aggregator task
-    FlAggregator,
 
     // ========================================================================
     // Rel-18 5G-Advanced tasks
@@ -129,7 +127,6 @@ impl std::fmt::Display for TaskId {
             TaskId::Nkef => write!(f, "NKEF"),
             TaskId::Isac => write!(f, "ISAC"),
             TaskId::Agent => write!(f, "Agent"),
-            TaskId::FlAggregator => write!(f, "FL"),
             TaskId::Energy => write!(f, "Energy"),
         }
     }
@@ -1444,43 +1441,6 @@ pub enum AgentMessage {
     },
 }
 
-/// Messages for the Federated Learning Aggregator task.
-///
-/// FL provides privacy-preserving distributed training per 3GPP TR 23.700-80.
-#[derive(Debug)]
-pub enum FlAggregatorMessage {
-    /// Participant registration
-    RegisterParticipant {
-        /// Participant identifier
-        participant_id: String,
-        /// Device capabilities (FLOPS)
-        compute_capability: u64,
-    },
-    /// Model update from participant
-    SubmitUpdate {
-        /// Participant identifier
-        participant_id: String,
-        /// Round number
-        round: u64,
-        /// Gradient updates
-        gradients: Vec<f32>,
-        /// Number of local samples
-        num_samples: u64,
-    },
-    /// Trigger aggregation
-    Aggregate {
-        /// Round number
-        round: u64,
-    },
-    /// Distribute global model
-    DistributeModel {
-        /// Model version
-        version: u64,
-        /// Model weights
-        weights: Vec<f32>,
-    },
-}
-
 // ============================================================================
 // Rel-18 Energy Savings Messages
 // ============================================================================
@@ -1667,8 +1627,6 @@ pub struct GnbSixgHandles {
     pub isac_tx: TaskHandle<IsacMessage>,
     /// Handle to the Agent task
     pub agent_tx: TaskHandle<AgentMessage>,
-    /// Handle to the FL (Federated Learning) Aggregator task
-    pub fl_tx: TaskHandle<FlAggregatorMessage>,
     /// Optional in-process topic bus for cross-cutting observations (issue #16).
     ///
     /// A **second** path, not a replacement: every producer below keeps its
@@ -1685,7 +1643,6 @@ pub struct GnbSixgReceivers {
     pub nkef_rx: mpsc::Receiver<TaskMessage<NkefMessage>>,
     pub isac_rx: mpsc::Receiver<TaskMessage<IsacMessage>>,
     pub agent_rx: mpsc::Receiver<TaskMessage<AgentMessage>>,
-    pub fl_rx: mpsc::Receiver<TaskMessage<FlAggregatorMessage>>,
 }
 
 impl GnbTaskBase {
@@ -1728,20 +1685,9 @@ impl GnbTaskBase {
         (base, app_rx, ngap_rx, rrc_rx, gtp_rx, rls_rx, sctp_rx)
     }
 
-    /// The FL aggregator's inbox: the hook the FL demo attaches its producer to
-    /// (#459).
-    ///
-    /// The FL tasks have no production producer yet because the FL demo
-    /// redesigns them; this is the one place it plugs in. `None` until the 6G
-    /// handles are installed (see [`crate::wiring::GnbWiring`]). A send to it
-    /// when FL is not enabled fails as a closed channel.
-    pub fn fl_aggregator_tx(&self) -> Option<&TaskHandle<FlAggregatorMessage>> {
-        self.sixg.as_ref().map(|sixg| &sixg.fl_tx)
-    }
-
     /// Initialize 6G task handles and return their receivers.
     ///
-    /// Call this after `new()` to enable 6G tasks (SHE, NWDAF, NKEF, ISAC, Agent, FL).
+    /// Call this after `new()` to enable 6G tasks (SHE, NWDAF, NKEF, ISAC, Agent).
     /// The returned receivers should be used to spawn the 6G task loops.
     pub fn init_6g_tasks(&mut self, channel_capacity: usize) -> GnbSixgReceivers {
         let (she_tx, she_rx) = mpsc::channel(channel_capacity);
@@ -1749,7 +1695,6 @@ impl GnbTaskBase {
         let (nkef_tx, nkef_rx) = mpsc::channel(channel_capacity);
         let (isac_tx, isac_rx) = mpsc::channel(channel_capacity);
         let (agent_tx, agent_rx) = mpsc::channel(channel_capacity);
-        let (fl_tx, fl_rx) = mpsc::channel(channel_capacity);
 
         self.sixg = Some(GnbSixgHandles {
             she_tx: TaskHandle::new(she_tx),
@@ -1757,7 +1702,6 @@ impl GnbTaskBase {
             nkef_tx: TaskHandle::new(nkef_tx),
             isac_tx: TaskHandle::new(isac_tx),
             agent_tx: TaskHandle::new(agent_tx),
-            fl_tx: TaskHandle::new(fl_tx),
             #[cfg(feature = "event-bus")]
             bus: Some(nextgsim_common::bus::EventBus::default()),
         });
@@ -1768,7 +1712,6 @@ impl GnbTaskBase {
             nkef_rx,
             isac_rx,
             agent_rx,
-            fl_rx,
         }
     }
 
@@ -1799,7 +1742,6 @@ impl GnbTaskBase {
             let _ = sixg.nkef_tx.shutdown().await;
             let _ = sixg.isac_tx.shutdown().await;
             let _ = sixg.agent_tx.shutdown().await;
-            let _ = sixg.fl_tx.shutdown().await;
         }
         // Rel-18 tasks (if initialized)
         if let Some(ref rel18) = self.rel18 {
@@ -1902,7 +1844,6 @@ impl TaskManager {
             TaskId::Nkef,
             TaskId::Isac,
             TaskId::Agent,
-            TaskId::FlAggregator,
             // Rel-18 5G-Advanced tasks
             TaskId::Energy,
         ] {
@@ -2428,7 +2369,6 @@ mod tests {
             TaskId::Nkef,
             TaskId::Isac,
             TaskId::Agent,
-            TaskId::FlAggregator,
             TaskId::Energy,
         ] {
             manager.mark_task_started(task_id);
@@ -2457,7 +2397,7 @@ mod tests {
         manager.mark_task_started(TaskId::Ngap);
 
         let summary = manager.status_summary();
-        assert_eq!(summary.len(), 13);
+        assert_eq!(summary.len(), 12);
 
         // Find App and Ngap in summary
         let app_state = summary

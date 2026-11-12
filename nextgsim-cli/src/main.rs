@@ -191,7 +191,6 @@ fn print_help(node_name: &str) {
         println!("    congestion-status               - Show the D441A cell-report exporter (demo-d441a-congestion-loop builds)");
         println!("    she-status                      - Show edge computing status");
         println!("    isac-config <enable|disable>    - Configure ISAC sensing");
-        println!("    fl-status                       - Show federated learning status");
         println!("    semantic-status                 - Show semantic codec status");
     } else {
         println!("  status, info");

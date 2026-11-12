@@ -70,7 +70,6 @@ fn any_6g_enabled(config: &GnbConfig) -> bool {
         || cfg!(feature = "nextgsim-nkef") && config.nkef_enabled
         || cfg!(feature = "nextgsim-isac") && config.isac_enabled
         || cfg!(feature = "nextgsim-agent") && config.agent_enabled
-        || cfg!(feature = "nextgsim-fl") && config.federated_learning_enabled
 }
 
 impl GnbWiring {
@@ -197,7 +196,6 @@ fn spawn_6g_tasks(task_base: &GnbTaskBase, sixg: GnbSixgReceivers) {
         nkef_rx,
         isac_rx,
         agent_rx,
-        fl_rx,
     } = sixg;
     let config = &task_base.config;
 
@@ -231,12 +229,6 @@ fn spawn_6g_tasks(task_base: &GnbTaskBase, sixg: GnbSixgReceivers) {
         agent.install_cli();
         spawn_task(agent, agent_rx);
         info!("Agent task spawned");
-    }
-
-    #[cfg(feature = "nextgsim-fl")]
-    if config.federated_learning_enabled {
-        spawn_task(crate::fl::FlAggregatorTask::new(task_base.clone()), fl_rx);
-        info!("FL Aggregator task spawned");
     }
 }
 

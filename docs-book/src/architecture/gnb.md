@@ -76,7 +76,6 @@ The gNB binary's own modules (`src/lib.rs` declares them all):
 | `daps` | `src/daps.rs` | Rel-17 DAPS handover types (`DapsManager`, `DapsState`), per code comments TS 38.300 §10.1.2.4. Library module — see [gaps](#simplifications--known-gaps). |
 | `mbs_ngap` | `src/mbs_ngap.rs` | Rel-17 MBS NGAP session state (`NgapMbsManager`, `GnbMbsState`), per code comments TS 38.413 §8.21. Live: the NGAP task owns one `NgapMbsManager` and routes the MBS session procedures into it. |
 | `agent` | `src/agent/` | 6G AI Agent Framework task. One-line honest pointer only; deferred to the [AI/6G stack chapter](../concepts/ai-6g-stack.md). |
-| `fl` | `src/fl/` | 6G Federated-Learning aggregator task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
 | `isac` | `src/isac/` | 6G Integrated Sensing & Communication task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
 | `nkef` | `src/nkef/` | 6G Network Knowledge Exposure Function task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
 | `nwdaf` | `src/nwdaf/` | 6G Network Data Analytics task. Prototype — see [AI/6G stack](../concepts/ai-6g-stack.md). |
@@ -86,8 +85,10 @@ Each AI/6G module is a thin wrapper: `<name>/mod.rs` re-exports a `<name>/task.r
 that adapts the corresponding `nextgsim-<name>` crate into the gNB task
 framework (e.g. `src/nkef/mod.rs` header: "wires the nextgsim-nkef crate into
 the gNB task framework"). Their message types live in `src/tasks.rs`
-(`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`,
-`FlAggregatorMessage`). Detail belongs in the [AI/6G stack chapter](../concepts/ai-6g-stack.md);
+(`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`).
+The gNB has no federated-learning task: the FL aggregator was removed in
+nextgsim#480, and federated learning runs in the `nr-fl-server` AF on the N6
+side, over the UEs' PDU sessions. Detail belongs in the [AI/6G stack chapter](../concepts/ai-6g-stack.md);
 this chapter treats them as optional, config-gated side tasks.
 
 ## Protocol stack
