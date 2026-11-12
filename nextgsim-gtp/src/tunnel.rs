@@ -252,24 +252,17 @@ impl TunnelManager {
 }
 
 impl TunnelManager {
-    /// Encapsulate user data for uplink transmission
+    /// The QFI an uplink G-PDU of this session is sent on.
     ///
-    /// Creates a GTP-U G-PDU message for sending data through the uplink tunnel.
-    pub fn encapsulate_uplink(
-        &self,
-        ue_id: u32,
-        psi: u8,
-        data: Bytes,
-    ) -> Result<(GtpHeader, SocketAddr), TunnelError> {
+    /// amfg-02: every uplink G-PDU MUST carry a UL PDU SESSION INFORMATION
+    /// container (TS 38.415 §5.5.2.2) conveyed via the PDU Session Container
+    /// GTP-U extension header (type 0x85, TS 29.281 §5.2.2.7). The QFI field
+    /// is mandatory, so fall back to a default flow when none is assigned.
+    pub fn uplink_qfi(&self, ue_id: u32, psi: u8) -> Result<u8, TunnelError> {
         let session = self
             .get_session(ue_id, psi)
             .ok_or(TunnelError::SessionNotFound { ue_id, psi })?;
-
-        // amfg-02: every uplink G-PDU MUST carry a UL PDU SESSION INFORMATION
-        // container (TS 38.415 §5.5.2.2) conveyed via the PDU Session Container
-        // GTP-U extension header (type 0x85, TS 29.281 §5.2.2.7). The QFI field
-        // is mandatory, so fall back to a default flow when none is assigned.
-        let qfi = match session.qfi {
+        Ok(match session.qfi {
             Some(qfi) => qfi,
             None => {
                 tracing::debug!(
@@ -280,10 +273,41 @@ impl TunnelManager {
                 );
                 DEFAULT_UPLINK_QFI
             }
-        };
+        })
+    }
 
-        let header = GtpHeader::g_pdu(session.uplink_tunnel.teid, data)
-            .with_pdu_session_info(PduSessionInfo::uplink(qfi));
+    /// Encapsulate user data for uplink transmission
+    ///
+    /// Creates a GTP-U G-PDU message for sending data through the uplink tunnel,
+    /// with a plain UL PDU SESSION INFORMATION frame for [`Self::uplink_qfi`].
+    pub fn encapsulate_uplink(
+        &self,
+        ue_id: u32,
+        psi: u8,
+        data: Bytes,
+    ) -> Result<(GtpHeader, SocketAddr), TunnelError> {
+        let qfi = self.uplink_qfi(ue_id, psi)?;
+        self.encapsulate_uplink_with_info(ue_id, psi, data, PduSessionInfo::uplink(qfi))
+    }
+
+    /// Encapsulate `data` for the uplink tunnel with a caller-built UL PDU SESSION
+    /// INFORMATION frame, for example one carrying a QoS monitoring response
+    /// (TS 38.415 §5.5.2.2).
+    ///
+    /// `data` may be empty: a G-PDU without a T-PDU is the dummy UL packet of
+    /// TS 23.501 §5.33.3.2 (TS 29.281 §5.2.2.7 allows it with this extension
+    /// header).
+    pub fn encapsulate_uplink_with_info(
+        &self,
+        ue_id: u32,
+        psi: u8,
+        data: Bytes,
+        info: PduSessionInfo,
+    ) -> Result<(GtpHeader, SocketAddr), TunnelError> {
+        let session = self
+            .get_session(ue_id, psi)
+            .ok_or(TunnelError::SessionNotFound { ue_id, psi })?;
+        let header = GtpHeader::g_pdu(session.uplink_tunnel.teid, data).with_pdu_session_info(info);
         Ok((header, session.uplink_tunnel.address))
     }
 
@@ -308,9 +332,9 @@ impl TunnelManager {
 
         // amfg-09: extract the DL QFI / RQI from the PDU Session Container, if
         // the UPF included one.
-        let (qfi, rqi) = match header.pdu_session_info() {
-            Some(info) => (Some(info.qfi), info.rqi),
-            None => (None, false),
+        let (qfi, rqi, dl_sending_time_stamp) = match header.pdu_session_info() {
+            Some(info) => (Some(info.qfi), info.rqi, info.dl_sending_time_stamp),
+            None => (None, false, None),
         };
 
         Ok(DecapsulatedDownlink {
@@ -318,6 +342,7 @@ impl TunnelManager {
             psi: session.psi,
             qfi,
             rqi,
+            dl_sending_time_stamp,
             payload: &header.payload,
         })
     }
@@ -338,6 +363,9 @@ pub struct DecapsulatedDownlink<'a> {
     pub qfi: Option<u8>,
     /// Reflective QoS Indicator (DL only).
     pub rqi: bool,
+    /// The DL Sending Time Stamp of a QoS Monitoring Packet (QMP = 1,
+    /// TS 38.415 §5.5.3.8-9); `None` for an ordinary G-PDU.
+    pub dl_sending_time_stamp: Option<u64>,
     /// Decapsulated user-plane payload.
     pub payload: &'a Bytes,
 }

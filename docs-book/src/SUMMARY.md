@@ -31,6 +31,7 @@
 - [D440B: verified model loading](demos/d440b-model-verify.md)
 - [D446A: agent conflict over a booster cell](demos/d446a-agent-conflict.md)
 - [D441C: UE Mobility from AMF location events](demos/d441c-amf-mobility.md)
+- [D444A: app adaptation to a network-signalled Session-AMBR](demos/d444a-ambr-adapt.md)
 - [D441A: RAN-fed User Data Congestion loop](demos/d441a-congestion-loop.md)
 
 # Community

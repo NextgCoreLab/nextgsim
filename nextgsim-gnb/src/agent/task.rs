@@ -126,7 +126,7 @@ impl AgentTask {
                     let ue = intent.target.clone().unwrap_or_default();
                     if let Err(e) = self.coordinator.submit_intent(intent) {
                         if let Some(d) = self.d446a.as_mut() {
-                            d.on_actuation(&id, ue.parse().unwrap_or(-1), false, &e);
+                            d.on_actuation(&id, ue.parse().unwrap_or(-1), false, false, &e);
                         }
                         continue;
                     }
@@ -147,6 +147,7 @@ impl AgentTask {
                 d.on_actuation(
                     &result.intent_id,
                     -1,
+                    false,
                     false,
                     result.message.as_deref().unwrap_or("not executed"),
                 );
@@ -353,14 +354,18 @@ impl Task for AgentTask {
                             intent_id,
                             ue_id,
                             success,
+                            signalled,
                             detail,
                         } => {
                             #[cfg(feature = "demo-d446a-agent-conflict")]
                             if let Some(d) = self.d446a.as_mut() {
-                                d.on_actuation(&intent_id, ue_id, success, &detail);
+                                // Nothing reached the network: lb-1 may try the UE
+                                // again at a later tick.
+                                let retry_ue = !success && !signalled;
+                                d.on_actuation(&intent_id, ue_id, success, retry_ue, &detail);
                             }
                             #[cfg(not(feature = "demo-d446a-agent-conflict"))]
-                            let _ = (intent_id, ue_id, success, detail);
+                            let _ = (intent_id, ue_id, success, signalled, detail);
                         }
                         AgentMessage::CoordinationEvent {
                             event_type,

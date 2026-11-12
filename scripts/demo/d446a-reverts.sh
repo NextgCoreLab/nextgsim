@@ -19,6 +19,8 @@
 #   446-connected-guardrail  the guardrail counts UEs with a data-carrying bearer,
 #                            not connected ones
 #                            -> a_connected_but_silent_ue_holds_the_switch_off
+#   446-retry-unsignalled    a UE whose handover never left the gNB stays tried
+#                            -> an_unsignalled_handover_failure_is_retried
 #
 # Docker-free: each arm rebuilds and runs one unit test. ARMS="a b" runs a subset.
 # Exit 0 when every arm fails its named test as it must.
@@ -34,8 +36,9 @@ declare -A test_of=(
     [446-handback-hold]="-p nextgsim-gnb --lib a_held_source_cell_is_not_handed_back"
     [446-switch-off]="-p nextgsim-gnb --lib an_off_air_cell_answers_no_heartbeat"
     [446-connected-guardrail]="-p nextgsim-gnb --features demo-d446a-agent-conflict --lib a_connected_but_silent_ue_holds_the_switch_off"
+    [446-retry-unsignalled]="-p nextgsim-gnb --features demo-d446a-agent-conflict --lib an_unsignalled_handover_failure_is_retried"
 )
-arms="${ARMS:-446-supersede 446-cause 446-inbound-arbitration 446-policy-toggle 446-handback-hold 446-switch-off 446-connected-guardrail}"
+arms="${ARMS:-446-supersede 446-cause 446-inbound-arbitration 446-policy-toggle 446-handback-hold 446-switch-off 446-connected-guardrail 446-retry-unsignalled}"
 for arm in $arms; do
     args="${test_of[$arm]:?unknown arm $arm}"
     name="${args##* }"

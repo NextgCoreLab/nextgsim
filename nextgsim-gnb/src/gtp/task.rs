@@ -11,7 +11,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use nextgsim_gtp::codec::{GtpHeader, GtpMessageType};
+use nextgsim_gtp::codec::{
+    ntp_timestamp, GtpHeader, GtpMessageType, PduSessionInfo, QmpTimestamps,
+};
 use nextgsim_gtp::path::{EchoOutcome, PathSupervisor};
 #[cfg(feature = "sdap-dataplane")]
 use nextgsim_gtp::qfi_drb::{allocate_drbs, QfiDrbMap};
@@ -21,6 +23,7 @@ use nextgsim_gtp::restart::RestartCounter;
 use nextgsim_gtp::tunnel::{GtpTunnel, PduSession, TunnelError, TunnelManager, GTP_U_PORT};
 
 use nextgsim_ngap::procedures::pdu_session_resource_notify::NotifyCause;
+use nextgsim_ngap::procedures::transfer::QosMonitoringRequest;
 
 use crate::tasks::UeReleaseRequestCause;
 use crate::tasks::{
@@ -61,6 +64,28 @@ struct SdapSessionState {
     qfi_drb: QfiDrbMap,
     /// Per-flow DSCP resolution and MBR policing (TS 23.501 §5.7.2.6).
     enforcer: QosFlowEnforcer,
+}
+
+/// One QoS flow the SMF asked this gNB to monitor (TS 38.413 §9.3.1.12,
+/// TS 23.501 §5.33.3.2, nextgsim#509).
+#[derive(Debug, Clone, Copy)]
+struct MonitoredQosFlow {
+    /// Which RAN-part delays the SMF asked for; decides the Delay Results sent.
+    request: QosMonitoringRequest,
+    /// A received QoS Monitoring Packet not answered yet.
+    pending: Option<PendingQmp>,
+}
+
+/// A DL QoS Monitoring Packet awaiting its UL response (TS 23.501 §5.33.3.2).
+#[derive(Debug, Clone, Copy)]
+struct PendingQmp {
+    /// T1: the UPF's DL Sending Time Stamp.
+    t1: u64,
+    /// T2: when this gNB received the packet.
+    t2: u64,
+    /// When the response goes out in a dummy UL G-PDU if no uplink packet of the
+    /// flow has carried it by then.
+    due: tokio::time::Instant,
 }
 
 /// After the first, an uplink PDU dropped for want of a PDU session is logged once
@@ -106,6 +131,12 @@ pub struct GtpTask {
     /// in either direction (#352). Kept only while `inactivity_timer_secs` is
     /// set; see [`GtpTask::take_inactive_ues`].
     last_user_plane_activity: HashMap<i32, tokio::time::Instant>,
+    /// Per QoS flow QoS monitoring, keyed by `(ue_id, psi)` then QFI (#509).
+    ///
+    /// Held here and not on the tunnel's `PduSession` because a modify rebuilds the
+    /// tunnel, and the monitoring the SMF asked for must survive that. Empty
+    /// unless `qos_monitoring.enabled`.
+    qos_monitoring: HashMap<(i32, u8), HashMap<u8, MonitoredQosFlow>>,
 }
 
 impl GtpTask {
@@ -171,6 +202,7 @@ impl GtpTask {
             #[cfg(feature = "sdap-dataplane")]
             sdap_sessions: HashMap::new(),
             last_user_plane_activity: HashMap::new(),
+            qos_monitoring: HashMap::new(),
         }
     }
 
@@ -271,6 +303,9 @@ impl GtpTask {
         // downlink packet could be steered onto a GBR bearer nobody established.
         #[cfg(feature = "sdap-dataplane")]
         self.sdap_sessions.retain(|(id, _), _| *id != ue_id);
+        // Monitoring goes too, for the same reason: a reallocated id must not
+        // inherit it.
+        self.qos_monitoring.retain(|(id, _), _| *id != ue_id);
 
         // Remove UE context
         self.ue_contexts.remove(&ue_id);
@@ -299,8 +334,9 @@ impl GtpTask {
         if created {
             self.install_sdap_session(ue_id, resource.psi as u8, &resource.qos_flows);
         }
-        #[cfg(not(feature = "sdap-dataplane"))]
-        let _ = created;
+        if created {
+            self.install_qos_monitoring(ue_id, resource.psi as u8, &resource.qos_monitoring);
+        }
     }
 
     /// Create the N3 tunnel half of a PDU session; `false` if it could not be made.
@@ -435,6 +471,204 @@ impl GtpTask {
         }
         #[cfg(not(feature = "sdap-dataplane"))]
         let _ = created;
+        // Checked on the tunnel itself rather than `created`, which is also true when
+        // `create_session` refused the rebuild: a session left with no tunnel has
+        // nothing to monitor (#509).
+        if self
+            .tunnel_manager
+            .has_session(ue_id as u32, resource.psi as u8)
+        {
+            self.amend_qos_monitoring(ue_id, resource.psi as u8, &resource.qos_monitoring);
+        } else {
+            self.qos_monitoring.remove(&(ue_id, resource.psi as u8));
+        }
+    }
+
+    /// Store the flows a session create asks this gNB to monitor (TS 38.413
+    /// §8.2.1.2: "store this information, and, if supported, perform delay
+    /// measurement"). A create states the whole set, so it replaces.
+    fn install_qos_monitoring(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        requests: &[(u8, QosMonitoringRequest)],
+    ) {
+        self.qos_monitoring.remove(&(ue_id, psi));
+        self.amend_qos_monitoring(ue_id, psi, requests);
+    }
+
+    /// Apply a modify's QoS Monitoring Requests (TS 38.413 §8.2.3.2): a named flow
+    /// is (re)configured, `Stop` ends its monitoring, and an unnamed flow keeps
+    /// what it had.
+    fn amend_qos_monitoring(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        requests: &[(u8, QosMonitoringRequest)],
+    ) {
+        if requests.is_empty() {
+            return;
+        }
+        if !self.task_base.config.qos_monitoring.enabled {
+            // "if supported": this node is configured not to support it.
+            debug!(
+                "QoS Monitoring Request for ue_id={ue_id} psi={psi} {requests:?} not \
+                 acted on: qos_monitoring.enabled is false"
+            );
+            return;
+        }
+        let flows = self.qos_monitoring.entry((ue_id, psi)).or_default();
+        for &(qfi, request) in requests {
+            if request == QosMonitoringRequest::Stop {
+                flows.remove(&qfi);
+                info!("QoS monitoring stopped: ue_id={ue_id} psi={psi} qfi={qfi}");
+                continue;
+            }
+            flows
+                .entry(qfi)
+                .and_modify(|f| f.request = request)
+                .or_insert(MonitoredQosFlow {
+                    request,
+                    pending: None,
+                });
+            info!("QoS monitoring {request:?}: ue_id={ue_id} psi={psi} qfi={qfi}");
+        }
+        if flows.is_empty() {
+            self.qos_monitoring.remove(&(ue_id, psi));
+        }
+    }
+
+    /// A DL QoS Monitoring Packet arrived: record T1 and T2 for the flow's
+    /// response (TS 23.501 §5.33.3.2), or ignore it for a flow nobody asked this
+    /// gNB to monitor (TS 38.415 §5.5.3.8).
+    async fn note_qos_monitoring_packet(&mut self, ue_id: i32, psi: u8, qfi: u8, t1: u64) {
+        let cfg = &self.task_base.config.qos_monitoring;
+        let wait = std::time::Duration::from_millis(cfg.dummy_response_after_ms);
+        let Some(flow) = self
+            .qos_monitoring
+            .get_mut(&(ue_id, psi))
+            .and_then(|flows| flows.get_mut(&qfi))
+        else {
+            debug!(
+                "QMP for ue_id={ue_id} psi={psi} qfi={qfi} ignored: QoS monitoring is not \
+                 configured for the flow (TS 38.415 §5.5.3.8)"
+            );
+            return;
+        };
+        let t2 = ntp_timestamp(std::time::SystemTime::now());
+        let request = flow.request;
+        let pending = PendingQmp {
+            t1,
+            t2,
+            due: tokio::time::Instant::now() + wait,
+        };
+        // An older packet still unanswered is answered now rather than dropped:
+        // otherwise a UPF probing faster than the dummy wait would never hear back.
+        if let Some(older) = flow.pending.replace(pending) {
+            self.send_dummy_qmp_response(ue_id, psi, qfi, older, request)
+                .await;
+        }
+        if wait.is_zero() {
+            self.flush_due_qmp_responses().await;
+        }
+    }
+
+    /// Take the flow's unanswered QoS Monitoring Packet, if it has one.
+    fn take_pending_qmp(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        qfi: u8,
+    ) -> Option<(PendingQmp, QosMonitoringRequest)> {
+        let flow = self.qos_monitoring.get_mut(&(ue_id, psi))?.get_mut(&qfi)?;
+        Some((flow.pending.take()?, flow.request))
+    }
+
+    /// The UL PDU SESSION INFORMATION frame answering `pending` (TS 38.415
+    /// §5.5.2.2): QMP with T1, T2 and T3 (taken now, as the frame is about to be
+    /// sent), and the configured RAN-part Delay Results the request asked for.
+    fn qmp_response(
+        &self,
+        qfi: u8,
+        pending: PendingQmp,
+        request: QosMonitoringRequest,
+    ) -> PduSessionInfo {
+        let cfg = &self.task_base.config.qos_monitoring;
+        PduSessionInfo::uplink(qfi)
+            .with_qmp_response(QmpTimestamps {
+                dl_sending_time_stamp_repeated: pending.t1,
+                dl_received_time_stamp: pending.t2,
+                ul_sending_time_stamp: ntp_timestamp(std::time::SystemTime::now()),
+            })
+            .with_delay_results(
+                cfg.ran_dl_delay_ms.filter(|_| request.wants_dl()),
+                cfg.ran_ul_delay_ms.filter(|_| request.wants_ul()),
+            )
+    }
+
+    /// Send `pending`'s response in a dummy UL G-PDU, one without a T-PDU
+    /// (TS 23.501 §5.33.3.2, TS 29.281 §5.2.2.7).
+    async fn send_dummy_qmp_response(
+        &mut self,
+        ue_id: i32,
+        psi: u8,
+        qfi: u8,
+        pending: PendingQmp,
+        request: QosMonitoringRequest,
+    ) {
+        let Some(socket) = self.udp_socket.clone() else {
+            return;
+        };
+        let info = self.qmp_response(qfi, pending, request);
+        match self.tunnel_manager.encapsulate_uplink_with_info(
+            ue_id as u32,
+            psi,
+            Bytes::new(),
+            info,
+        ) {
+            Ok((header, dest)) => {
+                if let Err(e) = socket.send_to(&header.encode(), dest).await {
+                    error!("Failed to send dummy UL G-PDU (QMP response): {e}");
+                } else {
+                    debug!("Sent dummy UL G-PDU (QMP response): ue_id={ue_id} psi={psi} qfi={qfi}");
+                }
+            }
+            Err(e) => {
+                // The tunnel went (a purge or an Error Indication) while the packet
+                // waited; its monitoring goes with it.
+                debug!("QMP response for ue_id={ue_id} psi={psi} dropped: {e}");
+                self.qos_monitoring.remove(&(ue_id, psi));
+            }
+        }
+    }
+
+    /// The earliest moment a pending QMP response falls due, if any is pending.
+    fn next_qmp_deadline(&self) -> Option<tokio::time::Instant> {
+        self.qos_monitoring
+            .values()
+            .flat_map(|flows| flows.values())
+            .filter_map(|f| f.pending.map(|p| p.due))
+            .min()
+    }
+
+    /// Send a dummy UL G-PDU for every QMP response whose wait for an uplink
+    /// packet has run out.
+    async fn flush_due_qmp_responses(&mut self) {
+        let now = tokio::time::Instant::now();
+        let mut due = Vec::new();
+        for (&(ue_id, psi), flows) in &mut self.qos_monitoring {
+            for (&qfi, flow) in flows.iter_mut() {
+                if flow.pending.is_some_and(|p| p.due <= now) {
+                    if let Some(p) = flow.pending.take() {
+                        due.push((ue_id, psi, qfi, p, flow.request));
+                    }
+                }
+            }
+        }
+        for (ue_id, psi, qfi, pending, request) in due {
+            self.send_dummy_qmp_response(ue_id, psi, qfi, pending, request)
+                .await;
+        }
     }
 
     /// Handle PDU session release from NGAP
@@ -442,6 +676,7 @@ impl GtpTask {
         // See `handle_ue_context_release` for why this is dropped and not left.
         #[cfg(feature = "sdap-dataplane")]
         self.sdap_sessions.remove(&(ue_id, psi as u8));
+        self.qos_monitoring.remove(&(ue_id, psi as u8));
         match self.tunnel_manager.delete_session(ue_id as u32, psi as u8) {
             Ok(_) => {
                 info!("PDU session released: ue_id={}, psi={}", ue_id, psi);
@@ -496,7 +731,7 @@ impl GtpTask {
         }
 
         // Normal mode: send to UPF
-        let socket = match &self.udp_socket {
+        let socket = match self.udp_socket.clone() {
             Some(s) => s,
             None => {
                 error!("Uplink data failed: UDP socket not initialized");
@@ -504,12 +739,25 @@ impl GtpTask {
             }
         };
 
-        // Encapsulate in GTP-U
+        // Encapsulate in GTP-U. An unanswered QoS Monitoring Packet of the flow
+        // this packet goes on rides on it (TS 23.501 §5.33.3.2, #509).
         let payload = Bytes::from(pdu);
-        match self
+        let encapsulated = self
             .tunnel_manager
-            .encapsulate_uplink(ue_id as u32, psi as u8, payload)
-        {
+            .uplink_qfi(ue_id as u32, psi as u8)
+            .and_then(|qfi| {
+                let info = match self.take_pending_qmp(ue_id, psi as u8, qfi) {
+                    Some((pending, request)) => self.qmp_response(qfi, pending, request),
+                    None => PduSessionInfo::uplink(qfi),
+                };
+                self.tunnel_manager.encapsulate_uplink_with_info(
+                    ue_id as u32,
+                    psi as u8,
+                    payload,
+                    info,
+                )
+            });
+        match encapsulated {
             Ok((header, dest_addr)) => {
                 let encoded = header.encode();
                 if let Err(e) = socket.send_to(&encoded, dest_addr).await {
@@ -773,6 +1021,23 @@ impl GtpTask {
                 let ue_id = dl.ue_id as i32;
                 let psi = dl.psi as i32;
 
+                // A QoS Monitoring Packet (TS 38.415 §5.5.3.8, #509). It is acted on
+                // only for a flow being monitored; a dummy one (no T-PDU) is never
+                // delivered to the UE (TS 29.244 §5.24.4.3 NOTE), whether or not it
+                // was acted on.
+                if let Some(t1) = dl.dl_sending_time_stamp {
+                    self.note_qos_monitoring_packet(ue_id, dl.psi, dl.qfi.unwrap_or(0), t1)
+                        .await;
+                    if dl.payload.is_empty() {
+                        debug!(
+                            "Dummy DL G-PDU (QMP, no T-PDU) for ue_id={ue_id} psi={psi} \
+                             qfi={:?} not delivered to the UE",
+                            dl.qfi
+                        );
+                        return;
+                    }
+                }
+
                 // amfg-09: the DL QFI/RQI arrive in the PDU Session Container
                 // (TS 38.415 §5.5.2.1) and are what selects the QoS flow toward the
                 // UE. Without `sdap-dataplane` there is no SDAP sublayer to act on
@@ -983,6 +1248,8 @@ impl GtpTask {
             return;
         };
         let (ue_id, psi) = (session.ue_id, session.psi);
+        // QoS monitoring (#509) goes with the tunnel it measures.
+        self.qos_monitoring.remove(&(ue_id as i32, psi));
         match self.tunnel_manager.delete_session(ue_id, psi) {
             Ok(_) => {
                 info!(
@@ -1059,6 +1326,8 @@ impl GtpTask {
 
         let mut released = Vec::with_capacity(doomed.len());
         for (ue_id, psi) in doomed {
+            // QoS monitoring (#509) goes with the tunnel it measures.
+            self.qos_monitoring.remove(&(ue_id as i32, psi));
             match self.tunnel_manager.delete_session(ue_id, psi) {
                 Ok(_) => released.push((ue_id, psi)),
                 // Kept going rather than returned: one session that cannot be deleted
@@ -1265,10 +1534,27 @@ impl Task for GtpTask {
         let mut inactivity_check = tokio::time::interval(std::time::Duration::from_secs(1));
         inactivity_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        if self.task_base.config.qos_monitoring.enabled {
+            info!(
+                "Per QoS flow QoS monitoring supported (TS 23.501 §5.33.3.2): dummy UL \
+                 response after {} ms",
+                self.task_base.config.qos_monitoring.dummy_response_after_ms
+            );
+        }
+
         info!("GTP task started");
 
         loop {
+            let qmp_deadline = self.next_qmp_deadline();
             tokio::select! {
+                // A QoS Monitoring Packet's response waited long enough for an
+                // uplink packet to carry it (#509). Never armed with nothing pending.
+                _ = tokio::time::sleep_until(
+                    qmp_deadline.unwrap_or_else(tokio::time::Instant::now)
+                ), if qmp_deadline.is_some() => {
+                    self.flush_due_qmp_responses().await;
+                }
+
                 _ = inactivity_check.tick(), if inactivity_enabled => {
                     self.release_inactive_ues().await;
                 }
@@ -1655,6 +1941,362 @@ mod tests {
         assert!(got.is_err(), "an empty SDU is not tunnelled");
     }
 
+    // -----------------------------------------------------------------------
+    // #509: per QoS flow QoS monitoring (TS 23.501 §5.33.3.2, TS 38.415 §5.5.2)
+    // -----------------------------------------------------------------------
+
+    /// A forwarding (non-loopback) task with QoS monitoring configured by
+    /// `qm`, one session (UE 1, PSI 1, QFI 9) tunnelled to a test UPF socket, and
+    /// the RLS receiver kept so a test can see what reaches the UE.
+    async fn qmp_task(
+        qm: nextgsim_common::config::QosMonitoringConfig,
+    ) -> (GtpTask, UdpSocket, mpsc::Receiver<TaskMessage<RlsMessage>>) {
+        let mut config = test_config();
+        config.qos_monitoring = qm;
+        let (task_base, _, _, _, _, rls_rx, _) = GnbTaskBase::new(config, 16);
+        let mut task = GtpTask::with_loopback(task_base, false);
+        task.udp_socket = Some(Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()));
+        let upf = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let gnb_addr = SocketAddr::new(task.task_base.config.gtp_ip, GTP_U_PORT);
+        task.tunnel_manager
+            .create_session(
+                PduSession::new(
+                    1,
+                    1,
+                    GtpTunnel::new(0x1000, upf.local_addr().unwrap()),
+                    GtpTunnel::new(0x2000, gnb_addr),
+                )
+                .with_qfi(9),
+            )
+            .unwrap();
+        (task, upf, rls_rx)
+    }
+
+    fn monitoring_on(dummy_after_ms: u64) -> nextgsim_common::config::QosMonitoringConfig {
+        nextgsim_common::config::QosMonitoringConfig {
+            enabled: true,
+            dummy_response_after_ms: dummy_after_ms,
+            ran_dl_delay_ms: Some(3),
+            ran_ul_delay_ms: Some(4),
+        }
+    }
+
+    /// The bytes a UPF sends: a DL G-PDU on the session's TEID whose PDU Session
+    /// Container is a QoS Monitoring Packet for QFI 9 with DL Sending Time Stamp
+    /// `t1` (Figure 5.5.2.1-1), carrying `payload` (empty: a dummy G-PDU).
+    fn dl_qmp_bytes(t1: u64, payload: &'static [u8]) -> Vec<u8> {
+        // flags E=1, G-PDU, length, TEID 0x2000, seq/N-PDU, next ext 0x85,
+        // ext length 3 (12 octets): content QMP|QFI|T1 is 10 octets, already the
+        // (n*4 - 2) of §5.5.3.5, so no padding; then next ext 0.
+        let mut ext = vec![0x03, 0x08, 0x09];
+        ext.extend_from_slice(&t1.to_be_bytes());
+        ext.push(0x00); // next extension header type: none
+        let mut b = vec![0x34, 0xFF];
+        let len = 4 + ext.len() + payload.len();
+        b.extend_from_slice(&(len as u16).to_be_bytes());
+        b.extend_from_slice(&0x2000u32.to_be_bytes());
+        b.extend_from_slice(&[0x00, 0x00, 0x00, 0x85]);
+        b.extend_from_slice(&ext);
+        b.extend_from_slice(payload);
+        b
+    }
+
+    async fn recv_gpdu(upf: &UdpSocket, within: std::time::Duration) -> Option<GtpHeader> {
+        let mut buf = [0u8; 512];
+        let (n, _) = tokio::time::timeout(within, upf.recv_from(&mut buf))
+            .await
+            .ok()?
+            .ok()?;
+        Some(GtpHeader::decode(&buf[..n]).expect("a G-PDU"))
+    }
+
+    fn src() -> SocketAddr {
+        "127.0.0.1:2152".parse().unwrap()
+    }
+
+    /// Criterion 2: a QMP G-PDU for a monitored flow is delivered (it has a
+    /// T-PDU), and the next uplink packet of that flow carries QMP = 1 with T1
+    /// repeated, T2, T3 and the configured RAN-part Delay Results.
+    #[tokio::test]
+    async fn a_qmp_for_a_monitored_flow_rides_on_the_next_uplink_packet() {
+        let (mut task, upf, mut rls_rx) = qmp_task(monitoring_on(60_000)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        let before = nextgsim_gtp::ntp_timestamp(std::time::SystemTime::now());
+        let t1 = 0xE8F0_0000_1234_5678;
+
+        task.handle_udp_receive(&dl_qmp_bytes(t1, b"payload"), src())
+            .await;
+        match rls_rx.try_recv() {
+            Ok(TaskMessage::Message(RlsMessage::DownlinkData { pdu, .. })) => {
+                // With the SDAP sublayer the T-PDU follows the 1-octet DL SDAP
+                // header `nextgsim_pdcp::sdap::encode_dl_header` builds for QFI 9,
+                // RQI 0 (TS 37.324 §6.2.2.2): 0x80 | 9 = 0x89.
+                #[cfg(feature = "sdap-dataplane")]
+                assert_eq!(
+                    pdu.data(),
+                    b"\x89payload",
+                    "SDAP header + the T-PDU reach the UE"
+                );
+                #[cfg(not(feature = "sdap-dataplane"))]
+                assert_eq!(pdu.data(), b"payload", "the T-PDU reaches the UE");
+            }
+            other => panic!("expected the T-PDU to reach the UE, got {other:?}"),
+        }
+
+        task.handle_uplink_data(1, 1, b"uplink".to_vec()).await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .expect("the uplink reaches the UPF");
+        assert_eq!(ul.payload.as_ref(), b"uplink");
+        let info = ul.pdu_session_info().expect("UL PDU SESSION INFORMATION");
+        assert_eq!(info.qfi, 9);
+        let ts = info.ul_qmp.expect("QMP = 1 with the three time stamps");
+        assert_eq!(ts.dl_sending_time_stamp_repeated, t1);
+        assert!(
+            ts.dl_received_time_stamp >= before,
+            "T2 is this gNB's receive time"
+        );
+        assert!(
+            ts.ul_sending_time_stamp >= ts.dl_received_time_stamp,
+            "T3 >= T2"
+        );
+        assert_eq!(info.dl_delay_result, Some(3));
+        assert_eq!(info.ul_delay_result, Some(4));
+
+        // Answered once: the packet after carries a plain container again.
+        task.handle_uplink_data(1, 1, b"again".to_vec()).await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(ul.pdu_session_info(), Some(&PduSessionInfo::uplink(9)));
+    }
+
+    /// Criteria 2 and 3: with no uplink traffic the response goes in a dummy UL
+    /// G-PDU (no T-PDU), and the dummy DL G-PDU is not delivered to the UE.
+    #[tokio::test]
+    async fn with_no_uplink_traffic_a_dummy_ul_g_pdu_answers_and_the_dummy_dl_is_not_delivered() {
+        let (mut task, upf, mut rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Dl)]);
+
+        task.handle_udp_receive(&dl_qmp_bytes(42, b""), src()).await;
+        assert!(
+            rls_rx.try_recv().is_err(),
+            "a dummy DL G-PDU never reaches the UE"
+        );
+
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .expect("a dummy UL G-PDU answers");
+        assert_eq!(ul.teid, 0x1000);
+        assert!(ul.payload.is_empty(), "the dummy carries no T-PDU");
+        let info = ul.pdu_session_info().unwrap();
+        assert_eq!(info.ul_qmp.unwrap().dl_sending_time_stamp_repeated, 42);
+        // A DL-only request reports the DL Delay Result only.
+        assert_eq!(info.dl_delay_result, Some(3));
+        assert_eq!(info.ul_delay_result, None);
+    }
+
+    /// The dummy waits for `dummy_response_after_ms`, then goes out on its own.
+    #[tokio::test]
+    async fn a_pending_response_falls_due_after_the_configured_wait() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(30)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Ul)]);
+        task.handle_udp_receive(&dl_qmp_bytes(7, b""), src()).await;
+        assert!(
+            recv_gpdu(&upf, std::time::Duration::from_millis(10))
+                .await
+                .is_none(),
+            "nothing is sent before the wait runs out"
+        );
+        let due = task.next_qmp_deadline().expect("a response is pending");
+        tokio::time::sleep_until(due).await;
+        task.flush_due_qmp_responses().await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let info = ul.pdu_session_info().unwrap();
+        assert_eq!(info.ul_qmp.unwrap().dl_sending_time_stamp_repeated, 7);
+        assert_eq!(info.dl_delay_result, None);
+        assert_eq!(info.ul_delay_result, Some(4));
+        assert!(task.next_qmp_deadline().is_none(), "answered once");
+    }
+
+    /// A second QMP arriving before the first was answered does not silently
+    /// replace it: the first is answered at once in a dummy, so a UPF probing
+    /// faster than the dummy wait still hears back.
+    #[tokio::test]
+    async fn an_unanswered_qmp_is_answered_when_the_next_one_arrives() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(60_000)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        task.handle_udp_receive(&dl_qmp_bytes(1, b""), src()).await;
+        task.handle_udp_receive(&dl_qmp_bytes(2, b""), src()).await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .expect("the first QMP is answered");
+        let ts = ul.pdu_session_info().unwrap().ul_qmp.unwrap();
+        assert_eq!(ts.dl_sending_time_stamp_repeated, 1);
+        task.handle_uplink_data(1, 1, b"up".to_vec()).await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            ul.pdu_session_info()
+                .unwrap()
+                .ul_qmp
+                .unwrap()
+                .dl_sending_time_stamp_repeated,
+            2,
+            "the second rides on the uplink packet"
+        );
+    }
+
+    /// Monitoring goes with its tunnel: an Error Indication release and a peer
+    /// purge both drop it, so a later session on the same ids starts clean.
+    #[tokio::test]
+    async fn monitoring_is_dropped_when_the_tunnel_is_released_from_the_n3_side() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        let upf_addr = upf.local_addr().unwrap();
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        let ei = GtpHeader::error_indication(0x1000, upf_addr.ip());
+        task.handle_error_indication(&ei, upf_addr).await;
+        assert!(
+            task.tunnel_manager.get_session(1, 1).is_none(),
+            "precondition"
+        );
+        assert!(
+            task.qos_monitoring.is_empty(),
+            "Error Indication release drops it"
+        );
+
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        task.purge_peer_tunnels(upf.local_addr().unwrap().ip(), "test restart")
+            .await;
+        assert!(task.qos_monitoring.is_empty(), "a peer purge drops it");
+    }
+
+    /// A modify whose tunnel rebuild is refused leaves the session with no tunnel,
+    /// and its monitoring goes with it rather than lingering.
+    #[tokio::test]
+    async fn a_refused_modify_rebuild_drops_the_sessions_monitoring() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.ue_contexts.insert(1, GtpUeContext::new(1));
+        // A second session holds downlink TEID 0x3000.
+        let gnb_addr = SocketAddr::new(task.task_base.config.gtp_ip, GTP_U_PORT);
+        task.tunnel_manager
+            .create_session(PduSession::new(
+                1,
+                2,
+                GtpTunnel::new(0x1001, upf.local_addr().unwrap()),
+                GtpTunnel::new(0x3000, gnb_addr),
+            ))
+            .unwrap();
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        // Rebuilding PSI 1 on TEID 0x3000 collides, so `create_session` refuses it.
+        task.handle_session_modify(
+            1,
+            PduSessionResource {
+                psi: 1,
+                qfi: Some(9),
+                qos_flows: Vec::new(),
+                qos_monitoring: Vec::new(),
+                uplink_teid: 0x1000,
+                downlink_teid: 0x3000,
+                upf_address: upf.local_addr().unwrap().ip(),
+            },
+        );
+        assert!(
+            task.tunnel_manager.get_session(1, 1).is_none(),
+            "precondition"
+        );
+        assert!(!task.qos_monitoring.contains_key(&(1, 1)));
+    }
+
+    /// TS 38.415 §5.5.3.8: a QMP for a flow nobody asked this gNB to monitor is
+    /// ignored -- no response, and the uplink container is the plain one.
+    #[tokio::test]
+    async fn a_qmp_for_an_unmonitored_flow_is_ignored() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.handle_udp_receive(&dl_qmp_bytes(42, b"x"), src())
+            .await;
+        assert!(
+            recv_gpdu(&upf, std::time::Duration::from_millis(200))
+                .await
+                .is_none(),
+            "no dummy UL G-PDU for an unmonitored flow"
+        );
+        task.handle_uplink_data(1, 1, b"up".to_vec()).await;
+        let ul = recv_gpdu(&upf, std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(ul.pdu_session_info(), Some(&PduSessionInfo::uplink(9)));
+    }
+
+    /// Criterion 4: with `qos_monitoring.enabled` false (the default) even an
+    /// SMF request is not acted on, and the uplink wire is byte-identical to the
+    /// plain encapsulation.
+    #[tokio::test]
+    async fn with_monitoring_off_the_uplink_wire_is_unchanged() {
+        assert!(!test_config().qos_monitoring.enabled, "off by default");
+        let (mut task, upf, mut rls_rx) = qmp_task(Default::default()).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        task.handle_udp_receive(&dl_qmp_bytes(42, b"x"), src())
+            .await;
+        assert!(
+            matches!(
+                rls_rx.try_recv(),
+                Ok(TaskMessage::Message(RlsMessage::DownlinkData { .. }))
+            ),
+            "the T-PDU is delivered as before"
+        );
+        task.handle_uplink_data(1, 1, b"up".to_vec()).await;
+        let mut buf = [0u8; 512];
+        let (n, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), upf.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let (plain, _) = task
+            .tunnel_manager
+            .encapsulate_uplink(1, 1, Bytes::from_static(b"up"))
+            .unwrap();
+        assert_eq!(&buf[..n], &plain.encode()[..]);
+        assert!(task.next_qmp_deadline().is_none());
+    }
+
+    /// `Stop` ends a flow's monitoring (TS 38.413 QosMonitoringRequest `stop`), and
+    /// a modify naming no flow keeps what the session had.
+    #[tokio::test]
+    async fn stop_ends_monitoring_and_an_empty_modify_keeps_it() {
+        let (mut task, _upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.install_qos_monitoring(
+            1,
+            1,
+            &[
+                (9, QosMonitoringRequest::Both),
+                (5, QosMonitoringRequest::Ul),
+            ],
+        );
+        task.amend_qos_monitoring(1, 1, &[]);
+        assert_eq!(task.qos_monitoring[&(1, 1)].len(), 2);
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Stop)]);
+        assert!(!task.qos_monitoring[&(1, 1)].contains_key(&9));
+        task.amend_qos_monitoring(1, 1, &[(5, QosMonitoringRequest::Stop)]);
+        assert!(!task.qos_monitoring.contains_key(&(1, 1)));
+        // A create replaces the whole set.
+        task.install_qos_monitoring(1, 1, &[(5, QosMonitoringRequest::Ul)]);
+        task.install_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Dl)]);
+        assert_eq!(
+            task.qos_monitoring[&(1, 1)]
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![9]
+        );
+        task.handle_session_release(1, 1);
+        assert!(task.qos_monitoring.is_empty(), "released with the session");
+    }
+
     /// #340: in loopback mode a non-IPv4 SDU is echoed back unchanged; only an
     /// IPv4 ICMP echo request is turned into a reply. Before, a non-IPv4 SDU never
     /// got this far, and the ICMPv4 rewrite did not check the IP version.
@@ -1692,6 +2334,7 @@ mod tests {
             psi: 1,
             qfi: Some(1),
             qos_flows: vec![(1, None)],
+            qos_monitoring: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1719,6 +2362,7 @@ mod tests {
             psi: 1,
             qfi: Some(1),
             qos_flows: vec![(1, None)],
+            qos_monitoring: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1745,6 +2389,7 @@ mod tests {
             psi: 1,
             qfi: Some(1),
             qos_flows: vec![(1, None)],
+            qos_monitoring: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1773,6 +2418,7 @@ mod tests {
                 psi,
                 qfi: Some(1),
                 qos_flows: vec![(1, None)],
+                qos_monitoring: Vec::new(),
                 uplink_teid: 0x1000 + psi as u32,
                 downlink_teid: 0x2000 + psi as u32,
                 upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -1909,6 +2555,7 @@ mod tests {
                 psi: 1,
                 qfi: Some(1),
                 qos_flows: vec![(1, None)],
+                qos_monitoring: Vec::new(),
                 uplink_teid: 0x1000,
                 downlink_teid: 0x2000,
                 upf_address: upf_addr.ip(),
