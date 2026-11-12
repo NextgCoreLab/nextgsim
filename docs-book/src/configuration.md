@@ -167,7 +167,7 @@ These spawn research-prototype tasks, and only in a gNB built with
 | `isac_ekf_process_noise_accel` | EKF acceleration process noise; unset uses the crate default |
 | `isac_anchors` | Anchor positions `[x, y, z]` in metres; defaults to a 100 m triangle at 10 m height |
 | `agent_enabled` | AI agent framework task |
-| `federated_learning_enabled` | Federated-learning aggregator task |
+| `federated_learning_enabled` | Removed (nextgsim#480): the gNB has no FL aggregator. `true` fails startup |
 | `pqc` | Post-quantum settings (`enabled`, `kem_algorithm`, `sign_algorithm`, `hybrid_mode`). The primitives are real, but no NAS or RRC path consumes them yet |
 
 ---

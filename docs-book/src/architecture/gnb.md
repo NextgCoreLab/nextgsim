@@ -86,8 +86,10 @@ Each AI/6G module is a thin wrapper: `<name>/mod.rs` re-exports a `<name>/task.r
 that adapts the corresponding `nextgsim-<name>` crate into the gNB task
 framework (e.g. `src/nkef/mod.rs` header: "wires the nextgsim-nkef crate into
 the gNB task framework"). Their message types live in `src/tasks.rs`
-(`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`,
-`FlAggregatorMessage`). Detail belongs in the [AI/6G stack chapter](../concepts/ai-6g-stack.md);
+(`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`).
+The gNB has no federated-learning task: the FL aggregator was removed in
+nextgsim#480, and federated learning runs in the `nr-fl-server` AF on the N6
+side, over the UEs' PDU sessions. Detail belongs in the [AI/6G stack chapter](../concepts/ai-6g-stack.md);
 this chapter treats them as optional, config-gated side tasks.
 
 ## Protocol stack

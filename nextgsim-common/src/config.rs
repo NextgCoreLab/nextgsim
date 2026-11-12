@@ -646,7 +646,11 @@ pub struct GnbConfig {
     /// otherwise the list is ignored. Empty by default.
     #[serde(default)]
     pub agents: Vec<AgentRuleConfig>,
-    /// Federated Learning Aggregator task enabled (Rel-20)
+    /// Removed (nextgsim#480): the gNB has no Federated Learning aggregator any
+    /// more. Federated learning is an application-layer AF (`nr-fl-server`) on
+    /// the N6 side, reached over the UEs' PDU sessions. The field is kept so an
+    /// old config with `false` still loads; `true` fails gNB startup
+    /// (`ConfigValidationError::FlAggregatorRemoved`) rather than being ignored.
     #[serde(default)]
     pub federated_learning_enabled: bool,
     /// Use QUIC transport instead of SCTP for NGAP (6G forward-looking, Rel-20+).

@@ -52,8 +52,7 @@ all of which default to "off":
 2. **Spawn gate (config flag).** Even when compiled, a 6G task loop is only
    `tokio::spawn`-ed if its config flag is set. On the gNB,
    `nextgsim-gnb/src/main.rs` computes `any_6g` from `she_enabled`,
-   `nwdaf_enabled`, `nkef_enabled`, `isac_enabled`, `agent_enabled`,
-   `federated_learning_enabled` and only then calls `init_6g_tasks`; each task is
+   `nwdaf_enabled`, `nkef_enabled`, `isac_enabled`, `agent_enabled` and only then calls `init_6g_tasks`; each task is
    further guarded by its own flag. On the UE, `nextgsim-ue/src/main.rs`
    (`spawn_tasks`) does the same with `cfg!(feature = …) && *_enabled`. Every one
    of these flags defaults to `false` in `nextgsim-common/src/config.rs`
@@ -177,9 +176,11 @@ FL concepts of TR 23.700-80 and the AI/ML training-management model of TS 28.105
 the scope of standardization. The `mns_adapter` module is explicitly "illustrative
 only — NOT a conformant YANG/JSON MnS schema".
 
-On a live run the gNB `FlAggregatorTask` (`nextgsim-gnb/src/fl/task.rs`) and UE
-`FlParticipantTask` are both **off by default**; the training round is exercised
-by `test_fl_task_full_training_round_via_channel` in the integration test.
+The gNB has no FL task: its `FlAggregatorTask` (a hard-coded `FedAvg, 2` with
+`loss: 0.0` and no producer) was removed in nextgsim#480. Federated learning is an
+application-layer AF on the N6 side (TS 23.501 §5.46: AI/ML logic "is out of
+scope of 3GPP"), not a RAN function. The UE `FlParticipantTask` is **off by
+default**.
 
 Depth: **partial-to-full** research engine; the "SecAgg" is an **illustrative
 stub** by design.

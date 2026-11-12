@@ -184,7 +184,6 @@ nwdaf_enabled: false            # Network Data Analytics Function (Rel-20)
 nkef_enabled: false             # Network Knowledge Exposure Function (Rel-20)
 isac_enabled: false             # Integrated Sensing and Communication (Rel-20)
 agent_enabled: false            # AI Agent Framework (Rel-20)
-federated_learning_enabled: false  # Federated Learning Aggregator (Rel-20)
 
 # Activate AS (Access Stratum) security end to end: SRB1 PDCP integrity
 # protection and ciphering (TS 33.501 §6.5, TS 38.331 §5.3.4).

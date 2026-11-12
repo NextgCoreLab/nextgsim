@@ -5,10 +5,10 @@
 //!
 //! - Task spawning via `GnbTaskBase::init_6g_tasks()`
 //! - Message delivery through mpsc channels to running task loops
-//! - State transitions inside each task (Agent, FL, ISAC, NWDAF)
+//! - State transitions inside each task (Agent, ISAC, NWDAF)
 //! - NWDAF → RRC handover recommendation cross-task wiring
 //!
-//! The 6G task types (`AgentTask`/`FlAggregatorTask`/`IsacTask`/`NwdafTask`) are
+//! The 6G task types (`AgentTask`/`IsacTask`/`NwdafTask`) are
 //! only re-exported from a `--features 6g` build of `nextgsim-gnb`, so this whole
 //! test binary is gated on the tests crate's `6g` feature (see Cargo.toml). Under
 //! a default (lean) `cargo test --workspace` it compiles to an empty binary.
@@ -22,10 +22,10 @@ use integration_tests::init_test_logging;
 use nextgsim_common::{config::GnbConfig, Plmn};
 use nextgsim_gnb::{
     tasks::{
-        AgentMessage, FlAggregatorMessage, GnbTaskBase, IsacMessage, NwdafMessage, RrcMessage,
-        Task, TaskMessage, DEFAULT_CHANNEL_CAPACITY,
+        AgentMessage, GnbTaskBase, IsacMessage, NwdafMessage, RrcMessage, Task, TaskMessage,
+        DEFAULT_CHANNEL_CAPACITY,
     },
-    AgentTask, FlAggregatorTask, IsacTask, NwdafTask,
+    AgentTask, IsacTask, NwdafTask,
 };
 use tokio::time::timeout;
 
@@ -45,7 +45,6 @@ fn sixg_gnb_config() -> GnbConfig {
         nkef_enabled: true,
         isac_enabled: true,
         agent_enabled: true,
-        federated_learning_enabled: true,
         ..Default::default()
     }
 }
@@ -87,7 +86,6 @@ async fn test_sixg_task_channels_open_after_init() {
     assert!(!sixg.nwdaf_tx.is_closed(), "NWDAF channel must be open");
     assert!(!sixg.isac_tx.is_closed(), "ISAC channel must be open");
     assert!(!sixg.agent_tx.is_closed(), "Agent channel must be open");
-    assert!(!sixg.fl_tx.is_closed(), "FL channel must be open");
     assert!(!sixg.she_tx.is_closed(), "SHE channel must be open");
     assert!(!sixg.nkef_tx.is_closed(), "NKEF channel must be open");
 }
@@ -102,7 +100,6 @@ async fn test_sixg_tasks_can_be_instantiated() {
 
     // Each constructor must succeed without panic
     let _agent_task = AgentTask::new(base.clone());
-    let _fl_task = FlAggregatorTask::new(base.clone());
     let _isac_task = IsacTask::new(base.clone());
     let _nwdaf_task = NwdafTask::new(base.clone());
 
@@ -173,112 +170,9 @@ async fn test_agent_register_then_submit_intent() {
 }
 
 // ============================================================================
-// Test 3: FL aggregation path
+// Test 3: (removed) the gNB FL aggregator is gone since nextgsim#480; federated
+// learning is the nr-fl-server AF on the N6 side (nextgsim-fl).
 // ============================================================================
-
-/// Drive the full FL training round through the task channel:
-/// `RegisterParticipant` × 2 → `DistributeModel` → `SubmitUpdate` × 2 → `Aggregate`.
-/// The task must process all messages and log a successful aggregation.
-#[tokio::test]
-async fn test_fl_task_full_training_round_via_channel() {
-    init_test_logging();
-
-    let (base, sixg_rx, _app_rx, _rrc_rx) = make_base_with_6g();
-    let sixg = base.sixg.as_ref().unwrap().clone();
-
-    let mut task = FlAggregatorTask::new(base);
-    let fl_rx = sixg_rx.fl_rx;
-    let handle = tokio::spawn(async move { task.run(fl_rx).await });
-
-    // Register two participants
-    sixg.fl_tx
-        .send(FlAggregatorMessage::RegisterParticipant {
-            participant_id: "ue-001".to_string(),
-            compute_capability: 500,
-        })
-        .await
-        .expect("RegisterParticipant ue-001 must succeed");
-
-    sixg.fl_tx
-        .send(FlAggregatorMessage::RegisterParticipant {
-            participant_id: "ue-002".to_string(),
-            compute_capability: 750,
-        })
-        .await
-        .expect("RegisterParticipant ue-002 must succeed");
-
-    // Initialise the global model (weights = 0.0 × 8)
-    sixg.fl_tx
-        .send(FlAggregatorMessage::DistributeModel {
-            version: 0,
-            weights: vec![0.0_f32; 8],
-        })
-        .await
-        .expect("DistributeModel must succeed");
-
-    // Submit gradient updates from both participants
-    sixg.fl_tx
-        .send(FlAggregatorMessage::SubmitUpdate {
-            participant_id: "ue-001".to_string(),
-            round: 1,
-            gradients: vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-            num_samples: 100,
-        })
-        .await
-        .expect("SubmitUpdate ue-001 must succeed");
-
-    sixg.fl_tx
-        .send(FlAggregatorMessage::SubmitUpdate {
-            participant_id: "ue-002".to_string(),
-            round: 1,
-            gradients: vec![0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
-            num_samples: 150,
-        })
-        .await
-        .expect("SubmitUpdate ue-002 must succeed");
-
-    // Trigger aggregation
-    sixg.fl_tx
-        .send(FlAggregatorMessage::Aggregate { round: 1 })
-        .await
-        .expect("Aggregate must succeed");
-
-    // Shutdown and verify no panic
-    sixg.fl_tx.shutdown().await.expect("Shutdown must succeed");
-
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("FlAggregatorTask must finish within 2 s")
-        .expect("FlAggregatorTask join must succeed");
-}
-
-/// Verify that sending `Aggregate` before any participants are registered
-/// (the error path) does not cause a panic – the task must stay alive and
-/// accept the subsequent shutdown.
-#[tokio::test]
-async fn test_fl_task_aggregate_before_participants_is_graceful() {
-    init_test_logging();
-
-    let (base, sixg_rx, _app_rx, _rrc_rx) = make_base_with_6g();
-    let sixg = base.sixg.as_ref().unwrap().clone();
-
-    let mut task = FlAggregatorTask::new(base);
-    let fl_rx = sixg_rx.fl_rx;
-    let handle = tokio::spawn(async move { task.run(fl_rx).await });
-
-    // Aggregate with no participants should warn but not panic
-    sixg.fl_tx
-        .send(FlAggregatorMessage::Aggregate { round: 1 })
-        .await
-        .expect("Aggregate send must succeed even with no participants");
-
-    sixg.fl_tx.shutdown().await.expect("Shutdown must succeed");
-
-    timeout(Duration::from_secs(2), handle)
-        .await
-        .expect("FlAggregatorTask must finish within 2 s")
-        .expect("FlAggregatorTask join must succeed");
-}
 
 // ============================================================================
 // Test 4: ISAC sensing pipeline
@@ -547,7 +441,7 @@ async fn test_nwdaf_task_predict_trajectory_via_channel() {
 // Test 6: Shutdown ordering – all 6G tasks stop cleanly
 // ============================================================================
 
-/// Spawn all four 6G tasks concurrently, then send a coordinated shutdown
+/// Spawn the three 6G tasks concurrently, then send a coordinated shutdown
 /// through `GnbTaskBase::shutdown_all()`.  Every task handle must finish
 /// within the timeout, proving the shutdown signal propagates correctly.
 #[tokio::test]
@@ -559,9 +453,6 @@ async fn test_sixg_all_tasks_shutdown_cleanly() {
     // Spawn all 6G tasks
     let mut agent_task = AgentTask::new(base.clone());
     let h_agent = tokio::spawn(async move { agent_task.run(sixg_rx.agent_rx).await });
-
-    let mut fl_task = FlAggregatorTask::new(base.clone());
-    let h_fl = tokio::spawn(async move { fl_task.run(sixg_rx.fl_rx).await });
 
     let mut isac_task = IsacTask::new(base.clone());
     let h_isac = tokio::spawn(async move { isac_task.run(sixg_rx.isac_rx).await });
@@ -575,7 +466,7 @@ async fn test_sixg_all_tasks_shutdown_cleanly() {
     // All tasks must finish within 2 s
     let results = timeout(
         Duration::from_secs(2),
-        futures::future::join_all([h_agent, h_fl, h_isac, h_nwdaf]),
+        futures::future::join_all([h_agent, h_isac, h_nwdaf]),
     )
     .await
     .expect("All 6G tasks must stop within 2 s after shutdown_all()");
