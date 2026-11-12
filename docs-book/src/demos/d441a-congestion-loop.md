@@ -194,8 +194,11 @@ The overlay's `scenario.sh` then:
 
 The artefacts go to `/tmp/eks-val/demos/d441a-congestion-loop/<mode>/<UTC>/`.
 
-The Results below were captured with the #1481 harness, and on main two lines
-read differently. The knob check prints its terms in another order. This is
+The Results below were captured with two harnesses. The fix runs used the #1481
+harness (`d75814c4`). The earlier runs (no-loop `162447Z`, statistics `164134Z`,
+prediction `165042Z` and `170200Z`, and the off control) used the #1477 harness
+(`55c6afcb0eda`), which prints no knob line and no chain suffix at all. On main,
+two lines read differently from the #1481 runs. The knob check prints its terms in another order. This is
 `d441a_restore_hysteresis` run on main's overlay files:
 
 ```
@@ -217,12 +220,12 @@ The chain line also ends with the restore's distance from UE-B's stop. In main's
 ## Results
 
 **All four arms pass on EKS with the restore-hysteresis fix (nextgcore #1481,
-merged).** On main (nextgcore `55c6afcb0eda`), three of the four
+merged).** On the pre-fix main (nextgcore `55c6afcb0eda`), three of the four
 passed. The demo-off control, the no-loop baseline and the statistics loop
 passed there. On a saturated cell, the loop keeps UE-V's ping p95 at 3.6 to
 4.2 ms against 320 ms with no loop, and the UPF polices UE-B at the 1 Mbps cap.
 
-The prediction arm failed on main in 2 of 2 runs. It restored UE-B while UE-B's
+The prediction arm failed on that pre-fix core in 2 of 2 runs. It restored UE-B while UE-B's
 load was still offered and re-throttled it about 2 s later, because the
 overlay's `restore_below: 10` sits inside the occupancy the throttle itself
 leaves (nextgcore#1480). With #1481's knobs (`restore_below: 3`,
@@ -330,7 +333,11 @@ stopped, and the scenario's restore wait held it.
 Since nextgcore #1485, `d441a_ue_b_load` checks every ramp and hold
 `kubectl exec`, and `d441a_load_traffic` fails a step with no ping summary,
 fewer than 100 requests a second of its deadline, or no replies. #1485's
-replay over the eight arms trips only `174900Z`, at step 6. Run on main over
+replay over the eight arms trips only `174900Z`, at step 6, once the old
+transcripts' single `=== hold:` block is split into `=== hold ping N` sections,
+as #1485 did. Run literally on these artefacts, main's check fails all eight
+with `load hold ping 1: not in the transcript`, because the transcript format
+changed in #1485. Run on main over
 this run's `scenario/ue-b-ramp.txt`, it names the step:
 `load step 6 produced no traffic: no ping summary (Unable to connect to the server: …)`.
 
@@ -343,7 +350,7 @@ with the kubelet timestamp prefix and the ANSI colour codes trimmed.
 The arms ran with `KEEP=true`, so that UE-B's post-run state could be read
 (`post/`). A wrapper then deleted the `nextg-demo` namespace that the run had
 created, in the same lock hold. That is why the verdicts say `teardown=kept`;
-every `post/wrapper.txt` contains `namespace gone`.
+every deployed arm's `post/wrapper.txt` contains `namespace gone`. `prediction/20261112T180011Z` never deployed, created nothing, and has no `namespace gone`.
 
 - **Harness:** nextgcore `55c6afcb0eda`, main with #1472, #1476 (upfd MBR/GBR in
   kbit/s) and #1477 (this scenario's saturating load and its captures).
@@ -365,8 +372,9 @@ every `post/wrapper.txt` contains `namespace gone`.
 | `d441a-congestion-loop prediction` (rerun) | `d441a-congestion-loop/prediction/20261112T170200Z` | FAIL: two throttles (nextgcore#1480) | 99.9 % | 4.3 ms |
 
 - **Demo-off control:** `demo_banner_lines=0 demo_prefix_lines=0 nextg_demo_enabled_series=0`.
-- **Demo arms:** `demo_banner_lines=3` in every demo arm except prediction
-  `170200Z` and statistics `174900Z`, which have `demo_banner_lines=2`. The
+- **Demo arms:** `demo_banner_lines=3` in every deployed demo arm except prediction
+  `170200Z` and statistics `174900Z`, which have `demo_banner_lines=2`
+  (`180011Z` never deployed: `demo_banner_lines=0`). The
   banners of pcfd, nwdafd and the gNB are all in the statistics capture
   (`statistics/20261112T164134Z/log-chain.txt`, prefixes trimmed):
 
@@ -477,7 +485,7 @@ nwdaf_ran_cell_reports_total{result="unauthorized"} 1
 demo_ambr_cap occurrences (non-null): 0 state_bytes: 5646
 ```
 
-### prediction on main, before the fix: it throttles in time, then restores mid-load (nextgcore#1480)
+### prediction on pre-fix main (`55c6afcb0eda`): it throttles in time, then restores mid-load (nextgcore#1480)
 
 The prediction crossed 80 % and pcfd throttled UE-B. Then, with UE-B still
 loading, pcfd restored it and throttled it again 2 s later (`scenario.log`, cut
@@ -550,7 +558,7 @@ every demo arm on three defects. All three are fixed on main now:
 
 In the D444A rerun on the same core commit, pcfd once skipped its NRF
 registration, so no UE could register: a start-up race in
-`pcf_sbi_open`, nextgcore#1479. None of the D441A arms hit it. Each pcfd here
+`pcf_sbi_open`, nextgcore#1479 (fixed by nextgcore #1483). None of the D441A arms hit it. Each pcfd here
 logged `PCF registered with NRF`.
 
 ## Honesty labels and limitations
