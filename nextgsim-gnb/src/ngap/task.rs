@@ -3772,6 +3772,7 @@ impl NgapTask {
                             intent,
                             ue_id,
                             false,
+                            true,
                             "TNGRELOCprep expired; HANDOVER CANCEL sent".to_string(),
                         );
                     }
@@ -4656,6 +4657,7 @@ impl NgapTask {
                 intent,
                 ue_id.unwrap_or_default(),
                 true,
+                true,
                 "HANDOVER COMMAND received".to_string(),
             );
         }
@@ -5169,6 +5171,7 @@ impl NgapTask {
                     intent,
                     ue_id,
                     false,
+                    false,
                     "no HANDOVER REQUIRED was sent".to_string(),
                 );
             }
@@ -5177,7 +5180,14 @@ impl NgapTask {
 
     /// Tells the Agent task how a handover its intent asked for ended
     /// (nextgsim#483). Never waits: a full or absent Agent inbox drops it.
-    fn report_agent_actuation(&self, intent_id: String, ue_id: i32, success: bool, detail: String) {
+    fn report_agent_actuation(
+        &self,
+        intent_id: String,
+        ue_id: i32,
+        success: bool,
+        signalled: bool,
+        detail: String,
+    ) {
         let Some(sixg) = &self.task_base.sixg else {
             return;
         };
@@ -5187,6 +5197,7 @@ impl NgapTask {
                 intent_id,
                 ue_id,
                 success,
+                signalled,
                 detail,
             })
         {
@@ -5534,6 +5545,7 @@ impl NgapTask {
                     intent,
                     ue_id,
                     false,
+                    true,
                     format!("HANDOVER PREPARATION FAILURE {:?}", ho_fail.cause),
                 );
             }
