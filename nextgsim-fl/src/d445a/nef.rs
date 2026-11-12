@@ -74,6 +74,8 @@ const MAX_STREAMS_PER_CONNECTION: usize = 16;
 /// The largest header list accepted (SETTINGS_MAX_HEADER_LIST_SIZE); h2's own
 /// default is 16 MiB.
 const MAX_HEADER_LIST: u32 = 16 * 1024;
+/// At most one warn summary of refused callback connections per this long.
+const REFUSAL_SUMMARY: Duration = Duration::from_secs(10);
 /// A callback connection with no request in flight for this long is closed.
 pub const CALLBACK_IDLE: Duration = Duration::from_secs(30);
 /// The default UE ID retrieval path (provisional; see the module doc).
@@ -581,6 +583,10 @@ pub async fn serve_callbacks(
     tx: mpsc::Sender<(String, Bytes)>,
 ) {
     let registry = Arc::new(Mutex::new(Registry::default()));
+    // Refusals are wire-driven: each is logged at debug, and a warn summary
+    // goes out at most once per REFUSAL_SUMMARY.
+    let mut refused: u64 = 0;
+    let mut summary_due = Instant::now();
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(a) => a,
@@ -594,11 +600,23 @@ pub async fn serve_callbacks(
         let held = {
             let mut r = lock(&registry);
             if !r.make_room(peer.ip()) {
-                tracing::warn!(
+                drop(r);
+                refused += 1;
+                tracing::debug!(
                     "[demo:{}] T8 listener: connection from {peer} refused (no idle connection \
                      to evict for it)",
                     super::KEY
                 );
+                if Instant::now() >= summary_due {
+                    tracing::warn!(
+                        "[demo:{}] T8 listener: {refused} connection(s) refused since the last \
+                         summary (latest from {peer}): every slot its source may take is busy \
+                         or opening",
+                        super::KEY
+                    );
+                    refused = 0;
+                    summary_due = Instant::now() + REFUSAL_SUMMARY;
+                }
                 continue;
             }
             r.next += 1;
@@ -718,8 +736,13 @@ async fn serve_connection(
                 continue;
             }
             () = evict.notified() => {
+                // Evicted connections are idle by construction (nothing in
+                // flight), and the registry has already given their slot away:
+                // close the socket now rather than drain it, so open sockets
+                // stay within the caps (plus idle closes, still counted while
+                // they drain).
                 tracing::debug!("[demo:{}] T8 listener: idle connection evicted", super::KEY);
-                break;
+                return Ok(());
             }
         };
         let Some(stream) = stream else {
@@ -893,12 +916,16 @@ mod tests {
     }
 
     fn held(r: &mut Registry, octet: u8, opening: bool) -> Arc<Notify> {
+        held_busy(r, octet, opening, 0)
+    }
+
+    fn held_busy(r: &mut Registry, octet: u8, opening: bool, busy: usize) -> Arc<Notify> {
         r.next += 1;
         let evict = Arc::new(Notify::new());
         r.held.push(Held {
             id: r.next,
             source: IpAddr::from([127, 0, 0, octet]),
-            busy: Arc::new(AtomicUsize::new(0)),
+            busy: Arc::new(AtomicUsize::new(busy)),
             opening: Arc::new(AtomicBool::new(opening)),
             last_active: Arc::new(Mutex::new(Instant::now())),
             evict: evict.clone(),
@@ -947,6 +974,72 @@ mod tests {
             .map(|_| held(&mut r, 30, true))
             .collect();
         assert!(!r.make_room(IpAddr::from([127, 0, 0, 30])));
+    }
+
+    fn src(octet: u8) -> IpAddr {
+        IpAddr::from([127, 0, 0, octet])
+    }
+
+    /// Boundary: at the total cap, a source holding exactly one more than the
+    /// newcomer's is not evicted (that would only swap their counts and
+    /// ping-pong); the newcomer is refused.
+    #[tokio::test]
+    async fn no_eviction_when_the_largest_holds_only_one_more() {
+        let mut r = Registry::default();
+        // The newcomer's source (.2) holds 1; the other 63 slots go to 31
+        // sources holding 2 each and one holding 1.
+        let mine = held(&mut r, 2, false);
+        let others: Vec<_> = (0..MAX_CALLBACK_CONNECTIONS - 1)
+            .map(|i| held(&mut r, 20 + (i / 2) as u8, false))
+            .collect();
+        assert_eq!(r.held.len(), MAX_CALLBACK_CONNECTIONS);
+        // Newcomer from source .2 (holds 1); the largest hold 2 == 1 + 1.
+        assert!(!r.make_room(src(2)), "evicted at n == mine + 1");
+        assert!(!evicted(&mine).await);
+        for n in &others {
+            assert!(!evicted(n).await, "evicted at n == mine + 1");
+        }
+    }
+
+    /// Boundary: a connection with a request in flight is never evicted,
+    /// neither by its own source at the per-source cap nor by another source
+    /// at the total cap.
+    #[tokio::test]
+    async fn a_busy_connection_is_never_evicted() {
+        let mut r = Registry::default();
+        let own: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|_| held_busy(&mut r, 30, false, 1))
+            .collect();
+        assert!(!r.make_room(src(30)), "a busy own connection was evicted");
+        let mut r = Registry::default();
+        let busy: Vec<_> = (0..MAX_CALLBACK_CONNECTIONS)
+            .map(|i| held_busy(&mut r, 20 + (i % 8) as u8, false, 1))
+            .collect();
+        assert!(!r.make_room(src(50)), "a busy connection was evicted");
+        for n in own.iter().chain(&busy) {
+            assert!(!evicted(n).await);
+        }
+    }
+
+    /// Boundary: at the total cap, another source's newcomer CAN evict a
+    /// connection that is still opening (the opening window protects a
+    /// connection only from its own source), so opening slots cannot be held
+    /// against other sources.
+    #[tokio::test]
+    async fn an_opening_connection_is_evicted_at_the_total_cap() {
+        let mut r = Registry::default();
+        let opening: Vec<_> = (0..MAX_CALLBACK_CONNECTIONS)
+            .map(|i| held(&mut r, 20 + (i % 8) as u8, true))
+            .collect();
+        assert!(
+            r.make_room(src(50)),
+            "opening slots held against another source"
+        );
+        let mut gone = 0;
+        for n in &opening {
+            gone += usize::from(evicted(n).await);
+        }
+        assert_eq!(gone, 1);
     }
 
     /// A connection from `127.0.0.octet` to `addr`.
@@ -1029,19 +1122,25 @@ mod tests {
             .unwrap();
     }
 
-    /// Churn cannot evict the NEF's notification connection either: 64 tasks
-    /// on one source address connect raw TCP in a loop, and every one of 200
-    /// notifications from another source, each on a fresh connection like
-    /// nefd's, is answered 204.
+    /// Smoke test, not the proof: 64 tasks on one source address connect raw
+    /// TCP in a loop, and 200 notifications from another source, each on a
+    /// fresh connection like nefd's, must all be answered 204. It is
+    /// statistical and does not catch every revert of the eviction rules (the
+    /// round-1 policy passes it); the deterministic Registry tests above carry
+    /// that. Ignored in the default suite because the flood loads loopback for
+    /// the other tests: run it alone, serially (`--ignored --test-threads=1`),
+    /// as CI and `scripts/demo/d445a-reverts.sh` do.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "smoke test; run serially with --ignored --test-threads=1"]
     async fn a_churning_source_cannot_evict_another_sources_notification() {
         churn_against_notifications(1).await;
     }
 
-    /// The same with the flood spread over 20 source addresses (160 tasks,
-    /// far more than the listener holds in all), so it sits at its total cap:
-    /// the fair-share rule keeps the notifier's slot.
+    /// Smoke test, as above, with the flood spread over 20 source addresses
+    /// (160 tasks, more than the listener holds in all) so it sits at its total
+    /// cap. The deterministic Registry tests are the proof.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "smoke test; run serially with --ignored --test-threads=1"]
     async fn a_churning_flood_from_many_sources_cannot_evict_a_notification() {
         churn_against_notifications(20).await;
     }

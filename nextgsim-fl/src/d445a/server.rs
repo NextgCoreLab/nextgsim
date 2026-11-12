@@ -118,7 +118,9 @@ pub struct ServerConfig {
     pub listen: SocketAddr,
     /// The T8 callback listener. Default 127.0.0.1:7481. It belongs on the
     /// network nefd reaches the AF on (the SBI or pod network), never on `fl-dn`,
-    /// which every UE reaches through the UPF.
+    /// which every UE reaches through the UPF. nefd must reach it from an
+    /// address no untrusted peer shares (no SNAT, hostNetwork or shared
+    /// loopback): the callback slots are counted per source address.
     #[serde(default = "default_t8_listen")]
     pub t8_listen: SocketAddr,
     /// The base of the `notificationDestination` given to the NEF, e.g.

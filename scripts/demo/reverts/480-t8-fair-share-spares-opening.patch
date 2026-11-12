@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -567,7 +567,7 @@
+         by_source
+             .into_iter()
+             .take_while(|(_, n)| *n > mine + 1)
+-            .any(|(s, _)| self.evict_oldest_idle_of(s, true))
++            .any(|(s, _)| self.evict_oldest_idle_of(s, false))
+     }
+ }
+ 

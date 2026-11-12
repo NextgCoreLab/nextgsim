@@ -116,7 +116,14 @@ The gNB has no FL task: its aggregator was removed (nextgsim#480). Federated lea
   - At 64 connections in all, an eviction takes from the source holding the most, and only if that source holds at least two more than the newcomer's source. A peer holding one connection is never evicted by a newcomer.
   - A connection with a request in flight is never evicted. A connection still opening (accept, h2 handshake, first request, at most 2 s) is not evicted by its own source.
 
-  So one flooding or churning host, or a flood spread over many addresses, cannot evict nefd's one-notification connection. Both cases are tested with 200 notifications and no loss, and the eviction rules have a deterministic test of their own. Filling every slot with fair shares takes more than 64 hosts, each sitting on its own connection. A raw SYN flood is below this layer and is the kernel's to absorb (SYN cookies).
+  So one flooding or churning host, or a flood spread over many addresses, cannot evict nefd's connection. Deterministic tests of the eviction rules prove this, including their boundaries. Two churn smoke tests (200 notifications under a flood, with no loss) run separately and serially.
+
+  Known limits:
+  - **nefd's address must not be shared.** Slots are counted per source address, so nefd must reach `t8_listen` on an address that no untrusted peer shares: pod-to-pod, with no SNAT between nefd and the AF, no hostNetwork, no NodePort or load-balancer path, and not the default 127.0.0.1 alongside other local processes. A peer that shares nefd's address shares its 8 slots, and could keep them all opening.
+  - **Many hosts can still refuse nefd.** With `k` notifications in flight at once, nefd's k-th connection is refused only when every slot is held by a source with at most `k` connections. That takes about 64/k hosts: more than 64 for one notification at a time, about 32 for two simultaneous loss-of-connectivity reports.
+  - **IPv6 is not covered.** On IPv6 one host with a /64 counts as many sources. The listener is IPv4 (pod network or loopback) here.
+  - **A raw SYN flood** is below this layer and is the kernel's to absorb (SYN cookies).
+- An evicted connection is closed at once; it is idle by construction. Open callback sockets therefore stay within the caps, plus connections closing after 30 s idle, which keep their slot while they drain. A refused connection is logged at debug level, with at most one warn summary every 10 s.
 - With `nef.oauth2` every NEF call carries an NRF token for an `AF`-typed consumer, or is not sent. The scopes `nnef-ueid` and `nnef-eventexposure` are nextgcore's NRF OAuth2 policy, not 3GPP surface: the 3GPP OpenAPI defines no scopes for these northbound APIs, and TS 23.222 / TS 33.122 put them behind CAPIF.
 
 Modes (`demo.d445a-fl-t8.mode`, default `t8-exclusion` in the overlay):
