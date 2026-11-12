@@ -1,8 +1,9 @@
 //! A stub nefd for the AF's tests: h2c, the three routes the AF calls, and a
 //! way to deliver a T8 LoC notification to the AF's callback listener over h2c.
 //!
-//! UE ID retrieval maps a loopback source `127.0.0.N` (N in 10..=99) to
-//! `msisdn-0010000000NNN`; any other address is 404, like a BSF with no binding.
+//! UE ID retrieval maps a loopback source `127.0.0.N` (N in 10..=99) to the
+//! `UeIdInfo` `{"externalId": "ueNNN@fl.nextg"}` (the AF's GPSI
+//! `extid-ueNNN@fl.nextg`); any other address is 404, like a BSF with no binding.
 
 use std::sync::{Arc, Mutex};
 
@@ -16,7 +17,7 @@ use tokio::net::TcpListener;
 #[derive(Debug, Clone, PartialEq)]
 pub struct StubSub {
     pub id: String,
-    pub msisdn: String,
+    pub external_id: String,
     pub destination: String,
     pub deleted: bool,
 }
@@ -28,9 +29,14 @@ pub struct StubNef {
     pub subs: Arc<Mutex<Vec<StubSub>>>,
 }
 
-/// The GPSI the stub gives source address `127.0.0.octet`.
+/// The External Identifier the stub gives source address `127.0.0.octet`.
+pub fn external_id_of(octet: u8) -> String {
+    format!("ue{octet:03}@fl.nextg")
+}
+
+/// The AF's GPSI for source address `127.0.0.octet`.
 pub fn gpsi_of(octet: u8) -> String {
-    format!("msisdn-0010000000{octet:03}")
+    format!("extid-{}", external_id_of(octet))
 }
 
 impl StubNef {
@@ -102,15 +108,14 @@ impl StubNef {
     /// nefd does: an h2c POST of a TS 29.122 MonitoringNotification to the live
     /// subscription's notificationDestination. Returns the AF's status.
     pub async fn notify_loc(&self, gpsi: &str) -> StatusCode {
-        let msisdn = gpsi.strip_prefix("msisdn-").unwrap();
+        let ext = gpsi.strip_prefix("extid-").unwrap();
         let sub = self
             .live()
             .into_iter()
             .rev()
-            .find(|s| s.msisdn == msisdn)
+            .find(|s| s.external_id == ext)
             .expect("a live subscription for the UE");
-        self.post(&sub.destination, &loc_body(&sub.id, msisdn))
-            .await
+        self.post(&sub.destination, &loc_body(&sub.id, ext)).await
     }
 
     /// POST `body` to `uri` over h2c.
@@ -121,13 +126,13 @@ impl StubNef {
 }
 
 /// The MonitoringNotification nefd sends for subscription `id`.
-pub fn loc_body(id: &str, msisdn: &str) -> Value {
+pub fn loc_body(id: &str, external_id: &str) -> Value {
     json!({
         "subscription": format!("/3gpp-monitoring-event/v1/fl-af/subscriptions/{id}"),
         "monitoringEventReports": [{
             "monitoringType": "LOSS_OF_CONNECTIVITY",
             "lossOfConnectReason": "DEREGISTERED",
-            "msisdn": msisdn,
+            "externalId": external_id,
         }],
     })
 }
@@ -150,7 +155,11 @@ fn route(
                 .and_then(|o| o.parse::<u8>().ok())
                 .filter(|o| (10..=99).contains(o));
             match octet {
-                Some(o) => (StatusCode::OK, None, Some(json!({ "gpsi": gpsi_of(o) }))),
+                Some(o) => (
+                    StatusCode::OK,
+                    None,
+                    Some(json!({ "externalId": external_id_of(o) })),
+                ),
                 None => (
                     StatusCode::NOT_FOUND,
                     None,
@@ -166,7 +175,7 @@ fn route(
             let id = format!("sub-{}", s.len() + 1);
             s.push(StubSub {
                 id: id.clone(),
-                msisdn: v["msisdn"].as_str().unwrap_or("").to_string(),
+                external_id: v["externalId"].as_str().unwrap_or("").to_string(),
                 destination: v["notificationDestination"]
                     .as_str()
                     .unwrap_or("")

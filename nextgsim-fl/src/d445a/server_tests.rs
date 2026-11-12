@@ -223,7 +223,7 @@ async fn t8_exclusion_excludes_ue3_and_readmits_it() {
     let ue3: Vec<_> = nef
         .all()
         .into_iter()
-        .filter(|s| s.msisdn == "0010000000013")
+        .filter(|s| s.external_id == "ue013@fl.nextg")
         .collect();
     assert_eq!(ue3.len(), 2);
     assert!(ue3[0].deleted && !ue3[1].deleted, "{ue3:?}");
@@ -460,6 +460,123 @@ async fn a_huge_samples_claim_is_capped() {
     }
 }
 
+/// B1: a member answering every round with a huge finite delta (`f32::MAX` in
+/// every weight) is refused on its norm and never aggregated. The AF finishes,
+/// the honest members' model stays finite and is their in-process run, bit for
+/// bit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_huge_finite_delta_is_refused_and_the_af_survives() {
+    let nef = StubNef::start().await;
+    let cfg = yaml(&nef.api_root, MODE_T8_EXCLUSION, "rounds: 3");
+    let run = start(cfg, MODE_T8_EXCLUSION, Knobs::default()).await;
+    let fl = run.fl;
+    let bomber = tokio::spawn(async move {
+        let s = connect(1, fl).await;
+        let (mut rd, mut wr) = tokio::io::split(s);
+        let hello = frame::encode(&Frame::Hello {
+            label: "ue1".into(),
+        })
+        .unwrap();
+        wr.write_all(&hello).await.unwrap();
+        let mut reader = FrameReader::default();
+        while let Ok(Some((Frame::GlobalModel { round, .. }, _))) = reader.next(&mut rd).await {
+            let f = Frame::Update {
+                round,
+                samples: 240,
+                loss: 0.0,
+                delta: vec![f32::MAX; mlp::PARAMS],
+            };
+            wr.write_all(&frame::encode(&f).unwrap()).await.unwrap();
+        }
+    });
+    let hs = [
+        member(2, 3, fl, MODE_T8_EXCLUSION, false),
+        member(3, 3, fl, MODE_T8_EXCLUSION, false),
+    ];
+    let report = finish(run).await;
+    assert_eq!(
+        report.refused_updates,
+        ["ue1 round=1", "ue1 round=2", "ue1 round=3"]
+    );
+    let arm = &report.arms[0];
+    for r in &arm.rounds {
+        assert_eq!(r.updates, ["ue2", "ue3"], "round {}", r.round);
+        assert!(r.mse.is_finite(), "round {} mse {}", r.round, r.mse);
+        assert_eq!(r.refused, None);
+    }
+    assert!(arm.model.iter().all(|w| w.is_finite()));
+    assert!(arm.oracle_bit_identical);
+    bomber.abort();
+    for h in hs {
+        h.abort();
+    }
+}
+
+/// A session saying `Hello label` from source address `127.0.0.octet`.
+fn impostor(octet: u8, label: u32, af: SocketAddr) -> JoinHandle<crate::d445a::client::SessionEnd> {
+    tokio::spawn(async move {
+        let t = Trainer::new(ClientParams::demo(label, 480, 3));
+        let s = TcpSocket::new_v4().unwrap();
+        s.bind(SocketAddr::from(([127, 0, 0, octet], 0))).unwrap();
+        let stream = s.connect(af).await.unwrap();
+        run_session(stream, &t, Duration::from_secs(30), || None, |_| {}).await
+    })
+}
+
+/// M2: one UE cannot hold two labels (a second weight), and another UE cannot
+/// take a member's label. Both are refused before any T8 subscription is made
+/// for them, and the selection never changes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_identity_clash_is_refused_before_subscribing() {
+    let nef = StubNef::start().await;
+    let cfg = yaml(
+        &nef.api_root,
+        MODE_T8_EXCLUSION,
+        "rounds: 4\nround_interval_ms: 300",
+    );
+    let mut run = start(cfg, MODE_T8_EXCLUSION, Knobs::default()).await;
+    let fl = run.fl;
+    let hs = [
+        member(1, 3, fl, MODE_T8_EXCLUSION, false),
+        member(2, 3, fl, MODE_T8_EXCLUSION, false),
+        member(3, 3, fl, MODE_T8_EXCLUSION, false),
+    ];
+    for _ in 0..3 {
+        until(&mut run.progress, |p| matches!(p, Progress::Joined(_))).await;
+    }
+    // ue1's UE (its source address) says it is ue2; a UE at .50 says it is ue1.
+    let twin = impostor(octet(1), 2, fl);
+    let thief = impostor(50, 1, fl);
+    for h in [twin, thief] {
+        let end = tokio::time::timeout(Duration::from_secs(10), h)
+            .await
+            .expect("refused promptly")
+            .unwrap();
+        assert!(
+            matches!(end, crate::d445a::client::SessionEnd::Closed),
+            "{end}"
+        );
+    }
+    let report = finish(run).await;
+    let mut refused = report.identity_mismatches.clone();
+    refused.sort();
+    assert_eq!(
+        refused,
+        [
+            format!("ue1 {}", gpsi_of(50)),
+            format!("ue2 {}", gpsi_of(octet(1))),
+        ]
+    );
+    for r in &report.arms[0].rounds {
+        assert_eq!(r.selected, ["ue1", "ue2", "ue3"], "round {}", r.round);
+    }
+    assert!(report.arms[0].oracle_bit_identical);
+    assert_eq!(nef.all().len(), 3, "no subscription for a refused identity");
+    for h in hs {
+        h.abort();
+    }
+}
+
 /// A peer the NEF cannot identify (not behind a PDU session) is refused and
 /// never selected: the provenance check behind "AF on any address, client on
 /// eth0".
@@ -512,7 +629,7 @@ async fn a_notification_must_name_our_subscription() {
     af.members.insert(
         "ue3".into(),
         Member {
-            gpsi: Gpsi("msisdn-1".into()),
+            gpsi: Gpsi("extid-ue001@fl.nextg".into()),
             conn: None,
             excluded: false,
             sub: Some(sub),
@@ -528,7 +645,7 @@ async fn a_notification_must_name_our_subscription() {
 }
 
 /// Startup refusals: a wildcard callback address, too few members for the
-/// attacker, a bad trim ratio.
+/// attacker, a bad trim ratio, a norm cap that is not a positive number.
 #[tokio::test]
 async fn configs_that_cannot_run_are_refused() {
     let nef = "http://127.0.0.1:9";
@@ -538,6 +655,9 @@ async fn configs_that_cannot_run_are_refused() {
         (MODE_POISONED_UE, "members: 4"),
         (MODE_T8_EXCLUSION, "trim_ratio: 1.0"),
         (MODE_T8_EXCLUSION, "rules: []"),
+        (MODE_T8_EXCLUSION, "max_update_norm: 0"),
+        (MODE_T8_EXCLUSION, "max_update_norm: -1"),
+        (MODE_T8_EXCLUSION, "max_update_norm: .inf"),
     ];
     for (mode, extra) in bad {
         let text = format!("nef: {{ api_root: \"{nef}\" }}\n{extra}\n");

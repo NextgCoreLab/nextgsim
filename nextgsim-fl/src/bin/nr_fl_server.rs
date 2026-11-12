@@ -8,8 +8,9 @@
 //! ```
 //!
 //! ```yaml
-//! listen: 10.46.0.10:7480       # default 127.0.0.1:7480; never a published port
-//! t8_listen: 10.46.0.10:7481    # default 127.0.0.1:7481
+//! listen: 10.46.0.10:7480       # the fl-dn address; default 127.0.0.1:7480; never published
+//! t8_listen: 10.244.1.20:7481   # the SBI/pod address nefd reaches, NOT fl-dn; default 127.0.0.1:7481
+//! t8_notify_base: "http://10.244.1.20:7481"
 //! nef: { api_root: "http://nef:7777" }
 //! seed: 480
 //! holds:

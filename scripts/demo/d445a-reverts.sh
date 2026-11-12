@@ -13,6 +13,14 @@
 #                      -> a_peer_the_nef_cannot_identify_is_refused
 #   480-poison-off     UE 005 never poisons in poisoned-ue
 #                      -> the_poisoned_arm_separates_the_rules
+#   480-norm-unchecked the AF aggregates an update whatever its norm
+#                      -> a_huge_finite_delta_is_refused_and_the_af_survives
+#   480-identity-clash the AF lets one GPSI hold two labels, or a label change GPSI
+#                      -> an_identity_clash_is_refused_before_subscribing
+#   480-subscribe-first the AF subscribes T8 for a clashing identity, then refuses
+#                      -> an_identity_clash_is_refused_before_subscribing
+#   480-t8-no-evict    the T8 listener refuses a new connection when 32 idle ones
+#                      hold every slot -> idle_connections_do_not_starve_a_notification
 #
 # The other revert arms are knobs, not patches, and have their own tests in
 # revert-hooks builds: --no-t8 (without_t8_the_round_waits_for_the_deadline),
@@ -31,8 +39,13 @@ declare -A test_of=(
     [480-samples-trust]="$fl a_huge_samples_claim_is_capped"
     [480-no-provenance]="$fl a_peer_the_nef_cannot_identify_is_refused"
     [480-poison-off]="$fl the_poisoned_arm_separates_the_rules"
+    [480-norm-unchecked]="$fl a_huge_finite_delta_is_refused_and_the_af_survives"
+    [480-identity-clash]="$fl an_identity_clash_is_refused_before_subscribing"
+    [480-subscribe-first]="$fl an_identity_clash_is_refused_before_subscribing"
+    [480-t8-no-evict]="$fl idle_connections_do_not_starve_a_notification"
 )
-arms="${ARMS:-480-t8-ignored 480-samples-trust 480-no-provenance 480-poison-off}"
+arms="${ARMS:-480-t8-ignored 480-samples-trust 480-no-provenance 480-poison-off \
+480-norm-unchecked 480-identity-clash 480-subscribe-first 480-t8-no-evict}"
 for arm in $arms; do
     args="${test_of[$arm]:?unknown arm $arm}"
     name="${args##* }"

@@ -3,20 +3,27 @@
 //!
 //! # Calls (h2c, through [`nextgsim_sbi_client`])
 //!
-//! - **UE ID retrieval** (TS 23.502 §4.15.10): `POST {nef}{ueid_path}` with
+//! - **UE ID retrieval** (TS 23.502 §4.15.10; TS 29.522 `3gpp-ueid` API,
+//!   RetrieveUEId): `POST {nef}{ueid_path}` with a `UeIdReq`
 //!   `{"afId": <scs_as_id>, "ueIpAddr": {"ipv4Addr": "<source address>"}}`. The
-//!   answer's `gpsi` (or `externalId`) is the member's identity. **Provisional
-//!   body:** TS 29.522 (Nnef_UEId) is not vendored, so the path and shape are this
-//!   demo's contract with nefd (nextgsim#480 plan item 7), and nefd returns the
-//!   GPSI in place of the AF-specific External Identifier.
+//!   answer is a `UeIdInfo`, whose one required member `externalId` is the
+//!   AF-specific External Identifier (`username@realm`). The member's identity is
+//!   the GPSI `extid-<externalId>` (the TS 29.571 `Gpsi` form), so a member is
+//!   logged as `extid-…`. This follows the Rel-18 OpenAPI
+//!   (`TS29522_UEId.yaml`, 3gpp-ueid 1.1.1); TS 29.522 is not vendored here, so it
+//!   is this demo's contract with nefd (nextgsim#480 plan item 7).
 //! - **T8 Monitoring Event** (TS 29.122 §5.3): `POST
 //!   {nef}/3gpp-monitoring-event/v1/{scs_as_id}/subscriptions` with
-//!   `monitoringType: LOSS_OF_CONNECTIVITY`, the UE's `msisdn` (or `externalId`)
-//!   and a `notificationDestination` on the callback listener. The answer's
-//!   `Location` is kept, to check notifications against and to DELETE.
+//!   `monitoringType: LOSS_OF_CONNECTIVITY`, the UE's `externalId` (or `msisdn`
+//!   for an `msisdn-` GPSI) and a `notificationDestination` on the callback
+//!   listener. The answer's `Location` is kept, to check notifications against
+//!   and to DELETE.
 //!
 //! With `oauth2` configured every call carries an NRF token for an `AF`-typed
-//! consumer, or is not sent ([`nextgsim_sbi_client`] fails closed).
+//! consumer, or is not sent ([`nextgsim_sbi_client`] fails closed). The scopes
+//! (`nnef-ueid`, `nnef-eventexposure`) are nextgcore's NRF OAuth2 policy, not 3GPP
+//! surface: the OpenAPI defines no scopes for these northbound APIs, which TS
+//! 23.222 / TS 33.122 put behind CAPIF authorisation.
 //!
 //! # The callback listener
 //!
@@ -24,12 +31,18 @@
 //! knowledge). It accepts only `POST {CALLBACK_PREFIX}{id}` for an id this AF
 //! minted for one of its own subscriptions: 128 random bits, handed only to the
 //! NEF. Anything else is 404 (unknown id), 405 (method) or 400 (body). Bodies are
-//! capped at [`MAX_NOTIFICATION`]. It binds 127.0.0.1 by default.
+//! capped at [`MAX_NOTIFICATION`], header lists at 16 KiB, streams at 16 per
+//! connection. A connection with nothing in flight is closed after
+//! [`CALLBACK_IDLE`], and at [`MAX_CALLBACK_CONNECTIONS`] a new connection evicts
+//! the one idle longest, so idle peers cannot starve the NEF's notifications. It
+//! binds 127.0.0.1 by default, and belongs on the network nefd reaches the AF on
+//! (SBI or pod network), not on the UEs' `fl-dn`.
 
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
@@ -37,16 +50,23 @@ use nextgsim_sbi_client::{CcaKey, OAuth2Config, SbiClient, SbiClientConfig, SbiE
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, Notify};
 
 /// The callback path prefix; the subscription's id follows.
 pub const CALLBACK_PREFIX: &str = "/fl-af/v1/t8-notify/";
 /// The largest notification body accepted.
 pub const MAX_NOTIFICATION: usize = 64 * 1024;
-/// Concurrent callback connections accepted.
-const MAX_CALLBACK_CONNECTIONS: usize = 32;
-/// Concurrent streams answered per callback connection.
+/// Concurrent callback connections held. A new one past this evicts the
+/// connection idle the longest; only when every one has a request in flight is
+/// it refused.
+pub const MAX_CALLBACK_CONNECTIONS: usize = 32;
+/// Concurrent streams per callback connection, advertised in SETTINGS.
 const MAX_STREAMS_PER_CONNECTION: usize = 16;
+/// The largest header list accepted (SETTINGS_MAX_HEADER_LIST_SIZE); h2's own
+/// default is 16 MiB.
+const MAX_HEADER_LIST: u32 = 16 * 1024;
+/// A callback connection with no request in flight for this long is closed.
+pub const CALLBACK_IDLE: Duration = Duration::from_secs(30);
 /// The default UE ID retrieval path (provisional; see the module doc).
 pub const DEFAULT_UEID_PATH: &str = "/3gpp-ueid/v1/retrieve";
 
@@ -142,8 +162,22 @@ impl NefConfig {
     }
 }
 
-/// A UE's identity as the NEF gave it: a GPSI (`msisdn-…`, `extid-…`) or an
-/// External Identifier.
+/// The member identity in a TS 29.522 `UeIdInfo`: the GPSI `extid-<externalId>`.
+/// `externalId` is the schema's one required member; anything else (a `gpsi`
+/// member, say, which the schema does not define) is not read.
+pub fn gpsi_of_ue_id_info(v: &Value) -> Result<Gpsi, String> {
+    let ext = v
+        .get("externalId")
+        .and_then(Value::as_str)
+        .ok_or("no externalId in the UeIdInfo")?;
+    if !ext.contains('@') {
+        return Err(format!("externalId {ext:?} is not username@realm"));
+    }
+    Gpsi::parse(&format!("extid-{ext}")).ok_or_else(|| format!("unusable externalId {ext:?}"))
+}
+
+/// A UE's identity: a GPSI (`extid-…` from the NEF's UE ID retrieval, or
+/// `msisdn-…`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Gpsi(pub String);
 
@@ -261,14 +295,7 @@ impl Nef {
             ));
         }
         let v: Value = r.json().map_err(|e| format!("UE ID retrieval: {e}"))?;
-        let id = v
-            .get("gpsi")
-            .or_else(|| v.get("externalId"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                format!("UE ID retrieval for {ip}: no gpsi or externalId in the answer")
-            })?;
-        Gpsi::parse(id).ok_or_else(|| format!("UE ID retrieval for {ip}: unusable identity"))
+        gpsi_of_ue_id_info(&v).map_err(|why| format!("UE ID retrieval for {ip}: {why}"))
     }
 
     /// Subscribe to `LOSS_OF_CONNECTIVITY` for `gpsi`, notifications to
@@ -443,6 +470,53 @@ impl CallbackIds {
     }
 }
 
+/// One held callback connection, as the listener's registry sees it.
+struct Held {
+    id: u64,
+    /// Requests in flight on it.
+    busy: Arc<AtomicUsize>,
+    /// When it last had a request in flight (or was accepted).
+    last_active: Arc<Mutex<Instant>>,
+    /// Told to close (evicted).
+    evict: Arc<Notify>,
+}
+
+/// The listener's held connections.
+#[derive(Default)]
+struct Registry {
+    next: u64,
+    held: Vec<Held>,
+}
+
+impl Registry {
+    /// Make room for one more: evict the connection idle longest when full.
+    /// `false` when full and every connection has a request in flight.
+    fn make_room(&mut self) -> bool {
+        if self.held.len() < MAX_CALLBACK_CONNECTIONS {
+            return true;
+        }
+        let oldest = self
+            .held
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| h.busy.load(Ordering::SeqCst) == 0)
+            .min_by_key(|(_, h)| *lock(&h.last_active))
+            .map(|(i, _)| i);
+        match oldest {
+            Some(i) => {
+                let h = self.held.swap_remove(i);
+                h.evict.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Serve the T8 callback listener on `listener`, forwarding each accepted body
 /// (callback id, bytes) to `tx`.
 pub async fn serve_callbacks(
@@ -450,7 +524,7 @@ pub async fn serve_callbacks(
     ids: CallbackIds,
     tx: mpsc::Sender<(String, Bytes)>,
 ) {
-    let slots = Arc::new(Semaphore::new(MAX_CALLBACK_CONNECTIONS));
+    let registry = Arc::new(Mutex::new(Registry::default()));
     loop {
         let (tcp, peer) = match listener.accept().await {
             Ok(a) => a,
@@ -461,20 +535,44 @@ pub async fn serve_callbacks(
                 continue;
             }
         };
-        let Ok(permit) = slots.clone().try_acquire_owned() else {
-            tracing::warn!(
-                "[demo:{}] T8 listener: connection from {peer} refused (busy)",
-                super::KEY
-            );
-            continue;
+        let held = {
+            let mut r = lock(&registry);
+            if !r.make_room() {
+                tracing::warn!(
+                    "[demo:{}] T8 listener: connection from {peer} refused (every connection busy)",
+                    super::KEY
+                );
+                continue;
+            }
+            r.next += 1;
+            let h = Held {
+                id: r.next,
+                busy: Arc::new(AtomicUsize::new(0)),
+                last_active: Arc::new(Mutex::new(Instant::now())),
+                evict: Arc::new(Notify::new()),
+            };
+            let mine = (h.id, h.busy.clone(), h.last_active.clone(), h.evict.clone());
+            r.held.push(h);
+            mine
         };
-        let (ids, tx) = (ids.clone(), tx.clone());
+        let (ids, tx, registry) = (ids.clone(), tx.clone(), registry.clone());
         tokio::spawn(async move {
-            let _permit = permit;
-            if let Err(e) = serve_connection(tcp, ids, tx).await {
+            let (id, busy, last_active, evict) = held;
+            if let Err(e) = serve_connection(tcp, ids, tx, &busy, &last_active, &evict).await {
                 tracing::debug!("[demo:{}] T8 listener: {peer}: {e}", super::KEY);
             }
+            lock(&registry).held.retain(|h| h.id != id);
         });
+    }
+}
+
+/// Decrements a connection's in-flight count when a request is answered.
+struct InFlight(Arc<AtomicUsize>, Arc<Mutex<Instant>>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        *lock(&self.1) = Instant::now();
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -482,32 +580,65 @@ async fn serve_connection(
     tcp: tokio::net::TcpStream,
     ids: CallbackIds,
     tx: mpsc::Sender<(String, Bytes)>,
+    busy: &Arc<AtomicUsize>,
+    last_active: &Arc<Mutex<Instant>>,
+    evict: &Notify,
 ) -> Result<(), h2::Error> {
-    let mut conn =
-        match tokio::time::timeout(Duration::from_secs(10), h2::server::handshake(tcp)).await {
+    let handshake = h2::server::Builder::new()
+        .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION as u32)
+        .max_header_list_size(MAX_HEADER_LIST)
+        .handshake(tcp);
+    let mut conn = tokio::select! {
+        c = tokio::time::timeout(Duration::from_secs(10), handshake) => match c {
             Ok(c) => c?,
             Err(_) => return Ok(()),
-        };
+        },
+        () = evict.notified() => return Ok(()),
+    };
     // Each stream is answered in its own task: reading a body needs the
     // connection driven, which only this accept loop does.
-    let streams = Arc::new(Semaphore::new(MAX_STREAMS_PER_CONNECTION));
-    while let Some(stream) = conn.accept().await {
-        let (req, respond) = stream?;
-        let Ok(permit) = streams.clone().try_acquire_owned() else {
-            let mut respond = respond;
-            let resp = Response::builder()
-                .status(StatusCode::SERVICE_UNAVAILABLE)
-                .body(())
-                .expect("static response");
-            let _ = respond.send_response(resp, true);
-            continue;
+    loop {
+        let idle_for = lock(last_active).elapsed();
+        let idle_left = if busy.load(Ordering::SeqCst) == 0 {
+            CALLBACK_IDLE.saturating_sub(idle_for)
+        } else {
+            CALLBACK_IDLE
         };
+        let stream = tokio::select! {
+            s = conn.accept() => s,
+            () = tokio::time::sleep(idle_left) => {
+                if busy.load(Ordering::SeqCst) == 0
+                    && lock(last_active).elapsed() >= CALLBACK_IDLE
+                {
+                    tracing::debug!("[demo:{}] T8 listener: idle connection closed", super::KEY);
+                    break;
+                }
+                continue;
+            }
+            () = evict.notified() => {
+                tracing::debug!("[demo:{}] T8 listener: idle connection evicted", super::KEY);
+                break;
+            }
+        };
+        let Some(stream) = stream else {
+            return Ok(());
+        };
+        let (req, respond) = stream?;
+        busy.fetch_add(1, Ordering::SeqCst);
+        *lock(last_active) = Instant::now();
+        let guard = InFlight(busy.clone(), last_active.clone());
         let (ids, tx) = (ids.clone(), tx.clone());
         tokio::spawn(async move {
-            let _permit = permit;
+            let _guard = guard;
             answer(req, respond, &ids, &tx).await;
         });
     }
+    // GOAWAY, then let in-flight streams finish (briefly).
+    conn.graceful_shutdown();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        while let Some(Ok(_)) = conn.accept().await {}
+    })
+    .await;
     Ok(())
 }
 
@@ -585,6 +716,17 @@ mod tests {
 
     #[test]
     fn a_gpsi_names_its_monitoring_member() {
+        let id = gpsi_of_ue_id_info(&json!({ "externalId": "ue013@fl.nextg" })).unwrap();
+        assert_eq!(id.0, "extid-ue013@fl.nextg");
+        assert_eq!(id.monitoring_target(), ("externalId", "ue013@fl.nextg"));
+        for bad in [
+            json!({ "gpsi": "msisdn-0010000000003" }),
+            json!({ "externalId": "no-realm" }),
+            json!({ "externalId": "a b@c" }),
+            json!({ "externalId": 7 }),
+        ] {
+            assert!(gpsi_of_ue_id_info(&bad).is_err(), "{bad}");
+        }
         let g = Gpsi::parse("msisdn-0010000000003").unwrap();
         assert_eq!(g.monitoring_target(), ("msisdn", "0010000000003"));
         let e = Gpsi::parse("extid-ue3@fl.example").unwrap();
@@ -598,7 +740,7 @@ mod tests {
     fn a_loc_notification_is_read_and_anything_else_refused() {
         let body = br#"{"subscription":"/3gpp-monitoring-event/v1/fl-af/subscriptions/s1",
             "monitoringEventReports":[{"monitoringType":"LOSS_OF_CONNECTIVITY",
-            "lossOfConnectReason":"DEREGISTERED","msisdn":"0010000000003"}]}"#;
+            "lossOfConnectReason":"DEREGISTERED","externalId":"ue003@fl.nextg"}]}"#;
         let r = parse_loc_notification("cb", body).unwrap();
         assert_eq!(
             r.subscription,
@@ -644,6 +786,58 @@ mod tests {
             route(&Method::POST, &path, &ids),
             Err(StatusCode::NOT_FOUND)
         );
+    }
+
+    /// Idle peers cannot starve the NEF: with all 32 slots held by idle h2c
+    /// connections, a notification on a fresh connection is still answered 204
+    /// and forwarded, and the connection idle longest is the one evicted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_connections_do_not_starve_a_notification() {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let ids = CallbackIds::default();
+        let id = new_callback_id();
+        ids.insert(&id, "ue3");
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(serve_callbacks(l, ids, tx));
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CALLBACK_CONNECTIONS {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut send, conn) = h2::client::handshake(tcp).await.unwrap();
+            let driver = tokio::spawn(conn);
+            // One request each, so every connection is past its handshake and
+            // registered before the next is opened.
+            let req = http::Request::get(format!("http://{addr}/other"))
+                .body(())
+                .unwrap();
+            let (resp, _) = send.send_request(req, true).unwrap();
+            assert_eq!(resp.await.unwrap().status(), StatusCode::NOT_FOUND);
+            idle.push((send, driver));
+        }
+        let body = json!({
+            "subscription": "/3gpp-monitoring-event/v1/fl-af/subscriptions/s1",
+            "monitoringEventReports": [{
+                "monitoringType": "LOSS_OF_CONNECTIVITY",
+                "lossOfConnectReason": "DEREGISTERED",
+            }],
+        });
+        let c = SbiClient::new(SbiClientConfig::default());
+        let r = c
+            .post_json(&format!("http://{addr}{CALLBACK_PREFIX}{id}"), &body, None)
+            .await
+            .unwrap();
+        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let (got, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, id);
+        let (_, first) = idle.remove(0);
+        tokio::time::timeout(Duration::from_secs(5), first)
+            .await
+            .expect("the connection idle longest was evicted")
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

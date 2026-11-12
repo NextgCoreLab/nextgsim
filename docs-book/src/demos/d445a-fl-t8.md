@@ -68,11 +68,11 @@ sequenceDiagram
   participant UDM as udmd
   participant AMF as amfd
   UE->>AF: Hello over the PDU session (uesimtunN, GTP-U, N6 without NAT)
-  AF->>NEF: UE ID retrieval (source address) [provisional body]
+  AF->>NEF: UE ID retrieval, TS 29.522 UeIdReq (afId, ueIpAddr)
   NEF->>BSF: Nbsf_Management_Discovery (ipv4Addr) -> SUPI
   NEF->>UDM: Nudm_SDM GetSupiOrGpsi -> GPSI
-  NEF->>AF: GPSI [in place of the AF-specific External Identifier]
-  AF->>NEF: T8 Monitoring Event subscription, LOSS_OF_CONNECTIVITY
+  NEF->>AF: UeIdInfo externalId (the AF-specific External Identifier)
+  AF->>NEF: T8 Monitoring Event subscription, LOSS_OF_CONNECTIVITY, externalId
   NEF->>UDM: Nudm_EE_Subscribe
   UDM->>AMF: Namf_EventExposure_Subscribe (TS 23.502 §4.15.3.2.3 step 3a)
   AF->>UE: GlobalModel (round K)
@@ -98,7 +98,7 @@ The gNB has no FL task: its aggregator was removed (nextgsim#480). Federated lea
 
 ### The AF
 
-- **Join.** A UE says `Hello { label: ueN }`. The AF asks the NEF who is behind the TCP source address, then subscribes to T8 `LOSS_OF_CONNECTIVITY` for that GPSI. A peer the NEF cannot identify is refused (`identity_unresolved`). That is what ties a member to a real PDU session. A label that comes back with a different GPSI, or a GPSI already bound to another label, is refused (`identity_mismatch`).
+- **Join.** A UE says `Hello { label: ueN }`. The AF asks the NEF who is behind the TCP source address (TS 29.522 UE ID retrieval). The answer's `externalId` becomes the member's GPSI `extid-<externalId>`. Only then does the AF subscribe to T8 `LOSS_OF_CONNECTIVITY` for it. A peer the NEF cannot identify is refused (`identity_unresolved`). That is what ties a member to a real PDU session. A label that comes back with a different GPSI, or a GPSI already bound to another label, is refused (`identity_mismatch`). The refusal comes before any T8 subscription is made for it, so one UE cannot hold two weights or take over another member's label. There is no per-source join rate limit: every Hello still costs one UE ID call, bounded by the 16-connection cap and the 10 s Hello timeout.
 - **Rounds.** Each round selects the joined members that are not excluded, sends each the global model, and waits for their updates until all are in or the straggler deadline T (`round_deadline_ms`, default 30 s) passes (`straggler_timeout`). The AF aggregates with the library's rule, applies the result and scores the model on the held-out set.
 - **Exclusion.** A T8 LoC report on one of the AF's own subscriptions excludes the member at once, and the AF stops waiting for it: `member_selection excluded=<gpsi> member=ue3 reason=nef_event lossOfConnectReason=…`. A TCP EOF or RST is only logged (`transport_closed`). After a deregistration or a power cycle there is no user plane left to carry a FIN, as with a real handset that loses radio.
 - **Readmission.** The same identity joining again is `member_selection readmitted=<gpsi>` from the next round. Its old subscription is deleted and a new one made.
@@ -108,10 +108,11 @@ The gNB has no FL task: its aggregator was removed (nextgsim#480). Federated lea
 ### Trust and exposure
 
 - `Update.samples` is client-supplied and is the FedAvg weight. The AF caps it at `samples`, the per-member count of its task (`samples_capped`), so a `u32::MAX` claim weighs the same as an honest one.
+- An update's delta is client-supplied too. One whose L2 norm exceeds `max_update_norm` (default 1000; the largest seed-480 update, the poisoned FedAvg arm's, is about 90) is refused and not aggregated (`update_refused … reason=norm`). A round whose aggregate would make any weight non-finite is refused and the previous global carries over (`refused="non-finite"`), in the AF and in the library's in-process run alike. So a member sending `f32::MAX` deltas cannot crash the AF or end an arm early.
 - Frames are the strict `NFL1` codec: exactly 261 finite floats, a short plain label, at most 1 MiB. A refused frame closes the connection (`frame_refused`). Every received byte is scanned for the task's canary rows; the run ends with `canary_rows=<n>`.
-- Both AF listeners bind 127.0.0.1 by default. The overlay binds the `fl-dn` or pod address, never advertises a wildcard (`t8_notify_base` must name a host), and publishes no port (ClusterIP only).
-- The T8 callback listener answers only `POST /fl-af/v1/t8-notify/<id>` for ids the AF minted (128 random bits, given only to the NEF), with a 64 KiB body cap. Any other id gets 404. A notification whose `subscription` link is not the AF's is ignored.
-- With `nef.oauth2` every NEF call carries an NRF token for an `AF`-typed consumer, or is not sent.
+- Both AF listeners bind 127.0.0.1 by default, and the AF publishes no port (ClusterIP only). `listen` (FL) binds the `fl-dn` address the UEs reach through the UPF. `t8_listen` belongs on the network nefd reaches the AF on (the SBI or pod network), never on `fl-dn`. The AF never advertises a wildcard (`t8_notify_base` must name a host).
+- The T8 callback listener answers only `POST /fl-af/v1/t8-notify/<id>` for ids the AF minted (128 random bits, given only to the NEF), with a 64 KiB body cap. Any other id gets 404. A notification whose `subscription` link is not the AF's is ignored. It allows at most 16 streams per connection and a 16 KiB header list. A connection with nothing in flight is closed after 30 s. With all 32 connection slots held, a new connection evicts the one idle longest; it is refused only when every connection has a request in flight. Idle peers therefore cannot keep the NEF's notification out.
+- With `nef.oauth2` every NEF call carries an NRF token for an `AF`-typed consumer, or is not sent. The scopes `nnef-ueid` and `nnef-eventexposure` are nextgcore's NRF OAuth2 policy, not 3GPP surface: the 3GPP OpenAPI defines no scopes for these northbound APIs, and TS 23.222 / TS 33.122 put them behind CAPIF.
 
 Modes (`demo.d445a-fl-t8.mode`, default `t8-exclusion` in the overlay):
 
@@ -160,7 +161,7 @@ Not yet run on devtest1. This section is filled from the captured artefacts (`/t
 - The data is synthetic and declared so. Learning is measured by the AF against local-only and pooled baselines it computes from the same pinned task.
 - Robustness is claimed only against this fixed attacker (UE 005, ×10 sign-flipped deltas).
 - Trust and secure aggregation are out of scope. This is not a privacy proof: the row-free frames and the canary scan show that no training row crosses the network, nothing more.
-- The GPSI returned by the UE ID retrieval stands in for the AF-specific External Identifier (TS 23.502 §4.15.10 steps 9-10). The request and response body are provisional until TS 29.522 is vendored.
+- UE ID retrieval follows the Rel-18 TS 29.522 OpenAPI (`TS29522_UEId.yaml`, 3gpp-ueid 1.1.1): `POST /3gpp-ueid/v1/retrieve` with a `UeIdReq`, answered by a `UeIdInfo` whose required `externalId` is the AF-specific External Identifier (TS 23.502 §4.15.10). The AF reads no other member. T8 names the UE by that `externalId` (TS 29.122 `MonitoringEventSubscription`), so nefd resolves it back to the UE. TS 29.522 is not vendored in nextgcore, so this is checked against the published OpenAPI only.
 - T8 is not claimed to be faster than a TCP keepalive. The AF simply does not treat a closed transport as a departure.
 - The AF has no `/metrics` listener (as with D444A's sink). Its demo state is in the startup banner and the `[demo:d445a-fl-t8]` lines.
 - One FL client per `nr-ue` process (the first UE instance): the overlay runs one UE per pod.

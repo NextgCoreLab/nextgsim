@@ -116,11 +116,13 @@ pub struct ServerConfig {
     /// address.
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
-    /// The T8 callback listener. Default 127.0.0.1:7481.
+    /// The T8 callback listener. Default 127.0.0.1:7481. It belongs on the
+    /// network nefd reaches the AF on (the SBI or pod network), never on `fl-dn`,
+    /// which every UE reaches through the UPF.
     #[serde(default = "default_t8_listen")]
     pub t8_listen: SocketAddr,
     /// The base of the `notificationDestination` given to the NEF, e.g.
-    /// `http://10.46.0.10:7481`. Default: `http://<t8_listen>`, which must then
+    /// `http://10.244.1.20:7481`. Default: `http://<t8_listen>`, which must then
     /// not be a wildcard address.
     #[serde(default)]
     pub t8_notify_base: Option<String>,
@@ -167,6 +169,12 @@ pub struct ServerConfig {
     /// Concurrent FL connections accepted.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// The largest L2 norm of one update's delta. A larger (or non-finite-norm)
+    /// delta is refused (`update_refused … reason=norm`) and not aggregated.
+    /// Default 1000: the seed-480 runs' largest update is about 90 (the poisoned
+    /// FedAvg arm), the honest ones below 10.
+    #[serde(default = "default_max_update_norm")]
+    pub max_update_norm: f64,
     /// Read by `nextgsim_demo`, not here.
     #[serde(default)]
     #[allow(dead_code)]
@@ -205,6 +213,9 @@ fn default_join_timeout() -> u64 {
 }
 fn default_max_connections() -> usize {
     16
+}
+fn default_max_update_norm() -> f64 {
+    1000.0
 }
 
 /// The revert-arm knobs (`revert-hooks` builds only; both off otherwise).
@@ -274,6 +285,10 @@ pub struct RunReport {
     pub capped: Vec<String>,
     /// Refused frames, `member-or-peer: why`.
     pub refused_frames: Vec<String>,
+    /// Updates refused for their norm, `member round=<r>`.
+    pub refused_updates: Vec<String>,
+    /// Joins refused for an identity clash, `label gpsi`.
+    pub identity_mismatches: Vec<String>,
     /// Canary rows found in received bytes.
     pub canary_hits: u64,
 }
@@ -311,6 +326,13 @@ enum Event {
         conn: u64,
         why: String,
     },
+    /// The NEF's answer to UE ID retrieval for a Hello.
+    Identified {
+        conn: u64,
+        label: String,
+        result: Result<Gpsi, String>,
+    },
+    /// The T8 subscription for an identified member (or why it failed).
     Admitted {
         conn: u64,
         label: String,
@@ -414,6 +436,12 @@ fn check(
     }
     if !(0.0..1.0).contains(&cfg.trim_ratio) {
         return Err(format!("trim_ratio {} must be in [0, 1)", cfg.trim_ratio));
+    }
+    if !(cfg.max_update_norm.is_finite() && cfg.max_update_norm > 0.0) {
+        return Err(format!(
+            "max_update_norm {} must be finite and positive",
+            cfg.max_update_norm
+        ));
     }
     if cfg.round_deadline_ms == 0 || cfg.max_connections == 0 {
         return Err("round_deadline_ms and max_connections must be at least 1".to_string());
@@ -731,23 +759,39 @@ impl Af {
             }
         );
         self.announce(Progress::RoundStarted { arm, round: r });
-        let bytes = frame::encode(&Frame::GlobalModel {
+        // The global model only ever takes finite steps (`sim::apply`), so this
+        // cannot fail; if it ever did, the round goes out to nobody and is
+        // refused with "no updates" rather than taking the AF down.
+        let sent: Vec<String> = match frame::encode(&Frame::GlobalModel {
             round: r,
             weights: global.to_vec(),
-        })
-        .expect("the global model is finite and the model's size");
-        for label in &selected {
-            if let Some(conn) = self.members.get(label).and_then(|m| m.conn) {
-                if let Some(c) = self.conns.get(&conn) {
-                    if c.out.try_send(Out::Frame(bytes.clone())).is_err() {
-                        tracing::debug!("[demo:{KEY}] {label}: output queue full or closed");
+        }) {
+            Ok(bytes) => {
+                for label in &selected {
+                    if let Some(conn) = self.members.get(label).and_then(|m| m.conn) {
+                        if let Some(c) = self.conns.get(&conn) {
+                            if c.out.try_send(Out::Frame(bytes.clone())).is_err() {
+                                tracing::debug!(
+                                    "[demo:{KEY}] {label}: output queue full or closed"
+                                );
+                            }
+                        }
                     }
                 }
+                selected.clone()
             }
-        }
+            Err(e) => {
+                demo_log!(
+                    error,
+                    KEY,
+                    "round={r}: the global model cannot be sent: {e:?}"
+                );
+                Vec::new()
+            }
+        };
         self.round = Some(RoundState {
             round: r,
-            awaiting: selected.iter().cloned().collect(),
+            awaiting: sent.into_iter().collect(),
             updates: BTreeMap::new(),
         });
         let deadline = started + Duration::from_millis(self.cfg.round_deadline_ms);
@@ -769,14 +813,12 @@ impl Af {
             (None, Some("no updates".to_string()))
         } else {
             match sim::aggregate(rule, &state.updates) {
-                Ok((agg, krum)) => {
-                    if !self.knobs.freeze_global {
-                        for (w, d) in global.iter_mut().zip(&agg) {
-                            *w += d;
-                        }
-                    }
-                    (krum, None)
-                }
+                Ok((_, krum)) if self.knobs.freeze_global => (krum, None),
+                Ok((agg, krum)) => match sim::apply(global, &agg) {
+                    Ok(()) => (krum, None),
+                    // The previous global carries over, as in `sim::run`.
+                    Err(why) => (krum, Some(why)),
+                },
                 Err(why) => (None, Some(why)),
             }
         };
@@ -940,6 +982,11 @@ impl Af {
                 peer,
                 out,
             } => self.on_hello(conn, label, peer, out),
+            Event::Identified {
+                conn,
+                label,
+                result,
+            } => self.on_identified(conn, label, result),
             Event::Admitted {
                 conn,
                 label,
@@ -1003,10 +1050,64 @@ impl Af {
             return;
         }
         self.conns.insert(conn, Conn { peer, out });
-        let (nef, ids, tx) = (self.nef.clone(), self.ids.clone(), self.tx.clone());
-        let base = self.notify_base.clone();
+        let (nef, tx) = (self.nef.clone(), self.tx.clone());
         tokio::spawn(async move {
-            let result = admit(&nef, &ids, &label, peer, base.as_deref()).await;
+            let result = identify(&nef, peer).await;
+            let _ = tx
+                .send(Event::Identified {
+                    conn,
+                    label,
+                    result,
+                })
+                .await;
+        });
+    }
+
+    /// Who else holds `label` or `gpsi`: a label must keep its GPSI, and a GPSI
+    /// its label (one UE, one weight; nobody takes over an excluded member).
+    fn clash(&self, label: &str, gpsi: &Gpsi) -> Option<String> {
+        self.members
+            .iter()
+            .find(|(l, m)| (l.as_str() == label) != (m.gpsi == *gpsi))
+            .map(|(l, m)| format!("{l} is {}", m.gpsi))
+    }
+
+    /// Refuse `conn` for an identity clash.
+    fn refuse_mismatch(&mut self, conn: u64, label: &str, gpsi: &Gpsi, clash: &str) {
+        let peer = self
+            .conns
+            .get(&conn)
+            .map_or_else(|| "?".to_string(), |c| c.peer.to_string());
+        demo_log!(
+            warn,
+            KEY,
+            "identity_mismatch member={label} gpsi={gpsi} peer={peer}: {clash}; refused"
+        );
+        self.report
+            .identity_mismatches
+            .push(format!("{label} {gpsi}"));
+        self.close(conn);
+    }
+
+    /// Step 2 of a join: the NEF has said who `conn` is. A clash is refused here,
+    /// before any T8 subscription is made for it.
+    fn on_identified(&mut self, conn: u64, label: String, result: Result<Gpsi, String>) {
+        let gpsi = match result {
+            Ok(g) => g,
+            Err(why) => return self.on_admitted(conn, label, Err(why)),
+        };
+        if !self.conns.contains_key(&conn) {
+            return;
+        }
+        if let Some(clash) = self.clash(&label, &gpsi) {
+            return self.refuse_mismatch(conn, &label, &gpsi, &clash);
+        }
+        let Some(base) = self.notify_base.clone() else {
+            return self.on_admitted(conn, label, Ok((gpsi, None)));
+        };
+        let (nef, ids, tx) = (self.nef.clone(), self.ids.clone(), self.tx.clone());
+        tokio::spawn(async move {
+            let result = subscribe(&nef, &ids, &label, &gpsi, &base).await;
             let _ = tx
                 .send(Event::Admitted {
                     conn,
@@ -1054,22 +1155,12 @@ impl Af {
             }
             return;
         };
-        let clash = self
-            .members
-            .iter()
-            .find(|(l, m)| (**l == label) != (m.gpsi == gpsi))
-            .map(|(l, m)| format!("{l} is {}", m.gpsi));
-        if let Some(clash) = clash {
-            demo_log!(
-                warn,
-                KEY,
-                "identity_mismatch member={label} gpsi={gpsi} peer={peer}: {clash}; refused"
-            );
+        // Checked again: another join may have completed while subscribing.
+        if let Some(clash) = self.clash(&label, &gpsi) {
             if let Some(sub) = sub {
                 self.drop_subscription(sub);
             }
-            self.close(conn);
-            return;
+            return self.refuse_mismatch(conn, &label, &gpsi, &clash);
         }
         let t8 = sub.as_ref().map_or_else(
             || "off".to_string(),
@@ -1129,6 +1220,23 @@ impl Af {
                 state.round,
                 state.awaiting.contains(&label)
             );
+            return;
+        }
+        let norm = delta
+            .iter()
+            .map(|x| f64::from(*x) * f64::from(*x))
+            .sum::<f64>()
+            .sqrt();
+        if norm.is_nan() || norm > self.cfg.max_update_norm {
+            demo_log!(
+                warn,
+                KEY,
+                "update_refused member={label} round={round} reason=norm norm={norm:.3e} cap={}",
+                self.cfg.max_update_norm
+            );
+            self.report
+                .refused_updates
+                .push(format!("{label} round={round}"));
             return;
         }
         let weight = u64::from(samples).min(cap);
@@ -1215,29 +1323,30 @@ impl Af {
     }
 }
 
-/// Identify `peer` at the NEF and, unless T8 is off, subscribe to its LoC.
-async fn admit(
-    nef: &Nef,
-    ids: &CallbackIds,
-    label: &str,
-    peer: SocketAddr,
-    notify_base: Option<&str>,
-) -> Result<(Gpsi, Option<Subscription>), String> {
+/// Ask the NEF who is behind `peer`.
+async fn identify(nef: &Nef, peer: SocketAddr) -> Result<Gpsi, String> {
     let ip = match peer.ip() {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(ip) => ip
             .to_ipv4_mapped()
             .ok_or_else(|| format!("{peer} is not an IPv4 UE address"))?,
     };
-    let gpsi = nef.ue_id(ip).await?;
-    let Some(base) = notify_base else {
-        return Ok((gpsi, None));
-    };
+    nef.ue_id(ip).await
+}
+
+/// Subscribe to `gpsi`'s LoC, notifications to a fresh callback id on `base`.
+async fn subscribe(
+    nef: &Nef,
+    ids: &CallbackIds,
+    label: &str,
+    gpsi: &Gpsi,
+    base: &str,
+) -> Result<(Gpsi, Option<Subscription>), String> {
     let id = nef::new_callback_id();
     // Registered first: the NEF may notify before its 201 arrives here.
     ids.insert(&id, label);
-    match nef.subscribe_loc(&gpsi, base, &id).await {
-        Ok(sub) => Ok((gpsi, Some(sub))),
+    match nef.subscribe_loc(gpsi, base, &id).await {
+        Ok(sub) => Ok((gpsi.clone(), Some(sub))),
         Err(e) => {
             ids.remove(&id);
             Err(e)
