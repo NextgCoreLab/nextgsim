@@ -1,0 +1,14 @@
+--- a/nextgsim-ue/src/app/task.rs
++++ b/nextgsim-ue/src/app/task.rs
+@@ -168,9 +168,8 @@
+                         psi: psi as u8,
+                         session_ambr: session_ambr.clone(),
+                     };
+-                    if let Err(e) = sixg.semantic_codec_tx.try_send(msg) {
+-                        debug!("Session-AMBR not forwarded to the semantic codec task: {e}");
+-                    }
++                    // 477-app-forward revert: the event stops at the App task.
++                    let _ = (sixg, msg);
+                 }
+                 self.cli_handler
+                     .on_session_parameters_changed(psi as u8, session_ambr);

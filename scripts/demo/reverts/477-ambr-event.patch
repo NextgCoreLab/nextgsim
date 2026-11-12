@@ -1,0 +1,23 @@
+--- a/nextgsim-ue/src/main.rs
++++ b/nextgsim-ue/src/main.rs
+@@ -1633,17 +1633,9 @@
+                 info!("PDU session {psi} modification completed");
+             }
+             SmOutput::SessionParametersChanged { psi, session_ambr } => {
+-                // Up to the App task (#454): the NAS layer applied the new
+-                // Session-AMBR already; this is what tells the layer above.
+-                let _ = task_base
+-                    .app_tx
+-                    .send(AppMessage::StatusUpdate(
+-                        UeStatusUpdate::SessionParametersChanged {
+-                            psi: i32::from(psi),
+-                            session_ambr,
+-                        },
+-                    ))
+-                    .await;
++                // 477-ambr-event revert: #454's upward event is dropped; NAS still
++                // applies the AMBR and answers COMPLETE.
++                let _ = (psi, session_ambr);
+             }
+             SmOutput::SessionModificationFailed { psi, cause } => {
+                 warn!(

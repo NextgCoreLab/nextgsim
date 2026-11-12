@@ -27,6 +27,10 @@ default = []
     "nextgsim-fl",
     "nextgsim-semantic",
 ]
+# Demo D444A (nextgsim#477): the UE application's UL feature stream adapts to
+# the Session-AMBR the network signals. Demo-only, off by default; also needs
+# the `demo:` block and `semantic_comm_enabled` plus a `semantic_stream:` block.
+demo-d444a-ambr-adapt = ["nextgsim-semantic"]
 # Test-only accessors (the AS security context and its keys) for other crates'
 # tests, such as the in-process cross-end test in nextgsim-integration-tests.
 # Not part of the production API (#348 review).

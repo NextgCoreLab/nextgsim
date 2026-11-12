@@ -1,0 +1,36 @@
+# Demo d444a-ambr-adapt (nextgsim#477): an override of nextgcore's standalone
+# docker/rust/docker-compose.demo-n2ho.yml (never of docker-compose.yml, whose
+# published ports a `-f` override would inherit; compose merges `ports:` lists):
+#
+#   docker compose -f $NEXTGCORE/docker/rust/docker-compose.demo-n2ho.yml \
+#                  -f config/demo-semantic/compose.override.yml up -d
+#
+# One gNB (gnb-west) and this directory's UE; gnb-east is parked behind a
+# profile, so nothing hands over. semantic-sink runs in the UPF's network
+# namespace (network_mode: service:upf) and binds 10.45.0.1, the UE subnet's
+# gateway on the UPF's TUN. It adds no port and no network. The nextgsim-ue
+# image must be built with nr-ue `--features demo-d444a-ambr-adapt` and carry
+# binaries/semantic-sink (Dockerfile.ue-local copies it when present):
+#
+#   cargo build --release -p nextgsim-ue --features demo-d444a-ambr-adapt --bin nr-ue
+#   cargo build --release -p nextgsim-semantic --features demo-d444a-ambr-adapt --bin semantic-sink
+#
+# The throttle comes from the core (a PCF Session-AMBR change; see README.md).
+services:
+  gnb-east:
+    profiles: ["n2ho"]
+  ue:
+    command: ["-c", "/etc/nextgsim/demo-semantic/ue.yaml"]
+  semantic-sink:
+    image: nextgsim-ue:latest
+    container_name: nextgsim-semantic-sink
+    entrypoint: ["semantic-sink"]
+    command: ["-c", "/etc/nextgsim/demo-semantic/sink.yaml"]
+    network_mode: "service:upf"
+    environment:
+      RUST_LOG: info
+    volumes:
+      - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+    depends_on:
+      upf:
+        condition: service_healthy

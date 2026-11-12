@@ -1360,6 +1360,15 @@ pub enum SemanticCodecMessage {
         /// Model path or identifier
         model_id: String,
     },
+    /// The network changed a PDU session's Session-AMBR (#454's upward
+    /// `SessionParametersChanged`, forwarded by the App task). Demo D444A
+    /// (#477) re-plans its UL feature stream from it; nothing else reads it.
+    SessionAmbrChanged {
+        /// PDU session ID
+        psi: u8,
+        /// The Session-AMBR now in force (TS 24.501 §9.11.4.14)
+        session_ambr: nextgsim_nas::messages::sm::IeSessionAmbr,
+    },
     /// Set adaptive compression parameters
     SetAdaptiveCompression {
         /// Enable adaptive compression

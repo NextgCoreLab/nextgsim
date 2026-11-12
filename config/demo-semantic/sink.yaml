@@ -1,0 +1,13 @@
+# semantic-sink for demo D444A (nextgsim#477). NON-NORMATIVE.
+# Runs inside the UPF's network namespace and binds the UE subnet's gateway
+# address there, so only traffic that crossed a PDU session reaches it. No
+# published port, no Service.
+listen: 10.45.0.1:5444
+seed: 444          # the UE's semantic_stream.seed
+rate_hz: 50        # the UE's semantic_stream.rate_hz
+epoch_datagrams: 500
+demo:
+  enabled: true
+  d444a-ambr-adapt:
+    enabled: true
+    mode: semantic   # labels the rows; must match the UE's mode (config plus restart)
