@@ -136,6 +136,46 @@ impl Default for NkefLiveConfig {
     }
 }
 
+/// The gNB's per QoS flow QoS monitoring (TS 23.501 §5.33.3.2, TS 38.415
+/// §5.4.1.1 / §5.4.2.1, nextgsim#509).
+///
+/// **Off by default.** With `enabled: false` the gNB is a node that does not
+/// support QoS monitoring: a QoS Monitoring Packet (QMP = 1) is ignored as
+/// TS 38.415 §5.5.3.8 says, and nothing on N3 changes. With it on, the gNB answers
+/// a QMP only for a QoS flow the SMF asked it to monitor (the NGAP QoS Monitoring
+/// Request, TS 38.413 §9.3.1.12): the 3GPP gate, which this switch does not
+/// bypass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QosMonitoringConfig {
+    /// Whether this gNB supports QoS monitoring at all.
+    pub enabled: bool,
+    /// How long, in milliseconds, a QMP response waits for an uplink packet of the
+    /// same QoS flow to ride on before the gNB sends it in a dummy UL G-PDU (no
+    /// T-PDU). TS 23.501 §5.33.3.2 NOTE 1 leaves the moment to the NG-RAN; 0 sends
+    /// the dummy at once.
+    pub dummy_response_after_ms: u64,
+    /// The RAN part of the DL packet delay to report in the DL Delay Result
+    /// (TS 38.415 §5.5.3.14), in milliseconds. The simulator does not measure its
+    /// own radio delay, so this is a stated value, not a measurement. Unset: no
+    /// DL Delay Result is sent.
+    pub ran_dl_delay_ms: Option<u32>,
+    /// The RAN part of the UL packet delay for the UL Delay Result (§5.5.3.16),
+    /// in milliseconds; a stated value like `ran_dl_delay_ms`. Unset: none sent.
+    pub ran_ul_delay_ms: Option<u32>,
+}
+
+impl Default for QosMonitoringConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dummy_response_after_ms: 10,
+            ran_dl_delay_ms: None,
+            ran_ul_delay_ms: None,
+        }
+    }
+}
+
 /// gNB (gNodeB) configuration.
 ///
 /// Contains all configuration parameters for a 5G base station.
@@ -194,6 +234,10 @@ pub struct GnbConfig {
     /// cover it.
     #[serde(default)]
     pub gtpu_echo_period_secs: u64,
+    /// Per QoS flow QoS monitoring on N3 (nextgsim#509). Off by default; see
+    /// [`QosMonitoringConfig`].
+    #[serde(default)]
+    pub qos_monitoring: QosMonitoringConfig,
     /// Consecutive unanswered Echo supervision periods after which the N3 path is
     /// declared down (TS 23.007 §20.3.1 N3-REQUESTS). Default 3.
     #[serde(default = "default_gtpu_echo_max_misses")]
@@ -634,6 +678,7 @@ impl Default for GnbConfig {
             upf_addr: None,
             upf_port: 2152,
             gtpu_echo_period_secs: 0,
+            qos_monitoring: QosMonitoringConfig::default(),
             gtpu_echo_max_misses: default_gtpu_echo_max_misses(),
             inactivity_timer_secs: None,
             gtpu_restart_counter_path: None,

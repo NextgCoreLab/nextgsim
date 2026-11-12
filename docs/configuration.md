@@ -117,6 +117,7 @@ si_broadcast_period_ms: 80
 | `ngap_tngreloc_prep_secs` | u64 | 10 | TNGRELOCprep: how long handover preparation may stay in flight (TS 38.413 §8.4.1.2) |
 | `gtpu_echo_period_secs` | u64 | 0 | GTP-U Echo period for N3 path supervision (TS 29.281 §7.2.1). 0 disables the prober |
 | `gtpu_echo_max_misses` | u32 | 3 | Unanswered Echo periods before the N3 path is declared down |
+| `qos_monitoring` | object | off | Per QoS flow QoS monitoring on N3 (TS 23.501 §5.33.3.2, TS 38.415 §5.5.2). `enabled` (false): when true, a QoS Monitoring Packet (QMP) for a flow the SMF asked to monitor (NGAP QoS Monitoring Request) is answered in the UL PDU Session Container with T1, T2 and T3, on the flow's next uplink packet or in a dummy UL G-PDU after `dummy_response_after_ms` (10). `ran_dl_delay_ms` / `ran_ul_delay_ms` (unset): stated RAN-part delays reported as the DL/UL Delay Result; the simulator does not measure them. Off, a QMP is ignored and N3 is unchanged |
 | `gtpu_restart_counter_path` | path | none | File that keeps the GTP-U Recovery restart counter across restarts (TS 23.007). Unset advertises a fixed 0 |
 | `quic_enabled` | bool | false | Research flag. A QUIC transport exists in `nextgsim-sctp`, but the SCTP task logs a warning and stays on SCTP when this is set |
 

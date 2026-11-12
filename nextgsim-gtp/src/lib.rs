@@ -59,6 +59,7 @@ pub use codec::{
     PduSessionInfo,
     PduSessionType,
     ProcessingHint,
+    QmpTimestamps,
     // 6G TSN markers (A5.3)
     TsnMarker,
     EXT_HEADER_TYPE_IN_NETWORK_COMPUTE,
@@ -69,6 +70,8 @@ pub use codec::{
     IE_RECOVERY,
     IE_TEID_DATA_I,
 };
+
+pub use codec::ntp_timestamp;
 
 pub use path::{EchoOutcome, PathSupervisor};
 
