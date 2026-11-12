@@ -444,6 +444,25 @@ pub const LSQ_WINDOW: usize = 10;
 /// samples give 0, three a third, five or more the full R².
 pub const LSQ_FULL_CONFIDENCE_SAMPLES: usize = 5;
 
+/// The speed in m/s a list of waypoints implies: the straight-line distance
+/// from the first to the last waypoint over the time between them. 0 for fewer
+/// than two waypoints, a zero time span, or a non-finite result.
+pub fn waypoint_speed_mps(waypoints: &[(Vector3, u64)]) -> f64 {
+    let (Some((a, ta)), Some((b, tb))) = (waypoints.first(), waypoints.last()) else {
+        return 0.0;
+    };
+    let dt_s = tb.saturating_sub(*ta) as f64 / 1000.0;
+    if dt_s <= 0.0 {
+        return 0.0;
+    }
+    let speed = a.distance_to(b) / dt_s;
+    if speed.is_finite() {
+        speed
+    } else {
+        0.0
+    }
+}
+
 /// Least-squares constant-velocity trajectory prediction (nextgsim#467).
 ///
 /// Fits `p(t) = a + b·t` per axis by ordinary least squares over the last
@@ -458,7 +477,18 @@ pub const LSQ_FULL_CONFIDENCE_SAMPLES: usize = 5;
 ///   noisy positions) scores low, because most of the movement is residual;
 /// - a UE that did not move at all (`SS_tot` = 0) is predicted to stay, with the
 ///   fit's full confidence, since there is no variance left unexplained;
-/// - samples that all carry one timestamp give no velocity and confidence 0.
+/// - samples that all carry one timestamp give no velocity and confidence 0;
+/// - a non-finite input (a NaN or infinite coordinate) gives confidence 0, so no
+///   consumer's `confidence < threshold` test can be slipped by a NaN.
+///
+/// Because the three axes are pooled, the axis with the most movement
+/// dominates: a fast walk along x with a few metres of lateral scatter in y
+/// still scores high. For a handover the lateral error is the one that can pick
+/// the wrong neighbour, so a consumer that cares about it must look at the
+/// waypoints, not only at this number.
+///
+/// A confident "it stays here" is a valid trajectory prediction, but it is not
+/// mobility: [`crate::is_predicted_mobility`] also requires a minimum speed.
 ///
 /// This replaces a two-sample velocity whose confidence was the sample count
 /// capped at 0.7, which the `> 0.7` mobility test could never pass.
@@ -528,6 +558,11 @@ pub fn least_squares_trajectory(
     let history_factor =
         (n.saturating_sub(2) as f64 / (LSQ_FULL_CONFIDENCE_SAMPLES - 2) as f64).min(1.0);
     let confidence = (r2 * history_factor) as f32;
+    let confidence = if confidence.is_finite() {
+        confidence
+    } else {
+        0.0
+    };
 
     let num_waypoints: u32 = 10;
     let step_ms = horizon_ms / num_waypoints;
@@ -783,6 +818,36 @@ mod tests {
         let out = least_squares_trajectory(&p, &same, 1000, 5_000);
         assert_eq!(out.confidence, 0.0);
         assert!(out.waypoints.iter().all(|(w, _)| w.x.is_finite()));
+    }
+
+    /// #527 review: a NaN coordinate must not give a NaN confidence, which a
+    /// `confidence < min` skip test would let through.
+    #[test]
+    fn a_non_finite_sample_gives_zero_confidence() {
+        let (mut p, t) = track(|i| (2.5 * i, 0.0), 8);
+        p[3].y = f64::NAN;
+        let out = least_squares_trajectory(&p, &t, 1000, t[7]);
+        assert_eq!(out.confidence, 0.0);
+        let (mut p, t) = track(|i| (2.5 * i, 0.0), 8);
+        p[5].x = f64::INFINITY;
+        assert_eq!(least_squares_trajectory(&p, &t, 1000, t[7]).confidence, 0.0);
+    }
+
+    /// The waypoint speed is distance over time between the first and last.
+    #[test]
+    fn waypoint_speed_is_first_to_last_distance_over_time() {
+        let (p, t) = track(|i| (35.0 + 2.5 * i, 0.0), 10);
+        let out = least_squares_trajectory(&p, &t, 1000, t[9]);
+        assert!((waypoint_speed_mps(&out.waypoints) - 2.5).abs() < 0.1);
+        let (p, t) = track(|_| (40.0, 7.0), 10);
+        let out = least_squares_trajectory(&p, &t, 1000, t[9]);
+        assert_eq!(waypoint_speed_mps(&out.waypoints), 0.0);
+        assert_eq!(waypoint_speed_mps(&[]), 0.0);
+        let same_time = [
+            (Vector3::new(0.0, 0.0, 0.0), 5),
+            (Vector3::new(9.0, 0.0, 0.0), 5),
+        ];
+        assert_eq!(waypoint_speed_mps(&same_time), 0.0);
     }
 
     /// The predictor's fallback is exactly this fit.

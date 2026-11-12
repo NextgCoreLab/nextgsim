@@ -158,13 +158,34 @@ pub use nextgsim_common::Vector3;
 
 /// A trajectory prediction must be more confident than this for a handover
 /// recommendation to be classed [`HandoverReason::PredictedMobility`].
+///
+/// A recommendation's confidence means different things per reason: for
+/// `PredictedMobility` it is the trajectory fit's confidence (so 0.71 is
+/// possible), for `SignalBased` it is the fixed
+/// [`SIGNAL_BASED_HANDOVER_CONFIDENCE`]. Do not compare or rank confidences
+/// across the two reasons.
 pub const PREDICTED_MOBILITY_CONFIDENCE: f32 = 0.7;
+
+/// A trajectory must also move at least this fast (m/s, from its waypoints)
+/// to count as mobility. A parked UE is predicted to stay with full
+/// confidence; that is a good prediction, but not a reason to hand over.
+pub const MIN_PREDICTED_MOBILITY_SPEED_MPS: f64 = 0.5;
 
 /// The confidence of a [`HandoverReason::SignalBased`] recommendation: the
 /// neighbour was measured 3 dB above the serving cell, which no prediction
 /// qualifies, so it is a fixed value (the 0.85 every recommendation carried
-/// before nextgsim#467).
+/// before nextgsim#467). Not comparable with a `PredictedMobility` confidence;
+/// see [`PREDICTED_MOBILITY_CONFIDENCE`].
 pub const SIGNAL_BASED_HANDOVER_CONFIDENCE: f32 = 0.85;
+
+/// Whether a trajectory prediction is evidence of mobility (nextgsim#467): its
+/// confidence is finite and above [`PREDICTED_MOBILITY_CONFIDENCE`], and its
+/// waypoints move at least [`MIN_PREDICTED_MOBILITY_SPEED_MPS`].
+pub fn is_predicted_mobility(confidence: f32, waypoints: &[(Vector3, u64)]) -> bool {
+    confidence.is_finite()
+        && confidence > PREDICTED_MOBILITY_CONFIDENCE
+        && predictor::waypoint_speed_mps(waypoints) >= MIN_PREDICTED_MOBILITY_SPEED_MPS
+}
 
 /// UE measurement data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -573,13 +594,13 @@ impl NwdafManager {
             })?;
 
         // Check if trajectory prediction suggests handover
-        // A prediction confident enough to call it mobility carries its own
-        // confidence (nextgsim#467). A signal-based recommendation rests on the
+        // A prediction confident enough, and moving fast enough, to call it
+        // mobility carries its own confidence (nextgsim#467). A signal-based recommendation rests on the
         // measured 3 dB margin above, not on a prediction, and keeps the fixed
         // SIGNAL_BASED_HANDOVER_CONFIDENCE.
         let prediction = self.predict_trajectory(ue_id, 1000);
         let (reason, confidence) = match prediction {
-            Some(p) if p.confidence > PREDICTED_MOBILITY_CONFIDENCE => {
+            Some(p) if is_predicted_mobility(p.confidence, &p.waypoints) => {
                 (HandoverReason::PredictedMobility, p.confidence)
             }
             _ => (
@@ -1191,6 +1212,62 @@ mod tests {
     /// with the prediction's confidence, instead of a fixed 0.85 behind a test
     /// the 0.7 cap made unreachable. A scattered track stays SignalBased with
     /// the fixed signal-based confidence.
+    /// #527 review MAJOR: a parked UE is predicted to stay with full
+    /// confidence, but staying is not mobility, so a better neighbour gives a
+    /// SignalBased recommendation at the fixed confidence.
+    #[test]
+    fn a_stationary_ue_is_signal_based_not_predicted_mobility() {
+        let mut manager = NwdafManager::new(20);
+        for i in 0..10u64 {
+            manager.record_measurement(UeMeasurement {
+                ue_id: 1,
+                rsrp: -80.0,
+                rsrq: None,
+                sinr: None,
+                position: Vector3::new(40.0, 7.0, 0.0),
+                velocity: None,
+                serving_cell_id: 1,
+                timestamp_ms: 1_000 + i * 1_000,
+            });
+        }
+        let traj = manager.predict_trajectory(1, 1000).expect("predicts");
+        assert!(
+            traj.confidence > 0.99,
+            "staying put is a confident prediction"
+        );
+        let ho = manager
+            .recommend_handover(1, &[(2, -70.0)])
+            .expect("a 10 dB better neighbour");
+        assert_eq!(ho.reason, HandoverReason::SignalBased);
+        assert_eq!(ho.confidence, SIGNAL_BASED_HANDOVER_CONFIDENCE);
+    }
+
+    /// The mobility test: finite, above the threshold, and moving.
+    #[test]
+    fn is_predicted_mobility_needs_confidence_and_motion() {
+        let moving: Vec<(Vector3, u64)> = (0..10)
+            .map(|i| {
+                (
+                    Vector3::new(f64::from(i), 0.0, 0.0),
+                    1_000 + u64::from(i as u32) * 100,
+                )
+            })
+            .collect(); // 10 m/s
+        let slow: Vec<(Vector3, u64)> = (0..10)
+            .map(|i| {
+                (
+                    Vector3::new(0.04 * f64::from(i), 0.0, 0.0),
+                    u64::from(i as u32) * 100,
+                )
+            })
+            .collect(); // 0.4 m/s
+        assert!(is_predicted_mobility(0.9, &moving));
+        assert!(!is_predicted_mobility(0.7, &moving), "0.7 is not above 0.7");
+        assert!(!is_predicted_mobility(f32::NAN, &moving));
+        assert!(!is_predicted_mobility(0.9, &slow), "below the speed floor");
+        assert!(!is_predicted_mobility(0.9, &[]));
+    }
+
     #[test]
     fn recommend_handover_carries_the_least_squares_confidence() {
         let record = |manager: &mut NwdafManager, zigzag: bool| {

@@ -608,7 +608,7 @@ impl Anlf {
             pred.predict_trajectory(&positions, &timestamps, 1000, current_time)
                 .ok()
         }) {
-            Some(output) if output.confidence > crate::PREDICTED_MOBILITY_CONFIDENCE => {
+            Some(output) if crate::is_predicted_mobility(output.confidence, &output.waypoints) => {
                 (HandoverReason::PredictedMobility, output.confidence)
             }
             _ => (
@@ -1846,6 +1846,34 @@ mod tests {
         // fallback predictor's R² clears 0.7 and the recommendation carries it.
         assert_eq!(ho.reason, HandoverReason::PredictedMobility);
         assert!(ho.confidence > 0.99, "confidence {}", ho.confidence);
+    }
+
+    /// #527 review MAJOR: the ANLF copy too: a parked UE with a better
+    /// neighbour is SignalBased at the fixed confidence (it was on main, where
+    /// the 0.7 cap kept every prediction below the threshold).
+    #[test]
+    fn a_stationary_ue_is_signal_based_in_the_anlf() {
+        let mut anlf = Anlf::new();
+        let mut collector = DataCollector::new(100);
+        let mtlf = Mtlf::new();
+        for i in 0..10u64 {
+            collector.report_ue_measurement(UeMeasurement {
+                ue_id: 1,
+                rsrp: -80.0,
+                rsrq: None,
+                sinr: None,
+                position: Vector3::new(40.0, 7.0, 0.0),
+                velocity: None,
+                serving_cell_id: 1,
+                timestamp_ms: 1_000 + i * 1_000,
+            });
+        }
+        let ho = anlf
+            .recommend_handover(1, &[(2, -70.0)], &collector, &mtlf)
+            .expect("ok")
+            .expect("a 10 dB better neighbour");
+        assert_eq!(ho.reason, HandoverReason::SignalBased);
+        assert_eq!(ho.confidence, crate::SIGNAL_BASED_HANDOVER_CONFIDENCE);
     }
 
     #[test]
