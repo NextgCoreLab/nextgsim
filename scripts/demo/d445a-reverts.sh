@@ -37,13 +37,18 @@
 #                      that raced the eviction -> a_request_racing_an_eviction_is_answered
 #   480-t8-drain-drops the drain drops the streams it accepts
 #                      -> a_request_racing_an_eviction_is_answered
-#   480-t8-drain-uncounted  an evicted connection gives up its slot before it is
-#                      closed -> an_evicted_connection_keeps_its_slot_while_it_drains
+#   480-t8-drain-uncapped  draining connections have no cap of their own
+#                      -> drains_leave_admission_and_are_capped_on_their_own
+#   480-t8-drain-extends  each stream accepted while draining extends the drain
+#                      -> a_streaming_drain_ends_at_its_deadline
 #   480-refusal-no-timer  the refusal summary goes out only at a later refusal
 #                      -> the_last_refusal_window_is_flushed_on_a_timer
 #
-# After the arms, the T8 listener's churn smoke tests (#[ignore]d in the default
-# suite: they load loopback) run on their own, serially, and must pass. Set
+# After the arms, the T8 listener's churn smoke tests run on their own,
+# serially, and must pass. They are #[ignore]d in the default suite because they
+# load loopback. One of them is the never-PING flood, which checks the socket
+# bound and nefd's admission under the draining cap. It was revert-checked
+# against 3bc94d3, where about 600 fds are open against a bound of 188. Set
 # D445A_SMOKE=0 to skip them (CI runs them as a step of their own).
 #
 # The other revert arms are knobs, not patches, and have their own tests in
@@ -74,14 +79,15 @@ declare -A test_of=(
     [480-t8-fair-share-spares-opening]="$fl an_opening_connection_is_evicted_at_the_total_cap"
     [480-t8-evict-cuts]="$fl a_request_racing_an_eviction_is_answered"
     [480-t8-drain-drops]="$fl a_request_racing_an_eviction_is_answered"
-    [480-t8-drain-uncounted]="$fl an_evicted_connection_keeps_its_slot_while_it_drains"
+    [480-t8-drain-uncapped]="$fl drains_leave_admission_and_are_capped_on_their_own"
+    [480-t8-drain-extends]="$fl a_streaming_drain_ends_at_its_deadline"
     [480-refusal-no-timer]="$fl the_last_refusal_window_is_flushed_on_a_timer"
 )
 arms="${ARMS:-480-t8-ignored 480-samples-trust 480-no-provenance 480-poison-off \
 480-norm-unchecked 480-identity-clash 480-subscribe-first 480-t8-no-evict \
 480-t8-evict-any-source 480-t8-no-fair-share 480-t8-ping-pong 480-t8-evict-busy \
 480-t8-fair-share-spares-opening 480-t8-evict-cuts 480-t8-drain-drops \
-480-t8-drain-uncounted 480-refusal-no-timer}"
+480-t8-drain-uncapped 480-t8-drain-extends 480-refusal-no-timer}"
 for arm in $arms; do
     args="${test_of[$arm]:?unknown arm $arm}"
     name="${args##* }"

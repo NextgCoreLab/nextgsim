@@ -1,11 +1,11 @@
 --- a/nextgsim-fl/src/d445a/nef.rs
 +++ b/nextgsim-fl/src/d445a/nef.rs
-@@ -534,7 +534,7 @@
+@@ -577,7 +577,7 @@
              .iter()
              .enumerate()
              .filter(|(_, h)| {
--                h.source == source && !h.draining && h.idle() && (even_opening || !h.opening())
-+                h.source == source && !h.draining && (h.idle() || true) && (even_opening || !h.opening())
+-                h.source == source && !h.is_draining() && h.idle() && (even_opening || !h.opening())
++                h.source == source && !h.is_draining() && (h.idle() || true) && (even_opening || !h.opening())
              })
              .min_by_key(|(_, h)| *lock(&h.last_active))
              .map(|(i, _)| i);

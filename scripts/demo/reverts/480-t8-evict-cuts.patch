@@ -1,8 +1,8 @@
 --- a/nextgsim-fl/src/d445a/nef.rs
 +++ b/nextgsim-fl/src/d445a/nef.rs
-@@ -802,7 +802,7 @@
+@@ -853,7 +853,7 @@
                  // on the wire: drain (GOAWAY, then answer what the peer had
-                 // sent), still counted against the caps until this task ends.
+                 // sent), within the drain's absolute deadlines.
                  tracing::debug!("[demo:{}] T8 listener: idle connection evicted", super::KEY);
 -                break;
 +                return Ok(());

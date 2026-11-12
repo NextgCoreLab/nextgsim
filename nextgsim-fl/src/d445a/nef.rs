@@ -74,11 +74,17 @@ const MAX_STREAMS_PER_CONNECTION: usize = 16;
 /// The largest header list accepted (SETTINGS_MAX_HEADER_LIST_SIZE); h2's own
 /// default is 16 MiB.
 const MAX_HEADER_LIST: u32 = 16 * 1024;
-/// How long an evicted connection with nothing in flight drains: long enough
-/// for a request that raced the eviction to arrive and be answered.
+/// A draining connection accepts (and answers) new streams for this long from
+/// the start of its drain: long enough for a request that raced the eviction.
 const EVICT_DRAIN: Duration = Duration::from_millis(250);
-/// How long a draining connection gives a request in flight.
+/// A draining connection is closed this long after its drain started,
+/// whatever is still in flight. Never extended.
 const DRAIN_BUSY: Duration = Duration::from_secs(2);
+/// Draining connections held at once. Past this, the one draining longest is
+/// closed at once. With the per-source and total caps this bounds the
+/// listener's sockets at [`MAX_CALLBACK_CONNECTIONS`] live plus this many
+/// draining, each for at most [`DRAIN_BUSY`].
+pub const MAX_DRAINING: usize = 64;
 /// At most one warn summary of refused callback connections per this long.
 const REFUSAL_SUMMARY: Duration = Duration::from_secs(10);
 /// A callback connection with no request in flight for this long is closed.
@@ -500,12 +506,19 @@ struct Held {
     last_active: Arc<Mutex<Instant>>,
     /// Told to close (evicted).
     evict: Arc<Notify>,
-    /// Evicted and draining: still counted against its source and the total
-    /// (so open sockets stay within the caps), never evicted again.
-    draining: bool,
+    /// When it started draining (evicted, or closing after [`CALLBACK_IDLE`]),
+    /// shared with its task. A draining connection is out of the admission
+    /// counts, is never picked as a victim, and lasts at most [`DRAIN_BUSY`];
+    /// draining connections are capped on their own ([`MAX_DRAINING`]).
+    draining: Arc<Mutex<Option<Instant>>>,
+    /// Told to close at once because the draining cap was reached.
+    killed: bool,
 }
 
 impl Held {
+    fn is_draining(&self) -> bool {
+        lock(&self.draining).is_some()
+    }
     fn idle(&self) -> bool {
         self.busy.load(Ordering::SeqCst) == 0
     }
@@ -522,8 +535,38 @@ struct Registry {
 }
 
 impl Registry {
+    /// Connections not draining: the ones admission counts.
+    fn live(&self) -> impl Iterator<Item = &Held> {
+        self.held.iter().filter(|h| !h.is_draining())
+    }
+
     fn count(&self, source: IpAddr) -> usize {
-        self.held.iter().filter(|h| h.source == source).count()
+        self.live().filter(|h| h.source == source).count()
+    }
+
+    /// Draining connections not yet told to close at once.
+    fn draining(&self) -> usize {
+        self.held
+            .iter()
+            .filter(|h| !h.killed && h.is_draining())
+            .count()
+    }
+
+    /// Past [`MAX_DRAINING`], close the connection draining longest at once.
+    fn cap_draining(&mut self) {
+        while self.draining() > MAX_DRAINING {
+            let oldest = self
+                .held
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| !h.killed)
+                .filter_map(|(i, h)| lock(&h.draining).map(|t| (i, t)))
+                .min_by_key(|(_, t)| *t)
+                .map(|(i, _)| i);
+            let Some(i) = oldest else { return };
+            self.held[i].killed = true;
+            self.held[i].evict.notify_one();
+        }
     }
 
     /// Evict `source`'s connection idle longest, skipping one still opening
@@ -534,15 +577,17 @@ impl Registry {
             .iter()
             .enumerate()
             .filter(|(_, h)| {
-                h.source == source && !h.draining && h.idle() && (even_opening || !h.opening())
+                h.source == source && !h.is_draining() && h.idle() && (even_opening || !h.opening())
             })
             .min_by_key(|(_, h)| *lock(&h.last_active))
             .map(|(i, _)| i);
         match oldest {
             Some(i) => {
-                // It keeps its place in the counts until its task ends.
-                self.held[i].draining = true;
+                // Out of the admission counts from now; draining is bounded by
+                // its own cap and deadline.
+                *lock(&self.held[i].draining) = Some(Instant::now());
                 self.held[i].evict.notify_one();
+                self.cap_draining();
                 true
             }
             None => false,
@@ -565,11 +610,11 @@ impl Registry {
         if mine >= MAX_CONNECTIONS_PER_SOURCE {
             return self.evict_oldest_idle_of(source, false);
         }
-        if self.held.len() < MAX_CALLBACK_CONNECTIONS {
+        if self.live().count() < MAX_CALLBACK_CONNECTIONS {
             return true;
         }
         let mut by_source: Vec<(IpAddr, usize)> = Vec::new();
-        for h in &self.held {
+        for h in self.live() {
             match by_source.iter_mut().find(|(s, _)| *s == h.source) {
                 Some((_, n)) => *n += 1,
                 None => by_source.push((h.source, 1)),
@@ -689,7 +734,8 @@ async fn serve_callbacks_with(
                 opening: Arc::new(AtomicBool::new(true)),
                 last_active: Arc::new(Mutex::new(Instant::now())),
                 evict: Arc::new(Notify::new()),
-                draining: false,
+                draining: Arc::new(Mutex::new(None)),
+                killed: false,
             };
             let mine = (
                 h.id,
@@ -697,18 +743,20 @@ async fn serve_callbacks_with(
                 h.opening.clone(),
                 h.last_active.clone(),
                 h.evict.clone(),
+                h.draining.clone(),
             );
             r.held.push(h);
             mine
         };
         let (ids, tx, registry) = (ids.clone(), tx.clone(), registry.clone());
         tokio::spawn(async move {
-            let (id, busy, opening, last_active, evict) = held;
+            let (id, busy, opening, last_active, evict, draining) = held;
             let conn = ConnState {
                 busy,
                 opening,
                 last_active,
                 evict,
+                draining,
             };
             if let Err(e) = serve_connection(tcp, ids, tx, &conn).await {
                 tracing::debug!("[demo:{}] T8 listener: {peer}: {e}", super::KEY);
@@ -734,6 +782,7 @@ struct ConnState {
     opening: Arc<AtomicBool>,
     last_active: Arc<Mutex<Instant>>,
     evict: Arc<Notify>,
+    draining: Arc<Mutex<Option<Instant>>>,
 }
 
 async fn serve_connection(
@@ -793,6 +842,8 @@ async fn serve_connection(
                     && lock(last_active).elapsed() >= CALLBACK_IDLE
                 {
                     tracing::debug!("[demo:{}] T8 listener: idle connection closed", super::KEY);
+                    // Mark it draining first, so the registry never picks it.
+                    lock(&st.draining).get_or_insert_with(Instant::now);
                     break;
                 }
                 continue;
@@ -800,7 +851,7 @@ async fn serve_connection(
             () = evict.notified() => {
                 // Idle as the registry last saw it, but a request may already be
                 // on the wire: drain (GOAWAY, then answer what the peer had
-                // sent), still counted against the caps until this task ends.
+                // sent), within the drain's absolute deadlines.
                 tracing::debug!("[demo:{}] T8 listener: idle connection evicted", super::KEY);
                 break;
             }
@@ -819,37 +870,37 @@ async fn serve_connection(
             answer(req, respond, &ids, &tx).await;
         });
     }
-    // GOAWAY, then answer the streams the peer opened before it, and let those
-    // in flight finish. An idle drain ends after EVICT_DRAIN; any request in
-    // flight (or accepted now) extends it to DRAIN_BUSY from its arrival.
+    // GOAWAY, then answer the streams the peer opened before it. Absolute
+    // deadlines from the start of the drain, never extended: streams are
+    // accepted (and answered) until EVICT_DRAIN, later ones are refused, and
+    // at DRAIN_BUSY the connection is closed whatever is still in flight. A
+    // second eviction notice (the draining cap) closes it at once.
     conn.graceful_shutdown();
     let now = tokio::time::Instant::now;
-    let mut deadline = now()
-        + if busy.load(Ordering::SeqCst) > 0 {
-            DRAIN_BUSY
-        } else {
-            EVICT_DRAIN
-        };
-    let mut extended = false;
+    let start = now();
+    let accept_until = start + EVICT_DRAIN;
+    let hard = start + DRAIN_BUSY;
     loop {
+        let accepting = now() < accept_until;
+        if !accepting && busy.load(Ordering::SeqCst) == 0 {
+            break;
+        }
         let stream = tokio::select! {
             s = conn.accept() => s,
-            () = tokio::time::sleep_until(deadline) => {
-                // Something still being answered gets DRAIN_BUSY more, once.
-                if busy.load(Ordering::SeqCst) == 0 || extended {
-                    break;
-                }
-                extended = true;
-                deadline = now() + DRAIN_BUSY;
-                continue;
-            }
+            () = tokio::time::sleep_until(accept_until), if accepting => continue,
+            () = tokio::time::sleep(Duration::from_millis(20)), if !accepting => continue,
+            () = tokio::time::sleep_until(hard) => break,
+            () = evict.notified() => break,
         };
-        let Some(Ok((req, respond))) = stream else {
+        let Some(Ok((req, mut respond))) = stream else {
             break;
         };
+        if now() >= accept_until {
+            respond.send_reset(h2::Reason::REFUSED_STREAM);
+            continue;
+        }
         busy.fetch_add(1, Ordering::SeqCst);
         *lock(last_active) = Instant::now();
-        deadline = deadline.max(now() + DRAIN_BUSY);
         let guard = InFlight(busy.clone(), last_active.clone());
         let (ids, tx) = (ids.clone(), tx.clone());
         tokio::spawn(async move {
@@ -1021,7 +1072,8 @@ mod tests {
             opening: Arc::new(AtomicBool::new(opening)),
             last_active: Arc::new(Mutex::new(Instant::now())),
             evict: evict.clone(),
-            draining: false,
+            draining: Arc::new(Mutex::new(None)),
+            killed: false,
         });
         std::thread::sleep(Duration::from_millis(1));
         evict
@@ -1135,24 +1187,194 @@ mod tests {
         assert_eq!(gone, 1);
     }
 
-    /// An evicted connection drains (MINOR-1), so it keeps its place in the
-    /// counts until its task ends: open sockets stay within the caps, and a
-    /// draining connection is never picked again.
+    /// #533 MAJOR-1: admit-then-push over and over from one source, the way
+    /// the accept loop does. Draining connections leave the admission counts
+    /// (so they never cause a refusal), the source never holds more than its
+    /// cap live, draining is capped on its own with the longest-draining one
+    /// told to close at once, and nefd is still admitted. A connection
+    /// closing after its idle timeout (m-2) is draining too, never a victim.
     #[tokio::test]
-    async fn an_evicted_connection_keeps_its_slot_while_it_drains() {
+    async fn drains_leave_admission_and_are_capped_on_their_own() {
         let mut r = Registry::default();
-        let own: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+        let mut killed = 0;
+        for _ in 0..(MAX_CONNECTIONS_PER_SOURCE + MAX_DRAINING) * 3 {
+            assert!(r.make_room(src(50)), "the flooder refused its own churn");
+            held(&mut r, 50, false);
+            // A killed connection's task ends at once and leaves the registry.
+            killed += r.held.iter().filter(|h| h.killed).count();
+            r.held.retain(|h| !h.killed);
+            let live = r.held.iter().filter(|h| !h.is_draining()).count();
+            assert!(live <= MAX_CONNECTIONS_PER_SOURCE, "{live} live");
+            assert!(r.draining() <= MAX_DRAINING, "{} draining", r.draining());
+        }
+        assert!(killed > 0, "the draining cap never closed anything");
+        assert!(
+            r.held.len() <= MAX_CONNECTIONS_PER_SOURCE + MAX_DRAINING,
+            "{} sockets held",
+            r.held.len()
+        );
+        assert!(r.make_room(src(2)), "nefd refused");
+        // m-2: an idle-closing connection is draining, so it is never picked.
+        let mut r = Registry::default();
+        let closing = held(&mut r, 30, false);
+        *lock(&r.held[0].draining) = Some(Instant::now());
+        let own: Vec<_> = (1..MAX_CONNECTIONS_PER_SOURCE)
             .map(|_| held(&mut r, 30, false))
             .collect();
+        assert_eq!(r.count(src(30)), MAX_CONNECTIONS_PER_SOURCE - 1);
+        held(&mut r, 30, false);
         assert!(r.make_room(src(30)));
-        assert_eq!(
-            r.count(src(30)),
-            MAX_CONNECTIONS_PER_SOURCE,
-            "slot freed early"
+        assert!(
+            !evicted(&closing).await,
+            "an idle-closing connection was picked"
         );
-        assert!(r.make_room(src(30)));
-        assert!(evicted(&own[0]).await && evicted(&own[1]).await);
-        assert_eq!(r.held.iter().filter(|h| h.draining).count(), 2);
+        assert!(evicted(&own[0]).await);
+    }
+
+    /// Raw HTTP/2 from a peer that never answers PING (so a graceful
+    /// shutdown never completes on its side): the preface, an empty SETTINGS,
+    /// and `GET /` on stream `id`.
+    fn h2_preface() -> Vec<u8> {
+        let mut b = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        b.extend_from_slice(&[0, 0, 0, 4, 0, 0, 0, 0, 0]);
+        b
+    }
+
+    fn h2_get(id: u32) -> Vec<u8> {
+        // :method GET, :scheme http, :path /, :authority "a" (not indexed).
+        let block = [0x82, 0x86, 0x84, 0x01, 0x01, b'a'];
+        let mut b = vec![0, 0, block.len() as u8, 1, 0x05];
+        b.extend_from_slice(&(id & 0x7fff_ffff).to_be_bytes());
+        b.extend_from_slice(&block);
+        b
+    }
+
+    /// A never-PING peer that keeps sending `GET /` every `every` until the
+    /// connection fails; reads and discards everything (no PONG, no ACK).
+    async fn never_pong(mut tcp: tokio::net::TcpStream, every: Duration) {
+        use tokio::io::AsyncWriteExt;
+        if tcp.write_all(&h2_preface()).await.is_err() {
+            return;
+        }
+        let (mut rd, mut wr) = tcp.into_split();
+        let reader = async move {
+            let mut buf = [0u8; 4096];
+            while !matches!(rd.read(&mut buf).await, Ok(0) | Err(_)) {}
+        };
+        let writer = async move {
+            let mut id = 1u32;
+            loop {
+                if wr.write_all(&h2_get(id)).await.is_err() {
+                    return;
+                }
+                id += 2;
+                tokio::time::sleep(every).await;
+            }
+        };
+        tokio::select! {
+            () = reader => {}
+            () = writer => {}
+        }
+    }
+
+    /// #533 MAJOR-1: a draining connection is closed at its absolute deadline
+    /// even when the peer never answers the GOAWAY's PING and keeps opening
+    /// streams: no accepted stream extends the drain.
+    #[test]
+    fn a_streaming_drain_ends_at_its_deadline() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let (tx, _rx) = mpsc::channel(64);
+            let st = ConnState {
+                busy: Arc::new(AtomicUsize::new(0)),
+                opening: Arc::new(AtomicBool::new(true)),
+                last_active: Arc::new(Mutex::new(Instant::now())),
+                evict: Arc::new(Notify::new()),
+                draining: Arc::new(Mutex::new(None)),
+            };
+            let evict = st.evict.clone();
+            let peer = tokio::spawn(async move {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                never_pong(tcp, Duration::from_millis(50)).await;
+            });
+            let (tcp, _) = l.accept().await.unwrap();
+            let server = tokio::spawn(async move {
+                serve_connection(tcp, CallbackIds::default(), tx, &st).await
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let evicted_at = tokio::time::Instant::now();
+            evict.notify_one();
+            tokio::time::timeout(DRAIN_BUSY + Duration::from_secs(1), server)
+                .await
+                .expect("the drain outlived its deadline")
+                .unwrap()
+                .ok();
+            assert!(evicted_at.elapsed() <= DRAIN_BUSY + Duration::from_millis(500));
+            peer.abort();
+        });
+    }
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/proc/self/fd").map_or(0, Iterator::count)
+    }
+
+    /// #533 MAJOR-1, through the real accept loop: 300 connections from one
+    /// source that never answer PING and keep sending `GET /` churn far past
+    /// the caps. The process's open sockets stay bounded (the listener holds
+    /// at most 8 live from that source plus [`MAX_DRAINING`] draining, each
+    /// for at most [`DRAIN_BUSY`]), and nefd's notifications from another
+    /// source all get 204. Ignored in the default suite (it floods loopback):
+    /// run serially with the churn smoke tests.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "smoke test; run serially with --ignored --test-threads=1"]
+    async fn a_churning_never_pong_flood_keeps_sockets_bounded_and_nefd_admitted() {
+        let (addr, id, mut rx) = listener().await;
+        let base = open_fds();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flooding = stop.clone();
+        let flood = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                for i in 0..300u64 {
+                    if let Ok(tcp) = tcp_from(50, addr).await {
+                        tokio::spawn(never_pong(tcp, Duration::from_millis(15 + i % 86)));
+                    }
+                    tokio::time::sleep(Duration::from_millis(3)).await;
+                }
+                while !flooding.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            rt.shutdown_background();
+        });
+        let mut peak = 0;
+        let mut statuses = Vec::new();
+        for _ in 0..12 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            peak = peak.max(open_fds().saturating_sub(base));
+            statuses.push(notify_from(2, addr, &id).await);
+        }
+        stop.store(true, Ordering::Relaxed);
+        flood.join().unwrap();
+        // Both ends of every socket are in this process: at most 2 x (8 live
+        // + 64 draining + nefd's), plus slack for the runtimes.
+        let bound = 2 * (MAX_CONNECTIONS_PER_SOURCE + MAX_DRAINING + 2) + 40;
+        assert!(peak <= bound, "{peak} fds open (bound {bound})");
+        assert!(
+            statuses.iter().all(|s| *s == Ok(StatusCode::NO_CONTENT)),
+            "nefd refused: {statuses:?}"
+        );
+        let mut forwarded = 0;
+        while rx.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, 12);
     }
 
     /// MINOR-1 (#531 round 4): a request already on the wire when its
@@ -1180,6 +1402,7 @@ mod tests {
                 opening: Arc::new(AtomicBool::new(true)),
                 last_active: Arc::new(Mutex::new(Instant::now())),
                 evict: Arc::new(Notify::new()),
+                draining: Arc::new(Mutex::new(None)),
             };
             let (busy, evict) = (st.busy.clone(), st.evict.clone());
             let handle = server.handle().clone();

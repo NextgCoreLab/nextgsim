@@ -1,11 +1,11 @@
 --- a/nextgsim-fl/src/d445a/nef.rs
 +++ b/nextgsim-fl/src/d445a/nef.rs
-@@ -538,7 +538,7 @@
+@@ -581,7 +581,7 @@
              })
              .min_by_key(|(_, h)| *lock(&h.last_active))
              .map(|(i, _)| i);
 -        match oldest {
 +        match oldest.filter(|_| false) {
              Some(i) => {
-                 // It keeps its place in the counts until its task ends.
-                 self.held[i].draining = true;
+                 // Out of the admission counts from now; draining is bounded by
+                 // its own cap and deadline.
