@@ -59,6 +59,14 @@ demo-d446a-agent-conflict = ["nextgsim-agent"]
 # PR 3b). Active only with the demo: block on as well.
 demo-d440a-ai-paging = ["6g"]
 
+# Demo D441A (nextgsim#465, convention #458): a configured cell capacity C, a
+# token-bucket downlink queue at C, and an exporter that POSTs the measured (and,
+# in mode `prediction`, the OLS-predicted) cell occupancy to nwdafd's
+# non-normative /nnwdaf-randata/v1/cell-reports route with an NRF-issued token.
+# Off by default; demo-only code, inert unless the config's `demo:` block also
+# enables `d441a-congestion-loop`.
+demo-d441a-congestion-loop = ["6g", "sbi-client"]
+
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
 # `cargo build -p nextgsim-gnb --features 6g` yields the full build. There is no

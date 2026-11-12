@@ -17,14 +17,15 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AgentMessage, GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
+use nextgsim_common::config::GnbConfig;
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
+    codec, DistanceModel, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
     RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
-    SimCoord,
+    ShadowedModel, Shadowing, SimCoord,
 };
 
 /// Default RLS port for gNB
@@ -147,6 +148,34 @@ pub struct RlsTask {
     /// incarnation's tracker had not timed out yet. Their eventual loss is the
     /// stale incarnation's, not the UE's, and is not reported.
     retired_trackers: std::collections::HashSet<i32>,
+    /// Demo D441A (nextgsim#465): the capacity-C downlink queue and its
+    /// measurement window. `None` unless that demo is active.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    congestion: Option<crate::congestion::CellState>,
+}
+
+/// The cell tracker for this gNB: the default distance model, with seeded
+/// log-normal shadowing on top when `shadowing.sigma_db > 0` (nextgsim#467).
+///
+/// The shadowing is keyed by the NCI (the tracker's STI, stable across starts),
+/// so one seed gives each gNB its own reproducible field. With the block absent
+/// the tracker is exactly what it always was.
+fn build_cell_tracker(config: &GnbConfig, sti: u64, phy_location: SimCoord) -> GnbCellTracker {
+    let s = config.shadowing;
+    if !s.is_enabled() {
+        return GnbCellTracker::new(sti, phy_location);
+    }
+    info!(
+        "RLS: seeded log-normal shadowing on: sigma={} dB seed={} decorrelation={} m \
+         (non-normative simulator model)",
+        s.sigma_db, s.seed, s.decorrelation_m
+    );
+    let shadowing = Shadowing::new(s.sigma_db, s.seed, s.decorrelation_m, sti);
+    GnbCellTracker::with_channel_model(
+        sti,
+        phy_location,
+        Box::new(ShadowedModel::new(Box::new(DistanceModel), shadowing)),
+    )
 }
 
 impl RlsTask {
@@ -158,13 +187,14 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -188,6 +218,8 @@ impl RlsTask {
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
+            #[cfg(feature = "demo-d441a-congestion-loop")]
+            congestion: None,
         }
     }
 
@@ -198,10 +230,11 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -225,6 +258,8 @@ impl RlsTask {
             ue_grant_ceiling: HashMap::new(),
             ue_alias: HashMap::new(),
             retired_trackers: std::collections::HashSet::new(),
+            #[cfg(feature = "demo-d441a-congestion-loop")]
+            congestion: None,
         }
     }
 
@@ -1173,6 +1208,21 @@ impl RlsTask {
                 c_rnti: None,
             };
             let msg = RlsProtocolMessage::PduTransmission(transmission);
+            // D441A (#465): through the cell's capacity-C FIFO instead of
+            // straight to the socket, charged the RLC PDU's octets.
+            #[cfg(feature = "demo-d441a-congestion-loop")]
+            if let Some(cell) = &mut self.congestion {
+                let octets = match &msg {
+                    RlsProtocolMessage::PduTransmission(t) => t.pdu.len(),
+                    _ => 0,
+                };
+                if !cell.queue.enqueue(dest, codec::encode(&msg), octets) {
+                    debug!(
+                        "[demo:d441a-congestion-loop] downlink queue full: dropped a {octets}-octet PDU for UE[{ue_id}]"
+                    );
+                }
+                continue;
+            }
             self.send_rls_message(dest, &msg).await;
         }
     }
@@ -1190,6 +1240,88 @@ impl RlsTask {
         let encoded = codec::encode(msg);
         if let Err(e) = socket.send_to(&encoded, dest).await {
             error!("Failed to send RLS message to {}: {}", dest, e);
+        }
+    }
+
+    /// Demo D441A (#465): install the capacity-C queue and its window, feeding
+    /// `exporter`. Called at start-up when the demo is active, and by tests.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    pub(crate) fn enable_congestion(
+        &mut self,
+        exporter: Option<mpsc::Sender<crate::congestion::WindowSample>>,
+    ) {
+        // Never a rate-0 queue: a caller that skipped startup's checks gets no
+        // queue rather than one that blackholes the downlink.
+        if let Err(e) = crate::congestion::validate_config(&self.task_base.config) {
+            error!("[demo:d441a-congestion-loop] RLS: no downlink queue: {e}");
+            return;
+        }
+        let cell = crate::congestion::CellState::new(&self.task_base.config, exporter);
+        info!(
+            "[demo:d441a-congestion-loop] RLS: downlink served through one FIFO at C={} Mbps \
+             (limit {} octets, window {} ms)",
+            self.task_base
+                .config
+                .congestion_export
+                .cell_capacity_mbps
+                .unwrap_or(0.0),
+            self.task_base.config.congestion_export.queue_limit_bytes,
+            cell.window.as_millis()
+        );
+        self.congestion = Some(cell);
+    }
+
+    /// Demo D441A (#465): the gate. With D441A active in `demo`, install the
+    /// queue, feed it to the exporter startup built ([`crate::congestion::take_prepared`])
+    /// and return the 1 ms drain tick; otherwise change nothing and return
+    /// `None`, so the downlink goes straight to the socket.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    pub(crate) fn congestion_setup(
+        &mut self,
+        demo: Option<&nextgsim_demo::DemoRuntime>,
+    ) -> Option<tokio::time::Interval> {
+        if !crate::congestion::active_in(demo) {
+            return None;
+        }
+        let exporter = match crate::congestion::take_prepared() {
+            Some(ex) => Some(crate::congestion::exporter::spawn(ex)),
+            None => {
+                error!(
+                    "[demo:d441a-congestion-loop] RLS: no exporter was prepared at startup; the \
+                     queue runs but nothing is exported"
+                );
+                None
+            }
+        };
+        self.enable_congestion(exporter);
+        self.congestion.as_ref()?;
+        let mut t = interval(Duration::from_millis(1));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Some(t)
+    }
+
+    /// Demo D441A (#465): send what the token bucket allows now, and close the
+    /// measurement window when it is due.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    async fn on_congestion_tick(&mut self) {
+        let now = Instant::now();
+        let connected_ues = self.ue_addresses.len() as u32;
+        let Some(cell) = &mut self.congestion else {
+            return;
+        };
+        let out = cell.queue.drain(now);
+        let sample = cell.close_window(now, connected_ues);
+        if let (Some(sample), Some(tx)) = (sample, &cell.exporter) {
+            if tx.try_send(sample).is_err() {
+                debug!("[demo:d441a-congestion-loop] exporter busy: a window was not exported");
+            }
+        }
+        if let Some(socket) = &self.socket {
+            for (dest, encoded) in out {
+                if let Err(e) = socket.send_to(&encoded, dest).await {
+                    error!("Failed to send RLS message to {}: {}", dest, e);
+                }
+            }
         }
     }
 
@@ -1358,6 +1490,16 @@ impl RlsTask {
     }
 }
 
+/// Wait for `timer`'s next tick, or forever when there is none.
+async fn maybe_tick(timer: Option<&mut tokio::time::Interval>) {
+    match timer {
+        Some(t) => {
+            t.tick().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 #[async_trait::async_trait]
 impl Task for RlsTask {
     type Message = RlsMessage;
@@ -1382,8 +1524,21 @@ impl Task for RlsTask {
         // or after it is chance.
         heartbeat_timer.tick().await;
 
+        // Demo D441A (#465): the capacity-C queue is drained on a 1 ms tick, and
+        // only exists while the demo is active. Otherwise this branch never fires.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        let mut congestion_tick = self.congestion_setup(nextgsim_demo::installed());
+        #[cfg(not(feature = "demo-d441a-congestion-loop"))]
+        let mut congestion_tick: Option<tokio::time::Interval> = None;
+
         loop {
             tokio::select! {
+                // Demo D441A's queue drain and window (#465).
+                _ = maybe_tick(congestion_tick.as_mut()) => {
+                    #[cfg(feature = "demo-d441a-congestion-loop")]
+                    self.on_congestion_tick().await;
+                }
+
                 // Handle messages from other tasks
                 Some(msg) = rx.recv() => {
                     match msg {
@@ -1499,7 +1654,6 @@ impl Task for RlsTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
 
     fn test_config() -> GnbConfig {
@@ -2320,6 +2474,42 @@ mod tests {
         );
     }
 
+    /// nextgsim#467: no `shadowing:` block keeps the plain distance model; a
+    /// block with σ > 0 shadows the tracker's level, keyed by this gNB's NCI.
+    #[test]
+    fn the_shadowing_block_decides_the_trackers_channel_model() {
+        let origin = SimCoord::new(0, 0, 0);
+        let off = build_cell_tracker(&test_config(), 0x10, origin);
+        for x in [31, 62, 85, 119] {
+            assert_eq!(off.estimate_dbm(&SimCoord::new(x, 0, 0)), -x, "σ 0: x={x}");
+        }
+
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let on = build_cell_tracker(&cfg, 0x10, origin);
+        let again = build_cell_tracker(&cfg, 0x10, origin);
+        let other_gnb = build_cell_tracker(&cfg, 0x20, origin);
+        let field = Shadowing::new(8.0, 42, 20.0, 0x10);
+        let (mut moved, mut differs) = (0, 0);
+        for x in 31..120 {
+            let p = SimCoord::new(x, 0, 0);
+            let level = on.estimate_dbm(&p);
+            assert_eq!(level, (f64::from(-x) + field.offset_db(&p)).round() as i32);
+            assert_eq!(level, again.estimate_dbm(&p), "a restart reproduces x={x}");
+            moved += i32::from(level != -x);
+            differs += i32::from(level != other_gnb.estimate_dbm(&p));
+        }
+        assert!(moved > 40, "σ 8 dB moved only {moved} levels");
+        assert!(
+            differs > 40,
+            "another NCI is another field; {differs} differ"
+        );
+    }
+
     // ========================================================================
     // AM ARQ through the real task (#15)
     // ========================================================================
@@ -2723,6 +2913,60 @@ mod tests {
         assert_eq!(position, (10.0, 20.0, 30.0));
     }
 
+    /// #524 review: with shadowing on, the NWDAF is fed exactly the shadowed
+    /// level the ack carries, not a level recomputed from the distance. The real
+    /// heartbeat path, from the tracker to the NWDAF channel.
+    #[tokio::test]
+    async fn with_shadowing_the_nwdaf_feed_is_the_shadowed_ack_level() {
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(cfg.clone(), 16);
+        let sixg = task_base.init_6g_tasks(16);
+        let mut nwdaf_rx = sixg.nwdaf_rx;
+        let mut task = RlsTask::new(task_base);
+        let expected_tracker = build_cell_tracker(&cfg, task.sti, SimCoord::new(0, 0, 0));
+
+        let mut shadowed = 0;
+        for x in (35..100).step_by(5) {
+            let pos = SimCoord::new(x, 0, 0);
+            let (ack, _) = task.cell_tracker.process_heartbeat(
+                0xABCD,
+                "127.0.0.1:5000".parse().unwrap(),
+                &nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos),
+            );
+            let ack = ack.expect("in range");
+            task.sti_to_ue_id.insert(0xABCD, 7);
+            let heartbeat = nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos);
+            task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+                .await;
+            let Some(TaskMessage::Message(NwdafMessage::UeMeasurement { rsrp, .. })) =
+                nwdaf_rx.recv().await
+            else {
+                panic!("a heartbeat must produce a UE measurement");
+            };
+            let level = expected_tracker.estimate_dbm(&pos);
+            assert_eq!(
+                ack.dbm, level,
+                "the ack carries the shadowed level at x={x}"
+            );
+            assert_eq!(
+                rsrp,
+                Some(level as f32),
+                "the NWDAF gets the ack's level at x={x}"
+            );
+            shadowed += i32::from(level != -x);
+        }
+        assert!(
+            shadowed > 5,
+            "σ 8 dB must shadow the feed; {shadowed} of 13 differ"
+        );
+    }
+
     #[tokio::test]
     async fn a_heartbeat_from_an_unadmitted_ue_reports_nothing() {
         // Reporting under a placeholder id would merge two UEs' histories.
@@ -2988,5 +3232,146 @@ mod tests {
         task.report_cell_load_to_nwdaf().await;
 
         assert_eq!(task.load_window_octets, 0);
+    }
+
+    /// The demo runtime a D441A gate test runs under: the gNB's real registry.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    fn d441a_runtime(yaml: &str) -> nextgsim_demo::DemoRuntime {
+        nextgsim_demo::DemoRuntime::from_root(
+            &serde_yaml::from_str(yaml).expect("yaml"),
+            crate::demo::registry(),
+        )
+        .expect("valid demo block")
+    }
+
+    /// Demo D441A off (#465), review MAJOR 2: the gate itself. Under each of the
+    /// three demo-off shapes `congestion_setup` installs nothing and returns no
+    /// tick, and the downlink goes straight to the socket.
+    ///
+    /// REVERT-VERIFIED: making `congestion_setup` ignore `active_in` (always
+    /// enable) fails the first assertion.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test]
+    async fn with_the_demo_off_the_gate_installs_no_downlink_queue() {
+        for yaml in [
+            "nci: 16\n",
+            "demo:\n  enabled: false\n",
+            "demo:\n  enabled: false\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+        ] {
+            let rt = d441a_runtime(yaml);
+            let ue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config();
+            config.congestion_export.cell_capacity_mbps = Some(5.0);
+            config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
+            let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task =
+                RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+            task.init_socket().await.expect("RLS socket");
+            assert!(task.congestion_setup(Some(&rt)).is_none(), "{yaml}");
+            assert!(task.congestion.is_none(), "{yaml}");
+            assert!(task.congestion_setup(None).is_none());
+            task.ue_addresses.insert(1, ue.local_addr().unwrap());
+            task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&[0x45u8; 100]))
+                .await;
+            assert_eq!(drain_pdu_payload_lengths(&ue).await.len(), 1, "{yaml}");
+        }
+    }
+
+    /// Demo D441A on (#465): under a `statistics` runtime the gate installs the
+    /// capacity-C queue and returns the drain tick. With an invalid block (no
+    /// capacity) it installs no rate-0 queue (review MINOR 9).
+    ///
+    /// REVERT-VERIFIED: making `congestion_setup` return `None` unconditionally
+    /// fails the first assertion.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test]
+    async fn with_the_demo_on_the_gate_installs_the_queue() {
+        let rt = d441a_runtime(
+            "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+        );
+        let mut config = test_config();
+        config.congestion_export.cell_capacity_mbps = Some(5.0);
+        config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+        assert!(task.congestion_setup(Some(&rt)).is_some());
+        assert!(task.congestion.is_some(), "the queue is installed");
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+        assert!(
+            task.congestion_setup(Some(&rt)).is_none(),
+            "no capacity: no rate-0 queue"
+        );
+        assert!(task.congestion.is_none());
+    }
+
+    /// Demo D441A (#465): with the capacity-C queue in place, a protected UE's
+    /// packet sent behind a best-effort UE's burst leaves the cell only after
+    /// the burst has been served at C, and the window reports what was served.
+    ///
+    /// Revert-verified: sending straight to the socket instead of enqueueing
+    /// (the pre-demo path) makes the ping arrive at once and fails the delay
+    /// assertion.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test]
+    async fn the_capacity_queue_delays_a_packet_behind_a_burst() {
+        let ue_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ue_v = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.congestion_export.cell_capacity_mbps = Some(5.0);
+        config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
+        config.congestion_export.window_ms = 100;
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task =
+            RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind address"));
+        task.init_socket().await.expect("RLS socket");
+        let (tx, mut rx) = mpsc::channel(16);
+        task.enable_congestion(Some(tx));
+        task.ue_addresses.insert(1, ue_b.local_addr().unwrap());
+        task.ue_addresses.insert(2, ue_v.local_addr().unwrap());
+
+        // 100 x 1200-octet SDUs for UE-B (one PDU each), then one ping for UE-V.
+        for _ in 0..100 {
+            task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&[0x45u8; 1200]))
+                .await;
+        }
+        task.handle_downlink_data(2, 1, 1, OctetString::from_slice(&[0x45u8; 84]))
+            .await;
+        let start = Instant::now();
+        let mut buf = vec![0u8; UDP_BUFFER_SIZE];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), ue_v.recv(&mut buf))
+                .await
+                .is_err(),
+            "the ping is queued, not sent at once"
+        );
+        let mut arrived = None;
+        while start.elapsed() < Duration::from_secs(2) {
+            task.on_congestion_tick().await;
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(1), ue_v.recv(&mut buf)).await
+            {
+                arrived = Some(start.elapsed());
+                break;
+            }
+        }
+        let at = arrived.expect("the ping is eventually served");
+        // About 120 000 octets ahead of it at 625 000 octets/s: ~190 ms.
+        assert!(
+            at >= Duration::from_millis(150),
+            "the ping waited only {at:?} behind the burst"
+        );
+        // The windows closed meanwhile carry what was served.
+        let mut served = 0u64;
+        while let Ok(sample) = rx.try_recv() {
+            assert_eq!(sample.connected_ues, 2);
+            served += sample.served_octets;
+        }
+        assert!(served > 80_000, "windows reported {served} served octets");
     }
 }

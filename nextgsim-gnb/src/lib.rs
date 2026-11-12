@@ -73,6 +73,8 @@
 //! ```
 
 pub mod app;
+#[cfg(feature = "demo-d441a-congestion-loop")]
+pub mod congestion;
 pub mod demo;
 pub mod gtp;
 pub mod ngap;

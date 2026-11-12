@@ -7,7 +7,7 @@
 //!
 //! ```rust,ignore
 //! #[cfg(feature = "demo-d441a-congestion-loop")]
-//! specs.push(DemoSpec { key: "d441a-congestion-loop", modes: &["baseline", "closed-loop"], requires: &[] });
+//! specs.push(DemoSpec { key: D441A_KEY, modes: D441A_MODES, requires: &[] });
 //! ```
 
 use nextgsim_demo::{ActiveDemos, DemoConfigError, DemoRegistry, DemoRuntime, DemoSpec};
@@ -61,6 +61,15 @@ pub const D440A_KEY: &str = "d440a-ai-paging";
 /// it does what it names.
 pub const D440A_MODES: &[&str] = &["page-all"];
 
+/// D441A, the RAN-fed User Data Congestion loop (nextgsim#465). Registered under
+/// the `demo-d441a-congestion-loop` cargo feature.
+pub const D441A_KEY: &str = "d441a-congestion-loop";
+
+/// D441A's modes. `statistics`: export the measured cell occupancy every
+/// window. `prediction`: the same, plus the 8-sample OLS prediction.
+/// `no-loop`: no export (the baseline), the capacity-C queue still in place.
+pub const D441A_MODES: &[&str] = &["statistics", "prediction", "no-loop"];
+
 /// The demos compiled into this binary.
 #[allow(clippy::vec_init_then_push)] // one push per demo feature
 pub fn registry() -> DemoRegistry {
@@ -88,6 +97,12 @@ pub fn registry() -> DemoRegistry {
     specs.push(DemoSpec {
         key: D440B_KEY,
         modes: D440B_MODES,
+        requires: &[],
+    });
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    specs.push(DemoSpec {
+        key: D441A_KEY,
+        modes: D441A_MODES,
         requires: &[],
     });
     DemoRegistry::new(&specs)
@@ -216,7 +231,8 @@ mod tests {
         feature = "demo-d440a-ai-paging",
         feature = "demo-d446a-agent-conflict",
         feature = "model-registry",
-        feature = "nkef-sba"
+        feature = "nkef-sba",
+        feature = "demo-d441a-congestion-loop"
     )))]
     #[test]
     fn a_default_build_rejects_every_demo_key() {
@@ -428,6 +444,94 @@ mod tests {
             rt.render_metrics(&mut metrics);
             assert!(metrics
                 .contains("nextg_demo_enabled{demo=\"d440b-model-verify\",mode=\"fallback\"} 1"));
+        }
+    }
+
+    fn d441a(yaml: &str) -> Result<DemoRuntime, DemoConfigError> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        DemoRuntime::from_root(&root, registry())
+    }
+
+    fn d441a_block(on: bool, mode: &str) -> String {
+        format!("demo:\n  enabled: {on}\n  d441a-congestion-loop:\n    enabled: true\n    mode: {mode}\n")
+    }
+
+    /// Without the feature the d441a block is an unknown key.
+    #[cfg(not(feature = "demo-d441a-congestion-loop"))]
+    #[test]
+    fn without_its_feature_the_d441a_block_fails_startup() {
+        let err = d441a(&d441a_block(true, "statistics")).unwrap_err();
+        assert!(
+            matches!(&err, DemoConfigError::UnknownKey { key, .. } if key == D441A_KEY),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    mod d441a {
+        use super::*;
+
+        /// nextgsim#465: each of the three modes is accepted and active.
+        #[test]
+        fn each_mode_is_accepted_and_active() {
+            for mode in D441A_MODES {
+                let rt = d441a(&d441a_block(true, mode)).unwrap();
+                assert_eq!(rt.mode(D441A_KEY).as_deref(), Some(*mode));
+                assert_eq!(
+                    rt.snapshot().banner().unwrap(),
+                    format!("DEMO MODE ACTIVE: d441a-congestion-loop={mode}")
+                );
+            }
+        }
+
+        /// `mode: bogus` fails startup with the named error.
+        #[test]
+        fn an_unknown_mode_fails_startup() {
+            assert_eq!(
+                d441a(&d441a_block(true, "bogus")).unwrap_err(),
+                DemoConfigError::UnknownMode {
+                    demo: D441A_KEY.into(),
+                    mode: "bogus".into(),
+                    known: D441A_MODES.to_vec(),
+                }
+            );
+        }
+
+        /// No block, the kill switch off, and the kill switch off with the key
+        /// enabled: nothing active, no metric series.
+        #[test]
+        fn every_demo_off_shape_is_inactive() {
+            for yaml in [
+                "nci: 16\n".to_string(),
+                "demo:\n  enabled: false\n".to_string(),
+                d441a_block(false, "statistics"),
+            ] {
+                let rt = d441a(&yaml).unwrap();
+                assert!(rt.snapshot().is_empty(), "{yaml}");
+                assert_eq!(rt.mode(D441A_KEY), None);
+                let mut metrics = String::new();
+                rt.render_metrics(&mut metrics);
+                assert!(metrics.is_empty(), "{metrics}");
+            }
+        }
+
+        /// `set mode=bogus` is refused and the mode stays; a valid switch applies.
+        #[test]
+        fn a_runtime_switch_is_checked() {
+            let rt = d441a(&d441a_block(true, "statistics")).unwrap();
+            let err = rt
+                .handle_cli("d441a-congestion-loop set mode=bogus", "test")
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown mode \"bogus\""), "{err}");
+            assert_eq!(rt.mode(D441A_KEY).as_deref(), Some("statistics"));
+            rt.handle_cli("d441a-congestion-loop set mode=prediction", "test")
+                .unwrap();
+            assert_eq!(rt.mode(D441A_KEY).as_deref(), Some("prediction"));
+            let mut metrics = String::new();
+            rt.render_metrics(&mut metrics);
+            assert!(metrics.contains(
+                "nextg_demo_enabled{demo=\"d441a-congestion-loop\",mode=\"prediction\"} 1"
+            ));
         }
     }
 }

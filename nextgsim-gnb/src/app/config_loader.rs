@@ -69,6 +69,10 @@ pub enum ConfigValidationError {
     /// Invalid D440A paging grid (nextgsim#462)
     #[error("Invalid paging_grid: {0}")]
     InvalidPagingGrid(String),
+
+    /// Invalid `shadowing:` block (nextgsim#467)
+    #[error("Invalid shadowing configuration: {0}")]
+    InvalidShadowing(String),
 }
 
 /// Loads a gNB configuration from a YAML file.
@@ -190,6 +194,12 @@ pub fn validate_gnb_config(config: &GnbConfig) -> Result<(), ConfigValidationErr
 
     // Validate PLMN
     validate_plmn(&config.plmn)?;
+
+    // A shadowing field that cannot exist fails startup (nextgsim#467)
+    config
+        .shadowing
+        .validate()
+        .map_err(ConfigValidationError::InvalidShadowing)?;
 
     // Validate AMF configurations
     if config.amf_configs.is_empty() {
@@ -317,6 +327,40 @@ mod tests {
     fn test_validate_valid_config() {
         let config = valid_config();
         assert!(validate_gnb_config(&config).is_ok());
+    }
+
+    /// nextgsim#467: a gNB YAML `shadowing:` block loads, and a block that
+    /// cannot describe a field fails validation, so it fails startup.
+    #[test]
+    fn test_shadowing_block_loads_and_an_invalid_one_fails_validation() {
+        let base = "nci: 16\ngnb_id_length: 24\nplmn: {mcc: 310, mnc: 410, long_mnc: false}\n\
+                    tac: 1\nnssai: []\namf_configs: [{address: 127.0.0.1, port: 38412}]\n\
+                    link_ip: 127.0.0.1\nngap_ip: 127.0.0.1\ngtp_ip: 127.0.0.1\n\
+                    ignore_stream_ids: false\nupf_addr: null\nupf_port: 2152\n";
+        let plain = load_gnb_config_from_str(base).unwrap();
+        assert!(!plain.shadowing.is_enabled(), "no block is off");
+        assert!(validate_gnb_config(&plain).is_ok());
+
+        let on = load_gnb_config_from_str(&format!(
+            "{base}shadowing: {{sigma_db: 6, seed: 7, decorrelation_m: 15}}\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            (
+                on.shadowing.sigma_db,
+                on.shadowing.seed,
+                on.shadowing.decorrelation_m
+            ),
+            (6.0, 7, 15.0)
+        );
+        assert!(validate_gnb_config(&on).is_ok());
+
+        let bad =
+            load_gnb_config_from_str(&format!("{base}shadowing: {{sigma_db: -2}}\n")).unwrap();
+        assert!(matches!(
+            validate_gnb_config(&bad),
+            Err(ConfigValidationError::InvalidShadowing(_))
+        ));
     }
 
     #[test]
