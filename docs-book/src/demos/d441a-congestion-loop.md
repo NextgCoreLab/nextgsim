@@ -142,7 +142,10 @@ What the overlay provides:
 - nwdafd;
 - pcf.yaml's loop block: UE-V `imsi-999700000000001` protected, UE-B
   `imsi-999700000000002` best effort, a 1000 kbps cap, throttle at 80, restore
-  below 10 after 3 polls and a 10 s hold;
+  after 15 consecutive polls below 3 and a 10 s hold. Before nextgcore #1481
+  the restore was below 10 after 3 polls (see Results). The scenario refuses
+  knobs that fall inside the occupancy the throttle itself leaves
+  (`d441a_restore_hysteresis`);
 - the gNB block with C = 5 Mbps, the gNB at `RUST_LOG=info` with a 1000m CPU
   limit, and `nr-cli` at `/opt/d441a/nr-cli`;
 - UE-V and UE-B without their per-packet log lines, so kubelet does not rotate
@@ -159,7 +162,8 @@ The overlay's `scenario.sh` then:
    paced by the round trip, so the rate is set by the packet size. The ramp is ten
    4 s steps at IP packet sizes of 125·m bytes (m = 1..10), about 0.2C to 1.6C. Then
    comes a 12 s hold of two such pings at 1250-byte packets (about 3C). Then UE-B
-   stops, which leaves time for the restore;
+   stops. In the loop modes the run then waits up to 60 s for UE-B's restore
+   (#1481), since 15 quiet polls can outlast UE-V's ping;
 5. samples the gNB's measured occupancy once a second throughout
    (`nr-cli <gnb> congestion-status`, into `scenario/gnb-status.txt`);
 6. sends an unauthenticated POST to the ingest route;
@@ -191,15 +195,110 @@ The artefacts go to `/tmp/eks-val/demos/d441a-congestion-loop/<mode>/<UTC>/`.
 
 ## Results
 
-**Three of the four arms pass on EKS. The prediction arm fails.** The demo-off
-control, the no-loop baseline and the statistics loop pass. On a saturated cell,
-the loop keeps UE-V's ping p95 at 3.7 ms against 320 ms with no loop, and the
-UPF polices UE-B at the 1 Mbps cap. The prediction arm throttles at the right
-moment and protects UE-V just as well (p95 3.9 ms), but it fails its
-"exactly one throttle" assertion in 2 of 2 runs. It restores UE-B while UE-B's
-load is still offered, then re-throttles about 2 s later. This is a defect of the
-overlay's restore threshold, filed as nextgcore#1480 and not patched here (see
-below).
+**All four arms pass on EKS with the restore-hysteresis fix (nextgcore #1481,
+open, not merged).** On main (nextgcore `55c6afcb0eda`), three of the four
+passed. The demo-off control, the no-loop baseline and the statistics loop
+passed there. On a saturated cell, the loop keeps UE-V's ping p95 at 3.6 to
+4.2 ms against 320 ms with no loop, and the UPF polices UE-B at the 1 Mbps cap.
+
+The prediction arm failed on main in 2 of 2 runs. It restored UE-B while UE-B's
+load was still offered and re-throttled it about 2 s later, because the
+overlay's `restore_below: 10` sits inside the occupancy the throttle itself
+leaves (nextgcore#1480). With #1481's knobs (`restore_below: 3`,
+`restore_after_polls: 15`), prediction passed 2 of 2 and statistics passed. Each
+arm throttled once and restored once, after UE-B stopped. Two other attempts on
+#1481 failed for reasons outside the demo, both while the cluster API was
+unreachable from the operator host (below).
+
+### With the restore-hysteresis fix (nextgcore #1481)
+
+Core images `nextg/{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf,nwdaf}:demo-d441a-congestion-loop-d75814c46811`.
+#1481 changes only the overlay and the scenario, so these are the same release
+binaries as the `55c6afcb0eda` images, repackaged under the fix commit's tag.
+The gnb/ue images are the same `demo-d441a-congestion-loop-65fa4c899312`. The
+p95 baseline is the no-loop arm below (`no-loop/20261112T162447Z`,
+`saturated=yes`). The no-loop arm never restores, so it does not depend on the
+restore knobs.
+
+| arm | artefacts (`/tmp/eks-val/demos/d441a-congestion-loop/…`) | VERDICT | UE-V p95 |
+|---|---|---|---|
+| `statistics` | `statistics/20261112T180956Z` | PASS | 3.6 ms |
+| `prediction` | `prediction/20261112T180021Z` | PASS | 4.2 ms |
+| `prediction` | `prediction/20261112T181742Z` | PASS | 3.7 ms |
+| `statistics` | `statistics/20261112T174900Z` | FAIL: the load stalled, not the loop (below) | 3.8 ms |
+| `prediction` | `prediction/20261112T180011Z` | FAIL: `deploy` (cluster API unreachable) | n/a |
+
+Every run checked the knobs first (`scenario.log`):
+
+```
+[scenario] restore hysteresis ok: restore_below 3 <= 3, 15 polls x 1000 ms >= 12000 ms, ceiling 20 %
+```
+
+The prediction chain, one throttle during the load and one restore after UE-B
+stopped (`prediction/20261112T181742Z`, `scenario.log`):
+
+```
+[scenario] UE-B stopped at 2026-11-12T18:22:29Z
+[scenario] chain: ingest 2026-11-12 18:21:03.617850 → udc 2026-11-12 18:21:03.637976 → throttle 2026-11-12 18:21:50.638980 → smf 2026-11-12 18:21:50.647012 → upf 2026-11-12 18:21:50.647355 → ue-b 2026-11-12 18:21:50.732418 → restore 2026-11-12 18:22:46.639306
+[scenario] UE-V p95 3.7 ms vs no-loop 320.0 ms
+```
+
+The statistics chain (`statistics/20261112T180956Z`, `scenario/pcf-chain.txt`, `scenario.log`):
+
+```
+[2026-11-12T18:13:53.789Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=89(ran-user-data-congestion) action=throttle(supi=imsi-999700000000002) sm_policy_id=8b780551-dba2-4ff6-adc0-f06eac3606e5 ambr=1000000/1000000 bps (subscribed 1000000000/1000000000 bps, floor 500 kbps)
+[2026-11-12T18:14:48.787Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=0(ran-user-data-congestion) action=restore(supi=imsi-999700000000002) sm_policy_id=8b780551-dba2-4ff6-adc0-f06eac3606e5 reason=below-threshold
+[scenario] UE-V p95 3.6 ms vs no-loop 320.0 ms
+```
+
+Hysteresis margin. Here are the UDC `congLevel` answers pcfd received between
+the throttle and UE-B stopping, as the longest runs of consecutive polls below
+3 and below 10. These are counted by a script over each run's
+`scenario/nwdaf-chain.txt`, so they are not quoted lines:
+
+| run | knobs | in-load polls | min | longest < 3 | longest < 10 |
+|---|---|---|---|---|---|
+| statistics `164134Z` | 10 / 3 | 40 | 6 | 0 | 2 (passed by one poll) |
+| prediction `165042Z` | 10 / 3 | 40 | 0 | 6 | 7 (restored mid-load) |
+| prediction `170200Z` | 10 / 3 | 44 | 0 | 6 | 6 (restored mid-load) |
+| statistics `180956Z` | 3 / 15 | 40 | 1 | 1 | 1 |
+| prediction `180021Z` | 3 / 15 | 43 | 0 | 4 | 6 |
+| prediction `181742Z` | 3 / 15 | 39 | 0 | 5 | 6 |
+
+Under the old knobs, all three prediction runs on the fix would have restored
+UE-B mid-load (a run of 6 below 10 against 3 polls). Under the new ones, the
+longest in-load run below 3 was 6 polls, against 15 required. The restore
+came 15 to 17 s after UE-B stopped, and the scenario's restore wait held it.
+
+**The two failed attempts.** Neither is the loop.
+- `statistics/20261112T174900Z`: ramp step 6's `kubectl exec ping` returned no
+  output, and the once-a-second occupancy sampler (also a `kubectl exec`)
+  logged nothing between 17:55:55 and 17:56:12. UE-B offered no load for those
+  ~17 s, so the gNB served only UE-V's pings, and pcfd restored after 15 quiet
+  polls, which is correct. Step 7 then re-loaded the cell and pcfd throttled
+  again, hence two throttles. The scenario's own nwdafd capture came back empty
+  in the same run (`the nwdaf log does not reach back to the load start`), while
+  demo-check's later capture of the same container holds it. The gNB's reports
+  in that window (`logs/<nwdaf-pod>_nwdaf.log`):
+
+  ```
+  [2026-11-12T17:55:55.400Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] ran-ingest cell=99970-000000010 tai=99970-000001 occupancy=4.4% served_kbps=222/5000 connected_ues=2 amf_ues_in_area=2 from=6b1d7e3c-0000-4000-8000-00000000465a
+  [2026-11-12T17:55:56.400Z INFO  nextgcore_nwdafd::ran_congestion] [demo:d441a-congestion-loop] ran-ingest cell=99970-000000010 tai=99970-000001 occupancy=0.1% served_kbps=7/5000 connected_ues=2 amf_ues_in_area=2 from=6b1d7e3c-0000-4000-8000-00000000465a
+  ```
+
+  and pcfd's throttle and restore (`scenario/pcf-chain.txt`):
+
+  ```
+  [2026-11-12T17:55:52.972Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=84(ran-user-data-congestion) action=throttle(supi=imsi-999700000000002) sm_policy_id=49b02fca-d20e-40bc-869c-3bec1e521cb3 ambr=1000000/1000000 bps (subscribed 1000000000/1000000000 bps, floor 500 kbps)
+  [2026-11-12T17:56:10.971Z INFO  nextgcore_pcfd::congestion_loop] [demo:d441a-congestion-loop] congestion-loop: observed=congLevel=0(ran-user-data-congestion) action=restore(supi=imsi-999700000000002) sm_policy_id=49b02fca-d20e-40bc-869c-3bec1e521cb3 reason=below-threshold
+  ```
+
+- `prediction/20261112T180011Z`: deploy-eks.sh stopped with
+  `[fail  ] cannot reach the cluster API. Check credentials and endpoint access.`
+  It created nothing. The next run 10 s later deployed normally.
+
+The scenario does not yet detect a stalled load step; it reads as a restore.
+That is a harness gap, noted on #1481.
 
 Everything below is copied from the run artefacts under `/tmp/eks-val/demos/` on
 the operator host. Nothing is reconstructed. The code blocks are selected lines,
@@ -342,7 +441,7 @@ nwdaf_ran_cell_reports_total{result="unauthorized"} 1
 demo_ambr_cap occurrences (non-null): 0 state_bytes: 5646
 ```
 
-### prediction: it throttles in time, then restores mid-load (nextgcore#1480)
+### prediction on main, before the fix: it throttles in time, then restores mid-load (nextgcore#1480)
 
 The prediction crossed 80 % and pcfd throttled UE-B. Then, with UE-B still
 loading, pcfd restored it and throttled it again 2 s later (`scenario.log`, cut
@@ -385,9 +484,8 @@ The rerun (`prediction/20261112T170200Z`) did the same: a throttle at
 - The controller and the chain behave as configured. The thresholds are this
   demo's choices (see the honesty labels). nextgcore#1480 records the
   threshold and the options for fixing it (a `restore_below` under the throttled
-  floor, or a restore signal the throttle does not suppress). It is not
-  patched here, so this page stays a draft until that lands and both loop
-  arms are rerun.
+  floor, or a restore signal the throttle does not suppress). nextgcore #1481
+  fixes it; the runs on that branch are at the top of Results.
 
 UE-V was still protected, because every throttle took effect at once
 (`metrics/<upf-pod>.prom`, `scenario/ue-v-ping.txt`):
