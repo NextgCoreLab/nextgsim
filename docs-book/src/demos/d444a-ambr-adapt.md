@@ -78,17 +78,75 @@ flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh off off
 ```
 
 - Manual arms, all in `patches/ue-d444a-config.yaml` with the semantic arm. For `follow_session_ambr: false`, set it to `false`. For no `device:`, delete the `device:` line. Run the unknown mode as `k8s/demo-check.sh d444a-ambr-adapt bogus`.
-- Harness: nextgcore #1472 or later. Without it, the UE's log can rotate away before the restore chain is read (see Results).
+- Harness: nextgcore #1472 or later. Without it, the UE's log can rotate away before the restore chain is read (see Results). The raw control needs upfd's MBR fix too (nextgcore #1476): before it, no Session-AMBR was policed at the UPF.
 
 Code revert arms: `scripts/demo/d444a-reverts.sh`.
 
 ## Results
 
-**The semantic arm passes on EKS, and the raw control does not.** With nextgcore #1461 and #1467 in the core images, the throttle reaches the UE. The semantic run shows the whole success signal: smfd's step 3b, the UE's `keep 128->40`, a keep-40 epoch with no loss, and the restore. The raw control fails its one UPF assertion. Raw sends 120 kbit/s against a 64 kbps UL Session-AMBR, and upfd drops nothing, because of an MBR unit defect in upfd (below). The PCA-vs-baseline gap at keep 40 is what the pinned generator predicts (the table above), not a finding about semantic communication.
+**Both demo arms and the demo-off control pass on EKS.** The semantic arm and the off control passed in round 2. The raw control failed then, on an upfd MBR unit defect (nextgcore #1475). It passes in round 3, on nextgcore main with that fix (#1476) and the capture fix (#1472) merged. The UPF now polices raw's 120 kbit/s down to the 64 kbps UL Session-AMBR (`qer_gate 377 -> 674`), and the sink receives 63.8 kbit/s. So the round-2 semantic result (no loss at 49.6 kbit/s) now stands against a UPF that does police at 64 kbps. The semantic arm itself was not rerun on the #1476 images. The PCA-vs-baseline gap at keep 40 is what the pinned generator predicts (the table above), not a finding about semantic communication.
 
-The run used the harness from nextgcore #1472, which was not yet merged at the time. On the merged harness the same semantic run lost its restore chain to UE log rotation (below), and #1472 fixes that. So this result depends on #1472 merging.
+Captured on EKS (devtest1) with `k8s/demo-check.sh`, one arm per lock hold, each in a `nextg-demo` namespace that the run created. Every quoted line is copied from the run artefacts under `/tmp/eks-val/demos/` on the operator host. The code blocks are selected lines. In each line, the kubelet timestamp prefix and the ANSI colour codes are trimmed. Nothing is reconstructed. The arms ran with `KEEP=true`, so that the subscriber's restored state could be read back (`post/`) before a wrapper deleted the namespace in the same lock hold. That is why the verdicts say `teardown=kept`.
 
-Captured on EKS (devtest1) with `k8s/demo-check.sh`, one arm per lock hold, each in a `nextg-demo` namespace that the run created. Every quoted line is copied from the run artefacts under `/tmp/eks-val/demos/` on the operator host. The code blocks are selected lines. In each line, the kubelet timestamp prefix and the ANSI colour codes are trimmed. Nothing is reconstructed. The arms ran with `KEEP=true`, so that the subscriber's restored state could be read back (`post/`) before a wrapper deleted the namespace in the same lock hold. That is why the verdicts say `teardown=kept`. The build and run scripts are kept beside the artefacts: `d444a-ambr-adapt/{build-core.sh,push-core.sh,run-arm.sh}`.
+### Round 3: the raw control on nextgcore main (#1472, #1476)
+
+| arm | artefacts (under `/tmp/eks-val/demos/`) | harness (nextgcore) | VERDICT |
+|---|---|---|---|
+| `d444a-ambr-adapt raw` | `d444a-ambr-adapt/raw/20261112T163446Z` | `55c6afcb0eda` (main) | PASS |
+| `d444a-ambr-adapt raw` (first try) | `d444a-ambr-adapt/raw/20261112T161809Z` | `55c6afcb0eda` | FAIL before the demo: pcfd never registered with the NRF (nextgcore #1479), so the UE could not register |
+
+- **Images** (devtest1 ECR, new tags only): `nextg/{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf}:demo-d444a-ambr-adapt-55c6afcb0eda` (nextgcore main, the demo profile's 6G features), and `nextg/{gnb,ue}:demo-d444a-ambr-adapt-65fa4c899312` (nextgsim main `65fa4c8`; the UE image carries `nr-cli` and `semantic-sink`, checked before the push).
+- **e2e and toggle.** `e2e_rc=0 scenario_rc=0`, `demo_banner_lines=2 demo_prefix_lines=29 nextg_demo_enabled_series=1`, `VERDICT: PASS`.
+- The semantic arm was not rerun. #1476 changes only how upfd reads the MBR, and the semantic stream stays under it (49.6 of 64 kbit/s).
+
+The scenario's checks (`scenario.log`):
+
+```
+ok:   ordered smfd -> gNB -> UE chain (5 steps)
+ok:   raw: no rate target line
+ok:   epoch B: lost=234 qer_gate=297
+ok:   UL session AMBR and sm-data restored to the originals
+ok:   restore chain
+d444a scenario: PASS
+```
+
+The chain (`d444a/chain.txt`, head and tail):
+
+```
+[2026-11-12T16:37:59.382Z INFO  nextgcore_smfd] ref=1: network-requested PDU Session Modification (AMBR UL/DL 1000000000/1000000000 -> 64000/1000000000 bps, 5QI 9 -> 9, ARP PL 8 -> 8)
+[demo:d444a-ambr-adapt] session-AMBR (PSI 1) UL 64000 bps not followed: mode raw, keep 128
+```
+
+upfd installs the new QER and now polices to it. Epoch 7 is before the throttle, epoch 8 straddles it, and epochs 9 and 10 are under it (`logs/<upf-pod>_upf.log`; `d444a/sink-rows.txt`; `d444a/qer-gate.txt`):
+
+```
+[2026-11-12T16:37:59.381Z INFO  nextgcore_upfd] Installed 1 QERs for SEID=0x1
+2026-11-12T16:37:51.285815Z  INFO semantic_sink: [demo:d444a-ambr-adapt] epoch=7 mode=raw encoder=raw keep=128 received=500 lost=0 ip_bytes=150000 ul_kbps=120.0 acc=0.950
+2026-11-12T16:38:01.305810Z  INFO semantic_sink: [demo:d444a-ambr-adapt] epoch=8 mode=raw encoder=raw keep=128 received=460 lost=40 ip_bytes=138000 ul_kbps=110.4 acc=0.959
+2026-11-12T16:38:11.286412Z  INFO semantic_sink: [demo:d444a-ambr-adapt] epoch=9 mode=raw encoder=raw keep=128 received=266 lost=234 ip_bytes=79800 ul_kbps=63.8 acc=0.966
+2026-11-12T16:38:21.305919Z  INFO semantic_sink: [demo:d444a-ambr-adapt] epoch=10 mode=raw encoder=raw keep=128 received=267 lost=233 ip_bytes=80100 ul_kbps=64.1 acc=0.974
+qer_gate 377 -> 674
+```
+
+The restore (`d444a/restore-chain.txt`, first line) and the subscriber afterwards (`post/mongo-ambr-after.json`; `post/udr-sm-data-after.json` is byte-identical to `d444a/orig-sm-data.json`):
+
+```
+[2026-11-12T16:38:31.313Z INFO  nextgcore_smfd] ref=1: network-requested PDU Session Modification (AMBR UL/DL 64000/1000000000 -> 1000000000/1000000000 bps, 5QI 9 -> 9, ARP PL 8 -> 8)
+{"uplink":{"value":1,"unit":3},"downlink":{"value":1,"unit":3}}
+```
+
+**The first round-3 try failed in the base core, not in the demo.** pcfd lost a start-up race and ran without an NRF registration. amfd's AM policy create then failed on every attempt, so the UE never registered and the base e2e found no PDU session (`logs/<pcf-pod>_pcf.log`, `logs/<amf-pod>_amf.log`, `e2e-internet.log`):
+
+```
+[2026-11-12T16:18:58.513Z ERROR nextgcore_pcfd::app] PCF self instance not published by pcf_sbi_open; NRF registration and BSF pcfId would disagree. Continuing without NRF registration.
+[2026-11-12T16:19:50.017Z ERROR nextgcore_amfd::ngap_path] [imsi-999700000000001] Npcf_AMPolicyControl_Create failed: Request failed: AM policy create failed: HTTP/2 connection error: Connection refused (os error 111)
+```
+
+This is filed as nextgcore #1479 and not patched here. The PASS run's pcfd registered (`PCF registered with NRF (id=de13d6cf-a460-48f0-8f4a-94c2fc319657, status=201)`).
+
+### Round 2
+
+The build and run scripts of round 2 are kept beside its artefacts: `d444a-ambr-adapt/{build-core.sh,push-core.sh,run-arm.sh}`.
 
 **What ran (round 2).**
 
@@ -132,7 +190,7 @@ These are the epoch that straddles the throttle, then epoch B (the first wholly 
 2026-11-12T13:03:49.570745Z  INFO semantic_sink: [demo:d444a-ambr-adapt] epoch=11 mode=semantic encoder=pca keep=40 received=500 lost=0 ip_bytes=62000 ul_kbps=49.6 acc=0.960 baseline top-variance-raw acc=0.806 mean-pool acc=0.672 (equal bytes) margin=+0.154/+0.288
 ```
 
-The scenario's verdict on epoch B (`scenario.log`) was `ok:   epoch B: acc=0.968 top-variance-raw=0.810 mean-pool=0.684 lost=0 qer_gate=0`, and the upfd counter read `qer_gate 0 -> 0` (`d444a/qer-gate.txt`). That "no `qer_gate` drops" holds, but it is weaker than it looks. Because of the upfd defect below, the UPF would not have dropped anything at 120 kbit/s either. The stream staying at 49.6 kbit/s is the app's doing, and it is not yet shown to matter at the UPF.
+The scenario's verdict on epoch B (`scenario.log`) was `ok:   epoch B: acc=0.968 top-variance-raw=0.810 mean-pool=0.684 lost=0 qer_gate=0`, and the upfd counter read `qer_gate 0 -> 0` (`d444a/qer-gate.txt`). That "no `qer_gate` drops" holds, but it is weaker than it looks. Because of the upfd defect below, the UPF would not have dropped anything at 120 kbit/s either. The stream staying at 49.6 kbit/s is the app's doing, and it is not yet shown to matter at the UPF. Round 3 shows the UPF policing at 64 kbps since #1476.
 
 ### semantic: the restore (`d444a/restore-chain.txt`)
 
@@ -160,7 +218,7 @@ The first line is from the sink and the second from the UE. Each is shown withou
 
 These retransmissions are not counted as a failure. Neither chain depends on them.
 
-### raw: the control is not policed
+### raw (round 2, superseded by round 3): the control is not policed
 
 The chain and the raw UE line held (`d444a/chain.txt`, tail):
 
@@ -178,7 +236,7 @@ upfd installed the new QER, and then forwarded every datagram of the 120 kbit/s 
 upf_dataplane_dropped_packets_by_reason_total{reason="qer_gate"} 0
 ```
 
-**Diagnosis: upfd's MBR is 1000 times too loose.** smfd encodes the MBR IE correctly, in kbit/s (TS 29.244 §8.2.8, `n4_build.rs` `add_mbr`, `div_ceil(1000)`). upfd's parser then multiplies the kbit/s field by 1000 ("convert to bit/s for the internal rate policer", upfd `n4_build.rs`, since c6877b26). But `ParsedCreateQer.ul_mbr` is documented as kbps, and the policer takes it as kbps: `DataPlaneQer::set_mbr(ul_kbps, …)` → `TokenBucket::from_mbr_kbps`, at kbps × 125 bytes/s. So a 64 kbps Session-AMBR is policed as 64 Mbps. The same conversion is applied to GBR. This is nextgcore code and needs a fix PR, through review; it is not patched here. Until it is fixed, the raw arm cannot pass, and no MBR or GBR below about 1000× the stream rate is enforced at the UPF.
+**Diagnosis: upfd's MBR is 1000 times too loose.** smfd encodes the MBR IE correctly, in kbit/s (TS 29.244 §8.2.8, `n4_build.rs` `add_mbr`, `div_ceil(1000)`). upfd's parser then multiplies the kbit/s field by 1000 ("convert to bit/s for the internal rate policer", upfd `n4_build.rs`, since c6877b26). But `ParsedCreateQer.ul_mbr` is documented as kbps, and the policer takes it as kbps: `DataPlaneQer::set_mbr(ul_kbps, …)` → `TokenBucket::from_mbr_kbps`, at kbps × 125 bytes/s. So a 64 kbps Session-AMBR is policed as 64 Mbps. The same conversion is applied to GBR. This was nextgcore #1475, fixed by #1476; round 3 above is the raw arm on the fix.
 
 ### follow_session_ambr: false (revert arm)
 
@@ -257,4 +315,4 @@ The other round-1 artefacts are `d444a-ambr-adapt/semantic/20261112T072955Z`, `d
 - The UE application staying under its Session-AMBR is an application choice, not the UE's UL Session-AMBR enforcement (TS 23.501 §5.7.2.6), which nextgsim does not implement.
 - The stream starts at keep 128 and learns the Session-AMBR only from a PDU SESSION MODIFICATION COMMAND, not from the establishment accept. After a re-establishment it keeps the last modified keep until the next change. The demo's flow starts at the provisioned 1 Gbps, so this does not affect it.
 - Below about 30 kbit/s the floor of 8 features (60 B per datagram, 24 kbit/s at 50 Hz) is above the 80 % target, although the log still prints the target.
-- The throttle source: until nextgsim#465's pcfd controller merges, the EKS scenario lowers the subscriber's session AMBR in the UDR and re-authorises the SM policy association (TS 29.512 §4.2.3.2). That pcfd startup check (`MissingDependency` on `d441a-congestion-loop`) lands with #465's pcfd demo registry. On devtest1 it reaches the UE since nextgcore #1461 and #1467. The UPF does not yet enforce the lowered Session-AMBR: upfd reads the MBR 1000 times too high (see Results).
+- The throttle source: until nextgsim#465's pcfd controller merges, the EKS scenario lowers the subscriber's session AMBR in the UDR and re-authorises the SM policy association (TS 29.512 §4.2.3.2). That pcfd startup check (`MissingDependency` on `d441a-congestion-loop`) lands with #465's pcfd demo registry. On devtest1 it reaches the UE since nextgcore #1461 and #1467, and the UPF enforces it since #1476 (round 3).
