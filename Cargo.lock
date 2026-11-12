@@ -1690,15 +1690,22 @@ name = "nextgsim-fl"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "h2",
+ "http",
  "nextgsim-ai",
  "nextgsim-common",
+ "nextgsim-demo",
+ "nextgsim-sbi-client",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "serde",
  "serde_json",
+ "serde_yaml",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "x25519-dalek",
 ]
 

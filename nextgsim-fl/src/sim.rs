@@ -153,12 +153,10 @@ pub fn run(cfg: &RunConfig, rule: Rule, members: impl Fn(u32) -> Vec<u32>) -> Ou
             deltas.insert(member(c), (delta, data.clients[c as usize].len() as u64));
         }
         let (krum, refused) = match aggregate(rule, &deltas) {
-            Ok((agg, krum)) => {
-                for (w, d) in global.iter_mut().zip(&agg) {
-                    *w += d;
-                }
-                (krum, None)
-            }
+            Ok((agg, krum)) => match apply(&mut global, &agg) {
+                Ok(()) => (krum, None),
+                Err(why) => (krum, Some(why)),
+            },
             Err(why) => (None, Some(why)),
         };
         rounds.push(Round {
@@ -175,11 +173,27 @@ pub fn run(cfg: &RunConfig, rule: Rule, members: impl Fn(u32) -> Vec<u32>) -> Ou
     }
 }
 
+/// Add `agg` to `global`, unless that would make any weight non-finite: then
+/// `global` is left as it was and the round is refused. The AF applies its
+/// rounds through this too, so a refused round carries the same model over in
+/// both runs.
+pub fn apply(global: &mut [f32], agg: &[f32]) -> Result<(), String> {
+    let next: Vec<f32> = global.iter().zip(agg).map(|(w, d)| w + d).collect();
+    if next.len() != global.len() || !next.iter().all(|w| w.is_finite()) {
+        return Err("non-finite".to_string());
+    }
+    global.copy_from_slice(&next);
+    Ok(())
+}
+
 /// The round's aggregate delta, plus Krum's (selected, worst) members; `Err` when
 /// the rule refuses the round.
-type Aggregate = Result<(Vec<f32>, Option<(String, String)>), String>;
+pub type Aggregate = Result<(Vec<f32>, Option<(String, String)>), String>;
 
-fn aggregate(rule: Rule, deltas: &BTreeMap<String, (Vec<f32>, u64)>) -> Aggregate {
+/// Combine one round's deltas, keyed by member and weighted by sample count, with
+/// `rule`. The AF (`nr-fl-server`) calls this too, so the network run and this
+/// in-process run aggregate identically.
+pub fn aggregate(rule: Rule, deltas: &BTreeMap<String, (Vec<f32>, u64)>) -> Aggregate {
     // BTreeMap order: sorted by member, so every rule sees the same order.
     let names: Vec<&String> = deltas.keys().collect();
     let vecs: Vec<Vec<f32>> = deltas.values().map(|(d, _)| d.clone()).collect();
@@ -244,6 +258,16 @@ mod tests {
 
     fn bits(v: &[f32]) -> Vec<u32> {
         v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// A step that would overflow any weight is refused and the model kept.
+    #[test]
+    fn a_non_finite_step_is_refused_and_the_model_kept() {
+        let mut g = vec![1.0f32, f32::MAX];
+        assert_eq!(apply(&mut g, &[0.5, f32::MAX]), Err("non-finite".into()));
+        assert_eq!(g, [1.0, f32::MAX]);
+        assert_eq!(apply(&mut g, &[0.5, 0.0]), Ok(()));
+        assert_eq!(g, [1.5, f32::MAX]);
     }
 
     /// #480 scorecard, at library level, on the demo shape: round 10 ≤ 0.5× round

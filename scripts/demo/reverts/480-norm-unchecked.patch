@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/server.rs
++++ b/nextgsim-fl/src/d445a/server.rs
+@@ -1227,7 +1227,7 @@
+             .map(|x| f64::from(*x) * f64::from(*x))
+             .sum::<f64>()
+             .sqrt();
+-        if norm.is_nan() || norm > self.cfg.max_update_norm {
++        if false && (norm.is_nan() || norm > self.cfg.max_update_norm) {
+             demo_log!(
+                 warn,
+                 KEY,

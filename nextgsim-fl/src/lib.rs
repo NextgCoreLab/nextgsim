@@ -98,6 +98,11 @@ pub mod seeded;
 pub mod sim;
 pub mod synthetic;
 
+/// Demo D445A (nextgsim#480): the `nr-fl-server` AF, its NEF client and T8
+/// callback listener, and the UE FL client. Demo-only, off by default.
+#[cfg(feature = "demo-d445a-fl-t8")]
+pub mod d445a;
+
 // ---------------------------------------------------------------------------
 // Core data structures
 // ---------------------------------------------------------------------------

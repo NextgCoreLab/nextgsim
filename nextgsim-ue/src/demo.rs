@@ -24,6 +24,13 @@ pub fn registry() -> DemoRegistry {
         modes: nextgsim_semantic::rate_adapt::D444A_MODES,
         requires: &[],
     });
+    // D445A, network-assisted federated learning over PDU sessions (nextgsim#480).
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    specs.push(DemoSpec {
+        key: nextgsim_fl::d445a::KEY,
+        modes: nextgsim_fl::d445a::MODES,
+        requires: &[],
+    });
     DemoRegistry::new(&specs)
 }
 
@@ -40,7 +47,7 @@ mod tests {
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
     #[test]
-    #[cfg(not(feature = "demo-d444a-ambr-adapt"))]
+    #[cfg(not(any(feature = "demo-d444a-ambr-adapt", feature = "demo-d445a-fl-t8")))]
     fn a_default_build_rejects_every_demo_key() {
         assert!(registry().is_empty());
         let root: serde_yaml::Value = serde_yaml::from_str(
@@ -97,5 +104,44 @@ mod tests {
                 .snapshot()
                 .is_empty());
         }
+    }
+
+    /// nextgsim#480: a `demo-d445a-fl-t8` build knows d445a-fl-t8 with modes
+    /// `t8-exclusion` and `poisoned-ue`; `mode: bogus` fails startup with
+    /// `UnknownMode { demo: "d445a-fl-t8", mode: "bogus" }`, and the kill switch
+    /// off activates nothing.
+    #[test]
+    #[cfg(feature = "demo-d445a-fl-t8")]
+    fn a_d445a_build_registers_its_two_modes_and_rejects_an_unknown_one() {
+        let parse = |kill: bool, on: bool, mode: &str| {
+            let root: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "demo:\n  enabled: {kill}\n  d445a-fl-t8:\n    enabled: {on}\n    mode: {mode}\n"
+            ))
+            .unwrap();
+            DemoRuntime::from_root(&root, registry())
+        };
+        for mode in ["t8-exclusion", "poisoned-ue"] {
+            assert_eq!(
+                parse(true, true, mode)
+                    .unwrap()
+                    .mode("d445a-fl-t8")
+                    .as_deref(),
+                Some(mode)
+            );
+        }
+        match parse(true, true, "bogus") {
+            Err(DemoConfigError::UnknownMode { demo, mode, .. }) => {
+                assert_eq!((demo.as_str(), mode.as_str()), ("d445a-fl-t8", "bogus"));
+            }
+            other => panic!("expected UnknownMode, got {other:?}"),
+        }
+        assert!(parse(false, true, "t8-exclusion")
+            .unwrap()
+            .snapshot()
+            .is_empty());
+        assert!(parse(true, false, "t8-exclusion")
+            .unwrap()
+            .snapshot()
+            .is_empty());
     }
 }

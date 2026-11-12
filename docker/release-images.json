@@ -90,6 +90,10 @@
     {
       "bin": "semantic-sink",
       "reason": "demo-only: demo D444A (#477, feature demo-d444a-ambr-adapt); ships inside the demo UE image built by nextgcore's demo-d444a-ambr-adapt overlay, never published"
+    },
+    {
+      "bin": "nr-fl-server",
+      "reason": "demo-only: the FL application server (AF) of demo D445A (#480, feature demo-d445a-fl-t8); built into the demo image by nextgcore's demo-d445a-fl-t8 overlay, never published"
     }
   ]
 }
