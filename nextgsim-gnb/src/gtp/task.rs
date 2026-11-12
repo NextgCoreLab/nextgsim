@@ -469,8 +469,18 @@ impl GtpTask {
         if created {
             self.amend_sdap_session(ue_id, resource.psi as u8, &resource.qos_flows);
         }
-        if created {
+        #[cfg(not(feature = "sdap-dataplane"))]
+        let _ = created;
+        // Checked on the tunnel itself rather than `created`, which is also true when
+        // `create_session` refused the rebuild: a session left with no tunnel has
+        // nothing to monitor (#509).
+        if self
+            .tunnel_manager
+            .has_session(ue_id as u32, resource.psi as u8)
+        {
             self.amend_qos_monitoring(ue_id, resource.psi as u8, &resource.qos_monitoring);
+        } else {
+            self.qos_monitoring.remove(&(ue_id, resource.psi as u8));
         }
     }
 
@@ -1238,6 +1248,8 @@ impl GtpTask {
             return;
         };
         let (ue_id, psi) = (session.ue_id, session.psi);
+        // QoS monitoring (#509) goes with the tunnel it measures.
+        self.qos_monitoring.remove(&(ue_id as i32, psi));
         match self.tunnel_manager.delete_session(ue_id, psi) {
             Ok(_) => {
                 info!(
@@ -1314,6 +1326,8 @@ impl GtpTask {
 
         let mut released = Vec::with_capacity(doomed.len());
         for (ue_id, psi) in doomed {
+            // QoS monitoring (#509) goes with the tunnel it measures.
+            self.qos_monitoring.remove(&(ue_id as i32, psi));
             match self.tunnel_manager.delete_session(ue_id, psi) {
                 Ok(_) => released.push((ue_id, psi)),
                 // Kept going rather than returned: one session that cannot be deleted
@@ -2014,7 +2028,17 @@ mod tests {
             .await;
         match rls_rx.try_recv() {
             Ok(TaskMessage::Message(RlsMessage::DownlinkData { pdu, .. })) => {
-                assert_eq!(pdu.data(), b"payload", "the T-PDU reaches the UE")
+                // With the SDAP sublayer the T-PDU follows the 1-octet DL SDAP
+                // header `nextgsim_pdcp::sdap::encode_dl_header` builds for QFI 9,
+                // RQI 0 (TS 37.324 §6.2.2.2): 0x80 | 9 = 0x89.
+                #[cfg(feature = "sdap-dataplane")]
+                assert_eq!(
+                    pdu.data(),
+                    b"\x89payload",
+                    "SDAP header + the T-PDU reach the UE"
+                );
+                #[cfg(not(feature = "sdap-dataplane"))]
+                assert_eq!(pdu.data(), b"payload", "the T-PDU reaches the UE");
             }
             other => panic!("expected the T-PDU to reach the UE, got {other:?}"),
         }
@@ -2124,6 +2148,68 @@ mod tests {
             2,
             "the second rides on the uplink packet"
         );
+    }
+
+    /// Monitoring goes with its tunnel: an Error Indication release and a peer
+    /// purge both drop it, so a later session on the same ids starts clean.
+    #[tokio::test]
+    async fn monitoring_is_dropped_when_the_tunnel_is_released_from_the_n3_side() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        let upf_addr = upf.local_addr().unwrap();
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        let ei = GtpHeader::error_indication(0x1000, upf_addr.ip());
+        task.handle_error_indication(&ei, upf_addr).await;
+        assert!(
+            task.tunnel_manager.get_session(1, 1).is_none(),
+            "precondition"
+        );
+        assert!(
+            task.qos_monitoring.is_empty(),
+            "Error Indication release drops it"
+        );
+
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        task.purge_peer_tunnels(upf.local_addr().unwrap().ip(), "test restart")
+            .await;
+        assert!(task.qos_monitoring.is_empty(), "a peer purge drops it");
+    }
+
+    /// A modify whose tunnel rebuild is refused leaves the session with no tunnel,
+    /// and its monitoring goes with it rather than lingering.
+    #[tokio::test]
+    async fn a_refused_modify_rebuild_drops_the_sessions_monitoring() {
+        let (mut task, upf, _rls_rx) = qmp_task(monitoring_on(0)).await;
+        task.ue_contexts.insert(1, GtpUeContext::new(1));
+        // A second session holds downlink TEID 0x3000.
+        let gnb_addr = SocketAddr::new(task.task_base.config.gtp_ip, GTP_U_PORT);
+        task.tunnel_manager
+            .create_session(PduSession::new(
+                1,
+                2,
+                GtpTunnel::new(0x1001, upf.local_addr().unwrap()),
+                GtpTunnel::new(0x3000, gnb_addr),
+            ))
+            .unwrap();
+        task.amend_qos_monitoring(1, 1, &[(9, QosMonitoringRequest::Both)]);
+        // Rebuilding PSI 1 on TEID 0x3000 collides, so `create_session` refuses it.
+        task.handle_session_modify(
+            1,
+            PduSessionResource {
+                psi: 1,
+                qfi: Some(9),
+                qos_flows: Vec::new(),
+                qos_monitoring: Vec::new(),
+                uplink_teid: 0x1000,
+                downlink_teid: 0x3000,
+                upf_address: upf.local_addr().unwrap().ip(),
+            },
+        );
+        assert!(
+            task.tunnel_manager.get_session(1, 1).is_none(),
+            "precondition"
+        );
+        assert!(!task.qos_monitoring.contains_key(&(1, 1)));
     }
 
     /// TS 38.415 §5.5.3.8: a QMP for a flow nobody asked this gNB to monitor is

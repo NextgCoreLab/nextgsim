@@ -2507,8 +2507,21 @@ impl NgapTask {
                     .map(|&qfi| (qfi, None))
                     .collect(),
                 // TS 38.413 §8.2.3.2: store each added or modified flow's QoS
-                // Monitoring Request; flows it does not name keep theirs.
-                qos_monitoring: request.qos_monitoring_requests.clone(),
+                // Monitoring Request; flows it does not name keep theirs. A flow in
+                // `qosFlowToReleaseList` is gone, so its monitoring ends with it:
+                // carried as `stop`, which is what the GTP task acts on. (The SDAP
+                // mapping does not yet drop released flows either; that is separate.)
+                qos_monitoring: request
+                    .qos_monitoring_requests
+                    .iter()
+                    .copied()
+                    .chain(request.qos_flows_to_release.iter().map(|f| {
+                        (
+                            f.qfi,
+                            nextgsim_ngap::procedures::transfer::QosMonitoringRequest::Stop,
+                        )
+                    }))
+                    .collect(),
                 // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
                 // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
                 uplink_teid: upf_teid,
@@ -9011,6 +9024,41 @@ mod tests {
         );
     }
 
+    /// #509: a HANDOVER REQUEST's per-flow QoS Monitoring Request reaches the GTP
+    /// task with the admitted session, so the target keeps monitoring the flow
+    /// (TS 38.413 §8.4.2.2).
+    #[tokio::test]
+    async fn a_handover_requests_qos_monitoring_request_reaches_the_gtp_task() {
+        use nextgsim_ngap::procedures::transfer::{
+            decode_setup_request_transfer, encode_setup_request_transfer, QosMonitoringRequest,
+        };
+        let (mut task, _rrc_rx, mut gtp_rx, _sctp_rx) = task_with_sctp(1).await;
+        let pdu = handover_request(
+            &[5],
+            Some(HandoverSecurityContext {
+                next_hop_chaining_count: 1,
+                next_hop_nh: [0xA5; 32],
+            }),
+        );
+        let mut ho_req = nextgsim_ngap::procedures::handover::parse_handover_request(&pdu)
+            .expect("parse the request");
+        let mut transfer = decode_setup_request_transfer(&ho_req.pdu_sessions[0].transfer).unwrap();
+        transfer.qos_flows[0].qos_monitoring_request = Some(QosMonitoringRequest::Ul);
+        ho_req.pdu_sessions[0].transfer = encode_setup_request_transfer(&transfer).unwrap();
+
+        task.handle_handover_request(1, 8, ho_req).await;
+
+        let mut created = None;
+        while let Ok(msg) = gtp_rx.try_recv() {
+            if let TaskMessage::Message(GtpMessage::SessionCreate { resource, .. }) = msg {
+                created = Some(resource);
+            }
+        }
+        let resource = created.expect("the admitted session reaches the GTP task");
+        // The handover helper uses the PSI as the flow's QFI.
+        assert_eq!(resource.qos_monitoring, vec![(5, QosMonitoringRequest::Ul)]);
+    }
+
     /// #324, TS 38.413 §9.3.1.21 / TS 38.331 §11.2.2: the Target-to-Source container
     /// is an RRC HandoverCommand whose RRCReconfiguration sends the UE to THIS cell,
     /// with the AMF's NCC in the masterKeyUpdate and keySetChangeIndicator false.
@@ -10019,6 +10067,108 @@ mod tests {
         assert_eq!(
             resource.qos_monitoring,
             vec![(1, QosMonitoringRequest::Both)]
+        );
+    }
+
+    /// #509: a Modify Request's QoS Monitoring Requests reach the GTP task, and a
+    /// flow in its `qosFlowToReleaseList` is carried as `stop` so its monitoring
+    /// ends with it (TS 38.413 §8.2.3.2).
+    #[tokio::test]
+    async fn a_modify_requests_qos_monitoring_and_released_flows_reach_the_gtp_task() {
+        use nextgsim_ngap::codec::generated::*;
+        use nextgsim_ngap::procedures::pdu_session_resource::{
+            PduSessionResourceModifyRequestData, PduSessionResourceModifyRequestItem,
+        };
+        use nextgsim_ngap::procedures::transfer::{
+            decode_setup_request_transfer, encode_setup_request_transfer,
+            QosMonitoringRequest as QmReq,
+        };
+
+        let (mut task, _rrc_rx, mut gtp_rx, _rls_rx) = task_with_live_receivers(33).await;
+        key_ue(&mut task, 33, 2, 2);
+        let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        task.setup_one_pdu_session(33, &setup_item_with_policy(12, None), gnb_ip)
+            .await
+            .expect("setup");
+        while gtp_rx.try_recv().is_ok() {}
+        let ran_ue_ngap_id = task
+            .find_ue_context(33)
+            .map(|c| c.ran_ue_ngap_id as u32)
+            .expect("ran id");
+
+        // QoS parameters carrying a `dl` QoS Monitoring Request, taken from an
+        // encoded setup transfer so the extension is built by the real encoder.
+        let mut setup =
+            decode_setup_request_transfer(&setup_item_with_policy(12, None).transfer).unwrap();
+        setup.qos_flows[0].qos_monitoring_request = Some(QmReq::Dl);
+        let setup_asn: PDUSessionResourceSetupRequestTransfer =
+            nextgsim_ngap::codec::decode_aper(&encode_setup_request_transfer(&setup).unwrap())
+                .unwrap();
+        let params = setup_asn
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|e| match &e.value {
+                PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_QosFlowSetupRequestList(l) => {
+                    Some(l.0[0].qos_flow_level_qos_parameters.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let transfer = nextgsim_ngap::codec::encode_aper(&PDUSessionResourceModifyRequestTransfer {
+            protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(vec![
+                PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+                    id: ProtocolIE_ID(ID_QOS_FLOW_ADD_OR_MODIFY_REQUEST_LIST),
+                    criticality: Criticality(Criticality::REJECT),
+                    value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowAddOrModifyRequestList(
+                        QosFlowAddOrModifyRequestList(vec![QosFlowAddOrModifyRequestItem {
+                            qos_flow_identifier: QosFlowIdentifier(2),
+                            qos_flow_level_qos_parameters: Some(params),
+                            e_rab_id: None,
+                            ie_extensions: None,
+                        }]),
+                    ),
+                },
+                PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+                    id: ProtocolIE_ID(ID_QOS_FLOW_TO_RELEASE_LIST),
+                    criticality: Criticality(Criticality::REJECT),
+                    value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowToReleaseList(
+                        QosFlowListWithCause(vec![QosFlowWithCauseItem {
+                            qos_flow_identifier: QosFlowIdentifier(1),
+                            cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+                            ie_extensions: None,
+                        }]),
+                    ),
+                },
+            ]),
+        })
+        .expect("encode the modify transfer");
+
+        task.handle_pdu_session_resource_modify(
+            1,
+            8,
+            PduSessionResourceModifyRequestData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                pdu_session_resource_modify_list: vec![PduSessionResourceModifyRequestItem {
+                    pdu_session_id: 12,
+                    nas_pdu: None,
+                    transfer,
+                }],
+            },
+        )
+        .await;
+
+        let mut modified = None;
+        while let Ok(TaskMessage::Message(msg)) = gtp_rx.try_recv() {
+            if let GtpMessage::SessionModify { resource, .. } = msg {
+                modified = Some(resource);
+            }
+        }
+        let resource = modified.expect("the modify reaches the GTP task");
+        assert_eq!(
+            resource.qos_monitoring,
+            vec![(2, QmReq::Dl), (1, QmReq::Stop)]
         );
     }
 
