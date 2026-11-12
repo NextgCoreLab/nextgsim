@@ -193,6 +193,11 @@ fn validate_ue_config(config: &UeConfig) -> Result<()> {
         }
     }
 
+    // #462: at most one of sim_route / sim_movement, and a travellable route.
+    if let Err(e) = config.validate_sim_motion() {
+        bail!("Invalid simulated motion: {e}");
+    }
+
     // Validate key (must not be all zeros)
     if config.key.iter().all(|&b| b == 0) {
         bail!("Subscriber key K cannot be all zeros");
@@ -2599,6 +2604,33 @@ mod tests {
             suci,
             vec![0x01, 0x99, 0xF9, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10]
         );
+    }
+
+    /// #462: the shipped route configs validate; a config that sets both
+    /// `sim_route` and `sim_movement`, or an untravellable route, fails startup.
+    #[test]
+    fn startup_refuses_conflicting_or_untravellable_sim_motion() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config");
+        for name in ["ue-n2ho.yaml", "ue-d440a-m0.yaml"] {
+            let config = load_and_validate_ue_config(&format!("{dir}/{name}"))
+                .unwrap_or_else(|e| panic!("{name} must validate: {e:#}"));
+            if name == "ue-d440a-m0.yaml" {
+                assert!(config.sim_route.is_some() && config.sim_movement.is_none());
+            }
+        }
+        let routed = load_ue_config(&format!("{dir}/ue-d440a-m0.yaml")).expect("parses");
+        let mut both = routed.clone();
+        both.sim_movement = load_ue_config(&format!("{dir}/ue-n2ho.yaml"))
+            .expect("parses")
+            .sim_movement;
+        let err = validate_ue_config(&both).expect_err("both set must fail");
+        assert!(format!("{err:#}").contains("not both"), "{err:#}");
+        let mut stalled = routed;
+        if let Some(r) = stalled.sim_route.as_mut() {
+            r.speed_mps = 0.0;
+        }
+        let err = validate_ue_config(&stalled).expect_err("speed 0 must fail");
+        assert!(format!("{err:#}").contains("speed_mps"), "{err:#}");
     }
 
     #[test]

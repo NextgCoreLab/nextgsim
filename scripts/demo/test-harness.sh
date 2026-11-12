@@ -60,6 +60,17 @@ unset DEMO_SEED
 demo_seed >/dev/null
 case "$DEMO_SEED" in '' | *[!0-9]*) not_ok "fresh seed '$DEMO_SEED'" ;; *) ok "demo_seed: draws a fresh seed" ;; esac
 
+# demo_compose_init merges override files, in order (#462), and refuses a missing one.
+: > "$work/base.yml"
+: > "$work/over.yml"
+demo_compose_init "$work/base.yml" "$work/over.yml"
+[ "${DEMO_COMPOSE[*]}" = "docker compose -f $work/base.yml -f $work/over.yml" ] \
+    && ok "demo_compose_init: base then overrides, in order" || not_ok "init: ${DEMO_COMPOSE[*]}"
+if (demo_compose_init "$work/base.yml" "$work/absent.yml" >/dev/null 2>&1); then
+    not_ok "a missing override was accepted"
+fi
+ok "demo_compose_init: refuses a missing override"
+
 # demo_assert_private reads `docker compose config --format json`; a stub stands in.
 fake_config() { cat "$work/model.json"; }
 DEMO_COMPOSE=(fake_config)

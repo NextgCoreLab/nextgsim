@@ -66,6 +66,10 @@ pub enum ConfigValidationError {
     #[error("Invalid IP configuration: {0}")]
     InvalidIpConfig(String),
 
+    /// Invalid D440A paging grid (nextgsim#462)
+    #[error("Invalid paging_grid: {0}")]
+    InvalidPagingGrid(String),
+
     /// Invalid `shadowing:` block (nextgsim#467)
     #[error("Invalid shadowing configuration: {0}")]
     InvalidShadowing(String),
@@ -248,6 +252,12 @@ pub fn validate_gnb_config(config: &GnbConfig) -> Result<(), ConfigValidationErr
             "gtp_ip cannot be unspecified (0.0.0.0 or ::)".to_string(),
         ));
     }
+
+    // #462: checked in every build, though only a D440A build reads it, so a
+    // malformed grid cannot hide behind a demo that is off.
+    config
+        .validate_paging_grid()
+        .map_err(ConfigValidationError::InvalidPagingGrid)?;
 
     Ok(())
 }
@@ -599,6 +609,65 @@ upf_port: 2152
     fn test_load_config_file_not_found() {
         let result = load_gnb_config("/nonexistent/path/config.yaml");
         assert!(matches!(result, Err(ConfigError::IoError(_))));
+    }
+
+    /// #462: the D440A page-all configs load and validate, each naming the
+    /// other gNB of the two-gNB stack in its paging grid.
+    #[test]
+    fn the_d440a_demo_configs_name_each_other_in_their_paging_grid() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/demo-ai-paging");
+        let west = load_and_validate_gnb_config(format!("{dir}/gnb-west.yaml")).expect("west");
+        let east = load_and_validate_gnb_config(format!("{dir}/gnb-east.yaml")).expect("east");
+        assert_eq!(west.paging_grid.len(), 1);
+        assert_eq!(east.paging_grid.len(), 1);
+        assert_eq!(west.paging_grid[0].nci, east.nci);
+        assert_eq!(east.paging_grid[0].nci, west.nci);
+        assert_eq!(west.paging_grid[0].position, east.sim_position);
+        assert_eq!(east.paging_grid[0].position, west.sim_position);
+        // #525 review: each is its base config verbatim plus the D440A block, so
+        // the two cannot drift apart silently.
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../config");
+        for (demo, plain) in [
+            ("gnb-west.yaml", "gnb.yaml"),
+            ("gnb-east.yaml", "gnb-n2ho-target.yaml"),
+        ] {
+            let demo_text = std::fs::read_to_string(format!("{dir}/{demo}")).expect("demo");
+            let base_text = std::fs::read_to_string(format!("{base}/{plain}")).expect("base");
+            assert!(
+                demo_text.contains(base_text.trim_end()),
+                "config/demo-ai-paging/{demo} must embed config/{plain} unchanged"
+            );
+            let tail = &demo_text
+                [demo_text.find(base_text.trim_end()).unwrap() + base_text.trim_end().len()..];
+            assert!(
+                tail.contains("d440a-ai-paging:") && tail.contains("paging_grid:"),
+                "{demo}: only the D440A block is appended"
+            );
+        }
+    }
+
+    /// #462: a malformed paging grid fails startup in every build, and the
+    /// shipped configs (no grid) still validate.
+    #[test]
+    fn a_malformed_paging_grid_fails_validation() {
+        use nextgsim_common::config::{PagingGridEntry, SimPosition};
+        let mut config = valid_config();
+        assert!(validate_gnb_config(&config).is_ok());
+        let neighbour = PagingGridEntry {
+            nci: (config.nci & 0xF_FFFF_FFFF) + 0x100,
+            gnb_id_length: None,
+            position: SimPosition { x: 120, y: 0, z: 0 },
+        };
+        config.paging_grid = vec![neighbour];
+        assert!(
+            validate_gnb_config(&config).is_ok(),
+            "one neighbour is fine"
+        );
+        config.paging_grid = vec![neighbour, neighbour];
+        assert!(matches!(
+            validate_gnb_config(&config),
+            Err(ConfigValidationError::InvalidPagingGrid(_))
+        ));
     }
 
     #[test]

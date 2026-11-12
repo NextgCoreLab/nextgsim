@@ -54,6 +54,11 @@ sdap-dataplane = []
 # needs the Agent task. Active only with the demo: block on as well.
 demo-d446a-agent-conflict = ["nextgsim-agent"]
 
+# Demo D440A (nextgsim#462, convention #458): model-predicted paging. Off by
+# default; demo-only code. It needs the 6G NWDAF task for its predictors (#462
+# PR 3b). Active only with the demo: block on as well.
+demo-d440a-ai-paging = ["6g"]
+
 # Demo D441A (nextgsim#465, convention #458): a configured cell capacity C, a
 # token-bucket downlink queue at C, and an exporter that POSTs the measured (and,
 # in mode `prediction`, the OLS-predicted) cell occupancy to nwdafd's

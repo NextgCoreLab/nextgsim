@@ -50,6 +50,17 @@ pub const D440B_KEY: &str = "d440b-model-verify";
 /// reproducing the silent-fallback state a consumer's check must catch.
 pub const D440B_MODES: &[&str] = &["verify", "fallback"];
 
+/// D440A, model-predicted paging (nextgsim#462). Registered under the
+/// `demo-d440a-ai-paging` cargo feature.
+pub const D440A_KEY: &str = "d440a-ai-paging";
+
+/// D440A's modes, so far. `page-all` is the predictor-off arm: no
+/// recommendation, so the AMF pages the registration area, exactly as with no
+/// demo. The predictor arms (`last-served`, `ct`, `lsq`, `onnx`) are registered
+/// by the PR that implements them (#462 PR 3b), so no mode is accepted before
+/// it does what it names.
+pub const D440A_MODES: &[&str] = &["page-all"];
+
 /// D441A, the RAN-fed User Data Congestion loop (nextgsim#465). Registered under
 /// the `demo-d441a-congestion-loop` cargo feature.
 pub const D441A_KEY: &str = "d441a-congestion-loop";
@@ -68,6 +79,12 @@ pub fn registry() -> DemoRegistry {
     specs.push(DemoSpec {
         key: D446A_KEY,
         modes: D446A_MODES,
+        requires: &[],
+    });
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    specs.push(DemoSpec {
+        key: D440A_KEY,
+        modes: D440A_MODES,
         requires: &[],
     });
     #[cfg(feature = "nkef-sba")]
@@ -132,6 +149,46 @@ pub fn init(config_yaml: &str) -> Result<&'static DemoRuntime, GnbDemoError> {
         .map_err(|_| GnbDemoError::Config(DemoConfigError::AlreadyInstalled))
 }
 
+/// Whether D440A is active in this process (its feature compiled in, and both
+/// gates on). Always false in a build without `demo-d440a-ai-paging`.
+pub fn d440a_active() -> bool {
+    cfg!(feature = "demo-d440a-ai-paging") && nextgsim_demo::active_mode(D440A_KEY).is_some()
+}
+
+/// What D440A reads of the gNB config at startup, logged once when the demo is
+/// active (nextgsim#462): the paging grid this gNB resolves recommendations
+/// against. Silent when the demo is off, so a default run logs nothing new.
+pub fn d440a_startup(config: &nextgsim_common::config::GnbConfig) {
+    if !d440a_active() {
+        return;
+    }
+    let cells: Vec<String> = config
+        .paging_grid
+        .iter()
+        .map(|e| {
+            format!(
+                "gNB {:#x} cell {:#x} at ({}, {}, {})",
+                e.gnb_id(config.gnb_id_length),
+                e.nci,
+                e.position.x,
+                e.position.y,
+                e.position.z
+            )
+        })
+        .collect();
+    nextgsim_demo::demo_log!(
+        info,
+        D440A_KEY,
+        "paging grid: this gNB {:#x} at ({}, {}, {}), {} neighbour cell(s): [{}]",
+        config.gnb_id(),
+        config.sim_position.x,
+        config.sim_position.y,
+        config.sim_position.z,
+        cells.len(),
+        cells.join(", ")
+    );
+}
+
 /// Whether D446A is active in this process (its feature compiled in, and both
 /// gates on). Always false in a build without `demo-d446a-agent-conflict`.
 pub fn d446a_active() -> bool {
@@ -171,6 +228,7 @@ mod tests {
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
     #[cfg(not(any(
+        feature = "demo-d440a-ai-paging",
         feature = "demo-d446a-agent-conflict",
         feature = "model-registry",
         feature = "nkef-sba",
@@ -192,6 +250,46 @@ mod tests {
             let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
             let rt = DemoRuntime::from_root(&root, registry()).unwrap();
             assert!(rt.snapshot().is_empty());
+        }
+    }
+
+    /// #462: a D440A build registers its key with `page-all` only. A predictor
+    /// mode is refused until the PR that implements it registers it, and so is
+    /// `mode: bogus`; the kill switch leaves the demo inactive.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn the_d440a_build_registers_page_all_and_no_unimplemented_mode() {
+        let parse = |y: &str| serde_yaml::from_str::<serde_yaml::Value>(y).unwrap();
+        let block = |on: bool, mode: &str| {
+            format!(
+                "demo:\n  enabled: {on}\n  d440a-ai-paging:\n    enabled: true\n    mode: {mode}\n"
+            )
+        };
+        let rt = DemoRuntime::from_root(&parse(&block(true, "page-all")), registry()).unwrap();
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("page-all"));
+        for mode in ["ct", "onnx", "bogus"] {
+            let err = DemoRuntime::from_root(&parse(&block(true, mode)), registry()).unwrap_err();
+            assert!(
+                matches!(&err, DemoConfigError::UnknownMode { demo, mode: m, .. }
+                    if demo == D440A_KEY && m == mode),
+                "{mode}: {err:?}"
+            );
+        }
+        let off = DemoRuntime::from_root(&parse(&block(false, "page-all")), registry()).unwrap();
+        assert_eq!(off.mode(D440A_KEY), None, "the kill switch wins");
+    }
+
+    /// #462: the shipped D440A configs' demo blocks are accepted by a D440A
+    /// build, in mode page-all.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn the_d440a_demo_configs_enable_page_all() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/demo-ai-paging");
+        for name in ["gnb-west.yaml", "gnb-east.yaml"] {
+            let text = std::fs::read_to_string(format!("{dir}/{name}")).expect("read");
+            let root: serde_yaml::Value = serde_yaml::from_str(&text).expect("yaml");
+            let rt = DemoRuntime::from_root(&root, registry()).expect(name);
+            assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("page-all"), "{name}");
         }
     }
 
