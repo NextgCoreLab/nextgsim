@@ -519,6 +519,71 @@ pub struct QosFlowSetupInfo {
     pub five_qi: Option<u16>,
     /// ARP priority level (1..15)
     pub arp_priority_level: u8,
+    /// The SMF's QoS Monitoring Request for this flow, from the
+    /// `QosFlowLevelQosParameters` extension (id 181, TS 38.413 §9.3.1.12).
+    /// `None` when the SMF asked for none.
+    pub qos_monitoring_request: Option<QosMonitoringRequest>,
+}
+
+/// The QoS Monitoring Request IE (TS 38.413 §9.3.1.12, id 181): which RAN-part
+/// delay the SMF asks the NG-RAN node to measure for a QoS flow (TS 23.501
+/// §5.33.3.2), or `Stop` to end a monitoring an earlier request started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosMonitoringRequest {
+    /// Uplink packet delay
+    Ul,
+    /// Downlink packet delay
+    Dl,
+    /// Both directions
+    Both,
+    /// Stop monitoring (the Rel-16 extension value)
+    Stop,
+}
+
+impl QosMonitoringRequest {
+    fn from_asn(v: &crate::codec::generated::QosMonitoringRequest) -> Option<Self> {
+        match v.0 {
+            crate::codec::generated::QosMonitoringRequest::UL => Some(Self::Ul),
+            crate::codec::generated::QosMonitoringRequest::DL => Some(Self::Dl),
+            crate::codec::generated::QosMonitoringRequest::BOTH => Some(Self::Both),
+            crate::codec::generated::QosMonitoringRequest::STOP => Some(Self::Stop),
+            // A later extension value this node does not know: no request it can act on.
+            _ => None,
+        }
+    }
+
+    fn to_asn(self) -> crate::codec::generated::QosMonitoringRequest {
+        crate::codec::generated::QosMonitoringRequest(match self {
+            Self::Ul => crate::codec::generated::QosMonitoringRequest::UL,
+            Self::Dl => crate::codec::generated::QosMonitoringRequest::DL,
+            Self::Both => crate::codec::generated::QosMonitoringRequest::BOTH,
+            Self::Stop => crate::codec::generated::QosMonitoringRequest::STOP,
+        })
+    }
+
+    /// Whether the UL packet delay is requested.
+    pub fn wants_ul(self) -> bool {
+        matches!(self, Self::Ul | Self::Both)
+    }
+
+    /// Whether the DL packet delay is requested.
+    pub fn wants_dl(self) -> bool {
+        matches!(self, Self::Dl | Self::Both)
+    }
+}
+
+/// The QoS Monitoring Request carried in one flow's `QosFlowLevelQosParameters`.
+fn qos_monitoring_request_of(params: &QosFlowLevelQosParameters) -> Option<QosMonitoringRequest> {
+    params
+        .ie_extensions
+        .iter()
+        .flat_map(|ext| ext.0.iter())
+        .find_map(|entry| match &entry.extension_value {
+            QosFlowLevelQosParametersIE_Extensions_EntryExtensionValue::Id_QosMonitoringRequest(
+                req,
+            ) => QosMonitoringRequest::from_asn(req),
+            _ => None,
+        })
 }
 
 /// Decoded PDU Session Resource Setup Request Transfer
@@ -598,6 +663,9 @@ pub fn decode_setup_request_transfer(
                                 .allocation_and_retention_priority
                                 .priority_level_arp
                                 .0,
+                            qos_monitoring_request: qos_monitoring_request_of(
+                                &item.qos_flow_level_qos_parameters,
+                            ),
                         })
                         .collect(),
                 );
@@ -699,7 +767,17 @@ pub fn encode_setup_request_transfer(
                 gbr_qos_information: None,
                 reflective_qos_attribute: None,
                 additional_qos_flow_information: None,
-                ie_extensions: None,
+                ie_extensions: flow.qos_monitoring_request.map(|req| {
+                    QosFlowLevelQosParametersIE_Extensions(vec![
+                        QosFlowLevelQosParametersIE_Extensions_Entry {
+                            id: ProtocolExtensionID(ID_QOS_MONITORING_REQUEST),
+                            criticality: Criticality(Criticality::IGNORE),
+                            extension_value: QosFlowLevelQosParametersIE_Extensions_EntryExtensionValue::Id_QosMonitoringRequest(
+                                req.to_asn(),
+                            ),
+                        },
+                    ])
+                }),
             },
             e_rab_id: None,
             ie_extensions: None,
@@ -1180,6 +1258,9 @@ pub struct ModifyRequestTransferData {
     pub new_ul_tunnel: Option<GtpTunnelInfo>,
     /// QFIs to add or modify (optional)
     pub qos_flows_add_or_modify: Vec<u8>,
+    /// The QoS Monitoring Request of each added or modified flow that carries
+    /// one in its `QosFlowLevelQosParameters` (TS 38.413 §8.2.3.2, §9.3.1.12).
+    pub qos_monitoring_requests: Vec<(u8, QosMonitoringRequest)>,
     /// QFIs to release with their causes (optional)
     pub qos_flows_to_release: Vec<FailedQosFlow>,
     /// MBS sessions this UE is joining or having updated, from
@@ -1218,6 +1299,14 @@ pub fn decode_modify_request_transfer(
             PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowAddOrModifyRequestList(list) => {
                 data.qos_flows_add_or_modify =
                     list.0.iter().map(|item| item.qos_flow_identifier.0).collect();
+                data.qos_monitoring_requests = list
+                    .0
+                    .iter()
+                    .filter_map(|item| {
+                        let req = qos_monitoring_request_of(item.qos_flow_level_qos_parameters.as_ref()?)?;
+                        Some((item.qos_flow_identifier.0, req))
+                    })
+                    .collect();
             }
             PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowToReleaseList(list) => {
                 data.qos_flows_to_release = list
@@ -1580,6 +1669,7 @@ mod tests {
                 qfi: 1,
                 five_qi: Some(9),
                 arp_priority_level: 8,
+                qos_monitoring_request: None,
             }],
             security_indication: None,
             mbs_sessions_to_join: Vec::new(),
@@ -1734,6 +1824,80 @@ mod tests {
         assert!(
             !fallback.integrity.is_mandatory() && !fallback.confidentiality.is_mandatory(),
             "the local default must never refuse a session the SMF did not ask to refuse"
+        );
+    }
+
+    /// #509: a QoS Monitoring Request (id 181) in a flow's
+    /// `QosFlowLevelQosParameters` reaches the parsed flow, for every value.
+    #[test]
+    fn a_qos_monitoring_request_round_trips_onto_the_parsed_flow() {
+        for req in [
+            QosMonitoringRequest::Ul,
+            QosMonitoringRequest::Dl,
+            QosMonitoringRequest::Both,
+            QosMonitoringRequest::Stop,
+        ] {
+            let mut data = sample_request();
+            data.qos_flows[0].qos_monitoring_request = Some(req);
+            let bytes = encode_setup_request_transfer(&data).unwrap();
+            let decoded = decode_setup_request_transfer(&bytes).unwrap();
+            assert_eq!(decoded.qos_flows[0].qos_monitoring_request, Some(req));
+        }
+        // And a flow without one parses to `None`.
+        let bytes = encode_setup_request_transfer(&sample_request()).unwrap();
+        let decoded = decode_setup_request_transfer(&bytes).unwrap();
+        assert_eq!(decoded.qos_flows[0].qos_monitoring_request, None);
+    }
+
+    /// #509: a Modify Request that adds or modifies a flow with a QoS Monitoring
+    /// Request surfaces it per QFI (TS 38.413 §8.2.3.2), and a flow modified
+    /// without QoS parameters yields nothing for that QFI.
+    #[test]
+    fn a_modify_request_surfaces_each_flows_qos_monitoring_request() {
+        let mut setup = sample_request();
+        setup.qos_flows[0].qos_monitoring_request = Some(QosMonitoringRequest::Both);
+        let setup_bytes = encode_setup_request_transfer(&setup).unwrap();
+        let setup_asn: PDUSessionResourceSetupRequestTransfer = decode_aper(&setup_bytes).unwrap();
+        let params = setup_asn
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|e| match &e.value {
+                PDUSessionResourceSetupRequestTransferProtocolIEs_EntryValue::Id_QosFlowSetupRequestList(l) => {
+                    Some(l.0[0].qos_flow_level_qos_parameters.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        let entries = vec![PDUSessionResourceModifyRequestTransferProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_QOS_FLOW_ADD_OR_MODIFY_REQUEST_LIST),
+            criticality: Criticality(Criticality::REJECT),
+            value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowAddOrModifyRequestList(
+                QosFlowAddOrModifyRequestList(vec![
+                    QosFlowAddOrModifyRequestItem {
+                        qos_flow_identifier: QosFlowIdentifier(2),
+                        qos_flow_level_qos_parameters: Some(params),
+                        e_rab_id: None,
+                        ie_extensions: None,
+                    },
+                    QosFlowAddOrModifyRequestItem {
+                        qos_flow_identifier: QosFlowIdentifier(3),
+                        qos_flow_level_qos_parameters: None,
+                        e_rab_id: None,
+                        ie_extensions: None,
+                    },
+                ]),
+            ),
+        }];
+        let bytes = encode_aper(&PDUSessionResourceModifyRequestTransfer {
+            protocol_i_es: PDUSessionResourceModifyRequestTransferProtocolIEs(entries),
+        })
+        .unwrap();
+        let decoded = decode_modify_request_transfer(&bytes).unwrap();
+        assert_eq!(decoded.qos_flows_add_or_modify, vec![2, 3]);
+        assert_eq!(
+            decoded.qos_monitoring_requests,
+            vec![(2, QosMonitoringRequest::Both)]
         );
     }
 

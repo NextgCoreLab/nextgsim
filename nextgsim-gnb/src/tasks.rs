@@ -883,6 +883,15 @@ pub struct PduSessionResource {
     /// is not a degraded state: every downlink QFI then falls to the default DRB,
     /// which is TS 37.324 §5.3.1's own rule for a flow with no explicit mapping.
     pub qos_flows: Vec<(u8, Option<u16>)>,
+    /// The QoS flows the SMF asked this gNB to monitor, as `(qfi, request)`, from
+    /// the NGAP QoS Monitoring Request (TS 38.413 §9.3.1.12, nextgsim#509).
+    ///
+    /// Like `qos_flows`, a create states the whole set and a modify is a delta:
+    /// on a modify a flow absent here keeps its monitoring, and `Stop` ends it.
+    pub qos_monitoring: Vec<(
+        u8,
+        nextgsim_ngap::procedures::transfer::QosMonitoringRequest,
+    )>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,
     /// Downlink TEID (UPF -> gNB)

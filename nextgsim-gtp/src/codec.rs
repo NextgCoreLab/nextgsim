@@ -208,21 +208,65 @@ impl PduSessionType {
     }
 }
 
+/// Octet 1 of both frames: the QoS Monitoring Packet flag, bit 4 of 1-8 (`0x08`).
+const PSC_QMP: u8 = 0x08;
+/// UL octet 1: DL Delay Ind. (§5.5.3.13), the presence of the DL Delay Result.
+const PSC_UL_DL_DELAY_IND: u8 = 0x04;
+/// UL octet 1: UL Delay Ind. (§5.5.3.15), the presence of the UL Delay Result.
+const PSC_UL_UL_DELAY_IND: u8 = 0x02;
+
+/// Seconds from the NTP prime epoch (1900-01-01) to the Unix epoch (RFC 5905 §6).
+const NTP_UNIX_EPOCH_OFFSET_SECS: u64 = 2_208_988_800;
+
+/// `t` in the 64-bit NTP timestamp format of RFC 5905 §6: 32 bits of seconds since
+/// 1900-01-01, then 32 bits of fraction.
+///
+/// This is the encoding TS 38.415 §5.5.3.9-12 prescribes for every QoS monitoring
+/// time stamp. The seconds field wraps at the end of NTP era 0 (2036) exactly as
+/// RFC 5905 says it does, so the low 32 bits are kept rather than saturated.
+pub fn ntp_timestamp(t: std::time::SystemTime) -> u64 {
+    let since_unix = t.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let secs = (since_unix.as_secs() + NTP_UNIX_EPOCH_OFFSET_SECS) & 0xFFFF_FFFF;
+    let frac = (u64::from(since_unix.subsec_nanos()) << 32) / 1_000_000_000;
+    (secs << 32) | frac
+}
+
+/// The three time stamps an NG-RAN node returns for a QoS Monitoring Packet, in
+/// the UL PDU SESSION INFORMATION frame (TS 38.415 §5.5.3.10-12).
+///
+/// All three are RFC 5905 §6 64-bit timestamps (see [`ntp_timestamp`]). They map
+/// onto TS 23.501 §5.33.3.2's T1, T2 and T3: the UPF supplies T4 itself and
+/// computes the delays from the four.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QmpTimestamps {
+    /// T1: the DL Sending Time Stamp the UPF put in the DL frame, repeated back.
+    pub dl_sending_time_stamp_repeated: u64,
+    /// T2: when the NG-RAN node received that DL frame.
+    pub dl_received_time_stamp: u64,
+    /// T3: when the NG-RAN node sent this UL frame.
+    pub ul_sending_time_stamp: u64,
+}
+
 /// PDU Session Container Information Element
 ///
 /// Carries 5GC-specific PDU session information inside the GTP-U
-/// PDU Session Container extension header (type 0x85) as defined in
-/// 3GPP TS 38.415.
+/// PDU Session Container extension header (type 0x85, TS 29.281 §5.2.2.7) as
+/// defined in TS 38.415 §5.5.2.
 ///
-/// # Downlink PDU Session Information
+/// # Downlink PDU Session Information (PDU Type 0, Figure 5.5.2.1-1)
 ///
-/// Contains the `QoS` Flow Identifier (QFI), Reflective `QoS` Indicator (RQI),
-/// Paging Policy Presence (PPP), and Paging Policy Indicator (PPI).
+/// QFI, RQI, PPP/PPI, and for a QoS Monitoring Packet (QMP = 1) the 8-octet DL
+/// Sending Time Stamp. SNP/MSNP and the fields they announce are not modelled:
+/// they are sent as 0 and, on receive, the fields after the DL Sending Time Stamp
+/// are not read.
 ///
-/// # Uplink PDU Session Information
+/// # Uplink PDU Session Information (PDU Type 1, Figure 5.5.2.2-1)
 ///
-/// Contains the `QoS` Flow Identifier (QFI) and an optional DL Sending
-/// Timestamp for N9 interface usage.
+/// QFI, and for a QoS monitoring response QMP = 1 with the three time stamps of
+/// [`QmpTimestamps`], plus the DL/UL Delay Results their Ind. bits announce. The
+/// UL frame has no PPP/RQI/PPI: octet 2 bits 8-7 are N3/N9 Delay Ind. and New IE
+/// Flag, which this node sends as 0 (it is not an I-UPF, and it sends none of the
+/// New IE Flags fields).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PduSessionInfo {
     /// PDU type: DL (0) or UL (1)
@@ -235,33 +279,43 @@ pub struct PduSessionInfo {
     pub ppp: bool,
     /// Paging Policy Indicator (DL only, 3 bits, valid when ppp is true)
     pub ppi: u8,
-    /// DL Sending Timestamp or additional data (UL, for N9 interface)
-    pub dl_sending_timestamp: Option<u32>,
+    /// DL only: the DL Sending Time Stamp (§5.5.3.9). `Some` exactly when the
+    /// frame is a QoS Monitoring Packet (QMP = 1, §5.5.3.8).
+    pub dl_sending_time_stamp: Option<u64>,
+    /// UL only: the QoS monitoring response time stamps (§5.5.3.10-12). `Some`
+    /// exactly when QMP = 1.
+    pub ul_qmp: Option<QmpTimestamps>,
+    /// UL only: the DL Delay Result in milliseconds (§5.5.3.14). `Some` exactly
+    /// when DL Delay Ind. = 1.
+    pub dl_delay_result: Option<u32>,
+    /// UL only: the UL Delay Result in milliseconds (§5.5.3.16). `Some` exactly
+    /// when UL Delay Ind. = 1.
+    pub ul_delay_result: Option<u32>,
 }
 
 impl PduSessionInfo {
-    /// Create a downlink PDU session info
-    pub fn downlink(qfi: u8) -> Self {
+    fn new(pdu_type: PduSessionType, qfi: u8) -> Self {
         Self {
-            pdu_type: PduSessionType::Dl,
+            pdu_type,
             qfi: qfi & 0x3F,
             rqi: false,
             ppp: false,
             ppi: 0,
-            dl_sending_timestamp: None,
+            dl_sending_time_stamp: None,
+            ul_qmp: None,
+            dl_delay_result: None,
+            ul_delay_result: None,
         }
+    }
+
+    /// Create a downlink PDU session info
+    pub fn downlink(qfi: u8) -> Self {
+        Self::new(PduSessionType::Dl, qfi)
     }
 
     /// Create an uplink PDU session info
     pub fn uplink(qfi: u8) -> Self {
-        Self {
-            pdu_type: PduSessionType::Ul,
-            qfi: qfi & 0x3F,
-            rqi: false,
-            ppp: false,
-            ppi: 0,
-            dl_sending_timestamp: None,
-        }
+        Self::new(PduSessionType::Ul, qfi)
     }
 
     /// Set the Reflective `QoS` Indicator (DL only)
@@ -277,35 +331,95 @@ impl PduSessionInfo {
         self
     }
 
-    /// Set the DL Sending Timestamp (UL, for N9 interface)
-    pub fn with_dl_sending_timestamp(mut self, ts: u32) -> Self {
-        self.dl_sending_timestamp = Some(ts);
+    /// Make this DL frame a QoS Monitoring Packet carrying `ts` as its DL Sending
+    /// Time Stamp (DL only, §5.5.3.8-9).
+    pub fn with_dl_sending_time_stamp(mut self, ts: u64) -> Self {
+        self.dl_sending_time_stamp = Some(ts);
         self
     }
 
-    /// Encode the PDU Session Info to bytes (content only, without ext header framing)
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(8);
+    /// Make this UL frame a QoS monitoring response (UL only, §5.5.3.8, 10-12).
+    pub fn with_qmp_response(mut self, ts: QmpTimestamps) -> Self {
+        self.ul_qmp = Some(ts);
+        self
+    }
 
-        // TS 38.415 §5.5.2.1 Figure 5.5.2.1-1 (DL PDU SESSION INFORMATION):
-        //   Octet 1: PDU Type (bits 8-5) | spare (QMP/SNP/MSNP/spare, bits 4-1)
-        //   Octet 2: PPP (bit 8) | RQI (bit 7) | QFI (bits 6-1, 6 contiguous bits)
-        //   Octet 3 (present when PPP=1): spare (bits 8-4) | PPI (bits 3-1)
-        let pdu_type_val = self.pdu_type as u8;
-        let rqi_val: u8 = if self.rqi { 1 } else { 0 };
-        let ppp_val: u8 = if self.ppp { 1 } else { 0 };
+    /// Set the RAN-part DL and UL Delay Results in milliseconds (UL only,
+    /// §5.5.3.13-16). `None` leaves the matching Ind. bit at 0.
+    pub fn with_delay_results(mut self, dl_ms: Option<u32>, ul_ms: Option<u32>) -> Self {
+        self.dl_delay_result = dl_ms;
+        self.ul_delay_result = ul_ms;
+        self
+    }
 
-        let octet1 = pdu_type_val << 4;
-        let octet2 = (ppp_val << 7) | (rqi_val << 6) | (self.qfi & 0x3F);
-
-        buf.put_u8(octet1);
-        buf.put_u8(octet2);
-        if self.ppp {
-            buf.put_u8(self.ppi & 0x07);
+    /// Whether the QoS Monitoring Packet flag is set (§5.5.3.8).
+    pub fn qmp(&self) -> bool {
+        match self.pdu_type {
+            PduSessionType::Dl => self.dl_sending_time_stamp.is_some(),
+            PduSessionType::Ul => self.ul_qmp.is_some(),
         }
+    }
 
-        if let Some(ts) = self.dl_sending_timestamp {
-            buf.put_u32(ts);
+    /// Encode the PDU Session Info to bytes (content only, without ext header framing)
+    ///
+    /// Fields of the other direction's frame are not encoded: a DL frame never
+    /// carries [`Self::ul_qmp`] or the delay results, and a UL frame never carries
+    /// RQI, PPP/PPI or a DL Sending Time Stamp. Padding to the (n*4 - 2) length of
+    /// §5.5.3.5 is added by the extension header framing.
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(36);
+        let qmp = if self.qmp() { PSC_QMP } else { 0 };
+        let pdu_type_val = (self.pdu_type as u8) << 4;
+
+        match self.pdu_type {
+            PduSessionType::Dl => {
+                // Figure 5.5.2.1-1:
+                //   Octet 1: PDU Type (8-5) | QMP (4) | SNP (3) | MSNP (2) | spare (1)
+                //   Octet 2: PPP (8) | RQI (7) | QFI (6-1)
+                //   Octet 3 (when PPP=1): PPI (8-6) | spare | BSSI | TTNBI
+                //   DL Sending Time Stamp (8 octets, when QMP=1)
+                buf.put_u8(pdu_type_val | qmp);
+                let ppp = if self.ppp { 0x80 } else { 0 };
+                let rqi = if self.rqi { 0x40 } else { 0 };
+                buf.put_u8(ppp | rqi | (self.qfi & 0x3F));
+                if self.ppp {
+                    buf.put_u8((self.ppi & 0x07) << 5);
+                }
+                if let Some(ts) = self.dl_sending_time_stamp {
+                    buf.put_u64(ts);
+                }
+            }
+            PduSessionType::Ul => {
+                // Figure 5.5.2.2-1:
+                //   Octet 1: PDU Type (8-5) | QMP (4) | DL Delay Ind (3) | UL Delay Ind (2) | SNP (1)
+                //   Octet 2: N3/N9 Delay Ind (8) | New IE Flag (7) | QFI (6-1)
+                //   DL Sending Time Stamp Repeated, DL Received Time Stamp,
+                //   UL Sending Time Stamp (8 octets each, when QMP=1)
+                //   DL Delay Result, UL Delay Result (4 octets each, per Ind.)
+                let dl_ind = if self.dl_delay_result.is_some() {
+                    PSC_UL_DL_DELAY_IND
+                } else {
+                    0
+                };
+                let ul_ind = if self.ul_delay_result.is_some() {
+                    PSC_UL_UL_DELAY_IND
+                } else {
+                    0
+                };
+                buf.put_u8(pdu_type_val | qmp | dl_ind | ul_ind);
+                buf.put_u8(self.qfi & 0x3F);
+                if let Some(ts) = self.ul_qmp {
+                    buf.put_u64(ts.dl_sending_time_stamp_repeated);
+                    buf.put_u64(ts.dl_received_time_stamp);
+                    buf.put_u64(ts.ul_sending_time_stamp);
+                }
+                if let Some(ms) = self.dl_delay_result {
+                    buf.put_u32(ms);
+                }
+                if let Some(ms) = self.ul_delay_result {
+                    buf.put_u32(ms);
+                }
+            }
         }
 
         buf.freeze()
@@ -313,11 +427,36 @@ impl PduSessionInfo {
 
     /// Decode PDU Session Info from bytes (content only, without ext header framing)
     ///
+    /// Trailing octets after the last field this codec models (sequence numbers,
+    /// New IE Flags fields, padding) are not read.
+    ///
     /// # Errors
     ///
-    /// Returns `GtpError::BufferTooShort` if the data is shorter than 2 bytes.
+    /// Returns `GtpError::BufferTooShort` if the data is shorter than 2 bytes, or
+    /// shorter than a field its flags announce.
     /// Returns `GtpError::InvalidExtHeaderType` if the PDU type field is invalid.
     pub fn decode(data: &[u8]) -> Result<Self, GtpError> {
+        fn take<'a>(data: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8], GtpError> {
+            let field = data
+                .get(*offset..*offset + n)
+                .ok_or(GtpError::BufferTooShort {
+                    needed: *offset + n,
+                    available: data.len(),
+                })?;
+            *offset += n;
+            Ok(field)
+        }
+        fn take_u64(data: &[u8], offset: &mut usize) -> Result<u64, GtpError> {
+            let f = take(data, offset, 8)?;
+            Ok(u64::from_be_bytes([
+                f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+            ]))
+        }
+        fn take_u32(data: &[u8], offset: &mut usize) -> Result<u32, GtpError> {
+            let f = take(data, offset, 4)?;
+            Ok(u32::from_be_bytes([f[0], f[1], f[2], f[3]]))
+        }
+
         if data.len() < 2 {
             return Err(GtpError::BufferTooShort {
                 needed: 2,
@@ -331,41 +470,39 @@ impl PduSessionInfo {
         let pdu_type_val = (octet1 >> 4) & 0x0F;
         let pdu_type = PduSessionType::from_u8(pdu_type_val)
             .ok_or(GtpError::InvalidExtHeaderType(pdu_type_val))?;
-
-        // TS 38.415: octet 2 = PPP(bit8) | RQI(bit7) | QFI(bits6-1); octet 3
-        // (present when PPP=1) carries the Paging Policy Indicator in bits 3-1.
-        let ppp = ((octet2 >> 7) & 0x01) != 0;
-        let rqi = ((octet2 >> 6) & 0x01) != 0;
-        let qfi = octet2 & 0x3F;
-
+        let qmp = octet1 & PSC_QMP != 0;
+        let mut info = Self::new(pdu_type, octet2 & 0x3F);
         let mut offset = 2;
-        let ppi = if ppp && data.len() > offset {
-            let v = data[offset] & 0x07;
-            offset += 1;
-            v
-        } else {
-            0
-        };
 
-        let dl_sending_timestamp = if data.len() >= offset + 4 {
-            Some(u32::from_be_bytes([
-                data[offset],
-                data[offset + 1],
-                data[offset + 2],
-                data[offset + 3],
-            ]))
-        } else {
-            None
-        };
+        match pdu_type {
+            PduSessionType::Dl => {
+                info.ppp = octet2 & 0x80 != 0;
+                info.rqi = octet2 & 0x40 != 0;
+                if info.ppp {
+                    info.ppi = (take(data, &mut offset, 1)?[0] >> 5) & 0x07;
+                }
+                if qmp {
+                    info.dl_sending_time_stamp = Some(take_u64(data, &mut offset)?);
+                }
+            }
+            PduSessionType::Ul => {
+                if qmp {
+                    info.ul_qmp = Some(QmpTimestamps {
+                        dl_sending_time_stamp_repeated: take_u64(data, &mut offset)?,
+                        dl_received_time_stamp: take_u64(data, &mut offset)?,
+                        ul_sending_time_stamp: take_u64(data, &mut offset)?,
+                    });
+                }
+                if octet1 & PSC_UL_DL_DELAY_IND != 0 {
+                    info.dl_delay_result = Some(take_u32(data, &mut offset)?);
+                }
+                if octet1 & PSC_UL_UL_DELAY_IND != 0 {
+                    info.ul_delay_result = Some(take_u32(data, &mut offset)?);
+                }
+            }
+        }
 
-        Ok(Self {
-            pdu_type,
-            qfi,
-            rqi,
-            ppp,
-            ppi,
-            dl_sending_timestamp,
-        })
+        Ok(info)
     }
 }
 
@@ -1865,7 +2002,7 @@ mod tests {
         assert!(decoded.rqi);
         assert!(decoded.ppp);
         assert_eq!(decoded.ppi, 3);
-        assert!(decoded.dl_sending_timestamp.is_none());
+        assert!(decoded.dl_sending_time_stamp.is_none());
     }
 
     #[test]
@@ -1877,23 +2014,155 @@ mod tests {
         // With RQI set: octet2 = RQI(bit7=0x40) | QFI(5) = 0x45.
         let bytes = PduSessionInfo::downlink(5).with_rqi(true).encode();
         assert_eq!(&bytes[..], &[0x00, 0x45]);
-        // With PPP+PPI: octet2 = PPP(bit8=0x80) | QFI(5) = 0x85, octet3 = PPI.
+        // With PPP+PPI: octet2 = PPP(bit8=0x80) | QFI(5) = 0x85; octet3 carries
+        // the PPI in its top three bits (Figure 5.5.2.1-1: PPI | Spare | BSSI |
+        // TTNBI), so PPI 2 is 0b010_00000 = 0x40.
         let bytes = PduSessionInfo::downlink(5).with_paging_policy(2).encode();
-        assert_eq!(&bytes[..], &[0x00, 0x85, 0x02]);
+        assert_eq!(&bytes[..], &[0x00, 0x85, 0x40]);
     }
 
+    /// A PPI octet from a spec-conformant UPF (PPI in bits 8-6, BSSI/TTNBI low)
+    /// decodes to its PPI, and the low bits do not leak into it.
     #[test]
-    fn test_pdu_session_info_ul_encode_decode() {
-        let info = PduSessionInfo::uplink(15).with_dl_sending_timestamp(0xDEADBEEF);
+    fn a_dl_ppi_is_read_from_the_top_three_bits_of_octet_3() {
+        // PPI 5 (0b101 << 5 = 0xA0) with BSSI and TTNBI set (0x03).
+        let decoded = PduSessionInfo::decode(&[0x00, 0x89, 0xA3]).unwrap();
+        assert!(decoded.ppp);
+        assert_eq!(decoded.ppi, 5);
+        assert_eq!(decoded.qfi, 9);
+    }
 
-        let encoded = info.encode();
-        let decoded = PduSessionInfo::decode(&encoded).unwrap();
+    /// Figure 5.5.2.1-1: a DL QoS Monitoring Packet sets QMP (octet 1 bit 4) and
+    /// carries the 8-octet DL Sending Time Stamp straight after octet 2 (or after
+    /// octet 3 when PPP=1).
+    #[test]
+    fn a_dl_qmp_frame_carries_the_8_octet_dl_sending_time_stamp() {
+        let t1 = 0xE8F0_1234_8000_0000u64;
+        let bytes = PduSessionInfo::downlink(9)
+            .with_dl_sending_time_stamp(t1)
+            .encode();
+        assert_eq!(
+            &bytes[..],
+            &[0x08, 0x09, 0xE8, 0xF0, 0x12, 0x34, 0x80, 0x00, 0x00, 0x00]
+        );
+        let decoded = PduSessionInfo::decode(&bytes).unwrap();
+        assert!(decoded.qmp());
+        assert_eq!(decoded.dl_sending_time_stamp, Some(t1));
 
+        // With PPP=1 the time stamp follows octet 3.
+        let bytes = [
+            0x08, 0x89, 0x40, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+        ];
+        let decoded = PduSessionInfo::decode(&bytes).unwrap();
+        assert_eq!(decoded.ppi, 2);
+        assert_eq!(decoded.dl_sending_time_stamp, Some(0x0102_0304_0506_0708));
+    }
+
+    /// A DL frame with QMP=0 has no time stamp, however many octets follow (they
+    /// are padding or later fields, never a time stamp: §5.5.3.8 ties presence to
+    /// QMP).
+    #[test]
+    fn a_dl_frame_without_qmp_reads_no_time_stamp_from_trailing_octets() {
+        let decoded = PduSessionInfo::decode(&[0x00, 0x09, 0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+        assert!(!decoded.qmp());
+        assert_eq!(decoded.dl_sending_time_stamp, None);
+    }
+
+    /// A QMP flag with a truncated time stamp is an error, not a guess.
+    #[test]
+    fn a_dl_qmp_frame_with_a_short_time_stamp_is_rejected() {
+        assert!(PduSessionInfo::decode(&[0x08, 0x09, 0x01, 0x02, 0x03, 0x04]).is_err());
+    }
+
+    /// Figure 5.5.2.2-1: the UL response frame sets QMP, DL Delay Ind. and UL
+    /// Delay Ind. in octet 1, and carries the three time stamps then the two
+    /// delay results, in that order.
+    #[test]
+    fn a_ul_qmp_response_has_the_figure_5_5_2_2_1_layout() {
+        let ts = QmpTimestamps {
+            dl_sending_time_stamp_repeated: 0x1111_1111_2222_2222,
+            dl_received_time_stamp: 0x3333_3333_4444_4444,
+            ul_sending_time_stamp: 0x5555_5555_6666_6666,
+        };
+        let bytes = PduSessionInfo::uplink(9)
+            .with_qmp_response(ts)
+            .with_delay_results(Some(7), Some(0x0102_0304))
+            .encode();
+        let mut expected = vec![0x10 | 0x08 | 0x04 | 0x02, 0x09];
+        expected.extend_from_slice(&[0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x22, 0x22]);
+        expected.extend_from_slice(&[0x33, 0x33, 0x33, 0x33, 0x44, 0x44, 0x44, 0x44]);
+        expected.extend_from_slice(&[0x55, 0x55, 0x55, 0x55, 0x66, 0x66, 0x66, 0x66]);
+        expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&bytes[..], &expected[..]);
+
+        let decoded = PduSessionInfo::decode(&bytes).unwrap();
         assert_eq!(decoded.pdu_type, PduSessionType::Ul);
-        assert_eq!(decoded.qfi, 15);
-        assert!(!decoded.rqi);
+        assert_eq!(decoded.qfi, 9);
+        assert_eq!(decoded.ul_qmp, Some(ts));
+        assert_eq!(decoded.dl_delay_result, Some(7));
+        assert_eq!(decoded.ul_delay_result, Some(0x0102_0304));
+    }
+
+    /// Only the UL Delay Result: the Ind. bits are independent, so the UL result
+    /// takes the DL result's place on the wire.
+    #[test]
+    fn a_ul_frame_with_only_the_ul_delay_result_round_trips() {
+        let bytes = PduSessionInfo::uplink(3)
+            .with_delay_results(None, Some(42))
+            .encode();
+        assert_eq!(&bytes[..], &[0x12, 0x03, 0x00, 0x00, 0x00, 0x2A]);
+        let decoded = PduSessionInfo::decode(&bytes).unwrap();
+        assert_eq!(decoded.ul_qmp, None);
+        assert_eq!(decoded.dl_delay_result, None);
+        assert_eq!(decoded.ul_delay_result, Some(42));
+    }
+
+    /// A plain UL frame is the two octets it always was: the wire is unchanged
+    /// when QoS monitoring is not in use.
+    #[test]
+    fn a_plain_ul_frame_is_two_octets() {
+        assert_eq!(&PduSessionInfo::uplink(1).encode()[..], &[0x10, 0x01]);
+    }
+
+    /// UL octet 2 bits 8-7 are N3/N9 Delay Ind. and New IE Flag, not PPP/RQI.
+    #[test]
+    fn ul_octet_2_high_bits_are_not_read_as_ppp_or_rqi() {
+        let decoded = PduSessionInfo::decode(&[0x10, 0xC5]).unwrap();
+        assert_eq!(decoded.qfi, 5);
         assert!(!decoded.ppp);
-        assert_eq!(decoded.dl_sending_timestamp, Some(0xDEADBEEF));
+        assert!(!decoded.rqi);
+    }
+
+    /// The response survives full GTP-U framing, including the (n*4 - 2) padding
+    /// of §5.5.3.5, as a G-PDU without a T-PDU (a dummy UL packet).
+    #[test]
+    fn a_dummy_ul_g_pdu_carries_the_qmp_response_through_framing() {
+        let ts = QmpTimestamps {
+            dl_sending_time_stamp_repeated: 1,
+            dl_received_time_stamp: 2,
+            ul_sending_time_stamp: 3,
+        };
+        let info = PduSessionInfo::uplink(9).with_qmp_response(ts);
+        let encoded = GtpHeader::g_pdu(0x55, Bytes::new())
+            .with_pdu_session_info(info.clone())
+            .encode();
+        // 26 octets of content + length octet + next-type octet = 28 = 7 units.
+        assert_eq!(encoded[11], 0x85);
+        assert_eq!(encoded[12], 7);
+        let decoded = GtpHeader::decode(&encoded).unwrap();
+        assert!(decoded.payload.is_empty());
+        assert_eq!(decoded.pdu_session_info(), Some(&info));
+    }
+
+    /// RFC 5905 §6: seconds since 1900 in the high 32 bits, fraction in the low.
+    #[test]
+    fn ntp_timestamp_uses_the_rfc_5905_era_0_layout() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::new(1, 500_000_000);
+        assert_eq!(
+            ntp_timestamp(t),
+            ((2_208_988_800u64 + 1) << 32) | 0x8000_0000
+        );
     }
 
     #[test]

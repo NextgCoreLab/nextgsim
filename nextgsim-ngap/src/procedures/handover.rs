@@ -2387,6 +2387,7 @@ mod tests {
                     qfi,
                     five_qi: Some(9),
                     arp_priority_level: 8,
+                    qos_monitoring_request: None,
                 }],
                 security_indication: None,
                 mbs_sessions_to_join: Vec::new(),
