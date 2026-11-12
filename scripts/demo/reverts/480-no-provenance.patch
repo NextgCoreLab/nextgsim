@@ -1,0 +1,14 @@
+--- a/nextgsim-fl/src/d445a/server.rs
++++ b/nextgsim-fl/src/d445a/server.rs
+@@ -1229,7 +1229,10 @@
+             .to_ipv4_mapped()
+             .ok_or_else(|| format!("{peer} is not an IPv4 UE address"))?,
+     };
+-    let gpsi = nef.ue_id(ip).await?;
++    let gpsi = nef
++        .ue_id(ip)
++        .await
++        .unwrap_or_else(|_| Gpsi(format!("label-{label}")));
+     let Some(base) = notify_base else {
+         return Ok((gpsi, None));
+     };

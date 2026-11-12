@@ -1,0 +1,10 @@
+--- a/nextgsim-fl/src/d445a/server.rs
++++ b/nextgsim-fl/src/d445a/server.rs
+@@ -1191,7 +1191,6 @@
+             );
+             return;
+         }
+-        m.excluded = true;
+         let label = label.clone();
+         let gpsi = m.gpsi.to_string();
+         demo_log!(

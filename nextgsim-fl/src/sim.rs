@@ -177,9 +177,12 @@ pub fn run(cfg: &RunConfig, rule: Rule, members: impl Fn(u32) -> Vec<u32>) -> Ou
 
 /// The round's aggregate delta, plus Krum's (selected, worst) members; `Err` when
 /// the rule refuses the round.
-type Aggregate = Result<(Vec<f32>, Option<(String, String)>), String>;
+pub type Aggregate = Result<(Vec<f32>, Option<(String, String)>), String>;
 
-fn aggregate(rule: Rule, deltas: &BTreeMap<String, (Vec<f32>, u64)>) -> Aggregate {
+/// Combine one round's deltas, keyed by member and weighted by sample count, with
+/// `rule`. The AF (`nr-fl-server`) calls this too, so the network run and this
+/// in-process run aggregate identically.
+pub fn aggregate(rule: Rule, deltas: &BTreeMap<String, (Vec<f32>, u64)>) -> Aggregate {
     // BTreeMap order: sorted by member, so every rule sees the same order.
     let names: Vec<&String> = deltas.keys().collect();
     let vecs: Vec<Vec<f32>> = deltas.values().map(|(d, _)| d.clone()).collect();

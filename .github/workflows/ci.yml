@@ -453,6 +453,19 @@ jobs:
           cargo test -p nextgsim-semantic --features demo-d444a-ambr-adapt
       - name: D444A revert arms (each patch must fail its named test)
         run: scripts/demo/d444a-reverts.sh
+      # Demo d445a-fl-t8 (#480): the nr-fl-server AF (FL listener, NEF client,
+      # T8 callback listener) and the UE FL client are behind
+      # `demo-d445a-fl-t8`; the revert knobs (--no-t8, --freeze-global,
+      # fl.leak_raw) behind `revert-hooks`. The AF tests run it end to end over
+      # loopback against a stub nefd over h2c.
+      - name: cargo test (demo-d445a-fl-t8)
+        run: |
+          cargo test -p nextgsim-fl --features demo-d445a-fl-t8
+          cargo test -p nextgsim-fl --features revert-hooks
+          cargo test -p nextgsim-ue --features demo-d445a-fl-t8
+          cargo test -p nextgsim-ue --features revert-hooks --lib fl_participant
+      - name: D445A revert arms (each patch must fail its named test)
+        run: scripts/demo/d445a-reverts.sh
       - name: cargo test (6g end to end)
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
@@ -463,6 +476,8 @@ jobs:
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
+          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets
+          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:

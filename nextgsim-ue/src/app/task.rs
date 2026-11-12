@@ -318,6 +318,17 @@ impl AppTask {
             return;
         }
 
+        // `fl-train` / `fl-status` (demo D445A, #480) are answered by the FL client.
+        #[cfg(feature = "demo-d445a-fl-t8")]
+        if let Some(out) = crate::fl_participant::d445a::route_cli(&cmd.command) {
+            if let Some(server) = &self.cli_server {
+                if let Err(e) = server.send_result(cmd.client_addr, out).await {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // Parse the command string into a UeCliCommandType
         let command_type = match parse_ue_cli_command(&cmd.command) {
             Ok(cmd_type) => cmd_type,

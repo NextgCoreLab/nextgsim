@@ -34,6 +34,7 @@
 - [D444A: app adaptation to a network-signalled Session-AMBR](demos/d444a-ambr-adapt.md)
 - [D441A: RAN-fed User Data Congestion loop](demos/d441a-congestion-loop.md)
 - [D441E: MTLF→AnLF model provisioning and retrain](demos/d441e-model-retrain.md)
+- [D445A: network-assisted federated learning over PDU sessions](demos/d445a-fl-t8.md)
 
 # Community
 
