@@ -1370,16 +1370,21 @@ impl RrcTask {
                 selected_cell.category
             );
 
-            // Notify RLS of the new serving cell
-            if let Err(e) = self
-                .task_base
-                .rls_tx
-                .send(RlsMessage::AssignCurrentCell {
-                    cell_id: selected_cell.cell_id,
-                })
-                .await
-            {
-                error!("Failed to notify RLS of cell change: {}", e);
+            // Notify RLS of the new serving cell. Not when the selection only
+            // re-confirmed the cell RLS already serves: the §5.2.6 selection on an
+            // RRCRelease (`select_cell_on_leaving_connected`) clears the selector's
+            // camp, so it reports a pick of the same cell as a change too.
+            if old_cell != Some(selected_cell.cell_id) {
+                if let Err(e) = self
+                    .task_base
+                    .rls_tx
+                    .send(RlsMessage::AssignCurrentCell {
+                        cell_id: selected_cell.cell_id,
+                    })
+                    .await
+                {
+                    error!("Failed to notify RLS of cell change: {}", e);
+                }
             }
 
             // A re-establishment searching for a cell (T311) re-establishes on this
@@ -2198,20 +2203,53 @@ impl RrcTask {
                 // For now, use default values that make the cell selectable
                 self.provide_simulated_system_info(id);
             }
+            // The serving cell is lost whatever the selector believes it camps on
+            // (#518 review). The two can name different cells: a handover moves
+            // `serving_cell_id` to the target and leaves the selector's camp on the
+            // source. Losing the serving cell then arrives as a plain `CellLost`, and
+            // a UE that kept `serving_cell_id` on a cell it can no longer hear would
+            // drop every page from the cell it can hear (TS 38.304 §5.2.5, #514). The
+            // selector's camp is stale in that case too, so it is cleared: the next
+            // selection then reports its pick as a change and rewrites the serving cell.
+            CellChangeEvent::CellLost(id) if self.serving_cell_id == Some(id) => {
+                warn!(
+                    "Serving cell lost: cell_id={id} (the cell selector camped elsewhere), \
+                     triggering cell selection"
+                );
+                self.measurement_manager.remove_measurement(id);
+                self.cell_selector.clear_camp();
+                self.serving_cell_id = None;
+                self.measurement_manager.set_serving_cell(None);
+                self.last_cell_selection = None;
+            }
             CellChangeEvent::CellLost(id) => {
                 debug!("Cell lost: cell_id={}", id);
                 // Remove from measurement manager
                 self.measurement_manager.remove_measurement(id);
             }
             CellChangeEvent::ActiveCellLost(cell_info) => {
+                // The selector's camp is gone either way, so it selects again.
+                self.last_cell_selection = None;
+                // But only the loss of the SERVING cell takes the serving cell away. After
+                // a handover the selector still camps on the source, and the source
+                // fading must not leave a UE connected to the target with no serving
+                // cell (#518 review): every DL-DCCH from the target would be dropped.
+                if self.serving_cell_id != Some(cell_info.cell_id) {
+                    debug!(
+                        "Cell {} lost: the cell selector camped on it, but the serving cell \
+                         is {:?}; reselecting",
+                        cell_info.cell_id, self.serving_cell_id
+                    );
+                    self.measurement_manager
+                        .remove_measurement(cell_info.cell_id);
+                    return;
+                }
                 warn!(
                     "Active cell lost: cell_id={}, triggering cell selection",
                     cell_info.cell_id
                 );
                 self.serving_cell_id = None;
                 self.measurement_manager.set_serving_cell(None);
-                // Trigger immediate cell selection
-                self.last_cell_selection = None;
             }
             CellChangeEvent::SignalUpdated(id, dbm) => {
                 debug!("Signal updated: cell_id={}, dbm={}", id, dbm);
@@ -2839,10 +2877,12 @@ impl RrcTask {
             .iter()
             .filter_map(|record| match record.ue_identity {
                 PagedUeIdentity::FiveGSTmsi(s_tmsi) if s_tmsi == own_s_tmsi => Some(s_tmsi),
-                // A full I-RNTI pages a UE in RRC_INACTIVE by an identity the
-                // NG-RAN allocated in the RRCRelease with suspendConfig, which
-                // this UE never receives (RRC_INACTIVE is not reachable yet), so
-                // it cannot be this UE.
+                // A full I-RNTI is RAN paging (TS 38.331 §5.3.2.3) of a UE in
+                // RRC_INACTIVE, by the identity its suspendConfig assigned. This UE
+                // does reach RRC_INACTIVE and holds that identity (`inactive`,
+                // #38), but RAN paging is not implemented: no gNB here sends an
+                // I-RNTI record, and this UE does not match one. It is answered
+                // only when paged by its 5G-S-TMSI (CN paging).
                 _ => None,
             })
             .collect();
@@ -3651,6 +3691,8 @@ impl RrcTask {
         // is given a fresh configuration with `fullConfig` (issue #107).
         self.cond_reconfig.clear();
         self.release_all_scells();
+        // §5.2.6 covers a release to RRC_INACTIVE as well as to RRC_IDLE.
+        self.select_cell_on_leaving_connected();
 
         info!(
             "Suspended to RRC_INACTIVE: I-RNTI={:#x}, t380={:?} min, RNA of {} cell(s), NCC={}",
@@ -3876,6 +3918,25 @@ impl RrcTask {
         }
     }
 
+    /// TS 38.304 §5.2.6: at an RRCRelease to RRC_IDLE or RRC_INACTIVE the UE
+    /// "shall attempt to select a suitable cell", rather than stay on the PCell
+    /// it was connected on (#518 review).
+    ///
+    /// The selector's camp is cleared and the throttle reset, so the next idle
+    /// cycle runs a fresh selection and reports its pick as a change, which
+    /// rewrites `serving_cell_id`. Without this the camp could be stale: a
+    /// handover moves `serving_cell_id` to the target but leaves the selector on
+    /// the source, `perform_cell_selection` then reports "no change" for ever,
+    /// and the PCCH guard (#514) drops the pages of the cell the selector is on.
+    ///
+    /// `serving_cell_id` is kept until that selection runs: the UE is still on
+    /// the cell it was released in, and a page from it in the meantime is
+    /// legitimate.
+    fn select_cell_on_leaving_connected(&mut self) {
+        self.cell_selector.clear_camp();
+        self.last_cell_selection = None;
+    }
+
     async fn handle_rrc_release(&mut self) {
         // Transition to idle state
         if let Err(e) = self.state_machine.on_rrc_release() {
@@ -3900,6 +3961,7 @@ impl RrcTask {
         self.srb1_suspended_for_reestablishment = false;
         // Nor does a handover's source snapshot (#415 review).
         self.handover_source = None;
+        self.select_cell_on_leaving_connected();
 
         info!("RRC connection released");
 
@@ -9931,6 +9993,211 @@ mod tests {
             Some(vec![own]),
             "once camped, the same page is acted on"
         );
+    }
+
+    /// Connects on [`PAGING_CELL`] and hands over to [`NEIGHBOUR_CELL`] through the
+    /// real command path, leaving `serving_cell_id` on the target while the cell
+    /// selector still camps on the source (the divergence of the #518 review).
+    async fn handed_over_to_the_neighbour(
+        task: &mut RrcTask,
+        rls_rx: &mut mpsc::Receiver<TaskMessage<RlsMessage>>,
+    ) {
+        camped_connected_and_keyed(task, rls_rx).await;
+        task.handle_signal_changed(NEIGHBOUR_CELL, -70).await;
+        let pdu = handover_command_pdu(NEIGHBOUR_CELL as u16, 500);
+        task.handle_handover_command(PAGING_CELL, parse_handover_command(&pdu).expect("parse"))
+            .await;
+        assert_eq!(
+            task.serving_cell_id,
+            Some(NEIGHBOUR_CELL),
+            "precondition: the handover to cell {NEIGHBOUR_CELL} completed"
+        );
+        assert_eq!(task.state_machine.state(), RrcState::Connected);
+    }
+
+    /// **#518 review, MAJOR 1**: handover A -> B, RRCRelease, B fades, then a page from
+    /// A, the only cell left, must reach NAS.
+    ///
+    /// The handover moved `serving_cell_id` to B but left the cell selector camped on
+    /// A. B's loss then arrived as a plain `CellLost`, `serving_cell_id` stayed on a
+    /// cell the UE could no longer hear, and selection kept reporting "no change"
+    /// because its own camp (A) was unchanged. The #514 guard then dropped every page
+    /// from A: a lost MT call. TS 38.304 §5.2.6 has the UE select a cell on the
+    /// release, and §5.2.5 has it monitor the paging channel of THAT cell.
+    #[test]
+    fn a_page_from_the_remaining_cell_reaches_nas_after_handover_release_and_target_loss() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            handed_over_to_the_neighbour(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(NEIGHBOUR_CELL, RrcChannel::DlDcch, plain_release())
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle, "precondition");
+
+            // B fades below the lost threshold, and the next idle cycle runs.
+            task.handle_signal_changed(NEIGHBOUR_CELL, -125).await;
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+        });
+        assert_eq!(
+            task.serving_cell_id,
+            Some(PAGING_CELL),
+            "the UE must camp on the cell it can still hear, not keep the lost target"
+        );
+        assert_eq!(
+            task.cell_selector.current_cell().map(|c| c.cell_id),
+            task.serving_cell_id,
+            "and the selector's camp and the serving cell must agree"
+        );
+
+        while nas_rx.try_recv().is_ok() {}
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "the page from cell {PAGING_CELL}, the cell the UE camps on, must reach NAS"
+        );
+    }
+
+    /// #518 review, MAJOR 1, the release itself: TS 38.304 §5.2.6 has the UE select a
+    /// cell at the RRCRelease, so the first idle cycle after a release that followed a
+    /// handover puts the serving cell and the selector's camp back in step. Here the
+    /// source is the stronger cell and nothing is lost, so only the selection on the
+    /// release can move the UE onto it.
+    #[test]
+    fn a_release_after_a_handover_reselects_and_monitors_the_cell_it_camps_on() {
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            handed_over_to_the_neighbour(&mut task, &mut rls_rx).await;
+            task.handle_downlink_rrc(NEIGHBOUR_CELL, RrcChannel::DlDcch, plain_release())
+                .await;
+            assert_eq!(task.state_machine.state(), RrcState::Idle, "precondition");
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+        });
+        // Cell selection, not reselection: the stronger cell (-60 dBm vs -70 dBm).
+        assert_eq!(task.serving_cell_id, Some(PAGING_CELL));
+        assert_eq!(
+            task.cell_selector.current_cell().map(|c| c.cell_id),
+            task.serving_cell_id,
+            "the selector's camp and the serving cell must agree after the release"
+        );
+
+        while nas_rx.try_recv().is_ok() {}
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "the page from the camped cell must reach NAS"
+        );
+    }
+
+    /// #518 review: only the loss of the SERVING cell takes the serving cell away. After
+    /// a handover the selector still camps on the source; the source fading reported
+    /// `ActiveCellLost` and cleared `serving_cell_id` while the UE was connected on the
+    /// target, so every DL-DCCH from the target would then have been dropped.
+    #[test]
+    fn losing_the_handover_source_leaves_the_target_serving() {
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(test_config(), 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            handed_over_to_the_neighbour(&mut task, &mut rls_rx).await;
+            task.handle_signal_changed(PAGING_CELL, -125).await;
+        });
+        assert_eq!(
+            task.serving_cell_id,
+            Some(NEIGHBOUR_CELL),
+            "the source fading must not take away the target the UE is connected on"
+        );
+        assert_eq!(task.state_machine.state(), RrcState::Connected);
+
+        // POSITIVE CONTROL: losing the target itself, the serving cell, does clear it,
+        // although the selector never camped on the target.
+        run_async(async {
+            task.handle_signal_changed(NEIGHBOUR_CELL, -125).await;
+        });
+        assert_eq!(
+            task.serving_cell_id, None,
+            "losing the serving cell must clear it, whatever the selector camped on"
+        );
+    }
+
+    /// **#518 review, MINOR 2**, #514 in RRC_INACTIVE: a suspended UE answers a page
+    /// with a resume (TS 38.331 §5.3.13.2), so a neighbour's page acted on would send
+    /// an `RRCResumeRequest1` towards a cell the UE does not camp on. It must send
+    /// nothing; the camped cell's identical page must resume with `mt-Access`.
+    #[test]
+    fn a_neighbours_page_to_an_inactive_ue_sends_no_resume_request() {
+        use nextgsim_rrc::procedures::rrc_resume::{decode_rrc_resume_request1, ResumeCauseValue};
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, mut rls_rx) = UeTaskBase::new(config, 32);
+        let mut task = RrcTask::new(task_base);
+        run_async(async {
+            camped_connected_and_keyed(&mut task, &mut rls_rx).await;
+            // The neighbour is in range (weaker), so its PCCH reaches this UE.
+            task.handle_signal_changed(NEIGHBOUR_CELL, -80).await;
+            task.handle_downlink_rrc(
+                PAGING_CELL,
+                RrcChannel::DlDcch,
+                suspending_release(Some(30), vec![PAGING_CELL as u64]),
+            )
+            .await;
+            assert_eq!(
+                task.state_machine.state(),
+                RrcState::Inactive,
+                "precondition"
+            );
+            // The §5.2.6 selection on the release keeps the UE on the stronger cell.
+            task.force_cell_selection_now();
+            task.perform_cycle().await;
+            assert_eq!(
+                task.serving_cell_id,
+                Some(PAGING_CELL),
+                "precondition: camped"
+            );
+            while rls_rx.try_recv().is_ok() {}
+            while nas_rx.try_recv().is_ok() {}
+
+            task.pin_sfn(PINNED_SFN);
+            task.set_paging_identity(Some(own));
+            task.handle_downlink_rrc(NEIGHBOUR_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+            assert!(
+                next_uplink_rrc_opt(&mut rls_rx).is_none(),
+                "a page from cell {NEIGHBOUR_CELL} must not make a UE camped on cell \
+                 {PAGING_CELL} resume (TS 38.304 §5.2.5)"
+            );
+            assert!(try_take_paging(&mut nas_rx).is_none(), "nor reach NAS");
+            assert_eq!(task.state_machine.state(), RrcState::Inactive);
+
+            // POSITIVE CONTROL: the camped cell's identical page resumes.
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+            let (channel, pdu) = next_uplink_rrc(&mut rls_rx);
+            assert_eq!(channel, RrcChannel::UlCcch1);
+            assert_eq!(
+                decode_rrc_resume_request1(pdu.data())
+                    .expect("real UPER")
+                    .resume_cause,
+                ResumeCauseValue::MtAccess
+            );
+        });
     }
 
     // ========================================================================
