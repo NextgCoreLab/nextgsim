@@ -62,6 +62,9 @@ sha2 = "0.10"
 hmac = "0.12"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 rand = "0.8"
+# ChaCha8 has a value-stable output stream (rand_chacha guarantees it across
+# versions; StdRng does not), so a seeded FL run reruns bit-identically (#480).
+rand_chacha = "0.3"
 zuc = "0.1"
 
 # Networking

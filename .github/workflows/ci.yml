@@ -1327,6 +1327,21 @@ jobs:
             grep -qE "^${key}: true" ue.yaml || { echo "::error::ue.yaml has no ${key}"; exit 1; }
           done
 
+      # Two of the asserted lines (the NWDAF cell load and UE measurement) are
+      # debug!. nextgcore #1436 made the compose file ship RUST_LOG=info for the
+      # gNB, which is right for a default run and leaves those lines out, so this
+      # job raises only the gNB's NWDAF module for its own run. The override file
+      # is the one `docker compose` loads on its own beside docker-compose.yml.
+      - name: Raise the gNB NWDAF log level to debug (this runner only)
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          test ! -e docker-compose.override.yml || { echo "::error::nextgcore now ships a docker-compose.override.yml"; exit 1; }
+          printf 'services:\n  gnb:\n    environment:\n      RUST_LOG: info,nextgsim_gnb::nwdaf=debug\n' > docker-compose.override.yml
+          docker compose config gnb > /tmp/gnb-compose.yml
+          grep -q 'RUST_LOG: info,nextgsim_gnb::nwdaf=debug' /tmp/gnb-compose.yml \
+            || { echo "::error::the gNB RUST_LOG override did not apply"; cat /tmp/gnb-compose.yml; exit 1; }
+
       - name: Start the 5GC
         run: |
           set -euo pipefail
