@@ -805,6 +805,41 @@ mod tests {
         }
     }
 
+    /// nextgsim#467: a shadowed tracker puts the offset into the heartbeat ack,
+    /// once, and two UEs (two random STIs) at the same spot are told the same
+    /// level, so a seeded run does not depend on the UE's per-start identity.
+    #[test]
+    fn a_shadowed_tracker_reports_the_shadowed_level_in_the_ack() {
+        use crate::channel::{DistanceModel, ShadowedModel, Shadowing};
+        let shadowing = Shadowing::new(8.0, 5, 20.0, 0x10);
+        let mut tracker = GnbCellTracker::with_channel_model(
+            0x10,
+            SimCoord::new(0, 0, 0),
+            Box::new(ShadowedModel::new(Box::new(DistanceModel), shadowing)),
+        );
+        let mut shifted = 0;
+        for x in (31..120).step_by(3) {
+            let pos = SimCoord::new(x, 0, 0);
+            let expected = (f64::from(-x) + shadowing.offset_db(&pos)).round() as i32;
+            let mut levels = Vec::new();
+            for sti in [0xAAAA_u64, 0x5555] {
+                let hb = RlsHeartbeat::with_position(sti, pos);
+                let (ack, _) = tracker.process_heartbeat(sti, test_addr(5000), &hb);
+                levels.push(ack.map(|a| a.dbm));
+            }
+            assert_eq!(levels[0], Some(expected), "x={x}");
+            assert_eq!(
+                levels[0], levels[1],
+                "two UEs at x={x} must hear the same level"
+            );
+            shifted += i32::from(expected != -x);
+        }
+        assert!(
+            shifted > 10,
+            "σ 8 dB must change the ack levels, shifted {shifted}"
+        );
+    }
+
     /// A tracker with an injected model reports that model's level in the
     /// heartbeat ack, so the model reaches the UE rather than stopping at the
     /// tracker: with free-space loss a UE at 1 km is still heard, where the

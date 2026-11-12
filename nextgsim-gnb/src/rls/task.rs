@@ -17,14 +17,15 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AgentMessage, GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
+use nextgsim_common::config::GnbConfig;
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
+    codec, DistanceModel, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
     RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
-    SimCoord,
+    ShadowedModel, Shadowing, SimCoord,
 };
 
 /// Default RLS port for gNB
@@ -153,6 +154,30 @@ pub struct RlsTask {
     congestion: Option<crate::congestion::CellState>,
 }
 
+/// The cell tracker for this gNB: the default distance model, with seeded
+/// log-normal shadowing on top when `shadowing.sigma_db > 0` (nextgsim#467).
+///
+/// The shadowing is keyed by the NCI (the tracker's STI, stable across starts),
+/// so one seed gives each gNB its own reproducible field. With the block absent
+/// the tracker is exactly what it always was.
+fn build_cell_tracker(config: &GnbConfig, sti: u64, phy_location: SimCoord) -> GnbCellTracker {
+    let s = config.shadowing;
+    if !s.is_enabled() {
+        return GnbCellTracker::new(sti, phy_location);
+    }
+    info!(
+        "RLS: seeded log-normal shadowing on: sigma={} dB seed={} decorrelation={} m \
+         (non-normative simulator model)",
+        s.sigma_db, s.seed, s.decorrelation_m
+    );
+    let shadowing = Shadowing::new(s.sigma_db, s.seed, s.decorrelation_m, sti);
+    GnbCellTracker::with_channel_model(
+        sti,
+        phy_location,
+        Box::new(ShadowedModel::new(Box::new(DistanceModel), shadowing)),
+    )
+}
+
 impl RlsTask {
     /// Creates a new RLS task
     pub fn new(task_base: GnbTaskBase) -> Self {
@@ -162,13 +187,14 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -204,10 +230,11 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -1627,7 +1654,6 @@ impl Task for RlsTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
 
     fn test_config() -> GnbConfig {
@@ -2448,6 +2474,42 @@ mod tests {
         );
     }
 
+    /// nextgsim#467: no `shadowing:` block keeps the plain distance model; a
+    /// block with σ > 0 shadows the tracker's level, keyed by this gNB's NCI.
+    #[test]
+    fn the_shadowing_block_decides_the_trackers_channel_model() {
+        let origin = SimCoord::new(0, 0, 0);
+        let off = build_cell_tracker(&test_config(), 0x10, origin);
+        for x in [31, 62, 85, 119] {
+            assert_eq!(off.estimate_dbm(&SimCoord::new(x, 0, 0)), -x, "σ 0: x={x}");
+        }
+
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let on = build_cell_tracker(&cfg, 0x10, origin);
+        let again = build_cell_tracker(&cfg, 0x10, origin);
+        let other_gnb = build_cell_tracker(&cfg, 0x20, origin);
+        let field = Shadowing::new(8.0, 42, 20.0, 0x10);
+        let (mut moved, mut differs) = (0, 0);
+        for x in 31..120 {
+            let p = SimCoord::new(x, 0, 0);
+            let level = on.estimate_dbm(&p);
+            assert_eq!(level, (f64::from(-x) + field.offset_db(&p)).round() as i32);
+            assert_eq!(level, again.estimate_dbm(&p), "a restart reproduces x={x}");
+            moved += i32::from(level != -x);
+            differs += i32::from(level != other_gnb.estimate_dbm(&p));
+        }
+        assert!(moved > 40, "σ 8 dB moved only {moved} levels");
+        assert!(
+            differs > 40,
+            "another NCI is another field; {differs} differ"
+        );
+    }
+
     // ========================================================================
     // AM ARQ through the real task (#15)
     // ========================================================================
@@ -2849,6 +2911,60 @@ mod tests {
         // RSRQ stays absent rather than invented -- RLS models no interference.
         assert_eq!(rsrq, None);
         assert_eq!(position, (10.0, 20.0, 30.0));
+    }
+
+    /// #524 review: with shadowing on, the NWDAF is fed exactly the shadowed
+    /// level the ack carries, not a level recomputed from the distance. The real
+    /// heartbeat path, from the tracker to the NWDAF channel.
+    #[tokio::test]
+    async fn with_shadowing_the_nwdaf_feed_is_the_shadowed_ack_level() {
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(cfg.clone(), 16);
+        let sixg = task_base.init_6g_tasks(16);
+        let mut nwdaf_rx = sixg.nwdaf_rx;
+        let mut task = RlsTask::new(task_base);
+        let expected_tracker = build_cell_tracker(&cfg, task.sti, SimCoord::new(0, 0, 0));
+
+        let mut shadowed = 0;
+        for x in (35..100).step_by(5) {
+            let pos = SimCoord::new(x, 0, 0);
+            let (ack, _) = task.cell_tracker.process_heartbeat(
+                0xABCD,
+                "127.0.0.1:5000".parse().unwrap(),
+                &nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos),
+            );
+            let ack = ack.expect("in range");
+            task.sti_to_ue_id.insert(0xABCD, 7);
+            let heartbeat = nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos);
+            task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+                .await;
+            let Some(TaskMessage::Message(NwdafMessage::UeMeasurement { rsrp, .. })) =
+                nwdaf_rx.recv().await
+            else {
+                panic!("a heartbeat must produce a UE measurement");
+            };
+            let level = expected_tracker.estimate_dbm(&pos);
+            assert_eq!(
+                ack.dbm, level,
+                "the ack carries the shadowed level at x={x}"
+            );
+            assert_eq!(
+                rsrp,
+                Some(level as f32),
+                "the NWDAF gets the ack's level at x={x}"
+            );
+            shadowed += i32::from(level != -x);
+        }
+        assert!(
+            shadowed > 5,
+            "σ 8 dB must shadow the feed; {shadowed} of 13 differ"
+        );
     }
 
     #[tokio::test]

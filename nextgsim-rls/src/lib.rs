@@ -22,7 +22,8 @@
 //! - [`channel`]: pluggable signal models behind the [`channel::ChannelModel`]
 //!   trait — the default [`channel::DistanceModel`] (negated distance, what the
 //!   tracker always did) and the opt-in [`channel::FreeSpaceModel`] (Friis path
-//!   loss). TR 38.901, sub-THz, RIS and NTN models are intended future
+//!   loss), plus [`channel::ShadowedModel`], seeded spatially consistent
+//!   log-normal shadowing on top of either (non-normative, off by default). TR 38.901, sub-THz, RIS and NTN models are intended future
 //!   implementations of the same trait; the last three are non-normative, as no
 //!   frozen Rel-20 stage-3 specification exists.
 //! - [`transport`]: RRC and user plane data transport
@@ -74,7 +75,7 @@ pub mod protocol;
 pub mod transport;
 
 // Re-export commonly used types from protocol
-pub use channel::{ChannelModel, DistanceModel, FreeSpaceModel};
+pub use channel::{ChannelModel, DistanceModel, FreeSpaceModel, ShadowedModel, Shadowing};
 pub use codec::{decode, encode, RlsCodecError};
 pub use protocol::{
     MessageType, PduInfo, PduType, RlfCause, RlsHeartbeat, RlsHeartbeatAck, RlsMessage,

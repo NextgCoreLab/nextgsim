@@ -130,6 +130,164 @@ impl ChannelModel for FreeSpaceModel {
     }
 }
 
+/// Seeded, spatially consistent log-normal shadowing on top of a channel model
+/// (nextgsim#467). **Non-normative**: a simulator model, not a 3GPP deliverable.
+///
+/// Shadowing is the slow, location-dependent fading that buildings and terrain
+/// put on a link: a UE standing at the same spot hears the same transmitter at
+/// the same level every time, and two nearby spots are correlated. So the offset
+/// is a deterministic function of `(seed, link_key, position)`, never a fresh
+/// draw per heartbeat:
+///
+/// - a lattice with spacing `decorrelation_m` holds one seeded N(0, 1) draw per
+///   lattice point, keyed by the seed and the transmitter (`link_key`, the gNB's
+///   NCI, which is stable across starts);
+/// - a position's value is the trilinear interpolation of its eight surrounding
+///   lattice points, divided by `sqrt(Σw²)` so that every position, on or between
+///   lattice points, is exactly N(0, 1);
+/// - the offset is that value times `sigma_db`.
+///
+/// The spatial correlation this gives is compact-support, not the exponential
+/// Gudmundson kernel of TR 38.901: about 0.3 on average one lattice spacing
+/// apart, exactly zero from two spacings on, and it varies with where in a
+/// lattice cell the two points sit.
+///
+/// Determinism holds per target: the hash is pure integer arithmetic, but the
+/// Box-Muller `ln`/`cos` come from the platform's libm, so two architectures
+/// could in principle differ in the last ulp, and that could flip a rounded level
+/// that lands exactly on .5 dB.
+///
+/// The UE is deliberately not part of the key: shadowing belongs to the location
+/// and the transmitter, and a UE's RLS identity is random per start, so keying on
+/// it would make a seeded run irreproducible.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Shadowing {
+    sigma_db: f64,
+    seed: u64,
+    decorrelation_m: f64,
+    link_key: u64,
+}
+
+impl Shadowing {
+    /// Shadowing of standard deviation `sigma_db` with lattice spacing
+    /// `decorrelation_m`, for the transmitter identified by `link_key`.
+    ///
+    /// The caller validates the parameters (the gNB does, at startup); a zero
+    /// `sigma_db` gives a zero offset everywhere.
+    ///
+    /// As a backstop for a caller that skipped validation, the model itself never
+    /// panics or yields NaN: a non-finite or negative `sigma_db` is treated as 0,
+    /// and `decorrelation_m` is clamped to `1.0..=1e4` m (NaN to 1 m).
+    pub fn new(sigma_db: f64, seed: u64, decorrelation_m: f64, link_key: u64) -> Self {
+        let sigma_db = if sigma_db.is_finite() && sigma_db > 0.0 {
+            sigma_db
+        } else {
+            0.0
+        };
+        let decorrelation_m = if decorrelation_m.is_nan() {
+            1.0
+        } else {
+            decorrelation_m.clamp(1.0, 1e4)
+        };
+        Self {
+            sigma_db,
+            seed,
+            decorrelation_m,
+            link_key,
+        }
+    }
+
+    /// The shadowing offset in dB at `pos`.
+    pub fn offset_db(&self, pos: &SimCoord) -> f64 {
+        if self.sigma_db == 0.0 {
+            return 0.0;
+        }
+        let d = self.decorrelation_m;
+        let axis = |v: i32| {
+            let f = f64::from(v) / d;
+            let base = f.floor();
+            (base as i64, f - base)
+        };
+        let (ix, ux) = axis(pos.x);
+        let (iy, uy) = axis(pos.y);
+        let (iz, uz) = axis(pos.z);
+        let (mut acc, mut weight_sq) = (0.0, 0.0);
+        for corner in 0..8u8 {
+            let pick = |bit: u8, u: f64| {
+                if corner & bit == 0 {
+                    (0, 1.0 - u)
+                } else {
+                    (1, u)
+                }
+            };
+            let (dx, wx) = pick(1, ux);
+            let (dy, wy) = pick(2, uy);
+            let (dz, wz) = pick(4, uz);
+            let w = wx * wy * wz;
+            if w == 0.0 {
+                continue;
+            }
+            // With d >= 1 m and i32 positions the indices are within ±2^31, so
+            // this cannot wrap; wrapping keeps the model panic-free regardless.
+            acc += w * self.lattice_normal(
+                ix.wrapping_add(dx),
+                iy.wrapping_add(dy),
+                iz.wrapping_add(dz),
+            );
+            weight_sq += w * w;
+        }
+        // The eight weights sum to 1, so Σw² >= 1/8 and never divides by zero.
+        self.sigma_db * acc / weight_sq.sqrt()
+    }
+
+    /// The seeded N(0, 1) draw at one lattice point (Box-Muller on two uniforms
+    /// hashed from the key).
+    fn lattice_normal(&self, i: i64, j: i64, k: i64) -> f64 {
+        let mut h = splitmix64(self.seed);
+        for part in [self.link_key, i as u64, j as u64, k as u64] {
+            h = splitmix64(h ^ part);
+        }
+        // 53-bit mantissas: u1 in (0, 1] so ln(u1) is finite, u2 in [0, 1).
+        const SCALE: f64 = 1.0 / (1u64 << 53) as f64;
+        let u1 = ((h >> 11) as f64 + 1.0) * SCALE;
+        let u2 = (splitmix64(h) >> 11) as f64 * SCALE;
+        (-2.0 * u1.ln()).sqrt() * (core::f64::consts::TAU * u2).cos()
+    }
+}
+
+/// SplitMix64's finaliser: a fast, well-mixed, dependency-free 64-bit hash.
+fn splitmix64(z: u64) -> u64 {
+    let mut z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A channel model with [`Shadowing`] added to its level (nextgsim#467).
+///
+/// The offset is added once, here, so every consumer of the gNB's received
+/// level (the UE's cell search and A3 evaluation via the heartbeat ack, and the
+/// gNB's own NWDAF feed) sees the same shadowed value.
+#[derive(Debug)]
+pub struct ShadowedModel {
+    inner: Box<dyn ChannelModel>,
+    shadowing: Shadowing,
+}
+
+impl ShadowedModel {
+    /// `inner`'s level plus `shadowing`'s offset at the UE's position.
+    pub fn new(inner: Box<dyn ChannelModel>, shadowing: Shadowing) -> Self {
+        Self { inner, shadowing }
+    }
+}
+
+impl ChannelModel for ShadowedModel {
+    fn estimate_dbm(&self, gnb_pos: &SimCoord, ue_pos: &SimCoord) -> i32 {
+        let level = f64::from(self.inner.estimate_dbm(gnb_pos, ue_pos));
+        (level + self.shadowing.offset_db(ue_pos)).round() as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,5 +390,182 @@ mod tests {
             model.estimate_dbm(&at(0, 0, 0), &at(1, 0, 0)),
             "and it equals the one-metre level, which is what the floor means"
         );
+    }
+
+    // ---- Shadowing (nextgsim#467) ----
+
+    fn shadow(sigma: f64, seed: u64, nci: u64) -> Shadowing {
+        Shadowing::new(sigma, seed, 20.0, nci)
+    }
+
+    /// The ticket's unit criterion: the same (gNB, position, seed) gives the same
+    /// level on every call and from every instance, so the A3 and NWDAF arms of
+    /// one seeded run, and two runs of the same seed, see the same levels.
+    #[test]
+    fn shadowing_is_identical_across_calls_and_instances() {
+        let a = shadow(6.0, 42, 0x10);
+        let b = shadow(6.0, 42, 0x10);
+        for x in (-50..200).step_by(7) {
+            let p = at(x, 13, 0);
+            let first = a.offset_db(&p);
+            assert_eq!(
+                first.to_bits(),
+                a.offset_db(&p).to_bits(),
+                "same instance, x={x}"
+            );
+            assert_eq!(
+                first.to_bits(),
+                b.offset_db(&p).to_bits(),
+                "new instance, x={x}"
+            );
+        }
+        let m1 = ShadowedModel::new(Box::new(DistanceModel), a);
+        let m2 = ShadowedModel::new(Box::new(DistanceModel), b);
+        for x in 0..120 {
+            let p = at(x, 0, 0);
+            assert_eq!(
+                m1.estimate_dbm(&at(0, 0, 0), &p),
+                m2.estimate_dbm(&at(0, 0, 0), &p)
+            );
+        }
+    }
+
+    /// A different seed, or a different gNB, is a different field.
+    #[test]
+    fn the_seed_and_the_gnb_select_the_field() {
+        let points: Vec<SimCoord> = (0..40).map(|i| at(i * 10, 5, 0)).collect();
+        let field = |s: &Shadowing| points.iter().map(|p| s.offset_db(p)).collect::<Vec<_>>();
+        let base = field(&shadow(6.0, 1, 0x10));
+        assert_ne!(base, field(&shadow(6.0, 2, 0x10)), "another seed");
+        assert_ne!(base, field(&shadow(6.0, 1, 0x20)), "another gNB");
+    }
+
+    /// σ 0 is off: the shadowed model reports exactly what the inner one does.
+    #[test]
+    fn zero_sigma_is_byte_identical_to_the_inner_model() {
+        let model = ShadowedModel::new(Box::new(DistanceModel), shadow(0.0, 7, 0x10));
+        for x in [0, 1, 31, 62, 85, 120, 500] {
+            let (g, u) = (at(0, 0, 0), at(x, 3, 0));
+            assert_eq!(
+                model.estimate_dbm(&g, &u),
+                DistanceModel.estimate_dbm(&g, &u)
+            );
+        }
+    }
+
+    /// On and off the lattice, the offset is N(0, σ²): sample mean and standard
+    /// deviation over many independent lattice cells, at an off-lattice point of
+    /// each, are within a few standard errors of 0 and σ.
+    #[test]
+    fn the_marginal_is_zero_mean_with_the_configured_sigma() {
+        let s = shadow(5.0, 9, 0x10);
+        // Every 3rd lattice cell (60 m apart, independent), at the cell's middle
+        // (where interpolation shrinks variance most before renormalisation).
+        let samples: Vec<f64> = (0..4000)
+            .map(|i| s.offset_db(&at((i % 80) * 60 + 10, (i / 80) * 60 + 10, 0)))
+            .collect();
+        let n = samples.len() as f64;
+        let mean = samples.iter().sum::<f64>() / n;
+        let sd = (samples.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+        assert!(mean.abs() < 0.3, "mean {mean} dB, expected ~0");
+        assert!((sd - 5.0).abs() < 0.3, "sd {sd} dB, expected ~5");
+    }
+
+    /// Spatially consistent: a metre apart the offsets nearly agree; points many
+    /// decorrelation distances apart are uncorrelated.
+    #[test]
+    fn nearby_points_correlate_and_far_points_do_not() {
+        let s = shadow(6.0, 3, 0x10);
+        let corr = |gap: i32| {
+            let pairs: Vec<(f64, f64)> = (0..3000)
+                .map(|i| {
+                    let p = at((i % 60) * 97, (i / 60) * 89, 0);
+                    let q = at(p.x + gap, p.y, 0);
+                    (s.offset_db(&p), s.offset_db(&q))
+                })
+                .collect();
+            let n = pairs.len() as f64;
+            let (ma, mb) = (
+                pairs.iter().map(|p| p.0).sum::<f64>() / n,
+                pairs.iter().map(|p| p.1).sum::<f64>() / n,
+            );
+            let cov = pairs.iter().map(|p| (p.0 - ma) * (p.1 - mb)).sum::<f64>();
+            let va = pairs.iter().map(|p| (p.0 - ma).powi(2)).sum::<f64>();
+            let vb = pairs.iter().map(|p| (p.1 - mb).powi(2)).sum::<f64>();
+            cov / (va * vb).sqrt()
+        };
+        assert!(corr(1) > 0.9, "1 m apart: {}", corr(1));
+        assert!(corr(200).abs() < 0.1, "200 m apart: {}", corr(200));
+    }
+
+    /// The offset rides on top of the inner level and is rounded once.
+    #[test]
+    fn the_shadowed_level_is_the_inner_level_plus_the_rounded_offset() {
+        let s = shadow(8.0, 11, 0x10);
+        let model = ShadowedModel::new(Box::new(DistanceModel), s);
+        let mut moved = 0;
+        for x in 31..120 {
+            let u = at(x, 0, 0);
+            let expected = (f64::from(-x) + s.offset_db(&u)).round() as i32;
+            let got = model.estimate_dbm(&at(0, 0, 0), &u);
+            assert_eq!(got, expected, "x={x}");
+            moved += i32::from(got != -x);
+        }
+        assert!(moved > 40, "σ 8 dB must move most levels, moved {moved}");
+    }
+
+    /// Golden values (#524 review): seeds are committed before demo runs and
+    /// replayed, so the field itself is pinned. A change to the hash, the key
+    /// order, Box-Muller or the interpolation fails here even when every
+    /// statistical property still holds. Tolerance 1e-9 dB, well inside the
+    /// per-target libm caveat and far below the 0.5 dB rounding step.
+    #[test]
+    fn the_field_is_pinned_by_golden_values() {
+        // (seed, NCI, position, offset in dB)
+        type Golden = (u64, u64, (i32, i32, i32), f64);
+        let golden: [Golden; 5] = [
+            (42, 0x10, (62, 0, 0), -4.892_357_991_851),
+            (42, 0x20, (62, 0, 0), 5.281_534_925_009),
+            (7, 0x10, (0, 0, 0), -2.571_213_662_869),
+            (7, 0x10, (-35, 13, 2), 8.797_099_696_273),
+            (0, 0x10, (85, 0, 0), 0.996_067_346_654),
+        ];
+        for (seed, nci, (x, y, z), expected) in golden {
+            let got = Shadowing::new(6.0, seed, 20.0, nci).offset_db(&at(x, y, z));
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "seed {seed}, NCI {nci:#x}, ({x}, {y}, {z}): {got:.12} != {expected:.12}"
+            );
+        }
+        let model =
+            ShadowedModel::new(Box::new(DistanceModel), Shadowing::new(6.0, 42, 20.0, 0x10));
+        assert_eq!(
+            model.estimate_dbm(&at(0, 0, 0), &at(62, 0, 0)),
+            -67,
+            "-62 - 4.89"
+        );
+    }
+
+    /// #524 review MAJOR: parameters a caller failed to validate must not panic
+    /// (index overflow) or produce NaN, which `round() as i32` turns into 0 dBm,
+    /// the strongest level, capturing every A3 decision.
+    #[test]
+    fn unvalidated_parameters_neither_panic_nor_yield_nan() {
+        let far = [at(i32::MAX, i32::MIN, 0), at(1, -1, 1), at(62, 0, 0)];
+        for d in [1.0e-320, 1.0e-12, 0.0, -5.0, f64::NAN, f64::INFINITY] {
+            for sigma in [8.0, f64::NAN, f64::INFINITY, -3.0] {
+                let s = Shadowing::new(sigma, 1, d, 0x10);
+                for p in &far {
+                    let v = s.offset_db(p);
+                    assert!(v.is_finite(), "sigma {sigma}, d {d}, {p:?}: {v}");
+                }
+                let m = ShadowedModel::new(Box::new(DistanceModel), s);
+                assert_ne!(
+                    m.estimate_dbm(&at(0, 0, 0), &at(62, 0, 0)),
+                    0,
+                    "never 0 dBm at 62 m"
+                );
+            }
+        }
     }
 }
