@@ -266,6 +266,23 @@ impl AppTask {
             return;
         }
 
+        // `congestion-status` (nextgsim#465, demo d441a-congestion-loop): the
+        // exporter's state, read from its status cell.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        if crate::congestion::is_status_command(&cmd.command) {
+            let result = crate::congestion::status_json();
+            if let Some(server) = &self.cli_server {
+                let sent = match result {
+                    Ok(out) => server.send_result(cmd.client_addr, out).await,
+                    Err(e) => server.send_error(cmd.client_addr, e).await,
+                };
+                if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // `nwdaf-status` (nextgsim#463) is answered by the NWDAF task over its
         // channel, so it cannot go through the synchronous command handler.
         #[cfg(feature = "model-registry")]

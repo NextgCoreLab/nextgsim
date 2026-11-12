@@ -65,6 +65,13 @@ impl GnbApp {
             .with_context(|| format!("Failed to read configuration from {config_path}"))?;
         nextgsim_gnb::demo::init(&config_text)
             .with_context(|| format!("Invalid demo block in {config_path}"))?;
+        // Demo D441A (#465): with the demo active, the congestion_export block
+        // must name a capacity and an NRF, and the exporter (its CCA key and
+        // JWK) must build, or startup fails.
+        #[cfg(feature = "demo-d441a-congestion-loop")]
+        nextgsim_gnb::congestion::prepare_startup(&config)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("Invalid congestion_export block in {config_path}"))?;
 
         info!(
             "Configuration loaded: NCI={:#x}, PLMN={}-{}, TAC={}",

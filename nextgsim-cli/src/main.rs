@@ -188,6 +188,7 @@ fn print_help(node_name: &str) {
         println!("    status, info, ue-list, amf-status");
         println!("  6G Features:");
         println!("    nwdaf-status                    - Show NWDAF analytics status");
+        println!("    congestion-status               - Show the D441A cell-report exporter (demo-d441a-congestion-loop builds)");
         println!("    she-status                      - Show edge computing status");
         println!("    isac-config <enable|disable>    - Configure ISAC sensing");
         println!("    fl-status                       - Show federated learning status");
