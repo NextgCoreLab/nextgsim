@@ -114,7 +114,7 @@ The chain (`d444a/chain.txt`, head and tail):
 
 ```
 [2026-11-12T16:37:59.382Z INFO  nextgcore_smfd] ref=1: network-requested PDU Session Modification (AMBR UL/DL 1000000000/1000000000 -> 64000/1000000000 bps, 5QI 9 -> 9, ARP PL 8 -> 8)
-[demo:d444a-ambr-adapt] session-AMBR (PSI 1) UL 64000 bps not followed: mode raw, keep 128
+2026-11-12T16:37:59.400220Z  INFO nextgsim_ue::semantic_codec::d444a: [demo:d444a-ambr-adapt] session-AMBR (PSI 1) UL 64000 bps not followed: mode raw, keep 128
 ```
 
 upfd installs the new QER and now polices to it. Epoch 7 is before the throttle, epoch 8 straddles it, and epochs 9 and 10 are under it (`logs/<upf-pod>_upf.log`; `d444a/sink-rows.txt`; `d444a/qer-gate.txt`):
@@ -142,7 +142,7 @@ The restore (`d444a/restore-chain.txt`, first line) and the subscriber afterward
 [2026-11-12T16:19:50.017Z ERROR nextgcore_amfd::ngap_path] [imsi-999700000000001] Npcf_AMPolicyControl_Create failed: Request failed: AM policy create failed: HTTP/2 connection error: Connection refused (os error 111)
 ```
 
-This is filed as nextgcore #1479 and not patched here. The PASS run's pcfd registered (`PCF registered with NRF (id=de13d6cf-a460-48f0-8f4a-94c2fc319657, status=201)`).
+This was filed as nextgcore #1479 and is fixed on main by nextgcore #1483, which merged after these runs. The PASS run's pcfd registered (`PCF registered with NRF (id=de13d6cf-a460-48f0-8f4a-94c2fc319657, status=201)`).
 
 ### Round 2
 
@@ -210,7 +210,7 @@ nextg_demo_enabled{demo="d444a-ambr-adapt",mode="semantic"} 1
 
 The first line is from the sink and the second from the UE. Each is shown without its `log-chain.txt` prefix (the kubelet stamp and the `[<pod>_<container>]` tag).
 
-**T3591.** smfd retransmitted the PDU SESSION MODIFICATION COMMAND six times in this run (`logs/<smf-pod>_smf.log`). The UE sent its COMPLETE (the chains above), but amfd does not yet relay it to smfd (nextgcore #1470, open at the time of the run):
+**T3591.** smfd retransmitted the PDU SESSION MODIFICATION COMMAND six times in this run (`logs/<smf-pod>_smf.log`). The UE sent its COMPLETE (the chains above), but amfd did not yet relay it to smfd at the time of this run. This was fixed by nextgcore #1470, which is in the round-3 core (`55c6afcb0eda`): the round-3 raw run on main logs no T3591 retransmission (`raw/20261112T163446Z/logs/<smf-pod>_smf.log`, no `T3591 expired` line):
 
 ```
 [2026-11-12T13:03:44.154Z WARN  nextgcore_smfd] SMF_TIMER_T3591 expired for ref=1; retransmitting the 5GSM command (attempt 1)
@@ -293,7 +293,7 @@ The first runs, on images `demo-d444a-ambr-adapt-2e04e3c9396e` (core) and `-7f36
 
 The other round-1 artefacts are `d444a-ambr-adapt/semantic/20261112T072955Z`, `d444a-ambr-adapt/raw/20261112T074032Z`, `off/off/20261112T074810Z` (PASS) and `d444a-ambr-adapt/semantic-diag-pcf-restart/20261112T080141Z` (a diagnostic, not a verdict). Two round-1 manual arms still stand, because the gnb/ue images are the same:
 
-- **No `device:`** (`d444a-ambr-adapt/no-device/20261112T080920Z`). The UE started without `SO_BINDTODEVICE`, and the sink still received every datagram. On the EKS UE pod the routing table already sends 10.45.0.1 through the session's TUN, so this arm does not discriminate there:
+- **No `device:`** (`d444a-ambr-adapt/no-device/20261112T080920Z`). The arm's verdict is `VERDICT: FAIL`, because it ran on the round-1 core with the pcfd defects; it is used here only for what the sink received. The UE started without `SO_BINDTODEVICE`, and the sink still received every datagram. On the EKS UE pod the routing table already sends 10.45.0.1 through the session's TUN, so this arm does not discriminate there:
 
 ```
 2026-11-12T08:11:09.306354Z  INFO nextgsim_ue::semantic_codec::d444a: [demo:d444a-ambr-adapt] UL feature stream to 10.45.0.1:5444 via the routing table at 50 Hz, mode semantic, keep 128, follow_session_ambr=true
@@ -315,4 +315,4 @@ The other round-1 artefacts are `d444a-ambr-adapt/semantic/20261112T072955Z`, `d
 - The UE application staying under its Session-AMBR is an application choice, not the UE's UL Session-AMBR enforcement (TS 23.501 §5.7.2.6), which nextgsim does not implement.
 - The stream starts at keep 128 and learns the Session-AMBR only from a PDU SESSION MODIFICATION COMMAND, not from the establishment accept. After a re-establishment it keeps the last modified keep until the next change. The demo's flow starts at the provisioned 1 Gbps, so this does not affect it.
 - Below about 30 kbit/s the floor of 8 features (60 B per datagram, 24 kbit/s at 50 Hz) is above the 80 % target, although the log still prints the target.
-- The throttle source: until nextgsim#465's pcfd controller merges, the EKS scenario lowers the subscriber's session AMBR in the UDR and re-authorises the SM policy association (TS 29.512 §4.2.3.2). That pcfd startup check (`MissingDependency` on `d441a-congestion-loop`) lands with #465's pcfd demo registry. On devtest1 it reaches the UE since nextgcore #1461 and #1467, and the UPF enforces it since #1476 (round 3).
+- The throttle source: the EKS scenario lowers the subscriber's session AMBR in the UDR and re-authorises the SM policy association (TS 29.512 §4.2.3.2). It still does so although #465's pcfd controller has merged (nextgcore #1447); the scenario does not use that controller. On devtest1 it reaches the UE since nextgcore #1461 and #1467, and the UPF enforces it since #1476 (round 3).
