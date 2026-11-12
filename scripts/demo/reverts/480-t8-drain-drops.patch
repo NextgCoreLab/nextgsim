@@ -1,0 +1,13 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -850,6 +850,10 @@
+         busy.fetch_add(1, Ordering::SeqCst);
+         *lock(last_active) = Instant::now();
+         deadline = deadline.max(now() + DRAIN_BUSY);
++        drop((req, respond));
++        busy.fetch_sub(1, Ordering::SeqCst);
++        continue;
++        #[allow(unreachable_code)]
+         let guard = InFlight(busy.clone(), last_active.clone());
+         let (ids, tx) = (ids.clone(), tx.clone());
+         tokio::spawn(async move {

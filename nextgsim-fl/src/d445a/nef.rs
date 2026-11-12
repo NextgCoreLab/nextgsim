@@ -74,6 +74,11 @@ const MAX_STREAMS_PER_CONNECTION: usize = 16;
 /// The largest header list accepted (SETTINGS_MAX_HEADER_LIST_SIZE); h2's own
 /// default is 16 MiB.
 const MAX_HEADER_LIST: u32 = 16 * 1024;
+/// How long an evicted connection with nothing in flight drains: long enough
+/// for a request that raced the eviction to arrive and be answered.
+const EVICT_DRAIN: Duration = Duration::from_millis(250);
+/// How long a draining connection gives a request in flight.
+const DRAIN_BUSY: Duration = Duration::from_secs(2);
 /// At most one warn summary of refused callback connections per this long.
 const REFUSAL_SUMMARY: Duration = Duration::from_secs(10);
 /// A callback connection with no request in flight for this long is closed.
@@ -495,6 +500,9 @@ struct Held {
     last_active: Arc<Mutex<Instant>>,
     /// Told to close (evicted).
     evict: Arc<Notify>,
+    /// Evicted and draining: still counted against its source and the total
+    /// (so open sockets stay within the caps), never evicted again.
+    draining: bool,
 }
 
 impl Held {
@@ -525,12 +533,16 @@ impl Registry {
             .held
             .iter()
             .enumerate()
-            .filter(|(_, h)| h.source == source && h.idle() && (even_opening || !h.opening()))
+            .filter(|(_, h)| {
+                h.source == source && !h.draining && h.idle() && (even_opening || !h.opening())
+            })
             .min_by_key(|(_, h)| *lock(&h.last_active))
             .map(|(i, _)| i);
         match oldest {
             Some(i) => {
-                self.held.swap_remove(i).evict.notify_one();
+                // It keeps its place in the counts until its task ends.
+                self.held[i].draining = true;
+                self.held[i].evict.notify_one();
                 true
             }
             None => false,
@@ -582,13 +594,77 @@ pub async fn serve_callbacks(
     ids: CallbackIds,
     tx: mpsc::Sender<(String, Bytes)>,
 ) {
+    serve_callbacks_with(listener, ids, tx, REFUSAL_SUMMARY).await;
+}
+
+/// Refused callback connections, summarised at most once per `every`.
+struct Refusals {
+    every: Duration,
+    count: u64,
+    latest: Option<SocketAddr>,
+    due: tokio::time::Instant,
+}
+
+impl Refusals {
+    fn new(every: Duration) -> Self {
+        Self {
+            every,
+            count: 0,
+            latest: None,
+            due: tokio::time::Instant::now(),
+        }
+    }
+
+    fn refused(&mut self, peer: SocketAddr) {
+        self.count += 1;
+        self.latest = Some(peer);
+        tracing::debug!(
+            "[demo:{}] T8 listener: connection from {peer} refused (no idle connection to \
+             evict for it)",
+            super::KEY
+        );
+        if tokio::time::Instant::now() >= self.due {
+            self.flush();
+        }
+    }
+
+    /// Warn with the window's count, if any, and start the next window.
+    fn flush(&mut self) {
+        if self.count > 0 {
+            tracing::warn!(
+                "[demo:{}] T8 listener: {} connection(s) refused since the last summary \
+                 (latest from {}): every slot its source may take is busy or opening",
+                super::KEY,
+                self.count,
+                self.latest
+                    .map_or_else(|| "?".to_string(), |p| p.to_string())
+            );
+        }
+        self.count = 0;
+        self.due = tokio::time::Instant::now() + self.every;
+    }
+}
+
+async fn serve_callbacks_with(
+    listener: TcpListener,
+    ids: CallbackIds,
+    tx: mpsc::Sender<(String, Bytes)>,
+    summary_every: Duration,
+) {
     let registry = Arc::new(Mutex::new(Registry::default()));
     // Refusals are wire-driven: each is logged at debug, and a warn summary
-    // goes out at most once per REFUSAL_SUMMARY.
-    let mut refused: u64 = 0;
-    let mut summary_due = Instant::now();
+    // goes out at most once per `summary_every`, flushed on a timer so the
+    // last window of a burst is reported too.
+    let mut refusals = Refusals::new(summary_every);
     loop {
-        let (tcp, peer) = match listener.accept().await {
+        let accepted = tokio::select! {
+            a = listener.accept() => a,
+            () = tokio::time::sleep_until(refusals.due), if refusals.count > 0 => {
+                refusals.flush();
+                continue;
+            }
+        };
+        let (tcp, peer) = match accepted {
             Ok(a) => a,
             Err(e) => {
                 // EMFILE and friends: back off rather than spin.
@@ -601,22 +677,7 @@ pub async fn serve_callbacks(
             let mut r = lock(&registry);
             if !r.make_room(peer.ip()) {
                 drop(r);
-                refused += 1;
-                tracing::debug!(
-                    "[demo:{}] T8 listener: connection from {peer} refused (no idle connection \
-                     to evict for it)",
-                    super::KEY
-                );
-                if Instant::now() >= summary_due {
-                    tracing::warn!(
-                        "[demo:{}] T8 listener: {refused} connection(s) refused since the last \
-                         summary (latest from {peer}): every slot its source may take is busy \
-                         or opening",
-                        super::KEY
-                    );
-                    refused = 0;
-                    summary_due = Instant::now() + REFUSAL_SUMMARY;
-                }
+                refusals.refused(peer);
                 continue;
             }
             r.next += 1;
@@ -628,6 +689,7 @@ pub async fn serve_callbacks(
                 opening: Arc::new(AtomicBool::new(true)),
                 last_active: Arc::new(Mutex::new(Instant::now())),
                 evict: Arc::new(Notify::new()),
+                draining: false,
             };
             let mine = (
                 h.id,
@@ -736,13 +798,11 @@ async fn serve_connection(
                 continue;
             }
             () = evict.notified() => {
-                // Evicted connections are idle by construction (nothing in
-                // flight), and the registry has already given their slot away:
-                // close the socket now rather than drain it, so open sockets
-                // stay within the caps (plus idle closes, still counted while
-                // they drain).
+                // Idle as the registry last saw it, but a request may already be
+                // on the wire: drain (GOAWAY, then answer what the peer had
+                // sent), still counted against the caps until this task ends.
                 tracing::debug!("[demo:{}] T8 listener: idle connection evicted", super::KEY);
-                return Ok(());
+                break;
             }
         };
         let Some(stream) = stream else {
@@ -759,12 +819,44 @@ async fn serve_connection(
             answer(req, respond, &ids, &tx).await;
         });
     }
-    // GOAWAY, then let in-flight streams finish (briefly).
+    // GOAWAY, then answer the streams the peer opened before it, and let those
+    // in flight finish. An idle drain ends after EVICT_DRAIN; any request in
+    // flight (or accepted now) extends it to DRAIN_BUSY from its arrival.
     conn.graceful_shutdown();
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(Ok(_)) = conn.accept().await {}
-    })
-    .await;
+    let now = tokio::time::Instant::now;
+    let mut deadline = now()
+        + if busy.load(Ordering::SeqCst) > 0 {
+            DRAIN_BUSY
+        } else {
+            EVICT_DRAIN
+        };
+    let mut extended = false;
+    loop {
+        let stream = tokio::select! {
+            s = conn.accept() => s,
+            () = tokio::time::sleep_until(deadline) => {
+                // Something still being answered gets DRAIN_BUSY more, once.
+                if busy.load(Ordering::SeqCst) == 0 || extended {
+                    break;
+                }
+                extended = true;
+                deadline = now() + DRAIN_BUSY;
+                continue;
+            }
+        };
+        let Some(Ok((req, respond))) = stream else {
+            break;
+        };
+        busy.fetch_add(1, Ordering::SeqCst);
+        *lock(last_active) = Instant::now();
+        deadline = deadline.max(now() + DRAIN_BUSY);
+        let guard = InFlight(busy.clone(), last_active.clone());
+        let (ids, tx) = (ids.clone(), tx.clone());
+        tokio::spawn(async move {
+            let _guard = guard;
+            answer(req, respond, &ids, &tx).await;
+        });
+    }
     Ok(())
 }
 
@@ -929,6 +1021,7 @@ mod tests {
             opening: Arc::new(AtomicBool::new(opening)),
             last_active: Arc::new(Mutex::new(Instant::now())),
             evict: evict.clone(),
+            draining: false,
         });
         std::thread::sleep(Duration::from_millis(1));
         evict
@@ -1040,6 +1133,171 @@ mod tests {
             gone += usize::from(evicted(n).await);
         }
         assert_eq!(gone, 1);
+    }
+
+    /// An evicted connection drains (MINOR-1), so it keeps its place in the
+    /// counts until its task ends: open sockets stay within the caps, and a
+    /// draining connection is never picked again.
+    #[tokio::test]
+    async fn an_evicted_connection_keeps_its_slot_while_it_drains() {
+        let mut r = Registry::default();
+        let own: Vec<_> = (0..MAX_CONNECTIONS_PER_SOURCE)
+            .map(|_| held(&mut r, 30, false))
+            .collect();
+        assert!(r.make_room(src(30)));
+        assert_eq!(
+            r.count(src(30)),
+            MAX_CONNECTIONS_PER_SOURCE,
+            "slot freed early"
+        );
+        assert!(r.make_room(src(30)));
+        assert!(evicted(&own[0]).await && evicted(&own[1]).await);
+        assert_eq!(r.held.iter().filter(|h| h.draining).count(), 2);
+    }
+
+    /// MINOR-1 (#531 round 4): a request already on the wire when its
+    /// connection is evicted (idle as the registry saw it, `busy == 0`) is
+    /// answered, not cut. The server's runtime is blocked while the POST is
+    /// sent and the eviction fires, so both are pending when it wakes. Five
+    /// rounds, each on a fresh connection.
+    #[test]
+    fn a_request_racing_an_eviction_is_answered() {
+        let client = tokio::runtime::Runtime::new().unwrap();
+        for round in 0..5 {
+            let server = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let std_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            std_l.set_nonblocking(true).unwrap();
+            let addr = std_l.local_addr().unwrap();
+            let ids = CallbackIds::default();
+            let id = new_callback_id();
+            ids.insert(&id, "ue3");
+            let (tx, mut rx) = mpsc::channel(4);
+            let st = ConnState {
+                busy: Arc::new(AtomicUsize::new(0)),
+                opening: Arc::new(AtomicBool::new(true)),
+                last_active: Arc::new(Mutex::new(Instant::now())),
+                evict: Arc::new(Notify::new()),
+            };
+            let (busy, evict) = (st.busy.clone(), st.evict.clone());
+            let handle = server.handle().clone();
+            let served = std::thread::spawn(move || {
+                server.block_on(async move {
+                    let l = TcpListener::from_std(std_l).unwrap();
+                    let (tcp, _) = l.accept().await.unwrap();
+                    let _ = serve_connection(tcp, ids, tx, &st).await;
+                });
+            });
+            let status = client.block_on(async {
+                let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let (mut send, conn) = h2::client::handshake(tcp).await.unwrap();
+                tokio::spawn(conn);
+                // Warm-up: past the handshake and the opening window.
+                let get = http::Request::get(format!("http://{addr}/other"))
+                    .body(())
+                    .unwrap();
+                let (resp, _) = send.send_request(get, true).unwrap();
+                assert_eq!(resp.await.unwrap().status(), StatusCode::NOT_FOUND);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert_eq!(busy.load(Ordering::SeqCst), 0);
+                // Block the server, send the request, evict, then let it run.
+                handle.spawn(async { std::thread::sleep(Duration::from_millis(300)) });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let post = http::Request::post(format!("http://{addr}{CALLBACK_PREFIX}{id}"))
+                    .body(())
+                    .unwrap();
+                let body = json!({
+                    "subscription": "/3gpp-monitoring-event/v1/fl-af/subscriptions/s1",
+                    "monitoringEventReports": [{
+                        "monitoringType": "LOSS_OF_CONNECTIVITY",
+                        "lossOfConnectReason": "DEREGISTERED",
+                    }],
+                });
+                let (resp, mut stream) = send.send_request(post, false).unwrap();
+                stream
+                    .send_data(Bytes::from(body.to_string()), true)
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                evict.notify_one();
+                resp.await.map(|r| r.status()).map_err(|e| e.to_string())
+            });
+            assert_eq!(status, Ok(StatusCode::NO_CONTENT), "round {round}");
+            assert_eq!(rx.try_recv().map(|(i, _)| i).ok(), Some(id.clone()));
+            served.join().unwrap();
+        }
+    }
+
+    /// MINOR-2 (#531 round 4): the last window of a refusal burst is reported
+    /// on a timer, not only when a later refusal comes.
+    #[tokio::test]
+    async fn the_last_refusal_window_is_flushed_on_a_timer() {
+        let logs = Logs::default();
+        let sub = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let _guard = tracing::subscriber::set_default(sub);
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let (tx, _rx) = mpsc::channel(4);
+        tokio::spawn(serve_callbacks_with(
+            l,
+            CallbackIds::default(),
+            tx,
+            Duration::from_millis(200),
+        ));
+        // Fill the source's slots with connections that stay opening (raw TCP,
+        // no h2), then three more: refused. The first refusal warns at once;
+        // the other two are only in the window.
+        let mut held = Vec::new();
+        for _ in 0..MAX_CONNECTIONS_PER_SOURCE {
+            held.push(tcp_from(40, addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        for _ in 0..3 {
+            held.push(tcp_from(40, addr).await.unwrap());
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let text = logs.text();
+        assert!(
+            text.contains("1 connection(s) refused"),
+            "the first refusal warns at once: {text}"
+        );
+        assert!(
+            text.contains("2 connection(s) refused"),
+            "the burst's last window was never reported: {text}"
+        );
+    }
+
+    /// A tracing writer into a buffer.
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl Logs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&lock(&self.0)).into_owned()
+        }
+    }
+
+    impl std::io::Write for Logs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
+        type Writer = Logs;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     /// A connection from `127.0.0.octet` to `addr`.

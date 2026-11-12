@@ -1,0 +1,12 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -541,8 +541,7 @@
+         match oldest {
+             Some(i) => {
+                 // It keeps its place in the counts until its task ends.
+-                self.held[i].draining = true;
+-                self.held[i].evict.notify_one();
++                self.held.swap_remove(i).evict.notify_one();
+                 true
+             }
+             None => false,

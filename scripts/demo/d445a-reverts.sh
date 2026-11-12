@@ -33,6 +33,14 @@
 #                      -> a_busy_connection_is_never_evicted
 #   480-t8-fair-share-spares-opening  the total-cap eviction skips opening
 #                      connections -> an_opening_connection_is_evicted_at_the_total_cap
+#   480-t8-evict-cuts  an evicted connection is closed at once, cutting a request
+#                      that raced the eviction -> a_request_racing_an_eviction_is_answered
+#   480-t8-drain-drops the drain drops the streams it accepts
+#                      -> a_request_racing_an_eviction_is_answered
+#   480-t8-drain-uncounted  an evicted connection gives up its slot before it is
+#                      closed -> an_evicted_connection_keeps_its_slot_while_it_drains
+#   480-refusal-no-timer  the refusal summary goes out only at a later refusal
+#                      -> the_last_refusal_window_is_flushed_on_a_timer
 #
 # After the arms, the T8 listener's churn smoke tests (#[ignore]d in the default
 # suite: they load loopback) run on their own, serially, and must pass. Set
@@ -64,11 +72,16 @@ declare -A test_of=(
     [480-t8-ping-pong]="$fl no_eviction_when_the_largest_holds_only_one_more"
     [480-t8-evict-busy]="$fl a_busy_connection_is_never_evicted"
     [480-t8-fair-share-spares-opening]="$fl an_opening_connection_is_evicted_at_the_total_cap"
+    [480-t8-evict-cuts]="$fl a_request_racing_an_eviction_is_answered"
+    [480-t8-drain-drops]="$fl a_request_racing_an_eviction_is_answered"
+    [480-t8-drain-uncounted]="$fl an_evicted_connection_keeps_its_slot_while_it_drains"
+    [480-refusal-no-timer]="$fl the_last_refusal_window_is_flushed_on_a_timer"
 )
 arms="${ARMS:-480-t8-ignored 480-samples-trust 480-no-provenance 480-poison-off \
 480-norm-unchecked 480-identity-clash 480-subscribe-first 480-t8-no-evict \
 480-t8-evict-any-source 480-t8-no-fair-share 480-t8-ping-pong 480-t8-evict-busy \
-480-t8-fair-share-spares-opening}"
+480-t8-fair-share-spares-opening 480-t8-evict-cuts 480-t8-drain-drops \
+480-t8-drain-uncounted 480-refusal-no-timer}"
 for arm in $arms; do
     args="${test_of[$arm]:?unknown arm $arm}"
     name="${args##* }"
