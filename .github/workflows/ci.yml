@@ -441,6 +441,10 @@ jobs:
       # are behind `nkef-sba`, which no other job enables.
       - name: cargo test (6g + nkef-sba)
         run: cargo test -p nextgsim-gnb --features 6g,nkef-sba
+      # Demo d441a-congestion-loop (#465): the downlink queue at C, the OLS
+      # predictor and the cell-report exporter are behind their own feature.
+      - name: cargo test (demo-d441a-congestion-loop)
+        run: cargo test -p nextgsim-gnb --features demo-d441a-congestion-loop
       # Demo d444a-ambr-adapt (#477): the UE's Session-AMBR-following stream and
       # the semantic-sink binary are behind `demo-d444a-ambr-adapt`.
       - name: cargo test (6g + demo-d444a-ambr-adapt)
@@ -455,6 +459,7 @@ jobs:
         run: |
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
           cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
+          cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets

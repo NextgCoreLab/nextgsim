@@ -136,6 +136,67 @@ impl Default for NkefLiveConfig {
     }
 }
 
+/// The D441A RAN congestion exporter's settings (nextgsim#465, demo
+/// `d441a-congestion-loop`).
+///
+/// Read only while that demo is active (the `demo-d441a-congestion-loop` gNB
+/// build with the `demo:` block on); otherwise ignored, so the block is inert in a
+/// default build and a default config. While the demo is active,
+/// `cell_capacity_mbps` and `nrf_uri` are required and startup fails without them.
+///
+/// - `cell_capacity_mbps`: the cell's downlink capacity C. **A simulator
+///   construct**: the gNB has no PHY or scheduler, so C is configured, and the
+///   downlink is served through one FIFO drained at C bps.
+/// - `queue_limit_bytes`: the FIFO's drop-tail limit.
+/// - `window_ms`: the measurement and export window.
+/// - `prediction_horizon_ms`: how far ahead mode `prediction` extrapolates.
+/// - `nrf_uri`: the NRF's SBI root; the exporter registers there as an AF and
+///   takes its access tokens from it.
+/// - `nwdaf_uri`: nwdafd's SBI root, skipping NRF discovery when set.
+/// - `nf_instance_id`: the AF instance id the exporter registers under.
+/// - `cca_key_file`: the ES256 client-assertion key (hex scalar), created when
+///   absent.
+/// - `cca_public_jwk_dir`: when set, the public JWK is written there as
+///   `<nf_instance_id>.jwk` for an NRF that reads its trusted keys from a directory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CongestionExportConfig {
+    /// Cell downlink capacity C, Mbps.
+    pub cell_capacity_mbps: Option<f64>,
+    /// Drop-tail limit of the downlink FIFO, octets.
+    pub queue_limit_bytes: usize,
+    /// Measurement and export window, ms.
+    pub window_ms: u64,
+    /// Prediction horizon, ms.
+    pub prediction_horizon_ms: u64,
+    /// The NRF's SBI root.
+    pub nrf_uri: Option<String>,
+    /// nwdafd's SBI root (skips discovery).
+    pub nwdaf_uri: Option<String>,
+    /// The AF instance id registered at the NRF.
+    pub nf_instance_id: String,
+    /// The CCA signing key file.
+    pub cca_key_file: std::path::PathBuf,
+    /// Where to publish the public JWK, if anywhere.
+    pub cca_public_jwk_dir: Option<std::path::PathBuf>,
+}
+
+impl Default for CongestionExportConfig {
+    fn default() -> Self {
+        Self {
+            cell_capacity_mbps: None,
+            queue_limit_bytes: 200_000,
+            window_ms: 1000,
+            prediction_horizon_ms: 5000,
+            nrf_uri: None,
+            nwdaf_uri: None,
+            nf_instance_id: "6b1d7e3c-0000-4000-8000-00000000441a".to_string(),
+            cca_key_file: std::path::PathBuf::from("/tmp/nextgsim-d441a-cca.key"),
+            cca_public_jwk_dir: None,
+        }
+    }
+}
+
 /// The gNB's per QoS flow QoS monitoring (TS 23.501 §5.33.3.2, TS 38.415
 /// §5.4.1.1 / §5.4.2.1, nextgsim#509).
 ///
@@ -536,6 +597,10 @@ pub struct GnbConfig {
     /// the block is inert in a default build and a default config.
     #[serde(default)]
     pub nkef_live: NkefLiveConfig,
+    /// What the D441A congestion exporter and downlink queue use (nextgsim#465,
+    /// demo d441a-congestion-loop). Read only while that demo is active.
+    #[serde(default)]
+    pub congestion_export: CongestionExportConfig,
     /// Integrated Sensing and Communication (ISAC) task enabled (Rel-20)
     #[serde(default)]
     pub isac_enabled: bool,
@@ -715,6 +780,7 @@ impl Default for GnbConfig {
             nwdaf_model_path: None,
             nkef_enabled: false,
             nkef_live: NkefLiveConfig::default(),
+            congestion_export: CongestionExportConfig::default(),
             isac_enabled: false,
             isac_ekf_tracking: false,
             isac_ekf_process_noise_accel: None,
