@@ -729,11 +729,11 @@ impl RlsTask {
         // along `sim_movement` if one is set. Each gNB derives this UE's received
         // level from it, so a moving UE's measurements change and a handover can
         // be driven. Carried in every heartbeat.
-        let cfg = &self.task_base.config;
-        let pos = match cfg.sim_movement {
-            Some(movement) => movement.position_at(cfg.sim_position, self.started_at.elapsed()),
-            None => cfg.sim_position,
-        };
+        // #462: or along `sim_route`, a route through waypoints.
+        let pos = self
+            .task_base
+            .config
+            .sim_position_at(self.started_at.elapsed());
         self.cell_search
             .set_position(SimCoord::new(pos.x, pos.y, pos.z));
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {

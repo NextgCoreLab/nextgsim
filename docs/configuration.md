@@ -137,6 +137,7 @@ si_broadcast_period_ms: 80
 | `cho_hysteresis_db` | f64 | 1.0 | Hysteresis in dB, for the same three |
 | `sim_position` | `{x, y, z}` (metres, i32) | origin | Where the gNB stands. Each UE's received level is -1 dBm per metre of distance to its own `sim_position`; levels above -31 dBm all report as -31 (RSRP-Range), and a cell below -120 dBm is not heard |
 | `handover_neighbours` | list of `{nci, tac, gnb_id_length?}` | `[]` | Other gNBs' cells a measurement-triggered handover may target. A reported `physCellId` (`nci % 1008`) is matched against them; the match names the target gNB ID (top `gnb_id_length` bits of `nci`, default this gNB's) and TAC for HANDOVER REQUIRED. A PCI matching none is not handed over to |
+| `paging_grid` | list of `{nci, gnb_id_length?, position: {x, y, z}}` | `[]` | Demo D440A (#462): the neighbouring gNBs' cells, with where each stands, that a paging recommendation is resolved against (`handover_neighbours` carries no position). Read only by a gNB built with `--features demo-d440a-ai-paging` with the `demo.d440a-ai-paging` block on; otherwise ignored. Validated in every build: an NCI over 36 bits, a `gnb_id_length` outside 22..32, a duplicate cell, this gNB's own cell or more than 256 entries fails startup. `config/demo-ai-paging/` is an example |
 | `rlc_am_psis` | list of u8 | `[]` | PDU sessions whose DRB uses RLC Acknowledged Mode instead of Unacknowledged Mode. Must match the UE's value |
 | `ims_voice_over_nr` | bool | false | Answer the AMF's UE Radio Capability Check with "IMS voice supported" when the UE also supports it |
 | `nrppa_serving_rsrp_dbm` | i32 | -85 | SS-RSRP reported in an NRPPa E-CID measurement result (configured, not measured) |
@@ -266,6 +267,7 @@ tun_name: null
 | `conditional_handover` | bool | false | Store CHO candidates from RRCReconfiguration and execute one when its condition holds |
 | `sim_position` | `{x, y, z}` (metres, i32) | origin | Where the UE starts; see the gNB's `sim_position` |
 | `sim_movement` | `{target: {x, y, z}, speed_mps, start_after_secs}` | none | Straight-line movement from `sim_position` to `target`, starting `start_after_secs` (default 0) after start-up. Drives measurement-triggered handover; `config/ue-n2ho.yaml` is an example |
+| `sim_route` | `{waypoints: [{x, y, z}, ...], speed_mps, start_after_secs}` | none | Movement from `sim_position` through each waypoint in order, along straight segments at `speed_mps`, starting `start_after_secs` (default 0) after start-up, stopping at the last waypoint (#462). For curved routes; exclusive with `sim_movement`. At least one and at most 1024 waypoints, and a finite `speed_mps` above 0, or the UE refuses to start; an unknown field is refused. `config/ue-d440a-m0.yaml` is an example |
 | `eutra_neighbours` | list | `[]` | E-UTRA neighbour cells the UE measures for events B1/B2 |
 | `eutra_b1_threshold_dbm` | i32 | -110 | `b1-ThresholdEUTRA` of the default B1 measurement |
 | `lpp_arfcn_eutra` | u32 | 0 | `arfcnEUTRA` reported in an LPP E-CID measurement (configured, not measured) |

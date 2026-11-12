@@ -1,0 +1,7 @@
+# Override for nextgcore's docker/rust/docker-compose.demo-n2ho.yml, used by
+# scripts/demo/d440a-m0-check.sh (nextgsim#462): the UE runs the D440A M0 config,
+# which moves while CM-IDLE along a sim_route. Nothing else changes; it publishes
+# nothing (the check asserts the merged model has no published port).
+services:
+  ue:
+    command: ["-c", "/etc/nextgsim/ue-d440a-m0.yaml"]

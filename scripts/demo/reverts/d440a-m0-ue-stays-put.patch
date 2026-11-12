@@ -1,0 +1,24 @@
+Revert arm of scripts/demo/d440a-m0-check.sh (#462): the UE keeps its start
+position (no sim_route), so it stays camped on gnb-west while CM-IDLE, never
+reselects to gnb-east, and the check must fail at ue step 3/7.
+
+  scripts/demo/revert-run.sh --expect "[ue] step 3/7 missing" \
+      scripts/demo/reverts/d440a-m0-ue-stays-put.patch -- scripts/demo/d440a-m0-check.sh
+
+diff --git a/config/ue-d440a-m0.yaml b/config/ue-d440a-m0.yaml
+index a15f5e2..172081c 100644
+--- a/config/ue-d440a-m0.yaml
++++ b/config/ue-d440a-m0.yaml
+@@ -109,12 +109,6 @@ gnb_search_list:
+ # R-criterion (q-Hyst 4 dB, TS 38.304 §5.2.4.6) on the way and the idle UE
+ # reselects to it, then answers a page through it.
+ sim_position: { x: 35, y: 0, z: 0 }
+-sim_route:
+-  waypoints:
+-    - { x: 60, y: 30, z: 0 }
+-    - { x: 110, y: 0, z: 0 }
+-  speed_mps: 5
+-  start_after_secs: 45
+ 
+ # Default PDU sessions to establish after registration
+ sessions:

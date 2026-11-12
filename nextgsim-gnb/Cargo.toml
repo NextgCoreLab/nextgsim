@@ -54,6 +54,11 @@ sdap-dataplane = []
 # needs the Agent task. Active only with the demo: block on as well.
 demo-d446a-agent-conflict = ["nextgsim-agent"]
 
+# Demo D440A (nextgsim#462, convention #458): model-predicted paging. Off by
+# default; demo-only code. It needs the 6G NWDAF task for its predictors (#462
+# PR 3b). Active only with the demo: block on as well.
+demo-d440a-ai-paging = ["6g"]
+
 # Umbrella feature enabling all six optional 6G / AI-native research crates at
 # once. Off by default, so `cargo build -p nextgsim-gnb` yields a lean 5G gNB and
 # `cargo build -p nextgsim-gnb --features 6g` yields the full build. There is no

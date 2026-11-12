@@ -8,8 +8,10 @@
 #   demo_seed [SEED]           seeded runs: export DEMO_SEED (given, $DEMO_SEED, or
 #                              fresh) and record it to the artefacts. A demo that
 #                              randomises passes it on; n2ho-check.sh only records it.
-#   demo_compose_init FILE     run every compose call below against FILE, under
-#                              project $DEMO_PROJECT (default: the file's own name:).
+#   demo_compose_init FILE [OVERRIDE...]
+#                              run every compose call below against FILE (merged
+#                              with each OVERRIDE, in order), under project
+#                              $DEMO_PROJECT (default: the file's own name:).
 #   demo_assert_private        fail if the stack publishes a host port or uses host
 #                              networking (`docker compose config`, the model `up` runs).
 #   demo_logs SERVICE OUT      capture a service's log to a FILE.
@@ -61,9 +63,12 @@ demo_artefacts() {
 }
 
 demo_compose_init() {
-    local file="$1"
-    [ -f "$file" ] || { demo_fail "compose file not found: $file"; return 1; }
-    DEMO_COMPOSE=(docker compose -f "$file")
+    local file
+    DEMO_COMPOSE=(docker compose)
+    for file in "$@"; do
+        [ -f "$file" ] || { demo_fail "compose file not found: $file"; return 1; }
+        DEMO_COMPOSE+=(-f "$file")
+    done
     if [ -n "${DEMO_PROJECT:-}" ]; then DEMO_COMPOSE+=(-p "$DEMO_PROJECT"); fi
 }
 

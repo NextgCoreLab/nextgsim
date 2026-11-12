@@ -576,6 +576,18 @@ pub struct GnbConfig {
     /// otherwise the list is ignored. Empty by default.
     #[serde(default)]
     pub agents: Vec<AgentRuleConfig>,
+    /// The neighbouring gNBs' cells a D440A paging recommendation may name, with
+    /// where each stands (nextgsim#462): the "grid map" a trajectory prediction
+    /// is resolved against, since [`Self::handover_neighbours`] carries no
+    /// position. This gNB itself is implicit (its own NCI and `sim_position`).
+    ///
+    /// Read only by a gNB built with the `demo-d440a-ai-paging` feature and with
+    /// that demo active (`demo.enabled` and `demo.d440a-ai-paging.enabled`);
+    /// otherwise ignored. Always validated at startup
+    /// ([`Self::validate_paging_grid`]), so a malformed grid cannot hide behind
+    /// a disabled demo. Empty by default.
+    #[serde(default)]
+    pub paging_grid: Vec<PagingGridEntry>,
     /// Federated Learning Aggregator task enabled (Rel-20)
     #[serde(default)]
     pub federated_learning_enabled: bool,
@@ -721,6 +733,7 @@ impl Default for GnbConfig {
             isac_anchors: default_isac_anchors(),
             agent_enabled: false,
             agents: Vec::new(),
+            paging_grid: Vec::new(),
             federated_learning_enabled: false,
             quic_enabled: false,
             sctp_backend: SctpBackendKind::Userspace,
@@ -736,6 +749,44 @@ impl GnbConfig {
     pub fn gnb_id(&self) -> u32 {
         let shift = 36 - self.gnb_id_length as i64;
         ((self.nci & 0xFFFFFFFFF) >> shift) as u32
+    }
+
+    /// Why [`Self::paging_grid`] is unusable, if it is (nextgsim#462): an NCI
+    /// wider than 36 bits, a gNB ID length outside 22..32, a cell listed twice,
+    /// this gNB's own cell, or more than [`PAGING_GRID_MAX_ENTRIES`] entries.
+    pub fn validate_paging_grid(&self) -> Result<(), String> {
+        if self.paging_grid.len() > PAGING_GRID_MAX_ENTRIES {
+            return Err(format!(
+                "paging_grid has {} entries; at most {PAGING_GRID_MAX_ENTRIES}",
+                self.paging_grid.len()
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, e) in self.paging_grid.iter().enumerate() {
+            if e.nci > 0xF_FFFF_FFFF {
+                return Err(format!(
+                    "paging_grid[{i}].nci {:#x} is wider than 36 bits",
+                    e.nci
+                ));
+            }
+            if let Some(len) = e.gnb_id_length {
+                if !(22..=32).contains(&len) {
+                    return Err(format!(
+                        "paging_grid[{i}].gnb_id_length {len} is outside 22..32 (TS 38.413 §9.3.1.6)"
+                    ));
+                }
+            }
+            if e.nci == (self.nci & 0xF_FFFF_FFFF) {
+                return Err(format!(
+                    "paging_grid[{i}] is this gNB's own cell {:#x}; the grid lists neighbours",
+                    e.nci
+                ));
+            }
+            if !seen.insert(e.nci) {
+                return Err(format!("paging_grid lists cell {:#x} twice", e.nci));
+            }
+        }
+        Ok(())
     }
 
     /// Returns the Cell ID extracted from the NCI.
@@ -759,6 +810,95 @@ pub struct SimPosition {
     /// Z, metres.
     #[serde(default)]
     pub z: i32,
+}
+
+/// A UE's route through waypoints (nextgsim#462): after `start_after_secs` it
+/// moves from its `sim_position` through each waypoint in order, along straight
+/// segments at `speed_mps`, and stops at the last one.
+///
+/// [`SimMovement`] is the one-waypoint case. A route is what a curved trajectory
+/// needs: D440A's predicted paging (#462), and the mobility demos that reuse it
+/// (#467, #469). A UE config sets one of the two, never both.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimRoute {
+    /// The points the UE visits after `sim_position`, in order. At least one.
+    pub waypoints: Vec<SimPosition>,
+    /// Speed in metres per second along every segment. Must be finite and
+    /// positive: a route that cannot be travelled is a configuration error.
+    pub speed_mps: f64,
+    /// Seconds after start-up before the UE leaves `sim_position`.
+    #[serde(default)]
+    pub start_after_secs: f64,
+}
+
+/// The most waypoints a route may have. A route this long already covers any
+/// simulated grid; a longer list is far more likely a generated config gone wrong.
+pub const SIM_ROUTE_MAX_WAYPOINTS: usize = 1024;
+
+impl SimRoute {
+    /// Why this route cannot be travelled, if it cannot.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.waypoints.is_empty() {
+            return Err("sim_route.waypoints must name at least one point".into());
+        }
+        if self.waypoints.len() > SIM_ROUTE_MAX_WAYPOINTS {
+            return Err(format!(
+                "sim_route.waypoints has {} points; at most {SIM_ROUTE_MAX_WAYPOINTS}",
+                self.waypoints.len()
+            ));
+        }
+        if !self.speed_mps.is_finite() || self.speed_mps <= 0.0 {
+            return Err(format!(
+                "sim_route.speed_mps must be a finite number above 0, not {}",
+                self.speed_mps
+            ));
+        }
+        if !self.start_after_secs.is_finite() || self.start_after_secs < 0.0 {
+            return Err(format!(
+                "sim_route.start_after_secs must be a finite number of seconds, at least 0, not {}",
+                self.start_after_secs
+            ));
+        }
+        Ok(())
+    }
+
+    /// The position `elapsed` after start-up, for a UE that started at `start`:
+    /// `start` until `start_after_secs`, then along the segments start ->
+    /// waypoint 1 -> ... at `speed_mps`, then the last waypoint for good.
+    ///
+    /// A route that fails [`Self::validate`] keeps the UE at `start` (the UE
+    /// binary refuses such a config at startup; this is the defensive answer).
+    pub fn position_at(&self, start: SimPosition, elapsed: std::time::Duration) -> SimPosition {
+        if self.validate().is_err() {
+            return start;
+        }
+        let moving_for = elapsed.as_secs_f64() - self.start_after_secs;
+        if moving_for <= 0.0 {
+            return start;
+        }
+        let mut left = self.speed_mps * moving_for;
+        let mut from = start;
+        for &to in &self.waypoints {
+            let (dx, dy, dz) = (
+                f64::from(to.x) - f64::from(from.x),
+                f64::from(to.y) - f64::from(from.y),
+                f64::from(to.z) - f64::from(from.z),
+            );
+            let length = (dx * dx + dy * dy + dz * dz).sqrt();
+            if left < length {
+                let f = left / length;
+                return SimPosition {
+                    x: (f64::from(from.x) + dx * f).round() as i32,
+                    y: (f64::from(from.y) + dy * f).round() as i32,
+                    z: (f64::from(from.z) + dz * f).round() as i32,
+                };
+            }
+            left -= length;
+            from = to;
+        }
+        from
+    }
 }
 
 /// A UE's straight-line movement (#324): after `start_after_secs` it moves from
@@ -873,6 +1013,35 @@ impl AgentRuleConfig {
             AgentRuleKind::LoadBalancing => 8,
             AgentRuleKind::EnergySaving => 5,
         })
+    }
+}
+
+/// One neighbouring gNB cell of the D440A paging grid (nextgsim#462).
+///
+/// The identity is what TS 38.413 needs to name the cell and its node in
+/// *Information on Recommended Cells and RAN Nodes for Paging*: the NR CGI
+/// (§9.3.1.71, this gNB's PLMN plus `nci`) and the Global gNB ID (§9.3.1.101,
+/// the top `gnb_id_length` bits of `nci`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PagingGridEntry {
+    /// The neighbour cell's NR Cell Identity (36 bits).
+    pub nci: u64,
+    /// The neighbour's gNB ID length in bits (22..32). Absent: this gNB's own.
+    #[serde(default)]
+    pub gnb_id_length: Option<u8>,
+    /// Where the neighbour's antenna stands, in metres (its own `sim_position`).
+    pub position: SimPosition,
+}
+
+/// The most entries a paging grid may hold.
+pub const PAGING_GRID_MAX_ENTRIES: usize = 256;
+
+impl PagingGridEntry {
+    /// The neighbour's gNB ID, given this gNB's own ID length as the default.
+    pub fn gnb_id(&self, own_gnb_id_length: u8) -> u32 {
+        let len = self.gnb_id_length.unwrap_or(own_gnb_id_length);
+        ((self.nci & 0xF_FFFF_FFFF) >> (36 - u32::from(len.clamp(22, 32)))) as u32
     }
 }
 
@@ -2169,6 +2338,11 @@ pub struct UeConfig {
     /// measurement-triggered handover can be driven deterministically.
     #[serde(default)]
     pub sim_movement: Option<SimMovement>,
+    /// Optional route through waypoints from `sim_position` (nextgsim#462), for a
+    /// curved trajectory. Exclusive with `sim_movement`: the UE binary refuses a
+    /// config that sets both. Absent: the UE does not follow a route.
+    #[serde(default)]
+    pub sim_route: Option<SimRoute>,
     /// Default PDU sessions to establish
     pub sessions: Vec<SessionConfig>,
     /// Configured NSSAI (network slices)
@@ -2579,6 +2753,7 @@ impl Default for UeConfig {
             gnb_search_list: Vec::new(),
             sim_position: SimPosition::default(),
             sim_movement: None,
+            sim_route: None,
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,
@@ -2705,6 +2880,31 @@ impl GnbConfig {
 }
 
 impl UeConfig {
+    /// The UE's simulated position `elapsed` after start-up: along `sim_route`
+    /// (#462) or `sim_movement` (#324), whichever is set, else `sim_position`.
+    /// When both are set (a config the UE binary refuses) the route wins.
+    pub fn sim_position_at(&self, elapsed: std::time::Duration) -> SimPosition {
+        if let Some(route) = &self.sim_route {
+            return route.position_at(self.sim_position, elapsed);
+        }
+        match self.sim_movement {
+            Some(movement) => movement.position_at(self.sim_position, elapsed),
+            None => self.sim_position,
+        }
+    }
+
+    /// Why the simulated motion config is unusable, if it is: both `sim_route`
+    /// and `sim_movement` set, or a route that cannot be travelled (#462).
+    pub fn validate_sim_motion(&self) -> Result<(), String> {
+        if self.sim_route.is_some() && self.sim_movement.is_some() {
+            return Err("set sim_route or sim_movement, not both".into());
+        }
+        match &self.sim_route {
+            Some(route) => route.validate(),
+            None => Ok(()),
+        }
+    }
+
     /// The MINT subscription this configuration is (0 = primary, or with no
     /// MINT configuration), see [`MintConfig::active_subscription`].
     pub fn subscription_index(&self) -> u8 {
@@ -2874,6 +3074,210 @@ mod tests {
             diagonal.position_at(SimPosition::default(), Duration::from_secs(1)),
             SimPosition { x: 15, y: 20, z: 0 },
             "half of the 50 m"
+        );
+    }
+
+    /// #462: a paging grid entry names its neighbour's cell, gNB ID and
+    /// position; a grid with a malformed, duplicate or own cell is refused.
+    #[test]
+    fn a_paging_grid_validates_its_cells() {
+        let entry: PagingGridEntry =
+            serde_yaml::from_str("nci: 0x000000020\nposition: { x: 120, y: 0 }\n").expect("parses");
+        assert_eq!(entry.gnb_id(32), 2, "the top 32 of 36 bits");
+        let wide = PagingGridEntry {
+            nci: 0x2000,
+            ..entry
+        };
+        assert_eq!(
+            wide.gnb_id(32),
+            0x200,
+            "this gNB's 32-bit length by default"
+        );
+        assert_eq!(wide.gnb_id(28), 0x20);
+        assert_eq!(
+            PagingGridEntry {
+                gnb_id_length: Some(28),
+                ..wide
+            }
+            .gnb_id(32),
+            0x20,
+            "the entry's own length wins over this gNB's"
+        );
+        assert_eq!(entry.position, SimPosition { x: 120, y: 0, z: 0 });
+        let own = GnbConfig {
+            nci: 0x10,
+            gnb_id_length: 32,
+            ..GnbConfig::default()
+        };
+        assert_eq!(own.validate_paging_grid(), Ok(()), "empty is valid");
+        let with = |grid: Vec<PagingGridEntry>| GnbConfig {
+            paging_grid: grid,
+            ..own.clone()
+        };
+        assert_eq!(with(vec![entry]).validate_paging_grid(), Ok(()));
+        for (why, grid) in [
+            ("twice", vec![entry, entry]),
+            ("own cell", vec![PagingGridEntry { nci: 0x10, ..entry }]),
+            (
+                "37 bits",
+                vec![PagingGridEntry {
+                    nci: 1 << 36,
+                    ..entry
+                }],
+            ),
+            (
+                "length 21",
+                vec![PagingGridEntry {
+                    gnb_id_length: Some(21),
+                    ..entry
+                }],
+            ),
+            ("too many", vec![entry; PAGING_GRID_MAX_ENTRIES + 1]),
+        ] {
+            assert!(
+                with(grid).validate_paging_grid().is_err(),
+                "{why} must be refused"
+            );
+        }
+        assert!(
+            serde_yaml::from_str::<PagingGridEntry>("nci: 1\nposition: {x: 0, y: 0}\ntac: 1\n")
+                .is_err(),
+            "an unknown field is refused"
+        );
+    }
+
+    /// #462: a route visits its waypoints in order at constant speed along
+    /// straight segments, after its delay, and stops at the last one.
+    #[test]
+    fn sim_route_follows_its_waypoints_and_stops_at_the_last() {
+        use std::time::Duration;
+        let start = SimPosition { x: 0, y: 0, z: 0 };
+        // An L: 30 m east, then 40 m north, at 10 m/s after 5 s.
+        let route = SimRoute {
+            waypoints: vec![
+                SimPosition { x: 30, y: 0, z: 0 },
+                SimPosition { x: 30, y: 40, z: 0 },
+            ],
+            speed_mps: 10.0,
+            start_after_secs: 5.0,
+        };
+        let at = |secs: f64| route.position_at(start, Duration::from_secs_f64(secs));
+        assert_eq!(at(0.0), start, "before the delay");
+        assert_eq!(at(5.0), start, "at the delay");
+        assert_eq!(at(6.5), SimPosition { x: 15, y: 0, z: 0 }, "mid first leg");
+        assert_eq!(at(8.0), SimPosition { x: 30, y: 0, z: 0 }, "at the corner");
+        assert_eq!(
+            at(10.0),
+            SimPosition { x: 30, y: 20, z: 0 },
+            "the second leg starts at the corner, not at the start"
+        );
+        assert_eq!(at(12.0), SimPosition { x: 30, y: 40, z: 0 }, "the end");
+        assert_eq!(at(3600.0), SimPosition { x: 30, y: 40, z: 0 }, "and stays");
+
+        // A repeated point is a zero-length segment: skipped, not a divide by zero.
+        let repeated = SimRoute {
+            waypoints: vec![
+                SimPosition { x: 0, y: 0, z: 0 },
+                SimPosition { x: 10, y: 0, z: 0 },
+            ],
+            speed_mps: 10.0,
+            start_after_secs: 0.0,
+        };
+        assert_eq!(
+            repeated.position_at(start, Duration::from_millis(500)),
+            SimPosition { x: 5, y: 0, z: 0 }
+        );
+    }
+
+    /// #462: a route with no waypoint, a speed that is not finite and positive,
+    /// or a bad delay is refused, and an unusable route keeps the UE put.
+    #[test]
+    fn an_untravellable_sim_route_is_refused() {
+        let ok = SimRoute {
+            waypoints: vec![SimPosition { x: 10, y: 0, z: 0 }],
+            speed_mps: 1.0,
+            start_after_secs: 0.0,
+        };
+        assert_eq!(ok.validate(), Ok(()));
+        let bad = [
+            SimRoute {
+                waypoints: vec![],
+                ..ok.clone()
+            },
+            SimRoute {
+                speed_mps: 0.0,
+                ..ok.clone()
+            },
+            SimRoute {
+                speed_mps: -1.0,
+                ..ok.clone()
+            },
+            SimRoute {
+                speed_mps: f64::NAN,
+                ..ok.clone()
+            },
+            SimRoute {
+                speed_mps: f64::INFINITY,
+                ..ok.clone()
+            },
+            SimRoute {
+                start_after_secs: -1.0,
+                ..ok.clone()
+            },
+            SimRoute {
+                waypoints: vec![SimPosition::default(); SIM_ROUTE_MAX_WAYPOINTS + 1],
+                ..ok.clone()
+            },
+        ];
+        for route in bad {
+            assert!(route.validate().is_err(), "{route:?} must be refused");
+            assert_eq!(
+                route.position_at(SimPosition::default(), std::time::Duration::from_secs(60)),
+                SimPosition::default()
+            );
+        }
+    }
+
+    /// #462: `sim_route` parses from YAML, is exclusive with `sim_movement`, and
+    /// drives `UeConfig::sim_position_at`; with neither the UE stays put.
+    #[test]
+    fn a_ue_config_takes_sim_route_or_sim_movement_not_both() {
+        use std::time::Duration;
+        let base = UeConfig::default();
+        assert_eq!(base.validate_sim_motion(), Ok(()));
+        assert_eq!(
+            base.sim_position_at(Duration::from_secs(60)),
+            base.sim_position,
+            "no motion configured: the UE stays put"
+        );
+        let route: SimRoute = serde_yaml::from_str(
+            "waypoints:\n  - { x: 20, y: 0 }\n  - { x: 20, y: 20 }\nspeed_mps: 10\n",
+        )
+        .expect("a route parses");
+        let routed = UeConfig {
+            sim_route: Some(route),
+            ..UeConfig::default()
+        };
+        assert_eq!(routed.validate_sim_motion(), Ok(()));
+        assert_eq!(
+            routed.sim_position_at(Duration::from_secs(3)),
+            SimPosition { x: 20, y: 10, z: 0 }
+        );
+        let both = UeConfig {
+            sim_movement: Some(SimMovement {
+                target: SimPosition { x: 5, y: 0, z: 0 },
+                speed_mps: 1.0,
+                start_after_secs: 0.0,
+            }),
+            ..routed.clone()
+        };
+        assert!(both.validate_sim_motion().is_err());
+        assert!(
+            serde_yaml::from_str::<SimRoute>(
+                "waypoints: [{x: 1, y: 0}]\nspeed_mps: 1\nloop: true\n"
+            )
+            .is_err(),
+            "a misspelt or unknown field is refused, not ignored"
         );
     }
 
@@ -3487,6 +3891,7 @@ configured_nssai:
             gnb_search_list: Vec::new(),
             sim_position: SimPosition::default(),
             sim_movement: None,
+            sim_route: None,
             sessions: Vec::new(),
             configured_nssai: NetworkSlice::new(),
             tun_name: None,

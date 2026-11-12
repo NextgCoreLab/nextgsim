@@ -1,0 +1,9 @@
+# Second override for scripts/demo/d440a-m0-check.sh page-all (nextgsim#462): both
+# gNBs run their config/demo-ai-paging/ configs, the D440A demo on in mode
+# page-all with a paging grid naming the other gNB. The gNB image must be built
+# with --features demo-d440a-ai-paging. Publishes nothing.
+services:
+  gnb-west:
+    command: ["-c", "/etc/nextgsim/demo-ai-paging/gnb-west.yaml"]
+  gnb-east:
+    command: ["-c", "/etc/nextgsim/demo-ai-paging/gnb-east.yaml"]

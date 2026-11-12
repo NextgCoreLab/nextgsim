@@ -65,6 +65,7 @@ impl GnbApp {
             .with_context(|| format!("Failed to read configuration from {config_path}"))?;
         nextgsim_gnb::demo::init(&config_text)
             .with_context(|| format!("Invalid demo block in {config_path}"))?;
+        nextgsim_gnb::demo::d440a_startup(&config);
 
         info!(
             "Configuration loaded: NCI={:#x}, PLMN={}-{}, TAC={}",

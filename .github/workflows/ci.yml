@@ -447,6 +447,10 @@ jobs:
         run: |
           cargo test -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt
           cargo test -p nextgsim-semantic --features demo-d444a-ambr-adapt
+      # Demo d440a-ai-paging (#462): the D440A registration, its paging grid
+      # startup line and their tests are behind `demo-d440a-ai-paging`.
+      - name: cargo test (demo-d440a-ai-paging)
+        run: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
       - name: D444A revert arms (each patch must fail its named test)
         run: scripts/demo/d444a-reverts.sh
       - name: cargo test (6g end to end)
@@ -455,6 +459,7 @@ jobs:
         run: |
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
           cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
+          cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
@@ -1666,6 +1671,155 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: demo-d446a-logs
+          path: ${{ runner.temp }}/demo
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker compose -f nextgcore/docker/rust/docker-compose.demo-n2ho.yml down -v --remove-orphans || true
+
+  # ====================================================================
+  # Demo D440A M0 gate (#462): before predicted paging is measured, the base
+  # stack must do what it is measured on. On nextgcore's two-gNB stack (#456),
+  # scripts/demo/d440a-m0-check.sh releases the UE to CM-IDLE on gnb-west, lets
+  # it move idle along a sim_route (config/ue-d440a-m0.yaml), and asserts the
+  # idle reselection to gnb-east (TS 38.304 §5.2.4) and a mobile-terminated
+  # Service Request through gnb-east answering the AMF's PAGING (TS 23.502
+  # §4.2.3.3), with the downlink pings answered.
+  #
+  # Arms: base (no demo block), then the revert arm (the UE has no route: the
+  # check must fail at ue step 3/7), then page-all (the gNBs built with
+  # --features demo-d440a-ai-paging, the demo on in its predictor-off mode, with
+  # a paging grid: same chain, plus the banner and the grid). Private: the
+  # merged stack publishes no port (asserted before `up`). Scheduled and
+  # dispatch only; the default nightly jobs and the other demo jobs are unchanged.
+  # ====================================================================
+  demo-d440a-m0:
+    name: Demo D440A M0 (idle reselection + MT Service Request via another gNB)
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # nextgcore main at #1448's merge (amfd paging.strategy, which #462's later
+      # arms use; the default strategy this gate runs is today's paging).
+      NEXTGCORE_DEMO_REF: ${{ inputs.nextgcore_ref || '10c50d56e065d92ac9d762c14241bb5fef00344d' }}
+    steps:
+      - name: Checkout nextgsim
+        uses: actions/checkout@v4
+        with:
+          path: nextgsim
+
+      - name: Checkout nextgcore (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: NextgCoreLab/nextgcore
+          ref: ${{ env.NEXTGCORE_DEMO_REF }}
+          path: nextgcore
+
+      - name: Record the pair under test
+        run: |
+          set -euo pipefail
+          {
+            echo "### Demo D440A M0 pair"
+            echo "| repo | commit |"
+            echo "|---|---|"
+            echo "| nextgsim (this repo, HEAD) | \`$(git -C nextgsim rev-parse HEAD)\` |"
+            echo "| nextgcore (pinned \`${NEXTGCORE_DEMO_REF}\`) | \`$(git -C nextgcore rev-parse HEAD)\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: The demo stack publishes no port (docker compose config)
+        run: |
+          set -euo pipefail
+          . nextgsim/scripts/demo/lib.sh
+          export NEXTGSIM_DIR="$GITHUB_WORKSPACE/nextgsim"
+          demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml \
+            nextgsim/scripts/demo/d440a-m0.compose.yml nextgsim/scripts/demo/d440a-page-all.compose.yml
+          demo_assert_private
+
+      - name: Build both workspaces via nextgcore's builder
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.builder -t nextg-builder ../../../
+          cd ../..
+          docker create --name builder nextg-builder /bin/true
+          mkdir -p docker/rust/binaries
+          docker cp builder:/out/. docker/rust/binaries/
+          docker rm builder
+          for b in nr-gnb nr-ue nr-cli; do
+            [ -f "docker/rust/binaries/$b" ] || { echo "::error::$b missing from the builder output"; exit 1; }
+          done
+
+      - name: Build the 5GC, gNB and UE images (not published)
+        run: |
+          set -euo pipefail
+          cd nextgcore/docker/rust
+          docker build -f Dockerfile.core -t nextgcore-core:latest .
+          for nf in amfd ausfd bsfd nrfd nssfd pcfd smfd udmd udrd upfd; do
+            docker build -f Dockerfile.nf \
+              --build-arg CORE_IMAGE=nextgcore-core:latest \
+              --build-arg NF_NAME=nextgcore-${nf} \
+              -t nextgcore-rust/${nf%%d}:latest .
+          done
+          mkdir -p ../../../nextgsim/binaries
+          cp binaries/nr-gnb binaries/nr-ue binaries/nr-cli ../../../nextgsim/binaries/
+          docker build -f ../../../nextgsim/Dockerfile.gnb-local -t nextgsim-gnb:latest ../../../nextgsim
+          docker build -f ../../../nextgsim/Dockerfile.ue-local -t nextgsim-ue:latest ../../../nextgsim
+
+      - name: M0 base arm (no demo block)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: nextgsim/scripts/demo/d440a-m0-check.sh base
+
+      - name: Revert arm (the UE has no route -> the check fails at ue step 3/7)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo/revert-ue-stays-put
+          M0_TIMEOUT: "60"
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          scripts/demo/revert-run.sh --expect '[ue] step 3/7 missing' \
+            scripts/demo/reverts/d440a-m0-ue-stays-put.patch -- scripts/demo/d440a-m0-check.sh base
+
+      - name: The revert arm left the checkout clean
+        if: always()
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          git diff --quiet HEAD -- || { echo "::error::tracked files differ from HEAD"; git status --short; exit 1; }
+
+      - name: Build the gNB with demo-d440a-ai-paging
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          # Built in a bookworm container: the images are debian:bookworm-slim
+          # (glibc 2.36), and a binary built on the runner needs GLIBC_2.38.
+          docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
+            'apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
+             cargo build --release -p nextgsim-gnb --features demo-d440a-ai-paging'
+          sudo chown -R "$(id -u):$(id -g)" target
+          cp target/release/nr-gnb binaries/
+          docker build -f Dockerfile.gnb-local -t nextgsim-gnb:latest .
+
+      - name: M0 page-all arm (D440A on, predictor off)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+          NR_CLI: ${{ github.workspace }}/nextgsim/binaries/nr-cli
+        run: nextgsim/scripts/demo/d440a-m0-check.sh page-all
+
+      - name: Upload the captured logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-d440a-m0-logs
           path: ${{ runner.temp }}/demo
           if-no-files-found: warn
           retention-days: 14
