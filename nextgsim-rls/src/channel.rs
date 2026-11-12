@@ -147,6 +147,16 @@ impl ChannelModel for FreeSpaceModel {
 ///   lattice points, is exactly N(0, 1);
 /// - the offset is that value times `sigma_db`.
 ///
+/// The spatial correlation this gives is compact-support, not the exponential
+/// Gudmundson kernel of TR 38.901: about 0.3 on average one lattice spacing
+/// apart, exactly zero from two spacings on, and it varies with where in a
+/// lattice cell the two points sit.
+///
+/// Determinism holds per target: the hash is pure integer arithmetic, but the
+/// Box-Muller `ln`/`cos` come from the platform's libm, so two architectures
+/// could in principle differ in the last ulp, and that could flip a rounded level
+/// that lands exactly on .5 dB.
+///
 /// The UE is deliberately not part of the key: shadowing belongs to the location
 /// and the transmitter, and a UE's RLS identity is random per start, so keying on
 /// it would make a seeded run irreproducible.
@@ -162,9 +172,23 @@ impl Shadowing {
     /// Shadowing of standard deviation `sigma_db` with lattice spacing
     /// `decorrelation_m`, for the transmitter identified by `link_key`.
     ///
-    /// The caller validates the parameters (finite, `sigma_db >= 0`,
-    /// `decorrelation_m > 0`); a zero `sigma_db` gives a zero offset everywhere.
+    /// The caller validates the parameters (the gNB does, at startup); a zero
+    /// `sigma_db` gives a zero offset everywhere.
+    ///
+    /// As a backstop for a caller that skipped validation, the model itself never
+    /// panics or yields NaN: a non-finite or negative `sigma_db` is treated as 0,
+    /// and `decorrelation_m` is clamped to `1.0..=1e4` m (NaN to 1 m).
     pub fn new(sigma_db: f64, seed: u64, decorrelation_m: f64, link_key: u64) -> Self {
+        let sigma_db = if sigma_db.is_finite() && sigma_db > 0.0 {
+            sigma_db
+        } else {
+            0.0
+        };
+        let decorrelation_m = if decorrelation_m.is_nan() {
+            1.0
+        } else {
+            decorrelation_m.clamp(1.0, 1e4)
+        };
         Self {
             sigma_db,
             seed,
@@ -203,7 +227,13 @@ impl Shadowing {
             if w == 0.0 {
                 continue;
             }
-            acc += w * self.lattice_normal(ix + dx, iy + dy, iz + dz);
+            // With d >= 1 m and i32 positions the indices are within ±2^31, so
+            // this cannot wrap; wrapping keeps the model panic-free regardless.
+            acc += w * self.lattice_normal(
+                ix.wrapping_add(dx),
+                iy.wrapping_add(dy),
+                iz.wrapping_add(dz),
+            );
             weight_sq += w * w;
         }
         // The eight weights sum to 1, so Σw² >= 1/8 and never divides by zero.
@@ -482,5 +512,60 @@ mod tests {
             moved += i32::from(got != -x);
         }
         assert!(moved > 40, "σ 8 dB must move most levels, moved {moved}");
+    }
+
+    /// Golden values (#524 review): seeds are committed before demo runs and
+    /// replayed, so the field itself is pinned. A change to the hash, the key
+    /// order, Box-Muller or the interpolation fails here even when every
+    /// statistical property still holds. Tolerance 1e-9 dB, well inside the
+    /// per-target libm caveat and far below the 0.5 dB rounding step.
+    #[test]
+    fn the_field_is_pinned_by_golden_values() {
+        // (seed, NCI, position, offset in dB)
+        type Golden = (u64, u64, (i32, i32, i32), f64);
+        let golden: [Golden; 5] = [
+            (42, 0x10, (62, 0, 0), -4.892_357_991_851),
+            (42, 0x20, (62, 0, 0), 5.281_534_925_009),
+            (7, 0x10, (0, 0, 0), -2.571_213_662_869),
+            (7, 0x10, (-35, 13, 2), 8.797_099_696_273),
+            (0, 0x10, (85, 0, 0), 0.996_067_346_654),
+        ];
+        for (seed, nci, (x, y, z), expected) in golden {
+            let got = Shadowing::new(6.0, seed, 20.0, nci).offset_db(&at(x, y, z));
+            assert!(
+                (got - expected).abs() < 1e-9,
+                "seed {seed}, NCI {nci:#x}, ({x}, {y}, {z}): {got:.12} != {expected:.12}"
+            );
+        }
+        let model =
+            ShadowedModel::new(Box::new(DistanceModel), Shadowing::new(6.0, 42, 20.0, 0x10));
+        assert_eq!(
+            model.estimate_dbm(&at(0, 0, 0), &at(62, 0, 0)),
+            -67,
+            "-62 - 4.89"
+        );
+    }
+
+    /// #524 review MAJOR: parameters a caller failed to validate must not panic
+    /// (index overflow) or produce NaN, which `round() as i32` turns into 0 dBm,
+    /// the strongest level, capturing every A3 decision.
+    #[test]
+    fn unvalidated_parameters_neither_panic_nor_yield_nan() {
+        let far = [at(i32::MAX, i32::MIN, 0), at(1, -1, 1), at(62, 0, 0)];
+        for d in [1.0e-320, 1.0e-12, 0.0, -5.0, f64::NAN, f64::INFINITY] {
+            for sigma in [8.0, f64::NAN, f64::INFINITY, -3.0] {
+                let s = Shadowing::new(sigma, 1, d, 0x10);
+                for p in &far {
+                    let v = s.offset_db(p);
+                    assert!(v.is_finite(), "sigma {sigma}, d {d}, {p:?}: {v}");
+                }
+                let m = ShadowedModel::new(Box::new(DistanceModel), s);
+                assert_ne!(
+                    m.estimate_dbm(&at(0, 0, 0), &at(62, 0, 0)),
+                    0,
+                    "never 0 dBm at 62 m"
+                );
+            }
+        }
     }
 }

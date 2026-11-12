@@ -784,9 +784,12 @@ pub struct ShadowingConfig {
     /// each gNB's field still differs, because its NCI is part of the key.
     #[serde(default)]
     pub seed: u64,
-    /// Decorrelation distance in metres: the lattice spacing of the field.
-    /// Levels a few metres apart are strongly correlated; levels several
-    /// decorrelation distances apart are independent.
+    /// Lattice spacing of the field in metres, in
+    /// [`MIN_SHADOWING_DECORRELATION_M`]..=[`MAX_SHADOWING_DECORRELATION_M`].
+    /// The field is trilinear between lattice points, so its spatial
+    /// correlation is compact-support, not exponential: about 0.3 on average at
+    /// one spacing, and exactly zero from two spacings on. It is comparable to,
+    /// but not the same as, a TR 38.901 `d_cor` (Gudmundson) value.
     #[serde(default = "default_shadowing_decorrelation_m")]
     pub decorrelation_m: f64,
 }
@@ -794,6 +797,15 @@ pub struct ShadowingConfig {
 /// Largest accepted `shadowing.sigma_db`: far above any realistic shadow-fading
 /// spread, so a value beyond it is a typo rather than a scenario.
 pub const MAX_SHADOWING_SIGMA_DB: f64 = 30.0;
+
+/// Smallest accepted `shadowing.decorrelation_m`. Positions are integer
+/// metres, so a finer lattice is just independent per-metre draws, and below it
+/// the lattice index arithmetic leaves the range of an `i64`.
+pub const MIN_SHADOWING_DECORRELATION_M: f64 = 1.0;
+
+/// Largest accepted `shadowing.decorrelation_m`: beyond it the field is
+/// constant across any simulated scenario, which is a typo rather than a model.
+pub const MAX_SHADOWING_DECORRELATION_M: f64 = 10_000.0;
 
 fn default_shadowing_decorrelation_m() -> f64 {
     20.0
@@ -816,8 +828,9 @@ impl ShadowingConfig {
     }
 
     /// Rejects a block that cannot describe a field: a non-finite or negative
-    /// `sigma_db`, one above [`MAX_SHADOWING_SIGMA_DB`], or a non-finite or
-    /// non-positive `decorrelation_m`.
+    /// `sigma_db`, one above [`MAX_SHADOWING_SIGMA_DB`], or a `decorrelation_m`
+    /// outside [`MIN_SHADOWING_DECORRELATION_M`]..=[`MAX_SHADOWING_DECORRELATION_M`]
+    /// (NaN included).
     pub fn validate(&self) -> Result<(), String> {
         if !self.sigma_db.is_finite()
             || self.sigma_db < 0.0
@@ -828,9 +841,12 @@ impl ShadowingConfig {
                 self.sigma_db
             ));
         }
-        if !self.decorrelation_m.is_finite() || self.decorrelation_m <= 0.0 {
+        if !(MIN_SHADOWING_DECORRELATION_M..=MAX_SHADOWING_DECORRELATION_M)
+            .contains(&self.decorrelation_m)
+        {
             return Err(format!(
-                "shadowing.decorrelation_m {} must be a positive number of metres",
+                "shadowing.decorrelation_m {} must be in \
+                 {MIN_SHADOWING_DECORRELATION_M}..={MAX_SHADOWING_DECORRELATION_M} m",
                 self.decorrelation_m
             ));
         }
@@ -2936,9 +2952,22 @@ mod tests {
             "{sigma_db: 4, decorrelation_m: 0}",
             "{sigma_db: 4, decorrelation_m: -5}",
             "{sigma_db: 4, decorrelation_m: .inf}",
+            "{sigma_db: 4, decorrelation_m: .nan}",
+            // #524 review: tiny positive spacings overflowed the lattice index.
+            "{sigma_db: 8, decorrelation_m: 1.0e-12}",
+            "{sigma_db: 8, decorrelation_m: 1.0e-320}",
+            "{sigma_db: 8, decorrelation_m: 0.5}",
+            "{sigma_db: 8, decorrelation_m: 10001}",
         ] {
             let c: ShadowingConfig = serde_yaml::from_str(bad).unwrap();
             assert!(c.validate().is_err(), "{bad} must be rejected");
+        }
+        for edge in [
+            "{sigma_db: 8, decorrelation_m: 1}",
+            "{sigma_db: 8, decorrelation_m: 10000}",
+        ] {
+            let c: ShadowingConfig = serde_yaml::from_str(edge).unwrap();
+            assert!(c.validate().is_ok(), "{edge} is in range");
         }
         // A misspelt key is an error, not a silently ignored field.
         assert!(serde_yaml::from_str::<ShadowingConfig>("{sigma: 6}").is_err());

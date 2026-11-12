@@ -2785,6 +2785,60 @@ mod tests {
         assert_eq!(position, (10.0, 20.0, 30.0));
     }
 
+    /// #524 review: with shadowing on, the NWDAF is fed exactly the shadowed
+    /// level the ack carries, not a level recomputed from the distance. The real
+    /// heartbeat path, from the tracker to the NWDAF channel.
+    #[tokio::test]
+    async fn with_shadowing_the_nwdaf_feed_is_the_shadowed_ack_level() {
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(cfg.clone(), 16);
+        let sixg = task_base.init_6g_tasks(16);
+        let mut nwdaf_rx = sixg.nwdaf_rx;
+        let mut task = RlsTask::new(task_base);
+        let expected_tracker = build_cell_tracker(&cfg, task.sti, SimCoord::new(0, 0, 0));
+
+        let mut shadowed = 0;
+        for x in (35..100).step_by(5) {
+            let pos = SimCoord::new(x, 0, 0);
+            let (ack, _) = task.cell_tracker.process_heartbeat(
+                0xABCD,
+                "127.0.0.1:5000".parse().unwrap(),
+                &nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos),
+            );
+            let ack = ack.expect("in range");
+            task.sti_to_ue_id.insert(0xABCD, 7);
+            let heartbeat = nextgsim_rls::RlsHeartbeat::with_position(0xABCD, pos);
+            task.forward_measurement_to_nwdaf(0xABCD, &ack, &heartbeat)
+                .await;
+            let Some(TaskMessage::Message(NwdafMessage::UeMeasurement { rsrp, .. })) =
+                nwdaf_rx.recv().await
+            else {
+                panic!("a heartbeat must produce a UE measurement");
+            };
+            let level = expected_tracker.estimate_dbm(&pos);
+            assert_eq!(
+                ack.dbm, level,
+                "the ack carries the shadowed level at x={x}"
+            );
+            assert_eq!(
+                rsrp,
+                Some(level as f32),
+                "the NWDAF gets the ack's level at x={x}"
+            );
+            shadowed += i32::from(level != -x);
+        }
+        assert!(
+            shadowed > 5,
+            "σ 8 dB must shadow the feed; {shadowed} of 13 differ"
+        );
+    }
+
     #[tokio::test]
     async fn a_heartbeat_from_an_unadmitted_ue_reports_nothing() {
         // Reporting under a placeholder id would merge two UEs' histories.
