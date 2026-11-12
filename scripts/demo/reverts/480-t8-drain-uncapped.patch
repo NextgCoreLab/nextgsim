@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -554,6 +554,8 @@
+ 
+     /// Past [`MAX_DRAINING`], close the connection draining longest at once.
+     fn cap_draining(&mut self) {
++        return;
++        #[allow(unreachable_code)]
+         while self.draining() > MAX_DRAINING {
+             let oldest = self
+                 .held

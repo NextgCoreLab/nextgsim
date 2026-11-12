@@ -1,11 +1,11 @@
 --- a/nextgsim-fl/src/d445a/nef.rs
 +++ b/nextgsim-fl/src/d445a/nef.rs
-@@ -523,7 +523,7 @@
-             .held
+@@ -577,7 +577,7 @@
              .iter()
              .enumerate()
--            .filter(|(_, h)| h.source == source && h.idle() && (even_opening || !h.opening()))
-+            .filter(|(_, h)| h.idle() && (source == h.source || true))
+             .filter(|(_, h)| {
+-                h.source == source && !h.is_draining() && h.idle() && (even_opening || !h.opening())
++                !h.is_draining() && h.idle() && (source == h.source || true)
+             })
              .min_by_key(|(_, h)| *lock(&h.last_active))
              .map(|(i, _)| i);
-         match oldest {

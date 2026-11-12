@@ -1,11 +1,11 @@
 --- a/nextgsim-fl/src/d445a/nef.rs
 +++ b/nextgsim-fl/src/d445a/nef.rs
-@@ -526,7 +526,7 @@
-             .filter(|(_, h)| h.source == source && h.idle() && (even_opening || !h.opening()))
+@@ -581,7 +581,7 @@
+             })
              .min_by_key(|(_, h)| *lock(&h.last_active))
              .map(|(i, _)| i);
 -        match oldest {
 +        match oldest.filter(|_| false) {
              Some(i) => {
-                 self.held.swap_remove(i).evict.notify_one();
-                 true
+                 // Out of the admission counts from now; draining is bounded by
+                 // its own cap and deadline.

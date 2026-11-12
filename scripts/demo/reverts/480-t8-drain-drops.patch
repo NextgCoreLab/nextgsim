@@ -1,0 +1,18 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -899,14 +899,7 @@
+             respond.send_reset(h2::Reason::REFUSED_STREAM);
+             continue;
+         }
+-        busy.fetch_add(1, Ordering::SeqCst);
+-        *lock(last_active) = Instant::now();
+-        let guard = InFlight(busy.clone(), last_active.clone());
+-        let (ids, tx) = (ids.clone(), tx.clone());
+-        tokio::spawn(async move {
+-            let _guard = guard;
+-            answer(req, respond, &ids, &tx).await;
+-        });
++        drop((req, respond));
+     }
+     Ok(())
+ }

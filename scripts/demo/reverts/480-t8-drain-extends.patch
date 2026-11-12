@@ -1,0 +1,22 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -879,7 +879,8 @@
+     let now = tokio::time::Instant::now;
+     let start = now();
+     let accept_until = start + EVICT_DRAIN;
+-    let hard = start + DRAIN_BUSY;
++    let mut hard = start + DRAIN_BUSY;
++    let mut accept_until = accept_until;
+     loop {
+         let accepting = now() < accept_until;
+         if !accepting && busy.load(Ordering::SeqCst) == 0 {
+@@ -899,6 +900,9 @@
+             respond.send_reset(h2::Reason::REFUSED_STREAM);
+             continue;
+         }
++        // Reverted: each accepted stream extends the drain.
++        hard = now() + DRAIN_BUSY;
++        accept_until = now() + EVICT_DRAIN;
+         busy.fetch_add(1, Ordering::SeqCst);
+         *lock(last_active) = Instant::now();
+         let guard = InFlight(busy.clone(), last_active.clone());
