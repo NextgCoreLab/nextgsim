@@ -114,7 +114,8 @@ nwdafd and pcfd switch only by changing their config and restarting.
 
 **EKS (devtest1)** uses the nextgcore overlay
 `deploy/eks/overlays/demo-d441a-congestion-loop/` and its harness from
-nextgcore #1477 or later. Run the arms in this order, each one under
+nextgcore #1485 or later (main). The restore knobs and their check need #1481,
+and the load checks need #1485. Run the arms in this order, each one under
 `flock /tmp/eks-nextg-demo.lock`, one arm per lock hold:
 
 ```bash
@@ -162,8 +163,14 @@ The overlay's `scenario.sh` then:
    paced by the round trip, so the rate is set by the packet size. The ramp is ten
    4 s steps at IP packet sizes of 125·m bytes (m = 1..10), about 0.2C to 1.6C. Then
    comes a 12 s hold of two such pings at 1250-byte packets (about 3C). Then UE-B
-   stops. In the loop modes the run then waits up to 60 s for UE-B's restore
-   (#1481), since 15 quiet polls can outlast UE-V's ping;
+   stops. Every ramp step's and hold ping's `kubectl exec` must exit 0 (#1485);
+   a failed one is named (`ramp step N (-s M): kubectl exec exited RC`). Each
+   step must also have carried traffic (#1485, `d441a_load_traffic`): it needs
+   its ping summary, at least 100 requests a second of its deadline, and at
+   least one reply. Otherwise the run fails with
+   `load <step> produced no traffic: …`. In the loop modes the run then waits up
+   to 60 s for UE-B's restore (#1481), since 15 quiet polls can outlast UE-V's
+   ping;
 5. samples the gNB's measured occupancy once a second throughout
    (`nr-cli <gnb> congestion-status`, into `scenario/gnb-status.txt`);
 6. sends an unauthenticated POST to the ingest route;
@@ -178,12 +185,26 @@ The overlay's `scenario.sh` then:
    - `statistics` / `prediction`: the ordered chain (ingest, UDC 200, pcfd
      throttle, smfd 1 Mbps, upfd QER, UE-B's N1 Session-AMBR before the restore,
      restore); exactly one throttle and one restore of UE-B and none of UE-V; the
+     restore bound (#1485), `T_STOP <= restore <= max(T_STOP + restore_after_polls·poll_ms,
+     throttle + min_hold_secs) + 10 s`, so a mid-load or a late restore fails; the
      AMF/gNB UE-count cross-check; UE-V's p95 at most 0.25× the newest no-loop
      arm's. The comparison is only made when that arm's `saturation.txt` says
      `saturated=yes`; otherwise the run fails with that reason;
    - every mode: the tokenless POST is 401 and is followed by no throttle.
 
 The artefacts go to `/tmp/eks-val/demos/d441a-congestion-loop/<mode>/<UTC>/`.
+
+The Results below were captured with the #1481 harness, and on main two lines
+read differently. The knob check prints its terms in another order. This is
+`d441a_restore_hysteresis` run on main's overlay files:
+
+```
+restore hysteresis ok: 15 polls x 1000 ms >= 12000 ms, restore_below 3 <= 3, ceiling 20 %
+```
+
+The chain line also ends with the restore's distance from UE-B's stop. In main's
+`scenario.sh` the chain's `print` ends with the f-string
+`f"({(t7 - t_stop).total_seconds():.1f} s after UE-B stopped)"`.
 
 **Compose.** No compose overlay ships for this demo yet. To run it by hand:
 1. Build nwdafd and pcfd with `--features demo-d441a-congestion-loop`, and the
@@ -196,7 +217,7 @@ The artefacts go to `/tmp/eks-val/demos/d441a-congestion-loop/<mode>/<UTC>/`.
 ## Results
 
 **All four arms pass on EKS with the restore-hysteresis fix (nextgcore #1481,
-open, not merged).** On main (nextgcore `55c6afcb0eda`), three of the four
+merged).** On main (nextgcore `55c6afcb0eda`), three of the four
 passed. The demo-off control, the no-loop baseline and the statistics loop
 passed there. On a saturated cell, the loop keeps UE-V's ping p95 at 3.6 to
 4.2 ms against 320 ms with no loop, and the UPF polices UE-B at the 1 Mbps cap.
@@ -208,7 +229,8 @@ leaves (nextgcore#1480). With #1481's knobs (`restore_below: 3`,
 `restore_after_polls: 15`), prediction passed 2 of 2 and statistics passed. Each
 arm throttled once and restored once, after UE-B stopped. Two other attempts on
 #1481 failed for reasons outside the demo, both while the cluster API was
-unreachable from the operator host (below).
+unreachable from the operator host (below). Since nextgcore #1485 (merged), the
+scenario names such a stalled load step instead of reading it as a restore.
 
 ### With the restore-hysteresis fix (nextgcore #1481)
 
@@ -228,7 +250,7 @@ restore knobs.
 | `statistics` | `statistics/20261112T174900Z` | FAIL: the load stalled, not the loop (below) | 3.8 ms |
 | `prediction` | `prediction/20261112T180011Z` | FAIL: `deploy` (cluster API unreachable) | n/a |
 
-Every run checked the knobs first (`scenario.log`):
+Every run that deployed checked the knobs first (`scenario.log`):
 
 ```
 [scenario] restore hysteresis ok: restore_below 3 <= 3, 15 polls x 1000 ms >= 12000 ms, ceiling 20 %
@@ -265,14 +287,22 @@ the throttle and UE-B stopping, as the longest runs of consecutive polls below
 | prediction `180021Z` | 3 / 15 | 43 | 0 | 4 | 6 |
 | prediction `181742Z` | 3 / 15 | 39 | 0 | 5 | 6 |
 
-Under the old knobs, all three prediction runs on the fix would have restored
-UE-B mid-load (a run of 6 below 10 against 3 polls). Under the new ones, the
-longest in-load run below 3 was 6 polls, against 15 required. The restore
-came 15 to 17 s after UE-B stopped, and the scenario's restore wait held it.
+Under the old knobs, both prediction runs on the fix would have restored UE-B
+mid-load (a run of 6 below 10 against 3 polls). Under the new ones, the longest
+in-load run below 3 was 5 polls on the fix runs (6 across all six runs, the
+figure behind `D441A_INLOAD_LOW_RUN_POLLS=6`), against 15 required. The restore
+came 15.8 s (`180956Z`), 16.9 s (`180021Z`) and 17.6 s (`181742Z`) after UE-B
+stopped, and the scenario's restore wait held it.
 
 **The two failed attempts.** Neither is the loop.
-- `statistics/20261112T174900Z`: ramp step 6's `kubectl exec ping` returned no
-  output, and the once-a-second occupancy sampler (also a `kubectl exec`)
+- `statistics/20261112T174900Z`: ramp step 6's `kubectl exec ping` failed
+  without reaching the cluster (`scenario/ue-b-ramp.txt`, the whole of step 6):
+
+  ```
+  Unable to connect to the server: dial tcp: lookup [REDACTED-HEX128].yl4.us-west-2.eks.amazonaws.com on 169.254.253.253:53: write udp 169.254.253.253:51345->169.254.253.253:53: write: operation not permitted
+  ```
+
+  The once-a-second occupancy sampler (also a `kubectl exec`)
   logged nothing between 17:55:55 and 17:56:12. UE-B offered no load for those
   ~17 s, so the gNB served only UE-V's pings, and pcfd restored after 15 quiet
   polls, which is correct. Step 7 then re-loaded the cell and pcfd throttled
@@ -297,8 +327,12 @@ came 15 to 17 s after UE-B stopped, and the scenario's restore wait held it.
   `[fail  ] cannot reach the cluster API. Check credentials and endpoint access.`
   It created nothing. The next run 10 s later deployed normally.
 
-The scenario does not yet detect a stalled load step; it reads as a restore.
-That is a harness gap, noted on #1481.
+Since nextgcore #1485, `d441a_ue_b_load` checks every ramp and hold
+`kubectl exec`, and `d441a_load_traffic` fails a step with no ping summary,
+fewer than 100 requests a second of its deadline, or no replies. #1485's
+replay over the eight arms trips only `174900Z`, at step 6. Run on main over
+this run's `scenario/ue-b-ramp.txt`, it names the step:
+`load step 6 produced no traffic: no ping summary (Unable to connect to the server: …)`.
 
 Everything below is copied from the run artefacts under `/tmp/eks-val/demos/` on
 the operator host. Nothing is reconstructed. The code blocks are selected lines,
@@ -309,7 +343,7 @@ with the kubelet timestamp prefix and the ANSI colour codes trimmed.
 The arms ran with `KEEP=true`, so that UE-B's post-run state could be read
 (`post/`). A wrapper then deleted the `nextg-demo` namespace that the run had
 created, in the same lock hold. That is why the verdicts say `teardown=kept`;
-every `post/wrapper.txt` ends with `namespace gone`.
+every `post/wrapper.txt` contains `namespace gone`.
 
 - **Harness:** nextgcore `55c6afcb0eda`, main with #1472, #1476 (upfd MBR/GBR in
   kbit/s) and #1477 (this scenario's saturating load and its captures).
@@ -331,8 +365,10 @@ every `post/wrapper.txt` ends with `namespace gone`.
 | `d441a-congestion-loop prediction` (rerun) | `d441a-congestion-loop/prediction/20261112T170200Z` | FAIL: two throttles (nextgcore#1480) | 99.9 % | 4.3 ms |
 
 - **Demo-off control:** `demo_banner_lines=0 demo_prefix_lines=0 nextg_demo_enabled_series=0`.
-- **Demo arms:** `demo_banner_lines=3`. The banners of pcfd, nwdafd and the gNB
-  are all in the capture now (statistics `log-chain.txt`, prefixes trimmed):
+- **Demo arms:** `demo_banner_lines=3` in every demo arm except prediction
+  `170200Z` and statistics `174900Z`, which have `demo_banner_lines=2`. The
+  banners of pcfd, nwdafd and the gNB are all in the statistics capture
+  (`statistics/20261112T164134Z/log-chain.txt`, prefixes trimmed):
 
   ```
   [2026-11-12T16:42:25.486Z WARN  nextgcore_demo] DEMO MODE ACTIVE: d441a-congestion-loop=statistics
@@ -485,7 +521,7 @@ The rerun (`prediction/20261112T170200Z`) did the same: a throttle at
   demo's choices (see the honesty labels). nextgcore#1480 records the
   threshold and the options for fixing it (a `restore_below` under the throttled
   floor, or a restore signal the throttle does not suppress). nextgcore #1481
-  fixes it; the runs on that branch are at the top of Results.
+  fixes it; the runs on the fix (now on main) are at the top of Results.
 
 UE-V was still protected, because every throttle took effect at once
 (`metrics/<upf-pod>.prom`, `scenario/ue-v-ping.txt`):
