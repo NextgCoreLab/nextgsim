@@ -542,6 +542,26 @@ upf_port: 2152
         assert_eq!(east.paging_grid[0].nci, west.nci);
         assert_eq!(west.paging_grid[0].position, east.sim_position);
         assert_eq!(east.paging_grid[0].position, west.sim_position);
+        // #525 review: each is its base config verbatim plus the D440A block, so
+        // the two cannot drift apart silently.
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../config");
+        for (demo, plain) in [
+            ("gnb-west.yaml", "gnb.yaml"),
+            ("gnb-east.yaml", "gnb-n2ho-target.yaml"),
+        ] {
+            let demo_text = std::fs::read_to_string(format!("{dir}/{demo}")).expect("demo");
+            let base_text = std::fs::read_to_string(format!("{base}/{plain}")).expect("base");
+            assert!(
+                demo_text.contains(base_text.trim_end()),
+                "config/demo-ai-paging/{demo} must embed config/{plain} unchanged"
+            );
+            let tail = &demo_text
+                [demo_text.find(base_text.trim_end()).unwrap() + base_text.trim_end().len()..];
+            assert!(
+                tail.contains("d440a-ai-paging:") && tail.contains("paging_grid:"),
+                "{demo}: only the D440A block is appended"
+            );
+        }
     }
 
     /// #462: a malformed paging grid fails startup in every build, and the

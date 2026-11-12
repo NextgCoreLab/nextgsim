@@ -101,9 +101,10 @@ pqc:
 gnb_search_list:
   - "172.23.0.100"
   - "172.23.0.102"
-# D440A M0 (nextgsim#462): start 35 m from gnb-west (x 0), and only 45 s after
+# D440A M0 (nextgsim#462): start 35 m from gnb-west (x 0), and only 90 s after
 # start-up -- by then scripts/demo/d440a-m0-check.sh has released the UE to
-# CM-IDLE, so it moves IDLE and no N2 handover can fire -- follow a curved route
+# CM-IDLE, so it moves IDLE and no N2 handover can fire; the check fails, naming
+# the reason, if the UE logs `Simulated motion started` before CM-IDLE -- follow a curved route
 # (sim_route) over (60, 30) to (110, 0), 10 m from gnb-east (x 120), at 5 m/s
 # (about 20 s). Levels are -1 dBm per metre, so east's cell overtakes west's
 # R-criterion (q-Hyst 4 dB, TS 38.304 §5.2.4.6) on the way and the idle UE
@@ -114,7 +115,7 @@ sim_route:
     - { x: 60, y: 30, z: 0 }
     - { x: 110, y: 0, z: 0 }
   speed_mps: 5
-  start_after_secs: 45
+  start_after_secs: 90
 
 # Default PDU sessions to establish after registration
 sessions:

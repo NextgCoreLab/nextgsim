@@ -20,6 +20,7 @@ use crate::tasks::{NasMessage, RlfCause, RlsMessage, RrcMessage, Task, TaskMessa
 /// `rrc::cell_selection::CELL_LOST_THRESHOLD_DBM`, which is what makes the cell
 /// selector drop the cell.
 const CELL_SIGNAL_LOST_DBM: i32 = i32::MIN;
+use nextgsim_common::config::SimPosition;
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
@@ -155,8 +156,10 @@ pub struct RlsTask {
     #[cfg(feature = "sdap-dataplane")]
     sdap_uplink: HashMap<i32, SdapUplinkBinding>,
     /// When this task started: the origin for the PDCP timers and for the
-    /// UE's `sim_movement` (#324).
+    /// UE's `sim_movement` (#324) and `sim_route` (#462).
     started_at: std::time::Instant,
+    /// Whether `Simulated motion started` was logged (#462): once per run.
+    motion_started: bool,
     /// The NTN uplink pre-compensation in force, derived from SIB19
     /// (TS 38.300 §16.14.2.2, issue #56).
     ///
@@ -274,6 +277,7 @@ impl RlsTask {
             #[cfg(feature = "sdap-dataplane")]
             sdap_uplink: HashMap::new(),
             started_at: std::time::Instant::now(),
+            motion_started: false,
             // No pre-compensation until a SIB19 says otherwise (issue #56). A
             // terrestrial UE never leaves this state, which is what keeps every
             // non-NTN scenario timed exactly as it was.
@@ -730,16 +734,38 @@ impl RlsTask {
         // level from it, so a moving UE's measurements change and a handover can
         // be driven. Carried in every heartbeat.
         // #462: or along `sim_route`, a route through waypoints.
-        let pos = self
-            .task_base
-            .config
-            .sim_position_at(self.started_at.elapsed());
+        let pos = self.motion_position(self.started_at.elapsed());
         self.cell_search
             .set_position(SimCoord::new(pos.x, pos.y, pos.z));
         for (addr, heartbeat) in self.cell_search.create_heartbeats() {
             self.send_rls_message(addr, &RlsProtocolMessage::Heartbeat(heartbeat))
                 .await;
         }
+    }
+
+    /// The UE's simulated position `elapsed` after start-up (#324, #462), and the
+    /// one-time `Simulated motion started` line when its route or movement first
+    /// leaves `sim_position`. That line is what the D440A M0 harness orders the
+    /// CM-IDLE release against, so a slow run cannot let the UE start moving while
+    /// still connected and pass for the wrong reason.
+    fn motion_position(&mut self, elapsed: std::time::Duration) -> SimPosition {
+        let cfg = &self.task_base.config;
+        if !self.motion_started && cfg.sim_motion_started(elapsed) {
+            self.motion_started = true;
+            let kind = if cfg.sim_route.is_some() {
+                "sim_route"
+            } else {
+                "sim_movement"
+            };
+            info!(
+                "Simulated motion started: {kind} from ({}, {}, {}) at {:.1} s after start-up",
+                cfg.sim_position.x,
+                cfg.sim_position.y,
+                cfg.sim_position.z,
+                elapsed.as_secs_f64()
+            );
+        }
+        cfg.sim_position_at(elapsed)
     }
 
     /// A cell stopped answering heartbeats. Losing the serving cell is a radio
@@ -1638,6 +1664,36 @@ mod tests {
         let task = RlsTask::new(task_base, rls_config);
         assert!(task.serving_cell.is_none());
         assert_eq!(task.cell_count(), 0);
+    }
+
+    /// #462: the heartbeat position follows `sim_route`, and the motion start is
+    /// flagged once, when the route first leaves `sim_position`.
+    #[test]
+    fn the_heartbeat_position_follows_the_sim_route() {
+        use nextgsim_common::config::{SimPosition, SimRoute};
+        use std::time::Duration;
+        let config = UeConfig {
+            sim_position: SimPosition { x: 35, y: 0, z: 0 },
+            sim_route: Some(SimRoute {
+                waypoints: vec![SimPosition { x: 35, y: 40, z: 0 }],
+                speed_mps: 10.0,
+                start_after_secs: 5.0,
+            }),
+            ..test_config()
+        };
+        let (task_base, _app_rx, _nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RlsTask::from_ue_config(task_base);
+        assert_eq!(
+            task.motion_position(Duration::from_secs(5)),
+            SimPosition { x: 35, y: 0, z: 0 }
+        );
+        assert!(!task.motion_started, "not before the delay");
+        assert_eq!(
+            task.motion_position(Duration::from_secs(7)),
+            SimPosition { x: 35, y: 20, z: 0 },
+            "the route, not the start"
+        );
+        assert!(task.motion_started);
     }
 
     #[test]

@@ -800,8 +800,10 @@ impl GnbConfig {
     }
 }
 
-/// A point in the simulation, in metres (#324). `z` may be omitted.
+/// A point in the simulation, in metres (#324). `z` may be omitted; any other
+/// key is refused (#462), so a misspelt `Z:` cannot silently become `z: 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimPosition {
     /// X, metres.
     pub x: i32,
@@ -2893,6 +2895,17 @@ impl UeConfig {
         }
     }
 
+    /// Whether the configured route or movement has left `sim_position` by
+    /// `elapsed` after start-up (#462): its delay has passed. False with neither.
+    pub fn sim_motion_started(&self, elapsed: std::time::Duration) -> bool {
+        let start_after = match (&self.sim_route, &self.sim_movement) {
+            (Some(route), _) => route.start_after_secs,
+            (None, Some(movement)) => movement.start_after_secs.max(0.0),
+            (None, None) => return false,
+        };
+        elapsed.as_secs_f64() > start_after
+    }
+
     /// Why the simulated motion config is unusable, if it is: both `sim_route`
     /// and `sim_movement` set, or a route that cannot be travelled (#462).
     pub fn validate_sim_motion(&self) -> Result<(), String> {
@@ -3132,13 +3145,31 @@ mod tests {
                     ..entry
                 }],
             ),
-            ("too many", vec![entry; PAGING_GRID_MAX_ENTRIES + 1]),
         ] {
             assert!(
                 with(grid).validate_paging_grid().is_err(),
                 "{why} must be refused"
             );
         }
+        // The cap, on DISTINCT cells (a repeated one is refused as a duplicate):
+        // exactly the maximum is accepted, one more is not.
+        let distinct = |n: usize| -> Vec<PagingGridEntry> {
+            (0..n as u64)
+                .map(|i| PagingGridEntry {
+                    nci: 0x100 + i,
+                    ..entry
+                })
+                .collect()
+        };
+        assert_eq!(
+            with(distinct(PAGING_GRID_MAX_ENTRIES)).validate_paging_grid(),
+            Ok(()),
+            "{PAGING_GRID_MAX_ENTRIES} distinct cells are accepted"
+        );
+        let err = with(distinct(PAGING_GRID_MAX_ENTRIES + 1))
+            .validate_paging_grid()
+            .expect_err("one over the cap is refused");
+        assert!(err.contains("at most"), "{err}");
         assert!(
             serde_yaml::from_str::<PagingGridEntry>("nci: 1\nposition: {x: 0, y: 0}\ntac: 1\n")
                 .is_err(),
@@ -3229,6 +3260,15 @@ mod tests {
                 ..ok.clone()
             },
         ];
+        assert_eq!(
+            SimRoute {
+                waypoints: vec![SimPosition::default(); SIM_ROUTE_MAX_WAYPOINTS],
+                ..ok.clone()
+            }
+            .validate(),
+            Ok(()),
+            "exactly {SIM_ROUTE_MAX_WAYPOINTS} waypoints are accepted"
+        );
         for route in bad {
             assert!(route.validate().is_err(), "{route:?} must be refused");
             assert_eq!(
@@ -3279,6 +3319,15 @@ mod tests {
             .is_err(),
             "a misspelt or unknown field is refused, not ignored"
         );
+        assert!(
+            serde_yaml::from_str::<SimRoute>("waypoints: [{x: 1, y: 0, Z: 3}]\nspeed_mps: 1\n")
+                .is_err(),
+            "a misspelt waypoint key is refused, not read as z: 0"
+        );
+        // The motion start: after the delay, never with no motion configured.
+        assert!(!routed.sim_motion_started(Duration::from_secs(0)));
+        assert!(routed.sim_motion_started(Duration::from_millis(100)));
+        assert!(!base.sim_motion_started(Duration::from_secs(3600)));
     }
 
     /// #324: a handover neighbour's PCI is `nci % 1008` and its gNB ID the top

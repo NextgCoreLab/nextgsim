@@ -37,7 +37,7 @@ on:
         # #456: the demo-n2ho job builds its 5GC images from a PINNED nextgcore
         # commit (NEXTGCORE_DEMO_REF in that job), not main, so a demo result
         # names the image pair it ran. A dispatch may point it at a branch or sha.
-        description: "nextgcore ref for demo-n2ho (empty: the pinned NEXTGCORE_DEMO_REF)"
+        description: "nextgcore ref for EVERY demo job (demo-n2ho, demo-d446a, demo-d440a-m0) at once; empty: each job's own pinned NEXTGCORE_DEMO_REF"
         required: false
         default: ""
 
@@ -1690,7 +1690,7 @@ jobs:
   # §4.2.3.3), with the downlink pings answered.
   #
   # Arms: base (no demo block), then the revert arm (the UE has no route: the
-  # check must fail at ue step 3/7), then page-all (the gNBs built with
+  # check must fail at ue step 4/9), then page-all (the gNBs built with
   # --features demo-d440a-ai-paging, the demo on in its predictor-off mode, with
   # a paging grid: same chain, plus the banner and the grid). Private: the
   # merged stack publishes no port (asserted before `up`). Scheduled and
@@ -1775,7 +1775,7 @@ jobs:
           DEMO_ARTEFACTS: ${{ runner.temp }}/demo
         run: nextgsim/scripts/demo/d440a-m0-check.sh base
 
-      - name: Revert arm (the UE has no route -> the check fails at ue step 3/7)
+      - name: Revert arm (the UE has no route -> the check fails at ue step 4/9)
         timeout-minutes: 15
         env:
           NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
@@ -1784,7 +1784,7 @@ jobs:
         run: |
           set -euo pipefail
           cd nextgsim
-          scripts/demo/revert-run.sh --expect '[ue] step 3/7 missing' \
+          scripts/demo/revert-run.sh --expect '[ue] step 4/9 missing' \
             scripts/demo/reverts/d440a-m0-ue-stays-put.patch -- scripts/demo/d440a-m0-check.sh base
 
       - name: The revert arm left the checkout clean
