@@ -338,6 +338,11 @@ pub struct GnbConfig {
     /// could ever favour one. Default: the origin.
     #[serde(default)]
     pub sim_position: SimPosition,
+    /// Seeded log-normal shadowing on this gNB's received levels (nextgsim#467).
+    /// Non-normative simulator model; off (`sigma_db: 0`) by default, so every
+    /// existing scenario measures exactly as before.
+    #[serde(default)]
+    pub shadowing: ShadowingConfig,
     /// The neighbouring gNBs' cells a measurement-triggered handover may target
     /// (#324): a reported `physCellId` is matched against `nci % 1008` of each
     /// entry, and the match names the target gNB and TAI for HANDOVER REQUIRED
@@ -692,6 +697,7 @@ impl Default for GnbConfig {
             cho_a3_offset_db: default_cho_a3_offset_db(),
             cho_hysteresis_db: default_cho_hysteresis_db(),
             sim_position: SimPosition::default(),
+            shadowing: ShadowingConfig::default(),
             handover_neighbours: Vec::new(),
             pqc_config: PqcConfig::default(),
             ntn_config: None,
@@ -759,6 +765,77 @@ pub struct SimPosition {
     /// Z, metres.
     #[serde(default)]
     pub z: i32,
+}
+
+/// The gNB's `shadowing:` block (nextgsim#467): seeded, spatially consistent
+/// log-normal shadowing added to the RLS received level, applied once where the
+/// gNB computes the heartbeat ack, so the UE's A3 evaluation and the gNB's own
+/// NWDAF feed see the same levels. Non-normative: a simulator model.
+///
+/// The field is keyed by `seed`, the gNB's NCI and the UE's position, so a run
+/// with the same seed and route reproduces every level.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShadowingConfig {
+    /// Standard deviation in dB. 0 (the default) is off.
+    #[serde(default)]
+    pub sigma_db: f64,
+    /// Seed of the shadowing field. Use the same value on every gNB of a run;
+    /// each gNB's field still differs, because its NCI is part of the key.
+    #[serde(default)]
+    pub seed: u64,
+    /// Decorrelation distance in metres: the lattice spacing of the field.
+    /// Levels a few metres apart are strongly correlated; levels several
+    /// decorrelation distances apart are independent.
+    #[serde(default = "default_shadowing_decorrelation_m")]
+    pub decorrelation_m: f64,
+}
+
+/// Largest accepted `shadowing.sigma_db`: far above any realistic shadow-fading
+/// spread, so a value beyond it is a typo rather than a scenario.
+pub const MAX_SHADOWING_SIGMA_DB: f64 = 30.0;
+
+fn default_shadowing_decorrelation_m() -> f64 {
+    20.0
+}
+
+impl Default for ShadowingConfig {
+    fn default() -> Self {
+        Self {
+            sigma_db: 0.0,
+            seed: 0,
+            decorrelation_m: default_shadowing_decorrelation_m(),
+        }
+    }
+}
+
+impl ShadowingConfig {
+    /// Whether shadowing changes any level (`sigma_db > 0`).
+    pub fn is_enabled(&self) -> bool {
+        self.sigma_db > 0.0
+    }
+
+    /// Rejects a block that cannot describe a field: a non-finite or negative
+    /// `sigma_db`, one above [`MAX_SHADOWING_SIGMA_DB`], or a non-finite or
+    /// non-positive `decorrelation_m`.
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.sigma_db.is_finite()
+            || self.sigma_db < 0.0
+            || self.sigma_db > MAX_SHADOWING_SIGMA_DB
+        {
+            return Err(format!(
+                "shadowing.sigma_db {} must be in 0..={MAX_SHADOWING_SIGMA_DB} dB",
+                self.sigma_db
+            ));
+        }
+        if !self.decorrelation_m.is_finite() || self.decorrelation_m <= 0.0 {
+            return Err(format!(
+                "shadowing.decorrelation_m {} must be a positive number of metres",
+                self.decorrelation_m
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A UE's straight-line movement (#324): after `start_after_secs` it moves from
@@ -2833,6 +2910,38 @@ mod tests {
         let config = AmfConfig::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 38412);
         assert_eq!(config.address, "192.168.1.1");
         assert_eq!(config.port, 38412);
+    }
+
+    /// nextgsim#467: no `shadowing:` block is off; a block parses with the
+    /// default decorrelation distance; out-of-range values and misspelt keys are
+    /// rejected.
+    #[test]
+    fn a_gnb_shadowing_block_parses_defaults_and_validates() {
+        let off = GnbConfig::default().shadowing;
+        assert_eq!(off, ShadowingConfig::default());
+        assert!(!off.is_enabled());
+        assert!(off.validate().is_ok());
+        let empty: ShadowingConfig = serde_yaml::from_str("{}").unwrap();
+        assert_eq!(empty, off);
+
+        let on: ShadowingConfig = serde_yaml::from_str("{sigma_db: 6, seed: 42}").unwrap();
+        assert!(on.is_enabled());
+        assert_eq!((on.sigma_db, on.seed, on.decorrelation_m), (6.0, 42, 20.0));
+        assert!(on.validate().is_ok());
+
+        for bad in [
+            "{sigma_db: -1}",
+            "{sigma_db: 31}",
+            "{sigma_db: .nan}",
+            "{sigma_db: 4, decorrelation_m: 0}",
+            "{sigma_db: 4, decorrelation_m: -5}",
+            "{sigma_db: 4, decorrelation_m: .inf}",
+        ] {
+            let c: ShadowingConfig = serde_yaml::from_str(bad).unwrap();
+            assert!(c.validate().is_err(), "{bad} must be rejected");
+        }
+        // A misspelt key is an error, not a silently ignored field.
+        assert!(serde_yaml::from_str::<ShadowingConfig>("{sigma: 6}").is_err());
     }
 
     /// #324: a UE moves in a straight line toward its target at the configured

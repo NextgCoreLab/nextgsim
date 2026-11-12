@@ -17,14 +17,15 @@ use tracing::{debug, error, info, warn};
 use crate::tasks::{
     AgentMessage, GnbTaskBase, GtpMessage, NwdafMessage, RlsMessage, RrcMessage, Task, TaskMessage,
 };
+use nextgsim_common::config::GnbConfig;
 use nextgsim_common::OctetString;
 #[cfg(feature = "drb-pdcp")]
 use nextgsim_pdcp::{Pdcp, PdcpConfig};
 use nextgsim_rlc::{RlcEntity, RlcMode, SnSize};
 use nextgsim_rls::{
-    codec, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
+    codec, DistanceModel, GnbCellTracker, GnbTrackerEvent, PduType, RlsHeartbeatAck,
     RlsMessage as RlsProtocolMessage, RlsPduTransmission, RlsPduTransmissionAck, RrcChannel,
-    SimCoord,
+    ShadowedModel, Shadowing, SimCoord,
 };
 
 /// Default RLS port for gNB
@@ -149,6 +150,30 @@ pub struct RlsTask {
     retired_trackers: std::collections::HashSet<i32>,
 }
 
+/// The cell tracker for this gNB: the default distance model, with seeded
+/// log-normal shadowing on top when `shadowing.sigma_db > 0` (nextgsim#467).
+///
+/// The shadowing is keyed by the NCI (the tracker's STI, stable across starts),
+/// so one seed gives each gNB its own reproducible field. With the block absent
+/// the tracker is exactly what it always was.
+fn build_cell_tracker(config: &GnbConfig, sti: u64, phy_location: SimCoord) -> GnbCellTracker {
+    let s = config.shadowing;
+    if !s.is_enabled() {
+        return GnbCellTracker::new(sti, phy_location);
+    }
+    info!(
+        "RLS: seeded log-normal shadowing on: sigma={} dB seed={} decorrelation={} m \
+         (non-normative simulator model)",
+        s.sigma_db, s.seed, s.decorrelation_m
+    );
+    let shadowing = Shadowing::new(s.sigma_db, s.seed, s.decorrelation_m, sti);
+    GnbCellTracker::with_channel_model(
+        sti,
+        phy_location,
+        Box::new(ShadowedModel::new(Box::new(DistanceModel), shadowing)),
+    )
+}
+
 impl RlsTask {
     /// Creates a new RLS task
     pub fn new(task_base: GnbTaskBase) -> Self {
@@ -158,13 +183,14 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         // Get bind address from config
         let bind_address = SocketAddr::new(task_base.config.link_ip, DEFAULT_RLS_PORT);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -198,10 +224,11 @@ impl RlsTask {
         // every gNB measured the same to every UE and no handover could trigger.
         let pos = task_base.config.sim_position;
         let phy_location = SimCoord::new(pos.x, pos.y, pos.z);
+        let cell_tracker = build_cell_tracker(&task_base.config, sti, phy_location);
 
         Self {
             task_base,
-            cell_tracker: GnbCellTracker::new(sti, phy_location),
+            cell_tracker,
             ue_addresses: HashMap::new(),
             sti_to_ue_id: HashMap::new(),
             pending_acks: HashMap::new(),
@@ -1499,7 +1526,6 @@ impl Task for RlsTask {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nextgsim_common::config::GnbConfig;
     use nextgsim_common::Plmn;
 
     fn test_config() -> GnbConfig {
@@ -2317,6 +2343,42 @@ mod tests {
         assert!(
             gtp_rx.try_recv().is_err(),
             "an SDU t-Reassembly abandoned must not be delivered by a late segment"
+        );
+    }
+
+    /// nextgsim#467: no `shadowing:` block keeps the plain distance model; a
+    /// block with σ > 0 shadows the tracker's level, keyed by this gNB's NCI.
+    #[test]
+    fn the_shadowing_block_decides_the_trackers_channel_model() {
+        let origin = SimCoord::new(0, 0, 0);
+        let off = build_cell_tracker(&test_config(), 0x10, origin);
+        for x in [31, 62, 85, 119] {
+            assert_eq!(off.estimate_dbm(&SimCoord::new(x, 0, 0)), -x, "σ 0: x={x}");
+        }
+
+        let mut cfg = test_config();
+        cfg.shadowing = nextgsim_common::config::ShadowingConfig {
+            sigma_db: 8.0,
+            seed: 42,
+            decorrelation_m: 20.0,
+        };
+        let on = build_cell_tracker(&cfg, 0x10, origin);
+        let again = build_cell_tracker(&cfg, 0x10, origin);
+        let other_gnb = build_cell_tracker(&cfg, 0x20, origin);
+        let field = Shadowing::new(8.0, 42, 20.0, 0x10);
+        let (mut moved, mut differs) = (0, 0);
+        for x in 31..120 {
+            let p = SimCoord::new(x, 0, 0);
+            let level = on.estimate_dbm(&p);
+            assert_eq!(level, (f64::from(-x) + field.offset_db(&p)).round() as i32);
+            assert_eq!(level, again.estimate_dbm(&p), "a restart reproduces x={x}");
+            moved += i32::from(level != -x);
+            differs += i32::from(level != other_gnb.estimate_dbm(&p));
+        }
+        assert!(moved > 40, "σ 8 dB moved only {moved} levels");
+        assert!(
+            differs > 40,
+            "another NCI is another field; {differs} differ"
         );
     }
 
