@@ -7,13 +7,17 @@
 //!
 //! # TR 22.870 mapping
 //!
-//! TR 22.870 does not define a dedicated semantic-communication use case;
-//! semantic communication appears only illustratively in the study body. This
-//! crate therefore prototypes, at the concept level, the AI-service use-case
-//! family it most naturally supports — TR 22.870 §6.24 (distributed 6G network
-//! for AI computing) and §6.25 (AI/ML model training and inference). TR 22.870
-//! is a Stage-1 study; these are potential requirements with no Stage-3 wire
-//! spec — this crate is a research prototype, not a conformant implementation.
+//! TR 22.870 §9.13 (use case on intelligent transmission service for user
+//! experience improvement) names semantic communication in its description:
+//! "semantic communication can extract key feature information from massive
+//! multimodal data" (22870-k00 l.33833-33835), and its PR 9.13.6-1 asks for
+//! "QoS adjustment based on real time network status" (l.33906-33908). The
+//! `rate_adapt` module (demo D444A, nextgsim#477) uses that as framing only:
+//! §9.13 is downlink, the demo is uplink. The crate also prototypes, at the
+//! concept level, §6.24 (distributed 6G network for AI computing) and §6.25
+//! (AI/ML model training and inference). TR 22.870 is a Stage-1 study; these are
+//! potential requirements with no Stage-3 wire spec, so this crate is a research
+//! prototype, not a conformant implementation.
 //!
 //! # Architecture
 //!
@@ -94,6 +98,9 @@ pub mod she_integration;
 
 /// Integration with ISAC for sensing data compression
 pub mod isac_integration;
+
+/// Rate-adaptive encoding against a network-signalled Session-AMBR (demo D444A, #477).
+pub mod rate_adapt;
 
 // ── Re-exports for convenience ───────────────────────────────────────────────
 

@@ -1,0 +1,14 @@
+--- a/nextgsim-ue/src/semantic_codec/d444a.rs
++++ b/nextgsim-ue/src/semantic_codec/d444a.rs
+@@ -91,9 +91,8 @@
+     /// The `keep` the current mode and AMBR call for.
+     fn planned_keep(&self) -> usize {
+         match (self.mode.as_str(), self.ul_ambr_bps) {
+-            ("semantic", Some(ul)) if self.config.follow_session_ambr => {
+-                keep_for_link_budget(ul, self.config.rate_hz)
+-            }
++            // 477-keep-plan revert: the AMBR never changes keep.
++            ("semantic", Some(_)) if self.config.follow_session_ambr => FEATURE_DIM,
+             _ => FEATURE_DIM,
+         }
+     }

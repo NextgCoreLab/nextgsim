@@ -160,6 +160,18 @@ impl AppTask {
                     session_ambr.uplink,
                     session_ambr.uplink_unit
                 );
+                // Up to the semantic codec task as well (demo D444A, #477): the
+                // application above NAS is what adapts to the new rate.
+                #[cfg(feature = "nextgsim-semantic")]
+                if let Some(sixg) = &self.task_base.sixg {
+                    let msg = crate::tasks::SemanticCodecMessage::SessionAmbrChanged {
+                        psi: psi as u8,
+                        session_ambr: session_ambr.clone(),
+                    };
+                    if let Err(e) = sixg.semantic_codec_tx.try_send(msg) {
+                        debug!("Session-AMBR not forwarded to the semantic codec task: {e}");
+                    }
+                }
                 self.cli_handler
                     .on_session_parameters_changed(psi as u8, session_ambr);
             }
@@ -289,6 +301,17 @@ impl AppTask {
                     Err(e) => server.send_error(cmd.client_addr, e.to_string()).await,
                 };
                 if let Err(e) = sent {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
+        // `semantic-status` (demo D444A, #477) is answered from the stream's state.
+        #[cfg(feature = "demo-d444a-ambr-adapt")]
+        if let Some(out) = crate::semantic_codec::d444a::route_cli(&cmd.command) {
+            if let Some(server) = &self.cli_server {
+                if let Err(e) = server.send_result(cmd.client_addr, out).await {
                     warn!("Failed to send CLI response: {}", e);
                 }
             }

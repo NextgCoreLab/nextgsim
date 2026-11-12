@@ -22,6 +22,10 @@ impl Task for SemanticCodecTask {
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("Semantic Codec task started");
+        // Demo D444A (#477): the UL feature stream, only when the demo is
+        // compiled in, enabled and configured.
+        #[cfg(feature = "demo-d444a-ambr-adapt")]
+        let d444a = super::d444a::start(self._task_base.config.semantic_stream.as_ref());
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {
@@ -48,6 +52,11 @@ impl Task for SemanticCodecTask {
                     }
                     SemanticCodecMessage::UpdateDecoder { model_id } => {
                         debug!("Semantic Codec: Update decoder {}", model_id);
+                    }
+                    SemanticCodecMessage::SessionAmbrChanged { psi, session_ambr } => {
+                        debug!("Semantic Codec: PDU session {psi} Session-AMBR {session_ambr:?}");
+                        #[cfg(feature = "demo-d444a-ambr-adapt")]
+                        super::d444a::on_session_ambr(d444a.as_ref(), psi, &session_ambr);
                     }
                     SemanticCodecMessage::SetAdaptiveCompression {
                         enabled,

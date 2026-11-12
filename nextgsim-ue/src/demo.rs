@@ -13,9 +13,17 @@
 use nextgsim_demo::{DemoConfigError, DemoRegistry, DemoRuntime, DemoSpec};
 
 /// The demos compiled into this binary.
+#[allow(clippy::vec_init_then_push)] // one push per demo feature
 pub fn registry() -> DemoRegistry {
     #[allow(unused_mut)]
     let mut specs: Vec<DemoSpec> = Vec::new();
+    // D444A, app adaptation to a network-signalled Session-AMBR (nextgsim#477).
+    #[cfg(feature = "demo-d444a-ambr-adapt")]
+    specs.push(DemoSpec {
+        key: nextgsim_semantic::rate_adapt::D444A_KEY,
+        modes: nextgsim_semantic::rate_adapt::D444A_MODES,
+        requires: &[],
+    });
     DemoRegistry::new(&specs)
 }
 
@@ -32,6 +40,7 @@ mod tests {
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
     #[test]
+    #[cfg(not(feature = "demo-d444a-ambr-adapt"))]
     fn a_default_build_rejects_every_demo_key() {
         assert!(registry().is_empty());
         let root: serde_yaml::Value = serde_yaml::from_str(
@@ -47,6 +56,46 @@ mod tests {
             let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
             let rt = DemoRuntime::from_root(&root, registry()).unwrap();
             assert!(rt.snapshot().is_empty());
+        }
+    }
+
+    /// nextgsim#477: a `demo-d444a-ambr-adapt` build knows d444a-ambr-adapt with
+    /// modes `semantic` and `raw`; `mode: bogus` fails startup with no fallback.
+    #[test]
+    #[cfg(feature = "demo-d444a-ambr-adapt")]
+    fn a_d444a_build_registers_its_two_modes_and_rejects_an_unknown_one() {
+        let parse = |mode: &str| {
+            let root: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "demo:\n  enabled: true\n  d444a-ambr-adapt:\n    enabled: true\n    mode: {mode}\n"
+            ))
+            .unwrap();
+            DemoRuntime::from_root(&root, registry())
+        };
+        for mode in ["semantic", "raw"] {
+            assert_eq!(
+                parse(mode).unwrap().mode("d444a-ambr-adapt").as_deref(),
+                Some(mode)
+            );
+        }
+        match parse("bogus") {
+            Err(DemoConfigError::UnknownMode { demo, mode, .. }) => {
+                assert_eq!(
+                    (demo.as_str(), mode.as_str()),
+                    ("d444a-ambr-adapt", "bogus")
+                );
+            }
+            other => panic!("expected UnknownMode, got {other:?}"),
+        }
+        // Off: no block, or the kill switch off, activates nothing.
+        for yaml in [
+            "nci: 16\n",
+            "demo:\n  enabled: false\n  d444a-ambr-adapt:\n    enabled: true\n    mode: semantic\n",
+        ] {
+            let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+            assert!(DemoRuntime::from_root(&root, registry())
+                .unwrap()
+                .snapshot()
+                .is_empty());
         }
     }
 }

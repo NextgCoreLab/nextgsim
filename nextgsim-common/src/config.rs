@@ -2502,6 +2502,62 @@ pub struct UeConfig {
     /// Semantic Communication codec task enabled (Rel-20)
     #[serde(default)]
     pub semantic_comm_enabled: bool,
+    /// The UL feature stream of demo D444A (nextgsim#477). Read only by a UE
+    /// built with `demo-d444a-ambr-adapt` whose `demo:` block enables it, and
+    /// only with `semantic_comm_enabled`; ignored otherwise.
+    #[serde(default)]
+    pub semantic_stream: Option<SemanticStreamConfig>,
+}
+
+/// Demo D444A's UL feature stream (nextgsim#477, non-normative): where the UE
+/// application sends its feature datagrams and how it reacts to the network's
+/// Session-AMBR.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SemanticStreamConfig {
+    /// The sink, a DN address reached through the PDU session (behind the UPF).
+    pub sink: std::net::SocketAddr,
+    /// The interface the socket is bound to (`SO_BINDTODEVICE`): the PDU
+    /// session's TUN, e.g. `uesimtun0`. `None` sends by the routing table,
+    /// i.e. around the session (the demo's routing revert arm).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// The PDU session whose Session-AMBR the stream follows.
+    #[serde(default = "SemanticStreamConfig::default_psi")]
+    pub psi: u8,
+    /// Datagrams per second.
+    #[serde(default = "SemanticStreamConfig::default_rate_hz")]
+    pub rate_hz: u32,
+    /// Datagrams per scoring epoch (the sink uses the same number). A mode
+    /// switch applies from the next epoch.
+    #[serde(default = "SemanticStreamConfig::default_epoch_datagrams")]
+    pub epoch_datagrams: u64,
+    /// The generator seed (the sink uses the same one).
+    #[serde(default = "SemanticStreamConfig::default_seed")]
+    pub seed: u64,
+    /// Whether the application adapts to the uplink Session-AMBR in mode
+    /// `semantic`. `false` is the demo's revert arm: the NAS still applies the
+    /// AMBR, the application keeps 128 features.
+    #[serde(default = "SemanticStreamConfig::default_follow")]
+    pub follow_session_ambr: bool,
+}
+
+impl SemanticStreamConfig {
+    fn default_psi() -> u8 {
+        1
+    }
+    fn default_rate_hz() -> u32 {
+        50
+    }
+    fn default_epoch_datagrams() -> u64 {
+        500
+    }
+    fn default_seed() -> u64 {
+        444
+    }
+    fn default_follow() -> bool {
+        true
+    }
 }
 
 impl Default for UeConfig {
@@ -2570,6 +2626,7 @@ impl Default for UeConfig {
             isac_enabled: false,
             federated_learning_enabled: false,
             semantic_comm_enabled: false,
+            semantic_stream: None,
         }
     }
 }

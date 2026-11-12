@@ -441,6 +441,14 @@ jobs:
       # are behind `nkef-sba`, which no other job enables.
       - name: cargo test (6g + nkef-sba)
         run: cargo test -p nextgsim-gnb --features 6g,nkef-sba
+      # Demo d444a-ambr-adapt (#477): the UE's Session-AMBR-following stream and
+      # the semantic-sink binary are behind `demo-d444a-ambr-adapt`.
+      - name: cargo test (6g + demo-d444a-ambr-adapt)
+        run: |
+          cargo test -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt
+          cargo test -p nextgsim-semantic --features demo-d444a-ambr-adapt
+      - name: D444A revert arms (each patch must fail its named test)
+        run: scripts/demo/d444a-reverts.sh
       - name: cargo test (6g end to end)
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
@@ -448,6 +456,8 @@ jobs:
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
           cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
+          cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
+          cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:
