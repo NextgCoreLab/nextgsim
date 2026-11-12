@@ -33,14 +33,17 @@
 //! NEF. Anything else is 404 (unknown id), 405 (method) or 400 (body). Bodies are
 //! capped at [`MAX_NOTIFICATION`], header lists at 16 KiB, streams at 16 per
 //! connection. A connection with nothing in flight is closed after
-//! [`CALLBACK_IDLE`], and at [`MAX_CALLBACK_CONNECTIONS`] a new connection evicts
-//! the one idle longest, so idle peers cannot starve the NEF's notifications. It
-//! binds 127.0.0.1 by default, and belongs on the network nefd reaches the AF on
+//! [`CALLBACK_IDLE`]. A source holds at most [`MAX_CONNECTIONS_PER_SOURCE`]
+//! connections and past that evicts only its own; at [`MAX_CALLBACK_CONNECTIONS`]
+//! eviction takes from the source holding the most, never pushing another source
+//! below a fair share; and a connection is not evictable while it opens
+//! ([`OPEN_GRACE`]). So one flooding or churning host cannot evict the NEF's
+//! connection. It binds 127.0.0.1 by default, and belongs on the network nefd reaches the AF on
 //! (SBI or pod network), not on the UEs' `fl-dn`.
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -56,10 +59,16 @@ use tokio::sync::{mpsc, Notify};
 pub const CALLBACK_PREFIX: &str = "/fl-af/v1/t8-notify/";
 /// The largest notification body accepted.
 pub const MAX_NOTIFICATION: usize = 64 * 1024;
-/// Concurrent callback connections held. A new one past this evicts the
-/// connection idle the longest; only when every one has a request in flight is
-/// it refused.
-pub const MAX_CALLBACK_CONNECTIONS: usize = 32;
+/// Concurrent callback connections held in all. See [`MAX_CONNECTIONS_PER_SOURCE`]
+/// and `Registry::make_room` for who may be evicted when it is reached.
+pub const MAX_CALLBACK_CONNECTIONS: usize = 64;
+/// Concurrent callback connections held per source address. A source past this
+/// evicts its own idle-longest connection, never another source's.
+pub const MAX_CONNECTIONS_PER_SOURCE: usize = 8;
+/// A new connection cannot be evicted for this long after accept unless it has
+/// made its first request: it covers the TCP accept, the h2 handshake and the
+/// first HEADERS of a one-notification connection like nefd's.
+pub const OPEN_GRACE: Duration = Duration::from_secs(2);
 /// Concurrent streams per callback connection, advertised in SETTINGS.
 const MAX_STREAMS_PER_CONNECTION: usize = 16;
 /// The largest header list accepted (SETTINGS_MAX_HEADER_LIST_SIZE); h2's own
@@ -473,12 +482,26 @@ impl CallbackIds {
 /// One held callback connection, as the listener's registry sees it.
 struct Held {
     id: u64,
+    /// The peer's address: eviction stays within a source.
+    source: IpAddr,
     /// Requests in flight on it.
     busy: Arc<AtomicUsize>,
+    /// Still opening: from TCP accept through the h2 handshake to its first
+    /// request, or [`OPEN_GRACE`]. Its own source cannot evict it then.
+    opening: Arc<AtomicBool>,
     /// When it last had a request in flight (or was accepted).
     last_active: Arc<Mutex<Instant>>,
     /// Told to close (evicted).
     evict: Arc<Notify>,
+}
+
+impl Held {
+    fn idle(&self) -> bool {
+        self.busy.load(Ordering::SeqCst) == 0
+    }
+    fn opening(&self) -> bool {
+        self.opening.load(Ordering::SeqCst)
+    }
 }
 
 /// The listener's held connections.
@@ -489,27 +512,60 @@ struct Registry {
 }
 
 impl Registry {
-    /// Make room for one more: evict the connection idle longest when full.
-    /// `false` when full and every connection has a request in flight.
-    fn make_room(&mut self) -> bool {
-        if self.held.len() < MAX_CALLBACK_CONNECTIONS {
-            return true;
-        }
+    fn count(&self, source: IpAddr) -> usize {
+        self.held.iter().filter(|h| h.source == source).count()
+    }
+
+    /// Evict `source`'s connection idle longest, skipping one still opening
+    /// unless `even_opening`; `false` if there is none to evict.
+    fn evict_oldest_idle_of(&mut self, source: IpAddr, even_opening: bool) -> bool {
         let oldest = self
             .held
             .iter()
             .enumerate()
-            .filter(|(_, h)| h.busy.load(Ordering::SeqCst) == 0)
+            .filter(|(_, h)| h.source == source && h.idle() && (even_opening || !h.opening()))
             .min_by_key(|(_, h)| *lock(&h.last_active))
             .map(|(i, _)| i);
         match oldest {
             Some(i) => {
-                let h = self.held.swap_remove(i);
-                h.evict.notify_one();
+                self.held.swap_remove(i).evict.notify_one();
                 true
             }
             None => false,
         }
+    }
+
+    /// Make room for one more connection from `source`. `false`: refuse it.
+    ///
+    /// - A connection with a request in flight is never evicted.
+    /// - A source holds at most [`MAX_CONNECTIONS_PER_SOURCE`]; past that its
+    ///   own idle-longest connection that has finished opening is evicted, never
+    ///   another source's (and the new one is refused if there is none).
+    /// - At [`MAX_CALLBACK_CONNECTIONS`] in all, the evicted connection comes from
+    ///   the source holding the most, opening or not, and only if that source
+    ///   holds at least two more than `source` does. A source can be pushed
+    ///   down to a fair share, never by a source holding fewer: a peer with one
+    ///   connection (nefd's one notification) is never evicted by a newcomer.
+    fn make_room(&mut self, source: IpAddr) -> bool {
+        let mine = self.count(source);
+        if mine >= MAX_CONNECTIONS_PER_SOURCE {
+            return self.evict_oldest_idle_of(source, false);
+        }
+        if self.held.len() < MAX_CALLBACK_CONNECTIONS {
+            return true;
+        }
+        let mut by_source: Vec<(IpAddr, usize)> = Vec::new();
+        for h in &self.held {
+            match by_source.iter_mut().find(|(s, _)| *s == h.source) {
+                Some((_, n)) => *n += 1,
+                None => by_source.push((h.source, 1)),
+            }
+        }
+        by_source.sort_by_key(|s| std::cmp::Reverse(s.1));
+        by_source
+            .into_iter()
+            .take_while(|(_, n)| *n > mine + 1)
+            .any(|(s, _)| self.evict_oldest_idle_of(s, true))
     }
 }
 
@@ -537,9 +593,10 @@ pub async fn serve_callbacks(
         };
         let held = {
             let mut r = lock(&registry);
-            if !r.make_room() {
+            if !r.make_room(peer.ip()) {
                 tracing::warn!(
-                    "[demo:{}] T8 listener: connection from {peer} refused (every connection busy)",
+                    "[demo:{}] T8 listener: connection from {peer} refused (no idle connection \
+                     to evict for it)",
                     super::KEY
                 );
                 continue;
@@ -547,18 +604,33 @@ pub async fn serve_callbacks(
             r.next += 1;
             let h = Held {
                 id: r.next,
+                source: peer.ip(),
                 busy: Arc::new(AtomicUsize::new(0)),
+                // Opening from accept.
+                opening: Arc::new(AtomicBool::new(true)),
                 last_active: Arc::new(Mutex::new(Instant::now())),
                 evict: Arc::new(Notify::new()),
             };
-            let mine = (h.id, h.busy.clone(), h.last_active.clone(), h.evict.clone());
+            let mine = (
+                h.id,
+                h.busy.clone(),
+                h.opening.clone(),
+                h.last_active.clone(),
+                h.evict.clone(),
+            );
             r.held.push(h);
             mine
         };
         let (ids, tx, registry) = (ids.clone(), tx.clone(), registry.clone());
         tokio::spawn(async move {
-            let (id, busy, last_active, evict) = held;
-            if let Err(e) = serve_connection(tcp, ids, tx, &busy, &last_active, &evict).await {
+            let (id, busy, opening, last_active, evict) = held;
+            let conn = ConnState {
+                busy,
+                opening,
+                last_active,
+                evict,
+            };
+            if let Err(e) = serve_connection(tcp, ids, tx, &conn).await {
                 tracing::debug!("[demo:{}] T8 listener: {peer}: {e}", super::KEY);
             }
             lock(&registry).held.retain(|h| h.id != id);
@@ -576,36 +648,66 @@ impl Drop for InFlight {
     }
 }
 
+/// A held connection's shared state (see [`Held`]).
+struct ConnState {
+    busy: Arc<AtomicUsize>,
+    opening: Arc<AtomicBool>,
+    last_active: Arc<Mutex<Instant>>,
+    evict: Arc<Notify>,
+}
+
 async fn serve_connection(
     tcp: tokio::net::TcpStream,
     ids: CallbackIds,
     tx: mpsc::Sender<(String, Bytes)>,
-    busy: &Arc<AtomicUsize>,
-    last_active: &Arc<Mutex<Instant>>,
-    evict: &Notify,
+    st: &ConnState,
 ) -> Result<(), h2::Error> {
+    let ConnState {
+        busy,
+        last_active,
+        evict,
+        ..
+    } = st;
+    // The connection is "opening" until its first request or OPEN_GRACE after
+    // accept, whichever comes first.
+    let open_until = tokio::time::Instant::now() + OPEN_GRACE;
+    let mut opening = true;
+    let end_opening = |opening: &mut bool| {
+        if std::mem::take(opening) {
+            *lock(last_active) = Instant::now();
+            st.opening.store(false, Ordering::SeqCst);
+        }
+    };
     let handshake = h2::server::Builder::new()
         .max_concurrent_streams(MAX_STREAMS_PER_CONNECTION as u32)
         .max_header_list_size(MAX_HEADER_LIST)
         .handshake(tcp);
-    let mut conn = tokio::select! {
-        c = tokio::time::timeout(Duration::from_secs(10), handshake) => match c {
-            Ok(c) => c?,
-            Err(_) => return Ok(()),
-        },
-        () = evict.notified() => return Ok(()),
+    let handshake = tokio::time::timeout(Duration::from_secs(10), handshake);
+    tokio::pin!(handshake);
+    let mut conn = loop {
+        tokio::select! {
+            c = &mut handshake => match c {
+                Ok(c) => break c?,
+                Err(_) => return Ok(()),
+            },
+            () = tokio::time::sleep_until(open_until), if opening => end_opening(&mut opening),
+            () = evict.notified() => return Ok(()),
+        }
     };
     // Each stream is answered in its own task: reading a body needs the
     // connection driven, which only this accept loop does.
     loop {
-        let idle_for = lock(last_active).elapsed();
         let idle_left = if busy.load(Ordering::SeqCst) == 0 {
-            CALLBACK_IDLE.saturating_sub(idle_for)
+            CALLBACK_IDLE.saturating_sub(lock(last_active).elapsed())
         } else {
             CALLBACK_IDLE
         };
         let stream = tokio::select! {
             s = conn.accept() => s,
+            () = tokio::time::sleep_until(open_until), if opening => {
+                end_opening(&mut opening);
+                continue;
+            }
             () = tokio::time::sleep(idle_left) => {
                 if busy.load(Ordering::SeqCst) == 0
                     && lock(last_active).elapsed() >= CALLBACK_IDLE
@@ -626,6 +728,7 @@ async fn serve_connection(
         let (req, respond) = stream?;
         busy.fetch_add(1, Ordering::SeqCst);
         *lock(last_active) = Instant::now();
+        end_opening(&mut opening);
         let guard = InFlight(busy.clone(), last_active.clone());
         let (ids, tx) = (ids.clone(), tx.clone());
         tokio::spawn(async move {
@@ -788,32 +891,21 @@ mod tests {
         );
     }
 
-    /// Idle peers cannot starve the NEF: with all 32 slots held by idle h2c
-    /// connections, a notification on a fresh connection is still answered 204
-    /// and forwarded, and the connection idle longest is the one evicted.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn idle_connections_do_not_starve_a_notification() {
-        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = l.local_addr().unwrap();
-        let ids = CallbackIds::default();
-        let id = new_callback_id();
-        ids.insert(&id, "ue3");
-        let (tx, mut rx) = mpsc::channel(4);
-        tokio::spawn(serve_callbacks(l, ids, tx));
-        let mut idle = Vec::new();
-        for _ in 0..MAX_CALLBACK_CONNECTIONS {
-            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
-            let (mut send, conn) = h2::client::handshake(tcp).await.unwrap();
-            let driver = tokio::spawn(conn);
-            // One request each, so every connection is past its handshake and
-            // registered before the next is opened.
-            let req = http::Request::get(format!("http://{addr}/other"))
-                .body(())
-                .unwrap();
-            let (resp, _) = send.send_request(req, true).unwrap();
-            assert_eq!(resp.await.unwrap().status(), StatusCode::NOT_FOUND);
-            idle.push((send, driver));
-        }
+    /// A connection from `127.0.0.octet` to `addr`.
+    async fn tcp_from(octet: u8, addr: SocketAddr) -> std::io::Result<tokio::net::TcpStream> {
+        let s = tokio::net::TcpSocket::new_v4()?;
+        s.bind(SocketAddr::from(([127, 0, 0, octet], 0)))?;
+        s.connect(addr).await
+    }
+
+    /// One notification the way nefd sends it: a fresh h2c connection (from
+    /// `127.0.0.octet`) per notification. The AF's status, or why it failed.
+    async fn notify_from(octet: u8, addr: SocketAddr, id: &str) -> Result<StatusCode, String> {
+        let tcp = tcp_from(octet, addr).await.map_err(|e| e.to_string())?;
+        let (mut send, conn) = h2::client::handshake(tcp)
+            .await
+            .map_err(|e| e.to_string())?;
+        let driver = tokio::spawn(conn);
         let body = json!({
             "subscription": "/3gpp-monitoring-event/v1/fl-af/subscriptions/s1",
             "monitoringEventReports": [{
@@ -821,12 +913,51 @@ mod tests {
                 "lossOfConnectReason": "DEREGISTERED",
             }],
         });
-        let c = SbiClient::new(SbiClientConfig::default());
-        let r = c
-            .post_json(&format!("http://{addr}{CALLBACK_PREFIX}{id}"), &body, None)
-            .await
+        let req = http::Request::post(format!("http://{addr}{CALLBACK_PREFIX}{id}"))
+            .header("content-type", "application/json")
+            .body(())
             .unwrap();
-        assert_eq!(r.status, StatusCode::NO_CONTENT);
+        let (resp, mut stream) = send.send_request(req, false).map_err(|e| e.to_string())?;
+        stream
+            .send_data(Bytes::from(body.to_string()), true)
+            .map_err(|e| e.to_string())?;
+        let status = resp.await.map_err(|e| e.to_string())?.status();
+        driver.abort();
+        Ok(status)
+    }
+
+    async fn listener() -> (SocketAddr, String, mpsc::Receiver<(String, Bytes)>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        let ids = CallbackIds::default();
+        let id = new_callback_id();
+        ids.insert(&id, "ue3");
+        let (tx, rx) = mpsc::channel(1024);
+        tokio::spawn(serve_callbacks(l, ids, tx));
+        (addr, id, rx)
+    }
+
+    /// Idle peers cannot starve the NEF: one source opening far more idle h2c
+    /// connections than its share keeps only [`MAX_CONNECTIONS_PER_SOURCE`], by
+    /// evicting its own oldest, and a notification from another source is
+    /// answered 204 and forwarded.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_connections_do_not_starve_a_notification() {
+        let (addr, id, mut rx) = listener().await;
+        let mut idle = Vec::new();
+        for _ in 0..MAX_CALLBACK_CONNECTIONS + 8 {
+            let tcp = tcp_from(20, addr).await.unwrap();
+            let (mut send, conn) = h2::client::handshake(tcp).await.unwrap();
+            let driver = tokio::spawn(conn);
+            // One request each: past its opening, so it is idle and evictable.
+            let req = http::Request::get(format!("http://{addr}/other"))
+                .body(())
+                .unwrap();
+            let (resp, _) = send.send_request(req, true).unwrap();
+            assert_eq!(resp.await.unwrap().status(), StatusCode::NOT_FOUND);
+            idle.push((send, driver));
+        }
+        assert_eq!(notify_from(2, addr, &id).await, Ok(StatusCode::NO_CONTENT));
         let (got, _) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .unwrap()
@@ -835,9 +966,65 @@ mod tests {
         let (_, first) = idle.remove(0);
         tokio::time::timeout(Duration::from_secs(5), first)
             .await
-            .expect("the connection idle longest was evicted")
+            .expect("the source's own oldest idle connection was evicted")
             .unwrap()
             .unwrap();
+    }
+
+    /// Churn cannot evict the NEF's notification connection either: 64 tasks
+    /// on one source address connect raw TCP in a loop, and every one of 200
+    /// notifications from another source, each on a fresh connection like
+    /// nefd's, is answered 204.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_churning_source_cannot_evict_another_sources_notification() {
+        churn_against_notifications(1).await;
+    }
+
+    /// The same with the flood spread over 20 source addresses, more than the
+    /// listener holds in all: the fair-share rule keeps the notifier's slot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_churning_flood_from_many_sources_cannot_evict_a_notification() {
+        churn_against_notifications(20).await;
+    }
+
+    async fn churn_against_notifications(sources: u8) {
+        let (addr, id, mut rx) = listener().await;
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flood: Vec<_> = (0..64u8)
+            .map(|t| {
+                let stop = stop.clone();
+                tokio::spawn(async move {
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(s) = tcp_from(20 + t % sources, addr).await {
+                            tokio::time::sleep(Duration::from_millis(u64::from(t % 7))).await;
+                            drop(s);
+                        }
+                    }
+                })
+            })
+            .collect();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut failed = Vec::new();
+        for n in 0..200 {
+            match notify_from(2, addr, &id).await {
+                Ok(StatusCode::NO_CONTENT) => {}
+                other => failed.push(format!("{n}: {other:?}")),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for f in flood {
+            let _ = f.await;
+        }
+        assert!(
+            failed.is_empty(),
+            "{} of 200 failed: {failed:?}",
+            failed.len()
+        );
+        let mut forwarded = 0;
+        while rx.try_recv().is_ok() {
+            forwarded += 1;
+        }
+        assert_eq!(forwarded, 200);
     }
 
     #[tokio::test]

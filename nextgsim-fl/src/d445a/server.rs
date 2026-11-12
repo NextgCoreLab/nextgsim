@@ -171,6 +171,8 @@ pub struct ServerConfig {
     pub max_connections: usize,
     /// The largest L2 norm of one update's delta. A larger (or non-finite-norm)
     /// delta is refused (`update_refused … reason=norm`) and not aggregated.
+    /// A crash guard, not a poisoning defence: a delta under the cap is
+    /// aggregated, and robustness is the rules' job.
     /// Default 1000: the seed-480 runs' largest update is about 90 (the poisoned
     /// FedAvg arm), the honest ones below 10.
     #[serde(default = "default_max_update_norm")]

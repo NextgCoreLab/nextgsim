@@ -19,8 +19,13 @@
 #                      -> an_identity_clash_is_refused_before_subscribing
 #   480-subscribe-first the AF subscribes T8 for a clashing identity, then refuses
 #                      -> an_identity_clash_is_refused_before_subscribing
-#   480-t8-no-evict    the T8 listener refuses a new connection when 32 idle ones
-#                      hold every slot -> idle_connections_do_not_starve_a_notification
+#   480-t8-no-evict    the T8 listener never evicts, so a source at its cap is
+#                      refused -> idle_connections_do_not_starve_a_notification
+#   480-t8-evict-any-source  eviction takes any source's idle connection, even
+#                      one still opening
+#                      -> a_churning_source_cannot_evict_another_sources_notification
+#   480-t8-no-fair-share  at the total cap, any source may be evicted down to zero
+#                      -> a_churning_flood_from_many_sources_cannot_evict_a_notification
 #
 # The other revert arms are knobs, not patches, and have their own tests in
 # revert-hooks builds: --no-t8 (without_t8_the_round_waits_for_the_deadline),
@@ -43,9 +48,12 @@ declare -A test_of=(
     [480-identity-clash]="$fl an_identity_clash_is_refused_before_subscribing"
     [480-subscribe-first]="$fl an_identity_clash_is_refused_before_subscribing"
     [480-t8-no-evict]="$fl idle_connections_do_not_starve_a_notification"
+    [480-t8-evict-any-source]="$fl a_churning_source_cannot_evict_another_sources_notification"
+    [480-t8-no-fair-share]="$fl a_churning_flood_from_many_sources_cannot_evict_a_notification"
 )
 arms="${ARMS:-480-t8-ignored 480-samples-trust 480-no-provenance 480-poison-off \
-480-norm-unchecked 480-identity-clash 480-subscribe-first 480-t8-no-evict}"
+480-norm-unchecked 480-identity-clash 480-subscribe-first 480-t8-no-evict \
+480-t8-evict-any-source 480-t8-no-fair-share}"
 for arm in $arms; do
     args="${test_of[$arm]:?unknown arm $arm}"
     name="${args##* }"
