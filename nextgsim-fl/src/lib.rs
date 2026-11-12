@@ -153,7 +153,8 @@ pub enum AggregationAlgorithm {
     /// Bonawitz et al. 2017 protocol. It only illustrates that antisymmetric
     /// pairwise masks cancel in the summation.
     MaskedSumDemo,
-    /// Krum: selects the single update closest to its neighbours (Byzantine-robust)
+    /// Krum: selects the single update closest to its neighbours (Byzantine-robust;
+    /// Blanchard et al. 2017, needs more than `2 · num_byzantine + 2` updates)
     Krum { num_byzantine: usize },
     /// Multi-Krum: averages the top-`m` Krum selections (Byzantine-robust)
     MultiKrum { num_byzantine: usize, m: usize },
@@ -925,9 +926,32 @@ impl FederatedAggregator {
             }
 
             let num_updates = round.received_updates.len();
+            // Refuse a round the robust rule cannot aggregate BEFORE the status
+            // moves to Aggregating, so the round stays open.
+            match self.algorithm {
+                AggregationAlgorithm::Krum { num_byzantine }
+                    if !krum_within_bound(num_updates, num_byzantine) =>
+                {
+                    return Err(format!(
+                        "Krum with f={num_byzantine} needs more than {} updates, got {num_updates}",
+                        2 * num_byzantine + 2
+                    ));
+                }
+                AggregationAlgorithm::TrimmedMean { trim_ratio } => {
+                    trim_count(num_updates, trim_ratio)?;
+                }
+                _ => {}
+            }
             let total_samples: u64 = round.received_updates.values().map(|u| u.num_samples).sum();
-            let avg_loss =
-                round.received_updates.values().map(|u| u.loss).sum::<f32>() / num_updates as f32;
+            // nextgsim#480: summed in sorted-member order, like FedAvg, so the
+            // reported loss is bit-stable.
+            let mut losses: Vec<(&String, f32)> = round
+                .received_updates
+                .iter()
+                .map(|(k, u)| (k, u.loss))
+                .collect();
+            losses.sort_by(|a, b| a.0.cmp(b.0));
+            let avg_loss = losses.iter().map(|(_, l)| l).sum::<f32>() / num_updates as f32;
 
             (
                 num_updates,
@@ -956,7 +980,15 @@ impl FederatedAggregator {
                     .iter()
                     .map(|k| updates_clone[*k].gradients.clone())
                     .collect();
-                krum_aggregate(&grads, num_byzantine)
+                let picked = krum_aggregate(&grads, num_byzantine);
+                if picked.is_empty() {
+                    // Every score was non-finite: nothing to trust this round.
+                    if let Some(round) = self.current_round.as_mut() {
+                        round.status = RoundStatus::Collecting;
+                    }
+                    return Err("Krum: no update has a finite score".into());
+                }
+                picked
             }
             AggregationAlgorithm::MultiKrum { num_byzantine, m } => {
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
@@ -974,7 +1006,8 @@ impl FederatedAggregator {
                     .iter()
                     .map(|k| updates_clone[*k].gradients.clone())
                     .collect();
-                trimmed_mean_aggregate(&grads, trim_ratio)
+                // The ratio was validated above, so this does not fail here.
+                trimmed_mean_aggregate(&grads, trim_ratio)?
             }
             AggregationAlgorithm::Median => {
                 let mut keys: Vec<&String> = updates_clone.keys().collect();
@@ -1126,7 +1159,10 @@ impl FederatedAggregator {
             return Vec::new();
         }
 
-        let all_keys = self.secagg_public_keys();
+        // nextgsim#480: the keys in id order too, so each mask accumulates in a
+        // fixed order.
+        let mut all_keys = self.secagg_public_keys();
+        all_keys.sort_by(|a, b| a.0.cmp(&b.0));
         let total_samples: u64 = updates.values().map(|u| u.num_samples).sum();
         if total_samples == 0 {
             return Vec::new();
@@ -1134,7 +1170,10 @@ impl FederatedAggregator {
 
         let mut masked_updates = Vec::new();
 
-        for update in updates.values() {
+        // nextgsim#480: sorted-member order, so the `f32` sum is bit-stable.
+        let mut sorted: Vec<&ModelUpdate> = updates.values().collect();
+        sorted.sort_by(|a, b| a.participant_id.cmp(&b.participant_id));
+        for update in sorted {
             // Fold the sample weight into the value BEFORE masking.
             let weight = update.num_samples as f32;
             let weighted: Vec<f32> = update.gradients.iter().map(|g| g * weight).collect();
@@ -2137,110 +2176,126 @@ pub fn fedavg_sorted(updates: &std::collections::BTreeMap<String, (Vec<f32>, u64
 }
 
 /// What Krum chose (nextgsim#480): the selected update, its index, and every
-/// update's score (the sum of distances to its nearest neighbours), so a caller
-/// can name the member Krum trusts least.
+/// update's score (the sum of squared distances to its `n − f − 2` nearest
+/// neighbours, Blanchard et al. 2017), so a caller can name the member Krum trusts
+/// least.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KrumSelection {
-    /// The selected update (empty when there were none).
+    /// The selected update (empty when nothing was selected).
     pub weights: Vec<f32>,
-    /// Its index in the input, `None` when there were no updates.
+    /// Its index in the input. `None` when there were no updates, when the input
+    /// is below Krum's bound (`n ≤ 2f + 2`, see [`krum_select`]), or when every
+    /// score is non-finite.
     pub selected: Option<usize>,
-    /// Each update's Krum score; the selected one has the smallest.
+    /// Each update's Krum score; the selected one has the smallest. A non-finite
+    /// score (a NaN or ±inf coordinate) is stored as `+inf`. Empty below the bound.
     pub scores: Vec<f32>,
 }
 
 impl KrumSelection {
-    /// The index with the LARGEST score, the update farthest from its neighbours.
-    /// Ties go to the lower index.
+    /// The index with the LARGEST score, the update farthest from its neighbours,
+    /// the one the AF logs as `excluded=`. Ties go to the lower index. `None`
+    /// whenever nothing was selected, so a below-bound round never names anyone.
     pub fn worst(&self) -> Option<usize> {
+        self.selected?;
         self.scores
             .iter()
             .enumerate()
             .fold(None, |best: Option<(usize, f32)>, (i, s)| match best {
-                Some((_, b)) if *s <= b => best,
+                Some((_, b)) if s.total_cmp(&b).is_le() => best,
                 _ => Some((i, *s)),
             })
             .map(|(i, _)| i)
     }
 }
 
-/// Krum aggregation: selects the gradient closest to its k-1 neighbors
+/// Krum's precondition (Blanchard et al. 2017): `n > 2f + 2`.
+pub fn krum_within_bound(n: usize, num_byzantine: usize) -> bool {
+    n > 2 * num_byzantine + 2
+}
+
+/// Krum aggregation: the update with the smallest Krum score ([`krum_select`]).
+/// Returns an empty vector when nothing is selected (no updates, `n ≤ 2f + 2`, or
+/// every score non-finite); [`FederatedAggregator::aggregate`] refuses that round.
 pub fn krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize) -> Vec<f32> {
     krum_select(updates, num_byzantine).weights
 }
 
-/// Krum (Blanchard et al. 2017), returning which update it selected and every
-/// score (nextgsim#480). [`krum_aggregate`] is this, weights only. The selection
-/// is the minimum score; ties go to the lower index.
+/// Every update's Krum score over its `k` nearest neighbours: the sum of SQUARED
+/// Euclidean distances. A NaN distance counts as `+inf` (whatever the NaN's sign
+/// bit), so it is never among an honest update's nearest when `k ≤ n − 2`, and a
+/// non-finite score is `+inf`.
+fn krum_scores(updates: &[Vec<f32>], k: usize) -> Vec<f32> {
+    let n = updates.len();
+    (0..n)
+        .map(|i| {
+            let mut d: Vec<f32> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| {
+                    let d = squared_distance(&updates[i], &updates[j]);
+                    if d.is_nan() {
+                        f32::INFINITY
+                    } else {
+                        d
+                    }
+                })
+                .collect();
+            d.sort_by(f32::total_cmp);
+            // Every distance is ≥ 0 or +inf, so the sum is too: never NaN.
+            d.iter().take(k).sum()
+        })
+        .collect()
+}
+
+/// Krum (Blanchard et al. 2017, "Machine Learning with Adversaries: Byzantine
+/// Tolerant Gradient Descent"), returning which update it selected and every score
+/// (nextgsim#480). [`krum_aggregate`] is this, weights only.
+///
+/// - score(i) = Σ ‖Vᵢ − Vⱼ‖² over the `n − f − 2` updates closest to Vᵢ;
+/// - the selection is the minimum score, ties to the lower index;
+/// - the paper requires `n > 2f + 2`. Below that bound nothing is selected and no
+///   score is reported (`selected: None`, so [`KrumSelection::worst`] is `None`):
+///   with 3 members and `f = 1`, or 2 after one leaves, there is no outlier to name;
+/// - a non-finite score is `+inf`: an update carrying NaN or inf is never selected
+///   and is always the worst. If every score is non-finite nothing is selected.
 pub fn krum_select(updates: &[Vec<f32>], num_byzantine: usize) -> KrumSelection {
-    if updates.is_empty() {
+    let n = updates.len();
+    if n == 0 || !krum_within_bound(n, num_byzantine) {
         return KrumSelection {
             weights: vec![],
             selected: None,
             scores: vec![],
         };
     }
-
-    let n = updates.len();
-    let k = n.saturating_sub(num_byzantine).saturating_sub(1).max(1);
-
-    // Compute pairwise distances
-    let mut scores = vec![0.0f32; n];
-    for i in 0..n {
-        let mut distances: Vec<(usize, f32)> = (0..n)
-            .filter(|&j| j != i)
-            .map(|j| {
-                let dist = euclidean_distance(&updates[i], &updates[j]);
-                (j, dist)
-            })
-            .collect();
-
-        // Sort by distance and sum k nearest
-        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        scores[i] = distances.iter().take(k).map(|(_, d)| d).sum();
-    }
-
-    // Select update with minimum score
-    let best_idx = scores
+    let scores = krum_scores(updates, n - num_byzantine - 2);
+    let best = scores
         .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
-
+        .filter(|(_, s)| s.is_finite())
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(i, _)| i);
     KrumSelection {
-        weights: updates[best_idx].clone(),
-        selected: Some(best_idx),
+        weights: best.map(|i| updates[i].clone()).unwrap_or_default(),
+        selected: best,
         scores,
     }
 }
 
-/// Multi-Krum: averages the top-m Krum selections
+/// Multi-Krum: averages the `m` updates with the smallest Krum scores (the same
+/// squared-distance score as [`krum_select`], over `max(n − f − 2, 1)` neighbours).
+/// Unlike [`krum_select`] it does not refuse below `n > 2f + 2`.
 pub fn multi_krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize, m: usize) -> Vec<f32> {
     if updates.is_empty() {
         return vec![];
     }
 
     let n = updates.len();
-    let k = n.saturating_sub(num_byzantine).saturating_sub(1).max(1);
+    let k = n.saturating_sub(num_byzantine + 2).max(1);
     let m = m.min(n);
 
-    // Compute Krum scores for all updates
-    let mut scores: Vec<(usize, f32)> = (0..n)
-        .map(|i| {
-            let mut distances: Vec<f32> = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| euclidean_distance(&updates[i], &updates[j]))
-                .collect();
-
-            distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let score: f32 = distances.iter().take(k).sum();
-            (i, score)
-        })
-        .collect();
-
-    // Sort by score and select top m
-    scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut scores: Vec<(usize, f32)> = krum_scores(updates, k).into_iter().enumerate().collect();
+    // Stable sort: ties keep the lower index first.
+    scores.sort_by(|a, b| a.1.total_cmp(&b.1));
     let selected_indices: Vec<usize> = scores.iter().take(m).map(|(idx, _)| *idx).collect();
 
     // Average selected updates
@@ -2255,42 +2310,59 @@ pub fn multi_krum_aggregate(updates: &[Vec<f32>], num_byzantine: usize, m: usize
     result
 }
 
-/// Trimmed mean: removes top and bottom `trim_ratio` of values per coordinate.
+/// How many values [`trimmed_mean_aggregate`] drops from EACH end of `n`, or why
+/// `trim_ratio` is refused: it must be in `[0, 1)` (NaN is refused) and must
+/// leave at least one value.
+pub fn trim_count(n: usize, trim_ratio: f32) -> Result<usize, String> {
+    if !(0.0..1.0).contains(&trim_ratio) {
+        return Err(format!("trim ratio {trim_ratio} is not in [0, 1)"));
+    }
+    let per_end = ((n as f32 * trim_ratio) / 2.0).floor() as usize;
+    // Unreachable for r < 1 in exact arithmetic; kept against f32 rounding of
+    // `n · r` at very large n.
+    if n > 0 && 2 * per_end >= n {
+        return Err(format!("trim ratio {trim_ratio} trims all {n} values"));
+    }
+    Ok(per_end)
+}
+
+/// Trimmed mean: per coordinate, sort the values and drop `floor(n · trim_ratio / 2)`
+/// from each end (so `trim_ratio` is the TOTAL fraction trimmed: 0.4 of 5 is one
+/// from each end), then average the rest. Errors for a ratio [`trim_count`] refuses.
+/// Values are ordered with `total_cmp`, so a NaN sorts to an end and is trimmed
+/// like any other extreme.
 ///
 /// Byzantine-robust coordinate-wise trimmed mean per Yin et al. 2018,
 /// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
 /// (ICML 2018).
-pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Vec<f32> {
+pub fn trimmed_mean_aggregate(updates: &[Vec<f32>], trim_ratio: f32) -> Result<Vec<f32>, String> {
+    let n = updates.len();
+    let trim = trim_count(n, trim_ratio)?;
     if updates.is_empty() {
-        return vec![];
+        return Ok(vec![]);
     }
 
     let dim = updates[0].len();
-    let n = updates.len();
-    let trim_count = ((n as f32 * trim_ratio) / 2.0).floor() as usize;
-
     let mut result = vec![0.0f32; dim];
 
-    for (i, result_val) in result.iter_mut().enumerate().take(dim) {
+    for (i, result_val) in result.iter_mut().enumerate() {
         let mut values: Vec<f32> = updates
             .iter()
             .map(|u| u.get(i).copied().unwrap_or(0.0))
             .collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values.sort_by(f32::total_cmp);
 
-        // Trim extremes
-        let trimmed = &values[trim_count..n.saturating_sub(trim_count)];
-        *result_val = if trimmed.is_empty() {
-            0.0
-        } else {
-            trimmed.iter().sum::<f32>() / trimmed.len() as f32
-        };
+        // Trim extremes; `trim_count` guarantees at least one value is kept.
+        let kept = &values[trim..n - trim];
+        *result_val = kept.iter().sum::<f32>() / kept.len() as f32;
     }
 
-    result
+    Ok(result)
 }
 
-/// Coordinate-wise median aggregation.
+/// Coordinate-wise median aggregation. Values are ordered with `total_cmp`, so the
+/// result does not depend on input order and a NaN member is just an extreme (the
+/// median stays finite while most members are finite).
 ///
 /// Byzantine-robust coordinate-wise median per Yin et al. 2018,
 /// "Byzantine-Robust Distributed Learning: Towards Optimal Statistical Rates"
@@ -2308,7 +2380,7 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
             .iter()
             .map(|u| u.get(i).copied().unwrap_or(0.0))
             .collect();
-        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        values.sort_by(f32::total_cmp);
 
         let mid = values.len() / 2;
         *result_val = if values.len().is_multiple_of(2) {
@@ -2321,15 +2393,9 @@ pub fn median_aggregate(updates: &[Vec<f32>]) -> Vec<f32> {
     result
 }
 
-/// Computes Euclidean distance between two vectors
-fn euclidean_distance(a: &[f32], b: &[f32]) -> f32 {
-    let len = a.len().min(b.len());
-    a[..len]
-        .iter()
-        .zip(b[..len].iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum::<f32>()
-        .sqrt()
+/// The squared Euclidean distance between two vectors (over the shorter length).
+fn squared_distance(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>()
 }
 
 // ---------------------------------------------------------------------------
@@ -3198,9 +3264,11 @@ mod tests {
             vec![1.0, 2.0, 3.0],
             vec![1.1, 2.1, 3.1],
             vec![1.2, 1.9, 3.2],
+            vec![0.9, 2.0, 2.9],
             vec![10.0, 10.0, 10.0], // Byzantine outlier
         ];
 
+        // n = 5 > 2f + 2 = 4.
         let result = krum_aggregate(&updates, 1);
         assert_eq!(result.len(), 3);
         // Should select one of the first three (not the outlier)
@@ -3215,17 +3283,226 @@ mod tests {
             vec![1.0, 2.0, 3.0],
             vec![1.1, 2.1, 3.1],
             vec![1.2, 1.9, 3.2],
+            vec![0.9, 2.0, 2.9],
             vec![10.0, 10.0, 10.0],
         ];
         let k = krum_select(&updates, 1);
         let selected = k.selected.expect("one selected");
-        assert!(selected < 3, "an honest update is selected");
+        assert!(selected < 4, "an honest update is selected");
         assert_eq!(k.weights, updates[selected]);
-        assert_eq!(k.worst(), Some(3), "the outlier scores worst");
-        assert_eq!(k.scores.len(), 4);
+        assert_eq!(k.worst(), Some(4), "the outlier scores worst");
+        assert_eq!(k.scores.len(), 5);
         assert_eq!(krum_aggregate(&updates, 1), k.weights);
         let empty = krum_select(&[], 1);
         assert_eq!((empty.selected, empty.worst()), (None, None));
+    }
+
+    /// nextgsim#480 review M2: Blanchard et al.'s score, by hand. 1-D updates
+    /// 0, 1, 3, 6, 10 with n = 5, f = 1: each score is the sum of the SQUARED
+    /// distances to the n − f − 2 = 2 nearest others.
+    /// - 0: {1, 9, 36, 100} → 1 + 9 = 10
+    /// - 1: {1, 4, 25, 81} → 1 + 4 = 5
+    /// - 3: {9, 4, 9, 49} → 4 + 9 = 13
+    /// - 6: {36, 25, 9, 16} → 9 + 16 = 25
+    /// - 10: {100, 81, 49, 16} → 16 + 49 = 65
+    #[test]
+    fn krum_scores_are_blanchards() {
+        let updates: Vec<Vec<f32>> = [0.0, 1.0, 3.0, 6.0, 10.0].map(|v| vec![v]).into();
+        let k = krum_select(&updates, 1);
+        assert_eq!(k.scores, vec![10.0, 5.0, 13.0, 25.0, 65.0]);
+        assert_eq!(k.selected, Some(1));
+        assert_eq!(k.worst(), Some(4));
+    }
+
+    /// nextgsim#480 review M2: at or below n = 2f + 2 Krum has no guarantee, so it
+    /// selects nothing and names no outlier (the `t8-exclusion` shape: 3 members,
+    /// then 2, with f = 1), and the aggregator refuses the round.
+    #[test]
+    fn krum_refuses_below_its_bound() {
+        for n in 1..=4 {
+            let updates: Vec<Vec<f32>> = (0..n).map(|i| vec![i as f32]).collect();
+            let k = krum_select(&updates, 1);
+            assert_eq!((k.selected, k.worst()), (None, None), "n = {n}");
+            assert!(k.weights.is_empty() && k.scores.is_empty());
+        }
+        assert!(krum_select(&vec![vec![0.0]; 5], 1).selected.is_some());
+        assert!(krum_select(&vec![vec![0.0]; 6], 2).selected.is_none());
+        assert!(krum_select(&vec![vec![0.0]; 7], 2).selected.is_some());
+
+        let mut agg = FederatedAggregator::new(AggregationAlgorithm::Krum { num_byzantine: 1 }, 1);
+        agg.initialize_model(vec![0.0]);
+        for i in 0..4 {
+            agg.register_participant(format!("ue{i}"), 10);
+        }
+        agg.start_round().expect("round");
+        for i in 0..4 {
+            agg.submit_update(update_for(&format!("ue{i}"), vec![i as f32]))
+                .expect("accept");
+        }
+        assert!(
+            agg.aggregate().is_err(),
+            "4 updates, f = 1: below the bound"
+        );
+        assert_eq!(agg.round_status(), Some(RoundStatus::Collecting));
+    }
+
+    fn update_for(id: &str, gradients: Vec<f32>) -> ModelUpdate {
+        ModelUpdate {
+            participant_id: id.into(),
+            base_version: 1,
+            gradients,
+            num_samples: 100,
+            loss: 0.1,
+            timestamp_ms: 0,
+        }
+    }
+
+    /// nextgsim#480 review M1, at the demo's size: 5 members, the one sorted FIRST
+    /// sends NaN (either sign). Krum neither selects it nor names anyone else as
+    /// worst; the median and the trimmed mean are finite and do not depend on
+    /// where the NaN member sits.
+    #[test]
+    fn a_nan_member_does_not_steer_the_robust_rules() {
+        let honest = [
+            vec![0.1f32, 1.0],
+            vec![0.2, 1.1],
+            vec![0.3, 0.9],
+            vec![0.25, 1.05],
+        ];
+        for nan in [f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut first = vec![vec![nan, nan]];
+            first.extend(honest.iter().cloned());
+            let mut last: Vec<Vec<f32>> = honest.to_vec();
+            last.push(vec![nan, nan]);
+
+            let k = krum_select(&first, 1);
+            assert_ne!(k.selected, Some(0), "{nan}: the bad member is not selected");
+            assert!(k.selected.is_some());
+            assert_eq!(k.worst(), Some(0), "{nan}: the bad member is the worst");
+            assert_eq!(k.scores[0], f32::INFINITY);
+            assert!(k.scores[1..].iter().all(|s| s.is_finite()));
+            assert_eq!(krum_select(&last, 1).worst(), Some(4));
+            // Every member bad: nothing to trust, nothing selected, nobody named.
+            let all_bad = krum_select(&vec![vec![nan, nan]; 5], 1);
+            assert_eq!((all_bad.selected, all_bad.worst()), (None, None), "{nan}");
+            assert!(all_bad.weights.is_empty());
+
+            let bits = |v: Vec<f32>| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            let (m0, m4) = (median_aggregate(&first), median_aggregate(&last));
+            assert!(m0.iter().all(|v| v.is_finite()), "{nan}: median {m0:?}");
+            assert_eq!(bits(m0), bits(m4), "{nan}: the median ignores input order");
+            let (t0, t4) = (
+                trimmed_mean_aggregate(&first, 0.4).unwrap(),
+                trimmed_mean_aggregate(&last, 0.4).unwrap(),
+            );
+            assert!(t0.iter().all(|v| v.is_finite()), "{nan}: trimmed {t0:?}");
+            assert_eq!(bits(t0), bits(t4), "{nan}: the trimmed mean ignores order");
+        }
+    }
+
+    /// nextgsim#480 review M1, at scale: with 21+ members and NaN scattered over
+    /// the coordinates, `partial_cmp(..).unwrap_or(Equal)` is not a total order and
+    /// `sort_by` may panic. The rules must not.
+    #[test]
+    fn scattered_nans_do_not_panic_the_robust_rules() {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(1);
+        for n in [21usize, 22, 25, 40] {
+            let updates: Vec<Vec<f32>> = (0..n)
+                .map(|_| {
+                    (0..64)
+                        .map(|_| {
+                            if rng.gen_bool(0.3) {
+                                f32::NAN
+                            } else {
+                                rng.gen_range(-1.0..1.0)
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            assert_eq!(median_aggregate(&updates).len(), 64);
+            assert_eq!(trimmed_mean_aggregate(&updates, 0.4).unwrap().len(), 64);
+            let k = krum_select(&updates, 2);
+            assert_eq!(k.scores.len(), n);
+            assert_eq!(multi_krum_aggregate(&updates, 2, 3).len(), 64);
+        }
+    }
+
+    /// nextgsim#480 review m1: the ratio must be in [0, 1) and keep a value.
+    #[test]
+    fn trimmed_mean_refuses_a_bad_ratio() {
+        let five: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32]).collect();
+        let four: Vec<Vec<f32>> = (0..4).map(|i| vec![i as f32]).collect();
+        for r in [1.5, 1.0, -0.1, f32::NAN, f32::INFINITY] {
+            assert!(trimmed_mean_aggregate(&five, r).is_err(), "ratio {r}");
+        }
+        // 0.99 of 4 is floor(1.98) = 1 per end: two values remain.
+        assert_eq!(trimmed_mean_aggregate(&four, 0.99), Ok(vec![1.5]));
+        // 0.99 of 2 is floor(0.99) = 0 per end: nothing is trimmed.
+        assert_eq!(trimmed_mean_aggregate(&four[..2], 0.99), Ok(vec![0.5]));
+        assert_eq!(trimmed_mean_aggregate(&five, 0.4), Ok(vec![2.0]));
+        assert_eq!(trimmed_mean_aggregate(&five, 0.0), Ok(vec![2.0]));
+        assert_eq!(trim_count(1, 0.0), Ok(0));
+        assert!(trim_count(2, 0.999_999).is_ok());
+
+        let mut agg =
+            FederatedAggregator::new(AggregationAlgorithm::TrimmedMean { trim_ratio: 1.0 }, 1);
+        agg.initialize_model(vec![0.0]);
+        agg.register_participant("ue1", 10);
+        agg.start_round().expect("round");
+        agg.submit_update(update_for("ue1", vec![1.0]))
+            .expect("accept");
+        assert!(agg.aggregate().is_err(), "a ratio of 1.0 trims everyone");
+        assert_eq!(agg.round_status(), Some(RoundStatus::Collecting));
+    }
+
+    /// nextgsim#480 review m2: `MaskedSumDemo` sums (and accumulates each mask) in
+    /// member order, so the same updates give the same bits every round, whatever
+    /// order the round's HashMap visits them in.
+    #[test]
+    fn masked_sum_is_independent_of_map_order() {
+        let values = [1.0e7f32, 1.0, -1.0e7, 3.3, 0.7, -2.2, 5.5e6, -0.3];
+        let mut agg = FederatedAggregator::new(AggregationAlgorithm::MaskedSumDemo, values.len());
+        agg.initialize_model(vec![0.0; 4]);
+        for i in 0..values.len() {
+            agg.register_participant(format!("ue-{i}"), 100 + i as u64);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            agg.start_round().expect("round");
+            for (i, v) in values.iter().enumerate() {
+                let mut u = update_for(&format!("ue-{i}"), vec![*v, -*v, *v * 0.5, 1.0]);
+                u.num_samples = 100 + i as u64;
+                agg.submit_update(u).expect("accept");
+            }
+            let w = agg.aggregate().expect("aggregate").weights;
+            seen.insert(w.iter().map(|x| x.to_bits()).collect::<Vec<_>>());
+        }
+        assert_eq!(seen.len(), 1, "one result, not {}", seen.len());
+    }
+
+    /// nextgsim#480 review m2: the reported average loss is summed in member order,
+    /// so it is bit-stable however the HashMap visits the updates.
+    #[test]
+    fn avg_loss_is_independent_of_map_order() {
+        let losses = [1.0e7f32, 1.0, -1.0e7, 3.3, 0.7, -2.2, 5.5e6, -0.3];
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..32 {
+            let mut agg = FederatedAggregator::new(AggregationAlgorithm::FedAvg, losses.len());
+            agg.initialize_model(vec![0.0]);
+            for i in 0..losses.len() {
+                agg.register_participant(format!("ue-{i}"), 100);
+            }
+            agg.start_round().expect("round");
+            for (i, l) in losses.iter().enumerate() {
+                let mut u = update_for(&format!("ue-{i}"), vec![0.0]);
+                u.loss = *l;
+                agg.submit_update(u).expect("accept");
+            }
+            seen.insert(agg.aggregate().expect("aggregate").avg_loss.to_bits());
+        }
+        assert_eq!(seen.len(), 1, "one avg_loss, not {}", seen.len());
     }
 
     /// nextgsim#480: FedAvg sums in sorted-member order, so the same updates give
@@ -3303,7 +3580,7 @@ mod tests {
             vec![100.0, 100.0, 100.0], // Outlier
         ];
 
-        let result = trimmed_mean_aggregate(&updates, 0.5);
+        let result = trimmed_mean_aggregate(&updates, 0.5).expect("valid ratio");
         assert_eq!(result.len(), 3);
         // Should be close to middle values, excluding outlier
         assert!(result[0] < 10.0);
@@ -3433,7 +3710,8 @@ mod tests {
     fn test_krum_dispatch_reachable() {
         // Plain mean of 3 honest (1.0) + 2 Byzantine (50.0) = (3+100)/5 = 20.6
         let plain_mean = (3.0_f32 * 1.0 + 2.0 * 50.0) / 5.0;
-        let result = run_byzantine_aggregation(AggregationAlgorithm::Krum { num_byzantine: 2 });
+        // f = 1: 5 > 2f + 2. (f = 2 would need 7 members.)
+        let result = run_byzantine_aggregation(AggregationAlgorithm::Krum { num_byzantine: 1 });
         assert_eq!(result.len(), 3, "Krum result must have correct dimension");
         // Krum selects the best single update (one of the honest ones ≈ 1.0)
         assert!(

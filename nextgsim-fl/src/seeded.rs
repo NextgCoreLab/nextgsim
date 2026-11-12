@@ -9,7 +9,20 @@
 //!
 //! Streams are independent by construction: each purpose selects its own ChaCha
 //! stream (`set_stream`), so adding a draw to one purpose (say, one more shuffle)
-//! never shifts the numbers another purpose sees.
+//! never shifts the numbers another purpose sees. A client and a round (32 bits
+//! each) and the purpose tag do not fit one 64-bit stream id, so
+//! `Shuffle { client, round }` packs `round` into the low 24 bits only while it
+//! fits (every demo run: the streams, and so the measured numbers, are unchanged);
+//! a round of 2^24 or more takes two levels instead, under its own tag: the
+//! client's stream yields a 256-bit key and the round is that key's stream. Every
+//! `(client, round)` pair is its own stream.
+//!
+//! **Bit-identity holds per platform.** The integer streams are portable, but the
+//! floats derived from them go through the platform's libm (`ln`, `cos` here,
+//! `tanh` in the model and the task), whose last-bit rounding differs between
+//! glibc, musl, macOS and across x86_64 and aarch64. Reruns are bit-identical on one
+//! platform image (debug and release alike); an AF on x86_64 and a UE on arm64 are
+//! not expected to match bit for bit.
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -31,23 +44,40 @@ pub enum Purpose {
 }
 
 impl Purpose {
+    /// The stream of the run seed's key this purpose reads. For a `Shuffle` with
+    /// `round ≥ 2^24` it is the client's key stream (tag 6); the round is applied
+    /// one level down, in [`rng`].
     fn stream_id(self) -> u64 {
         match self {
             Self::Teacher => 1,
             Self::HeldOut => 2,
             Self::Init => 3,
             Self::ClientData(c) => (4 << 56) | u64::from(c),
-            Self::Shuffle { client, round } => {
+            Self::Shuffle { client, round } if round < SHORT_ROUNDS => {
                 (5 << 56) | (u64::from(client) << 24) | u64::from(round)
             }
+            Self::Shuffle { client, .. } => (6 << 56) | u64::from(client),
         }
     }
 }
 
+/// Rounds below this pack into a `Shuffle` stream id directly (24 bits).
+const SHORT_ROUNDS: u32 = 1 << 24;
+
 /// The RNG for `purpose` in the run seeded by `seed`.
 pub fn rng(seed: u64, purpose: Purpose) -> ChaCha8Rng {
+    use rand::RngCore;
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     rng.set_stream(purpose.stream_id());
+    if let Purpose::Shuffle { round, .. } = purpose {
+        if round < SHORT_ROUNDS {
+            return rng;
+        }
+        let mut key = [0u8; 32];
+        rng.fill_bytes(&mut key);
+        rng = ChaCha8Rng::from_seed(key);
+        rng.set_stream(u64::from(round));
+    }
     rng
 }
 
@@ -99,6 +129,22 @@ mod tests {
                 Purpose::Shuffle {
                     client: 1,
                     round: 0,
+                },
+            ),
+            // Review m4: a bare 24-bit round field made this client 0's stream
+            // the same as client 1's round 0.
+            first(
+                7,
+                Purpose::Shuffle {
+                    client: 0,
+                    round: 1 << 24,
+                },
+            ),
+            first(
+                7,
+                Purpose::Shuffle {
+                    client: u32::MAX,
+                    round: u32::MAX,
                 },
             ),
             first(8, Purpose::Teacher),

@@ -11,6 +11,19 @@
 //! A client's contribution is its model DELTA (trained − global). The server
 //! applies an aggregate of the deltas, which is what lets the robust rules
 //! (median, trimmed mean, Krum) reject a poisoned delta.
+//!
+//! **The scorecard bounds are seed-480 results, not properties of the setup.**
+//! On the demo's pinned seed 480 the federation meets every #480 bound (the tests
+//! below). Across seeds 480-499, 1, 7 and 42 (nextgsim#528 review round):
+//! - every round's MSE is finite (a test), and local-only ≤ 0.8× holds on all 23;
+//! - round 10 ≤ 0.5× round 1 fails on 4 of them (484, 486, 488, 7);
+//! - round 10 ≤ 1.2× pooled holds on 480, 495 and 1 only;
+//! - the robust rules within 1.1× of their own clean run hold together on 480,
+//!   481, 489, 498 and 499 only;
+//! - Krum scores the poisoned member worst, and never selects it, on all 23.
+//!
+//! So a run on another seed is a different experiment, and is not expected to
+//! clear the pooled or robust-rule bounds.
 
 use crate::mlp::{self, TrainConfig};
 use crate::synthetic::{Dataset, Task};
@@ -28,7 +41,8 @@ pub enum Rule {
     /// half from each end ([`trimmed_mean_aggregate`]), so 0.4 of 5 is one each.
     TrimmedMean(f32),
     /// Krum with `f` tolerated Byzantine members: the one delta closest to its
-    /// neighbours.
+    /// neighbours ([`krum_select`]). It needs `n > 2f + 2` members; a round below
+    /// that is refused and names nobody.
     Krum(usize),
 }
 
@@ -69,8 +83,13 @@ pub struct Round {
     pub mse: f32,
     pub participants: Vec<String>,
     /// For [`Rule::Krum`]: the member whose delta was selected, and the member with
-    /// the worst (largest) score, the one the AF logs as `excluded=`.
+    /// the worst (largest) score, the one the AF logs as `excluded=`. `None` when
+    /// Krum selected nothing (below its `n > 2f + 2` bound), so nobody is named.
     pub krum: Option<(String, String)>,
+    /// Why the rule refused this round, if it did (Krum below its bound, or a
+    /// trimmed-mean ratio that trims everyone). A refused round applies no update:
+    /// the global model carries over unchanged.
+    pub refused: Option<String>,
 }
 
 /// A whole run.
@@ -133,15 +152,21 @@ pub fn run(cfg: &RunConfig, rule: Rule, members: impl Fn(u32) -> Vec<u32>) -> Ou
             };
             deltas.insert(member(c), (delta, data.clients[c as usize].len() as u64));
         }
-        let (agg, krum) = aggregate(rule, &deltas);
-        for (w, d) in global.iter_mut().zip(&agg) {
-            *w += d;
-        }
+        let (krum, refused) = match aggregate(rule, &deltas) {
+            Ok((agg, krum)) => {
+                for (w, d) in global.iter_mut().zip(&agg) {
+                    *w += d;
+                }
+                (krum, None)
+            }
+            Err(why) => (None, Some(why)),
+        };
         rounds.push(Round {
             round: r,
             mse: mlp::mse(&global, &data.held_out.xs, &data.held_out.ys),
             participants: deltas.keys().cloned().collect(),
             krum,
+            refused,
         });
     }
     Outcome {
@@ -150,22 +175,31 @@ pub fn run(cfg: &RunConfig, rule: Rule, members: impl Fn(u32) -> Vec<u32>) -> Ou
     }
 }
 
-fn aggregate(
-    rule: Rule,
-    deltas: &BTreeMap<String, (Vec<f32>, u64)>,
-) -> (Vec<f32>, Option<(String, String)>) {
+/// The round's aggregate delta, plus Krum's (selected, worst) members; `Err` when
+/// the rule refuses the round.
+type Aggregate = Result<(Vec<f32>, Option<(String, String)>), String>;
+
+fn aggregate(rule: Rule, deltas: &BTreeMap<String, (Vec<f32>, u64)>) -> Aggregate {
     // BTreeMap order: sorted by member, so every rule sees the same order.
     let names: Vec<&String> = deltas.keys().collect();
     let vecs: Vec<Vec<f32>> = deltas.values().map(|(d, _)| d.clone()).collect();
     match rule {
-        Rule::FedAvg => (fedavg_sorted(deltas), None),
-        Rule::Median => (median_aggregate(&vecs), None),
-        Rule::TrimmedMean(ratio) => (trimmed_mean_aggregate(&vecs, ratio), None),
+        Rule::FedAvg => Ok((fedavg_sorted(deltas), None)),
+        Rule::Median => Ok((median_aggregate(&vecs), None)),
+        Rule::TrimmedMean(ratio) => Ok((trimmed_mean_aggregate(&vecs, ratio)?, None)),
         Rule::Krum(f) => {
             let k = krum_select(&vecs, f);
-            let worst = k.worst().map(|i| names[i].clone()).unwrap_or_default();
-            let picked = k.selected.map(|i| names[i].clone()).unwrap_or_default();
-            (k.weights, Some((picked, worst)))
+            match (k.selected, k.worst()) {
+                (Some(picked), Some(worst)) => Ok((
+                    k.weights,
+                    Some((names[picked].clone(), names[worst].clone())),
+                )),
+                _ => Err(format!(
+                    "krum: nothing selected from {} members with f={f} (needs n > 2f + 2 \
+                     and a finite score)",
+                    vecs.len()
+                )),
+            }
         }
     }
 }
@@ -213,7 +247,8 @@ mod tests {
     }
 
     /// #480 scorecard, at library level, on the demo shape: round 10 ≤ 0.5× round
-    /// 1, ≤ 0.8× mean local-only, ≤ 1.2× pooled.
+    /// 1, ≤ 0.8× mean local-only, ≤ 1.2× pooled. These hold on seed 480, the demo's
+    /// pinned seed; they are not claimed for other seeds (see the module doc).
     #[test]
     fn the_federation_meets_the_scorecard() {
         let cfg = RunConfig::demo(480);
@@ -240,8 +275,61 @@ mod tests {
             a.rounds.iter().map(|r| r.mse.to_bits()).collect::<Vec<_>>(),
             b.rounds.iter().map(|r| r.mse.to_bits()).collect::<Vec<_>>()
         );
-        let other = run(&RunConfig::demo(481), Rule::FedAvg, everyone(&cfg));
+        // Another seed differs. It must be a finite run: NaN bits would differ
+        // from anything and prove nothing.
+        let other = run(&RunConfig::demo(482), Rule::FedAvg, everyone(&cfg));
+        assert!(other.model.iter().all(|w| w.is_finite()));
+        assert!(other.rounds.iter().all(|r| r.mse.is_finite()));
         assert_ne!(bits(&a.model), bits(&other.model));
+    }
+
+    /// Review M3: training is numerically safe across seeds, not just on 480.
+    /// Before gradient-norm clipping seed 481 went NaN in round 1 (and 15 of
+    /// seeds 0-299 went non-finite); now every round of every seed here is finite,
+    /// as are both baselines.
+    #[test]
+    fn every_round_is_finite_across_seeds() {
+        for seed in (480..=499).chain([1, 7, 42]) {
+            let cfg = RunConfig::demo(seed);
+            let out = run(&cfg, Rule::FedAvg, everyone(&cfg));
+            for r in &out.rounds {
+                assert!(
+                    r.mse.is_finite(),
+                    "seed {seed} round {}: {}",
+                    r.round,
+                    r.mse
+                );
+            }
+            assert!(out.model.iter().all(|w| w.is_finite()), "seed {seed}");
+            assert!(local_only_mse(&cfg).is_finite(), "seed {seed} local-only");
+            assert!(pooled_mse(&cfg).is_finite(), "seed {seed} pooled");
+        }
+    }
+
+    /// Review M2: the `t8-exclusion` shape (3 members, 2 while ue3 is away) is
+    /// below Krum's `n > 2f + 2` bound for f = 1, so no round names an outlier and
+    /// the global model carries over unchanged.
+    #[test]
+    fn krum_names_nobody_below_its_bound() {
+        let cfg = RunConfig::demo(480);
+        let out = run(&cfg, Rule::Krum(1), |r| {
+            if (4..7).contains(&r) {
+                vec![0, 1]
+            } else {
+                vec![0, 1, 2]
+            }
+        });
+        let start = mlp::mse(
+            &mlp::init(cfg.seed),
+            &Data::new(&cfg).held_out.xs,
+            &Data::new(&cfg).held_out.ys,
+        );
+        for r in &out.rounds {
+            assert_eq!(r.krum, None, "round {}", r.round);
+            assert!(r.refused.is_some(), "round {}", r.round);
+            assert_eq!(r.mse.to_bits(), start.to_bits(), "no update applied");
+        }
+        assert_eq!(bits(&out.model), bits(&mlp::init(cfg.seed)));
     }
 
     /// A departed member is simply absent from the next rounds, and the run still

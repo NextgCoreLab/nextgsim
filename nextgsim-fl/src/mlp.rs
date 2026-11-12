@@ -128,17 +128,23 @@ pub struct TrainConfig {
     pub epochs: u32,
     pub batch: usize,
     pub lr: f32,
+    /// The largest L2 norm of one mini-batch gradient: a larger one is scaled
+    /// down to it before the step. `f32::INFINITY` turns clipping off.
+    pub clip: f32,
 }
 
 impl Default for TrainConfig {
     fn default() -> Self {
-        // Chosen with the synthetic task (nextgsim#480) so the demo's 10 rounds
-        // land well inside the scorecard: about 0.23× round 1, 0.45× local-only,
-        // 1.06× pooled. lr 0.3 diverges; 0.15 keeps a 2× margin.
+        // Chosen with the synthetic task (nextgsim#480). On the demo's seed 480
+        // the 10 rounds give about 0.18× round 1, 0.47× local-only and 1.07×
+        // pooled; those are seed-480 results (see `sim`). Clipping each batch
+        // gradient to norm 1 keeps training finite across seeds: without it seed
+        // 481 went NaN in round 1 at this lr (nextgsim#528 review).
         Self {
             epochs: 2,
             batch: 8,
             lr: 0.15,
+            clip: 1.0,
         }
     }
 }
@@ -166,8 +172,16 @@ pub fn train(
             for &n in chunk {
                 accumulate_grad(p, &xs[n * IN..(n + 1) * IN], ys[n], scale, &mut g);
             }
+            // Gradient-norm clipping bounds every step, so one steep batch cannot
+            // throw the weights into tanh saturation and on to inf/NaN.
+            let norm = g.iter().map(|v| v * v).sum::<f32>().sqrt();
+            let step = if norm > cfg.clip {
+                cfg.lr * cfg.clip / norm
+            } else {
+                cfg.lr
+            };
             for (w, d) in p.iter_mut().zip(&g) {
-                *w -= cfg.lr * d;
+                *w -= step * d;
             }
         }
     }
