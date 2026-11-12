@@ -125,8 +125,8 @@ pub fn nf_profile(nf_instance_id: &str) -> Value {
 }
 
 /// The first NWDAF endpoint in a TS 29.510 `SearchResult` offering
-/// [`SERVICE`]: its first `ipEndPoints` entry, else the instance's first IPv4
-/// address on port 80.
+/// [`SERVICE`]: its first `ipEndPoints` entry (port 7777, nextgcore's SBI port,
+/// when it names none), else the instance's first IPv4 address on port 7777.
 pub fn nwdaf_from_search_result(result: &Value) -> Option<String> {
     for inst in result.get("nfInstances")?.as_array()? {
         let services = inst
@@ -143,7 +143,8 @@ pub fn nwdaf_from_search_result(result: &Value) -> Option<String> {
             .and_then(|e| e.first())
         {
             if let Some(ip) = ep.get("ipv4Address").and_then(Value::as_str) {
-                let port = ep.get("port").and_then(Value::as_u64).unwrap_or(80);
+                // nextgcore's SBI port when the profile names none.
+                let port = ep.get("port").and_then(Value::as_u64).unwrap_or(7777);
                 return Some(format!("http://{ip}:{port}"));
             }
         }
@@ -153,7 +154,7 @@ pub fn nwdaf_from_search_result(result: &Value) -> Option<String> {
             .and_then(|a| a.first())
             .and_then(Value::as_str)
         {
-            return Some(format!("http://{ip}:80"));
+            return Some(format!("http://{ip}:7777"));
         }
     }
     None
@@ -217,6 +218,7 @@ impl Exporter {
             .ok_or("congestion_export.nrf_uri is not set")?
             .trim_end_matches('/')
             .to_string();
+        check_existing_key_file(&c.cca_key_file)?;
         let key = CcaKey::load_or_create(&c.cca_key_file)
             .map_err(|e| format!("CCA key {}: {e}", c.cca_key_file.display()))?;
         if let Some(dir) = &c.cca_public_jwk_dir {
@@ -454,20 +456,58 @@ impl Exporter {
     }
 }
 
-/// Start the exporter on its own task, fed by the returned sender. Logs and
-/// returns `None` when the exporter cannot be built (an unusable key file).
-pub fn spawn(config: GnbConfig) -> Option<mpsc::Sender<WindowSample>> {
-    match Exporter::new(config) {
-        Ok(exporter) => {
-            let (tx, rx) = mpsc::channel(16);
-            tokio::spawn(exporter.run(rx));
-            Some(tx)
+/// Start a built exporter on its own task, fed by the returned sender. Building
+/// it (and failing on an unusable key) is startup's job,
+/// [`super::prepare_startup`].
+pub fn spawn(exporter: Exporter) -> mpsc::Sender<WindowSample> {
+    let (tx, rx) = mpsc::channel(16);
+    tokio::spawn(exporter.run(rx));
+    tx
+}
+
+/// A key file that already exists is used only when this process's user owns
+/// it and nobody else can read or write it (mode `0600` or tighter): a file
+/// another local user planted at the path would otherwise hand them the AF's
+/// private key. A file that does not exist is created `0600` by
+/// `CcaKey::load_or_create`.
+pub fn check_existing_key_file(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("CCA key {}: {e}", path.display())),
+        };
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "CCA key {} is not a regular file; refusing it",
+                path.display()
+            ));
         }
-        Err(e) => {
-            demo_log!(error, D441A_KEY, "export: cannot start: {e}");
-            None
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!(
+                "CCA key {} has mode {:o}; it must be 0600 (owner only)",
+                path.display(),
+                meta.mode() & 0o777
+            ));
+        }
+        // /proc/self is owned by the process's effective uid (Linux). Elsewhere
+        // the owner is not checked; the mode still is.
+        if let Ok(me) = std::fs::metadata("/proc/self") {
+            if meta.uid() != me.uid() {
+                return Err(format!(
+                    "CCA key {} is owned by uid {}, not by this process (uid {}); refusing it",
+                    path.display(),
+                    meta.uid(),
+                    me.uid()
+                ));
+            }
         }
     }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]

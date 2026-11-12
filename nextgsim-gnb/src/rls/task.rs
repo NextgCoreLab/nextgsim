@@ -1223,6 +1223,12 @@ impl RlsTask {
         &mut self,
         exporter: Option<mpsc::Sender<crate::congestion::WindowSample>>,
     ) {
+        // Never a rate-0 queue: a caller that skipped startup's checks gets no
+        // queue rather than one that blackholes the downlink.
+        if let Err(e) = crate::congestion::validate_config(&self.task_base.config) {
+            error!("[demo:d441a-congestion-loop] RLS: no downlink queue: {e}");
+            return;
+        }
         let cell = crate::congestion::CellState::new(&self.task_base.config, exporter);
         info!(
             "[demo:d441a-congestion-loop] RLS: downlink served through one FIFO at C={} Mbps \
@@ -1236,6 +1242,35 @@ impl RlsTask {
             cell.window.as_millis()
         );
         self.congestion = Some(cell);
+    }
+
+    /// Demo D441A (#465): the gate. With D441A active in `demo`, install the
+    /// queue, feed it to the exporter startup built ([`crate::congestion::take_prepared`])
+    /// and return the 1 ms drain tick; otherwise change nothing and return
+    /// `None`, so the downlink goes straight to the socket.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    pub(crate) fn congestion_setup(
+        &mut self,
+        demo: Option<&nextgsim_demo::DemoRuntime>,
+    ) -> Option<tokio::time::Interval> {
+        if !crate::congestion::active_in(demo) {
+            return None;
+        }
+        let exporter = match crate::congestion::take_prepared() {
+            Some(ex) => Some(crate::congestion::exporter::spawn(ex)),
+            None => {
+                error!(
+                    "[demo:d441a-congestion-loop] RLS: no exporter was prepared at startup; the \
+                     queue runs but nothing is exported"
+                );
+                None
+            }
+        };
+        self.enable_congestion(exporter);
+        self.congestion.as_ref()?;
+        let mut t = interval(Duration::from_millis(1));
+        t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        Some(t)
     }
 
     /// Demo D441A (#465): send what the token bucket allows now, and close the
@@ -1464,16 +1499,10 @@ impl Task for RlsTask {
 
         // Demo D441A (#465): the capacity-C queue is drained on a 1 ms tick, and
         // only exists while the demo is active. Otherwise this branch never fires.
-        #[allow(unused_mut)]
-        let mut congestion_tick: Option<tokio::time::Interval> = None;
         #[cfg(feature = "demo-d441a-congestion-loop")]
-        if crate::congestion::demo_active() {
-            let exporter = crate::congestion::exporter::spawn((*self.task_base.config).clone());
-            self.enable_congestion(exporter);
-            let mut t = interval(Duration::from_millis(1));
-            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            congestion_tick = Some(t);
-        }
+        let mut congestion_tick = self.congestion_setup(nextgsim_demo::installed());
+        #[cfg(not(feature = "demo-d441a-congestion-loop"))]
+        let mut congestion_tick: Option<tokio::time::Interval> = None;
 
         loop {
             tokio::select! {
@@ -3089,19 +3118,79 @@ mod tests {
         assert_eq!(task.load_window_octets, 0);
     }
 
-    /// Demo D441A off (#465): a task built from a config with no demo block has
-    /// no capacity queue, so the downlink goes straight to the socket.
+    /// The demo runtime a D441A gate test runs under: the gNB's real registry.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    fn d441a_runtime(yaml: &str) -> nextgsim_demo::DemoRuntime {
+        nextgsim_demo::DemoRuntime::from_root(
+            &serde_yaml::from_str(yaml).expect("yaml"),
+            crate::demo::registry(),
+        )
+        .expect("valid demo block")
+    }
+
+    /// Demo D441A off (#465), review MAJOR 2: the gate itself. Under each of the
+    /// three demo-off shapes `congestion_setup` installs nothing and returns no
+    /// tick, and the downlink goes straight to the socket.
+    ///
+    /// REVERT-VERIFIED: making `congestion_setup` ignore `active_in` (always
+    /// enable) fails the first assertion.
     #[cfg(feature = "demo-d441a-congestion-loop")]
     #[tokio::test]
-    async fn without_the_demo_there_is_no_downlink_queue() {
-        assert!(!crate::congestion::demo_active());
-        let ue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let mut task = broadcasting_task().await;
+    async fn with_the_demo_off_the_gate_installs_no_downlink_queue() {
+        for yaml in [
+            "nci: 16\n",
+            "demo:\n  enabled: false\n",
+            "demo:\n  enabled: false\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+        ] {
+            let rt = d441a_runtime(yaml);
+            let ue = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut config = test_config();
+            config.congestion_export.cell_capacity_mbps = Some(5.0);
+            config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
+            let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task =
+                RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+            task.init_socket().await.expect("RLS socket");
+            assert!(task.congestion_setup(Some(&rt)).is_none(), "{yaml}");
+            assert!(task.congestion.is_none(), "{yaml}");
+            assert!(task.congestion_setup(None).is_none());
+            task.ue_addresses.insert(1, ue.local_addr().unwrap());
+            task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&[0x45u8; 100]))
+                .await;
+            assert_eq!(drain_pdu_payload_lengths(&ue).await.len(), 1, "{yaml}");
+        }
+    }
+
+    /// Demo D441A on (#465): under a `statistics` runtime the gate installs the
+    /// capacity-C queue and returns the drain tick. With an invalid block (no
+    /// capacity) it installs no rate-0 queue (review MINOR 9).
+    ///
+    /// REVERT-VERIFIED: making `congestion_setup` return `None` unconditionally
+    /// fails the first assertion.
+    #[cfg(feature = "demo-d441a-congestion-loop")]
+    #[tokio::test]
+    async fn with_the_demo_on_the_gate_installs_the_queue() {
+        let rt = d441a_runtime(
+            "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: statistics\n",
+        );
+        let mut config = test_config();
+        config.congestion_export.cell_capacity_mbps = Some(5.0);
+        config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut task = RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+        assert!(task.congestion_setup(Some(&rt)).is_some());
+        assert!(task.congestion.is_some(), "the queue is installed");
+
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+            GnbTaskBase::new(test_config(), 16);
+        let mut task = RlsTask::with_bind_address(task_base, "127.0.0.1:0".parse().expect("bind"));
+        assert!(
+            task.congestion_setup(Some(&rt)).is_none(),
+            "no capacity: no rate-0 queue"
+        );
         assert!(task.congestion.is_none());
-        task.ue_addresses.insert(1, ue.local_addr().unwrap());
-        task.handle_downlink_data(1, 1, 1, OctetString::from_slice(&[0x45u8; 100]))
-            .await;
-        assert_eq!(drain_pdu_payload_lengths(&ue).await.len(), 1);
     }
 
     /// Demo D441A (#465): with the capacity-C queue in place, a protected UE's
@@ -3118,6 +3207,7 @@ mod tests {
         let ue_v = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let mut config = test_config();
         config.congestion_export.cell_capacity_mbps = Some(5.0);
+        config.congestion_export.nrf_uri = Some("http://127.0.0.1:1".into());
         config.congestion_export.window_ms = 100;
         let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);

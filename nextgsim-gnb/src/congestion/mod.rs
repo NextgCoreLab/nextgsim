@@ -53,24 +53,63 @@ pub fn demo_active() -> bool {
     current_mode().is_some()
 }
 
-/// Startup check, run after the demo block is installed: with the demo active,
-/// the `congestion_export` block must name a usable capacity and an NRF. With it
-/// inactive the block is not read at all.
-pub fn validate_startup(config: &GnbConfig) -> Result<(), String> {
-    if !demo_active() {
-        return Ok(());
-    }
-    validate_config(config)
+/// Whether `demo` has D441A active, in any mode. Taking the runtime as a
+/// parameter (rather than reading the process global) is what lets the gate's
+/// both directions be tested.
+pub fn active_in(demo: Option<&nextgsim_demo::DemoRuntime>) -> bool {
+    demo.and_then(|d| d.mode(D441A_KEY)).is_some()
 }
 
-/// The checks of [`validate_startup`], on any config.
+/// The exporter [`prepare_startup`] built, waiting for the RLS task.
+static PREPARED: Mutex<Option<exporter::Exporter>> = Mutex::new(None);
+
+/// Startup step, run in `GnbApp` after the demo block is installed: with the
+/// demo active, validate the `congestion_export` block **and build the
+/// exporter** (CCA key, JWK), so an unusable key file or JWK directory fails
+/// startup instead of leaving a demo arm that exports nothing while its banner
+/// says it is on. The exporter is handed to the RLS task ([`take_prepared`]).
+/// With the demo inactive the block is not read at all.
+pub fn prepare_startup(config: &GnbConfig) -> Result<(), String> {
+    let prepared = prepare_startup_with(config, nextgsim_demo::installed(), status_cell())?;
+    *PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = prepared;
+    Ok(())
+}
+
+/// [`prepare_startup`] under an explicit demo state, without storing the
+/// exporter. `Ok(None)` when the demo is inactive.
+pub fn prepare_startup_with(
+    config: &GnbConfig,
+    demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    status: &'static Mutex<Status>,
+) -> Result<Option<exporter::Exporter>, String> {
+    if !active_in(demo) {
+        return Ok(None);
+    }
+    validate_config(config)?;
+    exporter::Exporter::with_demo(config.clone(), demo, status).map(Some)
+}
+
+/// Take the exporter [`prepare_startup`] built, if any.
+pub fn take_prepared() -> Option<exporter::Exporter> {
+    PREPARED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+/// The block checks of [`prepare_startup`], on any config.
 pub fn validate_config(config: &GnbConfig) -> Result<(), String> {
     let c = &config.congestion_export;
     match c.cell_capacity_mbps {
-        Some(mbps) if mbps.is_finite() && mbps > 0.0 => {}
+        // At least 1 kbps: the report carries capacityKbps, which must be a
+        // positive integer at nwdafd.
+        Some(mbps) if mbps.is_finite() && mbps >= 0.001 => {}
         Some(mbps) => {
             return Err(format!(
-                "congestion_export.cell_capacity_mbps must be a positive number, got {mbps}"
+                "congestion_export.cell_capacity_mbps must be a positive number of at least \
+                 0.001 (1 kbps), got {mbps}"
             ))
         }
         None => {
@@ -269,6 +308,83 @@ mod tests {
         c
     }
 
+    fn leaked_runtime(mode: &str) -> &'static nextgsim_demo::DemoRuntime {
+        let yaml = format!(
+            "demo:\n  enabled: true\n  d441a-congestion-loop:\n    enabled: true\n    mode: {mode}\n"
+        );
+        Box::leak(Box::new(
+            nextgsim_demo::DemoRuntime::from_root(
+                &serde_yaml::from_str(&yaml).unwrap(),
+                crate::demo::registry(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    fn leaked_status() -> &'static Mutex<Status> {
+        Box::leak(Box::new(Mutex::new(Status::default())))
+    }
+
+    /// Review MAJOR 1: an exporter that cannot be built fails startup. A key
+    /// file that does not hold a P-256 scalar (`load_or_create` refuses to
+    /// regenerate it) is an `Err` from the startup step, not a running gNB that
+    /// silently exports nothing. With the demo off the block is not read.
+    ///
+    /// REVERT-VERIFIED: returning `Ok(None)` instead of building the exporter in
+    /// `prepare_startup_with` fails the first assertion.
+    #[tokio::test]
+    async fn a_bad_key_file_fails_startup() {
+        let dir = std::env::temp_dir().join(format!("d441a-badkey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("cca.key");
+        std::fs::write(&key, "not-a-hex-scalar\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let mut c = active_config();
+        c.congestion_export.cca_key_file = key.clone();
+        let err = prepare_startup_with(&c, Some(leaked_runtime("statistics")), leaked_status())
+            .err()
+            .expect("startup must fail on an unusable key file");
+        assert!(err.contains("CCA key"), "{err}");
+        assert!(
+            prepare_startup_with(&c, None, leaked_status())
+                .unwrap()
+                .is_none(),
+            "demo off: nothing is built or read"
+        );
+        // A good key path builds the exporter.
+        c.congestion_export.cca_key_file = dir.join("fresh.key");
+        let _ = std::fs::remove_file(&c.congestion_export.cca_key_file);
+        assert!(
+            prepare_startup_with(&c, Some(leaked_runtime("statistics")), leaked_status())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Review MINOR 4: a pre-existing key file readable by others is refused.
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_key_file_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("d441a-modekey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let key = dir.join("cca.key");
+        std::fs::write(&key, "11".repeat(32)).unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = exporter::check_existing_key_file(&key).unwrap_err();
+        assert!(err.contains("0600"), "{err}");
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(exporter::check_existing_key_file(&key), Ok(()));
+        assert_eq!(
+            exporter::check_existing_key_file(&dir.join("absent")),
+            Ok(())
+        );
+    }
+
     #[test]
     fn a_complete_block_validates() {
         assert_eq!(validate_config(&active_config()), Ok(()));
@@ -285,6 +401,12 @@ mod tests {
         let mut c = active_config();
         c.congestion_export.cell_capacity_mbps = Some(0.0);
         assert!(validate_config(&c).unwrap_err().contains("positive"));
+        // Review MINOR 6: a capacity that rounds to 0 kbps would be refused by
+        // nwdafd on every report.
+        c.congestion_export.cell_capacity_mbps = Some(0.0004);
+        assert!(validate_config(&c).unwrap_err().contains("1 kbps"));
+        c.congestion_export.cell_capacity_mbps = Some(0.001);
+        assert_eq!(validate_config(&c), Ok(()));
         let mut c = active_config();
         c.congestion_export.nrf_uri = None;
         assert!(validate_config(&c).unwrap_err().contains("nrf_uri"));
