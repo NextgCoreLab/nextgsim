@@ -6,6 +6,29 @@ authors.workspace = true
 license.workspace = true
 description = "Federated Learning research engine - aligned with FL concepts in 3GPP TR 23.700-80 / TS 28.105 6.2b.2.15 (research prototype; FL algorithms outside 3GPP standardization scope)"
 
+[features]
+default = []
+# Demo D445A (nextgsim#480): the `nr-fl-server` AF (FL listener, NEF client, T8
+# callback listener) and the UE FL client (`d445a` module). Demo-only, off by
+# default; the AF also refuses to start without the `demo.d445a-fl-t8` block.
+demo-d445a-fl-t8 = [
+    "dep:nextgsim-demo",
+    "dep:nextgsim-sbi-client",
+    "dep:serde_yaml",
+    "dep:tracing-subscriber",
+    "dep:h2",
+    "dep:http",
+    "dep:bytes",
+]
+# The D445A revert arms as knobs: `nr-fl-server --no-t8 | --freeze-global` and
+# the UE client's `fl.leak_raw`. Off by default; a build without it refuses them.
+revert-hooks = ["demo-d445a-fl-t8"]
+
+[[bin]]
+name = "nr-fl-server"
+path = "src/bin/nr_fl_server.rs"
+required-features = ["demo-d445a-fl-t8"]
+
 [dependencies]
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -18,6 +41,13 @@ rand_chacha = { workspace = true }
 x25519-dalek = { workspace = true }
 nextgsim-ai = { workspace = true }
 nextgsim-common = { workspace = true }
+nextgsim-demo = { workspace = true, optional = true }
+nextgsim-sbi-client = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+h2 = { version = "0.4", optional = true }
+http = { version = "1", optional = true }
+bytes = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

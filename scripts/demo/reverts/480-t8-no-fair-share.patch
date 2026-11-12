@@ -1,0 +1,27 @@
+--- a/nextgsim-fl/src/d445a/nef.rs
++++ b/nextgsim-fl/src/d445a/nef.rs
+@@ -561,11 +561,19 @@
+                 None => by_source.push((h.source, 1)),
+             }
+         }
+-        by_source.sort_by_key(|s| std::cmp::Reverse(s.1));
+-        by_source
+-            .into_iter()
+-            .take_while(|(_, n)| *n > mine + 1)
+-            .any(|(s, _)| self.evict_oldest_idle_of(s, true))
++        // Reverted: the oldest idle connection of any source.
++        let _ = by_source;
++        let oldest = self
++            .held
++            .iter()
++            .enumerate()
++            .filter(|(_, h)| h.idle())
++            .min_by_key(|(_, h)| *lock(&h.last_active))
++            .map(|(i, _)| i);
++        oldest.is_some_and(|i| {
++            self.held.swap_remove(i).evict.notify_one();
++            true
++        })
+     }
+ }
+ 

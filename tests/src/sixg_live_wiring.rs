@@ -33,8 +33,7 @@ use bytes::Bytes;
 use nextgsim_common::config::{GnbConfig, UeConfig};
 use nextgsim_common::Plmn;
 use nextgsim_gnb::tasks::{
-    AgentMessage, FlAggregatorMessage, NwdafMessage, TaskMessage as GnbTaskMessage,
-    DEFAULT_CHANNEL_CAPACITY,
+    AgentMessage, NwdafMessage, TaskMessage as GnbTaskMessage, DEFAULT_CHANNEL_CAPACITY,
 };
 use nextgsim_gnb::GnbWiring;
 use nextgsim_rls::{codec, RlsHeartbeat, RlsMessage as RlsProtocolMessage, SimCoord};
@@ -293,46 +292,6 @@ async fn the_ue_rrc_cycle_feeds_the_ue_nwdaf_reporter() {
     let _ = ue_manager.shutdown().await;
     let mut gnb_manager = gnb_manager;
     let _ = gnb_manager.shutdown().await;
-}
-
-/// #459, FL: the hook the FL demo plugs its producer into reaches the running
-/// FL aggregator through the library wiring. The FL tasks have no production
-/// producer by design (the FL demo redesigns them); this pins the hook.
-#[tokio::test]
-async fn the_fl_hook_reaches_the_gnb_fl_aggregator() {
-    let config = GnbConfig {
-        federated_learning_enabled: true,
-        nwdaf_enabled: false,
-        ..gnb_config(5)
-    };
-    let mut wiring = GnbWiring::new(config, DEFAULT_CHANNEL_CAPACITY);
-    let sixg = wiring.sixg.as_mut().expect("FL is enabled and compiled in");
-    let mut seen = probe(&mut sixg.fl_rx, |msg| match msg {
-        GnbTaskMessage::Message(FlAggregatorMessage::RegisterParticipant {
-            participant_id,
-            ..
-        }) => Some(participant_id.clone()),
-        _ => None,
-    });
-    let task_base = wiring.task_base();
-    let mut task_manager = wiring.spawn(true);
-
-    task_base
-        .fl_aggregator_tx()
-        .expect("the hook exists once the 6G handles are installed")
-        .send(FlAggregatorMessage::RegisterParticipant {
-            participant_id: "ue-459".to_string(),
-            compute_capability: 1,
-        })
-        .await
-        .expect("send through the FL hook");
-
-    let id = timeout(CROSSING_TIMEOUT, seen.recv())
-        .await
-        .expect("nothing reached the FL aggregator")
-        .expect("FL probe closed");
-    assert_eq!(id, "ue-459");
-    let _ = task_manager.shutdown().await;
 }
 
 /// #459, Agent: the gNB Agent task gets its first message from its production

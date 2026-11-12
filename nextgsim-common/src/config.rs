@@ -658,7 +658,11 @@ pub struct GnbConfig {
     /// a disabled demo. Empty by default.
     #[serde(default)]
     pub paging_grid: Vec<PagingGridEntry>,
-    /// Federated Learning Aggregator task enabled (Rel-20)
+    /// Removed (nextgsim#480): the gNB has no Federated Learning aggregator any
+    /// more. Federated learning is an application-layer AF (`nr-fl-server`) on
+    /// the N6 side, reached over the UEs' PDU sessions. The field is kept so an
+    /// old config with `false` still loads; `true` fails gNB startup
+    /// (`ConfigValidationError::FlAggregatorRemoved`) rather than being ignored.
     #[serde(default)]
     pub federated_learning_enabled: bool,
     /// Use QUIC transport instead of SCTP for NGAP (6G forward-looking, Rel-20+).
@@ -2842,6 +2846,67 @@ pub struct UeConfig {
     /// only with `semantic_comm_enabled`; ignored otherwise.
     #[serde(default)]
     pub semantic_stream: Option<SemanticStreamConfig>,
+    /// The FL client of demo D445A (nextgsim#480). Read only by a UE built with
+    /// `demo-d445a-fl-t8` whose `demo:` block enables it, and only with
+    /// `federated_learning_enabled`; ignored otherwise.
+    #[serde(default)]
+    pub fl: Option<FlClientConfig>,
+}
+
+/// Demo D445A's UE FL client (nextgsim#480, non-normative): which AF it trains
+/// with, over which PDU session, and which member of the synthetic task it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlClientConfig {
+    /// The AF (`nr-fl-server`) FL listener, a DN address reached through the
+    /// PDU session (behind the UPF, with no NAT toward it).
+    pub server: std::net::SocketAddr,
+    /// The interface the TCP socket is bound to (`SO_BINDTODEVICE`): the PDU
+    /// session's TUN, e.g. `uesimtun0`. `None` connects by the routing table,
+    /// i.e. possibly around the session (the "client on eth0" revert arm).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// This UE's member number, 1-based: it says Hello as `ue<member>`, trains
+    /// on that member's region of the task, and member 5 is the attacker in
+    /// `poisoned-ue`.
+    pub member: u32,
+    /// The run seed (the AF uses the same one).
+    #[serde(default = "FlClientConfig::default_seed")]
+    pub seed: u64,
+    /// The task's member count (3 in `t8-exclusion`, 5 in `poisoned-ue`).
+    #[serde(default = "FlClientConfig::default_clients")]
+    pub clients: u32,
+    /// Training rows of this member.
+    #[serde(default = "FlClientConfig::default_samples")]
+    pub samples: usize,
+    /// Connect at startup. `false` waits for `nr-cli <ue> fl-train`.
+    #[serde(default = "FlClientConfig::default_autostart")]
+    pub autostart: bool,
+    /// Reconnect after this many seconds without a global model.
+    #[serde(default = "FlClientConfig::default_idle")]
+    pub idle_timeout_s: u64,
+    /// Revert arm `leak-raw` (`revert-hooks` builds only; refused otherwise):
+    /// append a training row to every update.
+    #[serde(default)]
+    pub leak_raw: bool,
+}
+
+impl FlClientConfig {
+    fn default_seed() -> u64 {
+        480
+    }
+    fn default_clients() -> u32 {
+        3
+    }
+    fn default_samples() -> usize {
+        240
+    }
+    fn default_autostart() -> bool {
+        true
+    }
+    fn default_idle() -> u64 {
+        600
+    }
 }
 
 /// Demo D444A's UL feature stream (nextgsim#477, non-normative): where the UE
@@ -2963,6 +3028,7 @@ impl Default for UeConfig {
             federated_learning_enabled: false,
             semantic_comm_enabled: false,
             semantic_stream: None,
+            fl: None,
         }
     }
 }

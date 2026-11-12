@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/server.rs
++++ b/nextgsim-fl/src/d445a/server.rs
+@@ -1239,7 +1239,7 @@
+                 .push(format!("{label} round={round}"));
+             return;
+         }
+-        let weight = u64::from(samples).min(cap);
++        let weight = u64::from(samples);
+         if u64::from(samples) > cap {
+             demo_log!(
+                 warn,

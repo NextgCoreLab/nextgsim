@@ -31,6 +31,14 @@ default = []
 # the Session-AMBR the network signals. Demo-only, off by default; also needs
 # the `demo:` block and `semantic_comm_enabled` plus a `semantic_stream:` block.
 demo-d444a-ambr-adapt = ["nextgsim-semantic"]
+# Demo D445A (nextgsim#480): the UE FL client of network-assisted federated
+# learning, bound to the PDU session's TUN, plus `nr-cli fl-train` / `fl-status`.
+# Demo-only, off by default; also needs the `demo:` block,
+# `federated_learning_enabled` and an `fl:` block. Not part of `6g`.
+demo-d445a-fl-t8 = ["nextgsim-fl", "nextgsim-fl/demo-d445a-fl-t8"]
+# The D445A revert arm `fl.leak_raw` (a training row appended to each update).
+# Off by default; a build without it refuses the knob.
+revert-hooks = ["demo-d445a-fl-t8", "nextgsim-fl/revert-hooks"]
 # Test-only accessors (the AS security context and its keys) for other crates'
 # tests, such as the in-process cross-end test in nextgsim-integration-tests.
 # Not part of the production API (#348 review).

@@ -73,6 +73,15 @@ pub enum ConfigValidationError {
     /// Invalid `shadowing:` block (nextgsim#467)
     #[error("Invalid shadowing configuration: {0}")]
     InvalidShadowing(String),
+
+    /// `federated_learning_enabled: true`: the gNB FL aggregator was removed
+    /// (nextgsim#480), so the flag cannot be honoured.
+    #[error(
+        "federated_learning_enabled is true, but the gNB has no FL aggregator since \
+         nextgsim#480: federated learning runs in the nr-fl-server AF on the N6 side. \
+         Remove the flag (or set it to false)"
+    )]
+    FlAggregatorRemoved,
 }
 
 /// Loads a gNB configuration from a YAML file.
@@ -201,6 +210,12 @@ pub fn validate_gnb_config(config: &GnbConfig) -> Result<(), ConfigValidationErr
         .validate()
         .map_err(ConfigValidationError::InvalidShadowing)?;
 
+    // nextgsim#480: a flag whose task no longer exists fails startup rather
+    // than being silently ignored.
+    if config.federated_learning_enabled {
+        return Err(ConfigValidationError::FlAggregatorRemoved);
+    }
+
     // Validate AMF configurations
     if config.amf_configs.is_empty() {
         return Err(ConfigValidationError::NoAmfConfigured);
@@ -327,6 +342,29 @@ mod tests {
     fn test_validate_valid_config() {
         let config = valid_config();
         assert!(validate_gnb_config(&config).is_ok());
+    }
+
+    /// nextgsim#480: the gNB FL aggregator is gone, so `federated_learning_enabled:
+    /// true` fails startup instead of being silently ignored; `false` (what the
+    /// shipped configs used to carry) still loads.
+    #[test]
+    fn a_gnb_config_that_enables_fl_fails_validation() {
+        let base = "nci: 16\ngnb_id_length: 24\nplmn: {mcc: 310, mnc: 410, long_mnc: false}\n\
+                    tac: 1\nnssai: []\namf_configs: [{address: 127.0.0.1, port: 38412}]\n\
+                    link_ip: 127.0.0.1\nngap_ip: 127.0.0.1\ngtp_ip: 127.0.0.1\n\
+                    ignore_stream_ids: false\nupf_addr: null\nupf_port: 2152\n";
+        for ok in [
+            base.to_string(),
+            format!("{base}federated_learning_enabled: false\n"),
+        ] {
+            assert!(validate_gnb_config(&load_gnb_config_from_str(&ok).unwrap()).is_ok());
+        }
+        let on =
+            load_gnb_config_from_str(&format!("{base}federated_learning_enabled: true\n")).unwrap();
+        assert_eq!(
+            validate_gnb_config(&on),
+            Err(ConfigValidationError::FlAggregatorRemoved)
+        );
     }
 
     /// nextgsim#467: a gNB YAML `shadowing:` block loads, and a block that

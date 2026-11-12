@@ -24,6 +24,10 @@ impl Task for FlParticipantTask {
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("FL Participant task started");
+        // Demo D445A (#480): the FL client, when the demo is active and the
+        // config has an `fl:` block; a UE without the demo is unchanged.
+        #[cfg(feature = "demo-d445a-fl-t8")]
+        super::d445a::start(self._task_base.config.fl.as_ref());
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {

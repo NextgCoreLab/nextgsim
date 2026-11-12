@@ -59,7 +59,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 
 | Gap | Location | Details |
 |---|---|---|
-| **6G task stubs (SHE, NWDAF, NKEF, ISAC, Agent, FL)** | `src/tasks.rs:62-67` | `TaskId` enum defines 6 AI-native IDs. Message types (`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`, `FlAggregatorMessage`) are defined with detailed fields but **no task implementations exist**. `GnbTaskBase` now also carries channel handles (`she_tx`/`nwdaf_tx`/`nkef_tx`/`isac_tx`/`agent_tx`/`fl_tx`) and their receivers for the 6G tasks, but no consumer `run()` loops are spawned. |
+| **6G task stubs (SHE, NWDAF, NKEF, ISAC, Agent, FL)** | `src/tasks.rs:62-67` | `TaskId` enum defines 5 AI-native IDs (the FL aggregator was removed in nextgsim#480). Message types (`SheMessage`, `NwdafMessage`, `NkefMessage`, `IsacMessage`, `AgentMessage`) are defined with detailed fields but **no task implementations exist**. `GnbTaskBase` now also carries channel handles (`she_tx`/`nwdaf_tx`/`nkef_tx`/`isac_tx`/`agent_tx`) and their receivers for the 6G tasks, but no consumer `run()` loops are spawned. |
 | UE Context Release Request | `src/ngap/task.rs:752-755` | Comment: "encoding not yet implemented" -- local cleanup only, no NGAP message sent |
 | Unhandled NGAP messages | `src/ngap/task.rs` | Several NGAP message types have `_ => { tracing::warn!("not yet handled") }` match arms |
 | Inter-gNB handover | `src/rrc/handover.rs:48` | `InterGnb` variant exists in `HandoverType` but comment: "not implemented yet" |
@@ -212,7 +212,7 @@ The five node/infrastructure crates provide a solid 5G NR simulation baseline wi
 | **NKEF** (Network Key Escrow Function) | `Nkef` | -- | Key request/response, key rotation | None |
 | **ISAC** (Integrated Sensing and Communication) | `Isac` | `IsacSensor` | Start/stop sensing, sensing measurement, fused position request | None |
 | **Agent Framework** | `Agent` | -- | Agent coordination messages | None |
-| **Federated Learning** | `FlAggregator` | `FlParticipant` | Global model receive, training start, sample add, update submit | None |
+| **Federated Learning** | -- (removed in nextgsim#480; the server is the `nr-fl-server` AF on N6) | `FlParticipant` | Global model receive, training start, sample add, update submit | None |
 | **Semantic Communication** | -- | `SemanticCodec` | Encode/decode, encoder/decoder update, adaptive compression | None |
 
 ### Architecture Readiness for 6G

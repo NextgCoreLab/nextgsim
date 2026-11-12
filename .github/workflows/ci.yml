@@ -423,7 +423,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # The gNB's 6G surface -- NWDAF, ISAC, SHE, NKEF, agent, FL -- lives behind
+      # The gNB's 6G surface -- NWDAF, ISAC, SHE, NKEF, agent -- lives behind
       # the `6g` umbrella, so the default-feature jobs above compile none of it.
       # It is not entirely uncovered: the event-bus job tests it in the
       # `event-bus,6g` COMBINATION. This job covers `6g` on its own, which is the
@@ -457,6 +457,25 @@ jobs:
         run: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
       - name: D444A revert arms (each patch must fail its named test)
         run: scripts/demo/d444a-reverts.sh
+      # Demo d445a-fl-t8 (#480): the nr-fl-server AF (FL listener, NEF client,
+      # T8 callback listener) and the UE FL client are behind
+      # `demo-d445a-fl-t8`; the revert knobs (--no-t8, --freeze-global,
+      # fl.leak_raw) behind `revert-hooks`. The AF tests run it end to end over
+      # loopback against a stub nefd over h2c.
+      - name: cargo test (demo-d445a-fl-t8)
+        run: |
+          cargo test -p nextgsim-fl --features demo-d445a-fl-t8
+          cargo test -p nextgsim-fl --features revert-hooks
+          cargo test -p nextgsim-ue --features demo-d445a-fl-t8
+          cargo test -p nextgsim-ue --features revert-hooks --lib fl_participant
+      # The T8 listener's churn smoke tests flood loopback, so they are
+      # #[ignore]d in the suites above and run here on their own, serially.
+      - name: D445A T8 listener churn smoke tests (serial)
+        run: >-
+          cargo test -p nextgsim-fl --features demo-d445a-fl-t8 --lib churning
+          -- --ignored --test-threads=1
+      - name: D445A revert arms (each patch must fail its named test)
+        run: D445A_SMOKE=0 scripts/demo/d445a-reverts.sh
       - name: cargo test (6g end to end)
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
@@ -468,6 +487,8 @@ jobs:
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
+          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets
+          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:

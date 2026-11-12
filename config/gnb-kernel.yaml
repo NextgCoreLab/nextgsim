@@ -58,4 +58,3 @@ nwdaf_enabled: false
 nkef_enabled: false
 isac_enabled: false
 agent_enabled: false
-federated_learning_enabled: false

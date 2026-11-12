@@ -181,7 +181,8 @@ fn print_help(node_name: &str) {
         println!("    nwdaf-query <analytics-id>     - Query NWDAF analytics");
         println!("    she-offload <task-type>         - Offload computation to edge");
         println!("    isac-sense <mode>               - Perform ISAC sensing");
-        println!("    fl-train <model-id>             - Participate in federated learning");
+        println!("    fl-train                        - Start the D445A FL client (demo-d445a-fl-t8 builds)");
+        println!("    fl-status                       - Show the D445A FL client (demo-d445a-fl-t8 builds)");
         println!("    semantic-encode <modality>      - Encode data semantically");
     } else if node_name.contains("gnb") {
         println!("  5G Core:");
@@ -191,7 +192,6 @@ fn print_help(node_name: &str) {
         println!("    congestion-status               - Show the D441A cell-report exporter (demo-d441a-congestion-loop builds)");
         println!("    she-status                      - Show edge computing status");
         println!("    isac-config <enable|disable>    - Configure ISAC sensing");
-        println!("    fl-status                       - Show federated learning status");
         println!("    semantic-status                 - Show semantic codec status");
     } else {
         println!("  status, info");

@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/server.rs
++++ b/nextgsim-fl/src/d445a/server.rs
+@@ -1068,7 +1068,7 @@
+     fn clash(&self, label: &str, gpsi: &Gpsi) -> Option<String> {
+         self.members
+             .iter()
+-            .find(|(l, m)| (l.as_str() == label) != (m.gpsi == *gpsi))
++            .find(|(l, m)| false && (l.as_str() == label) != (m.gpsi == *gpsi))
+             .map(|(l, m)| format!("{l} is {}", m.gpsi))
+     }
+ 

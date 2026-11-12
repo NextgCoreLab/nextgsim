@@ -1,0 +1,11 @@
+--- a/nextgsim-fl/src/d445a/client.rs
++++ b/nextgsim-fl/src/d445a/client.rs
+@@ -120,7 +120,7 @@
+ 
+     /// Whether this member poisons in `mode`.
+     pub fn poisons_in(&self, mode: Option<&str>) -> bool {
+-        self.params.member == ATTACKER_MEMBER && mode == Some(MODE_POISONED_UE)
++        false && self.params.member == ATTACKER_MEMBER && mode == Some(MODE_POISONED_UE)
+     }
+ 
+     /// Train from `global` for `round`; poisoned when `poison` is set. The delta
