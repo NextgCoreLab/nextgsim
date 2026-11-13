@@ -248,9 +248,11 @@ goes in at render time. The overlay's `test-scenario.sh` checks nothing else
 differs, so the cluster rides the committed seed-464 route. The one exception
 is `start_after_secs`: the overlay deploys the route parked (86400), so the
 deploy's UE stays in A through the base e2e, and the scenario writes the
-committed 60 back just before it restarts the UE. So nwdafd's history starts
-with the deploy's registration in A: A -> A once beside the three A -> B,
-which makes the prediction B at about 75%, not 100%.
+committed 60 back just before it restarts the UE. If nwdafd ingests the
+deploy UE's registration in A, its history has one A -> A beside the three
+A -> B and the prediction is B at 75%; if it does not, every transition out of
+A is A -> B and the prediction is B at 100%. The Results quote the confidence
+the run's amfd `predicted=` line shows.
 
 ### Compose
 
