@@ -167,7 +167,52 @@ In-process arms (no core needed): `cargo test -p nextgsim-fl --features revert-h
 
 ## Results
 
-Not yet run on devtest1. This section is filled from the captured artefacts (`/tmp/eks-val/demos/d445a-fl-t8/<mode>/`) after the EKS runs; nothing here is invented ahead of them.
+All twelve arms pass on devtest1 EKS (us-west-2, cluster `devtest1`, namespace `nextg-demo`), driven from the DRAFT nextgcore PR [#1492](https://github.com/NextgCoreLab/nextgcore/pull/1492). Images
+`nextg/{nrf,amf,smf,upf,ausf,udm,udr,pcf,nssf,bsf,nef}:demo-d445a-fl-t8-d477985d6d44`
+(nextgcore `d477985d6d44` from the build tree) and `nextg/{gnb,ue}:demo-d445a-fl-t8-96a2933668ab` (nextgsim `96a2933668ab`).
+
+The run surfaced six harness defects, each fixed on the PR branch and verified by rerun (nextgcore commits
+`d77aca49` pipe-into-grep under pipefail, `7d94bc46` the delivery lines are not ordered against round 4,
+`e6f4a81f` probe cycle 1 matches a first join, `00d27996` the demo rollout waits for demo-added NFs, `cec73d25` `auth[@]` under `set -u`, `1827d9cd` the nefd bogus gate line stays on one line). The off, main, poisoned, no-t8, freeze-global, leak-raw, nat-on, nefd-down and udm-fallback arms all passed on their first attempt.
+
+| arm | artefacts (`/tmp/eks-val/demos/...`) | VERDICT | evidence |
+|---|---|---|---|
+| off | `off/off/20261113T160241Z` | PASS | base e2e UL 0->2 pkts, DL 0->2 pkts; no `nextg_demo_enabled` series |
+| main | `d445a-main/d445a-fl-t8/t8-exclusion/20261113T164301Z` | PASS | chain: udmd forwarded x3, from the Accept amfd delivered +1.9 ms, nefd T8 sub=d248427d-bf65-4353-bb35-19b3804c07e2 +3.7 ms, AF excluded extid-ue003@fl.nextg (DEREGISTERED) +3.4 ms, round 4 participants=2 +3.4 ms, dur_ms=3 (< 9000); scorecard rounds=10 last/r1=0.184 last/local=0.465 last/pooled=1.069 oracle_bit_identical=true; readmission rounds 7-10 participants=[3,3,3,3]; no_fin 7 segments 0 FIN/RST from the UE before the AF close; ul_delta per PDU session (0x1 +13094 >= AF 12636; 0x2 +13094 >= AF 12636; 0x3 released +3592 >= AF 3592 at the mid scrape; 0x4 +6368 >= AF 5910); AF uid 65534 CapEff/CapPrm/CapBnd 0 NoNewPrivs 1 |
+| poisoned | `d445a-poisoned/d445a-fl-t8/poisoned-ue/20261113T165432Z` | PASS | sources 5 joins (.2 to .6); poisoned median 0.937 trimmed-mean 1.042 fedavg 1 855 570.625; krum 10/10 excluded extid-ue005@fl.nextg; canary 0/0; ul_delta all five sessions above AF bytes |
+| probe | `d445a-probe/d445a-fl-t8/t8-exclusion/20261113T203158Z` | PASS | 10/10 cycles pass (one LoC on deregister with a reason, none within 20 s of the power cycle, readmission within 300 s) |
+| gates | `d445a-gates/d445a-fl-t8/t8-exclusion/20261113T213450Z` | PASS | every gate PASS: AF nnef-ueid token 200 externalId=ue001@fl.nextg; no token 401 Bearer invalid_token; malformed token 401; NWDAF asks the NRF for nnef-ueid refused unauthorized_client; AF nnef-eventexposure-only token 403 insufficient_scope; nr-cli bogus rejected (mode stays); nr-ue bogus fails startup (rc 1); ue1 timed out on UPF:7481 and 10.46.0.10:7481, connected to 10.46.0.10:7480; AF bogus rc=1; nefd kill switch no banner, route 404 Resource not found, metrics unreachable; nefd bogus fails startup; nefd back on with the demo banner |
+| no-t8 | `d445a-no-t8/d445a-fl-t8/t8-exclusion/20261113T180327Z` | PASS (revert arm holds) | chain FAILS; preconditions hold (Accept; ue3 joined t8=off; no udmd EE Subscribe, no forwarded leg); straggler_timeout round 4 member=ue3 after 30000 ms (T=30000) |
+| freeze-global | `d445a-freeze-global/d445a-fl-t8/t8-exclusion/20261113T183050Z` | PASS (revert arm holds) | scorecard FAILS rounds=10 last/r1=1.0 last/local=20.317 last/pooled=46.649 oracle_bit_identical=false; precondition last/r1=1.0 within [0.95, 1.05] (the global never moved) |
+| leak-raw | `d445a-leak-raw/d445a-fl-t8/t8-exclusion/20261113T185120Z` | PASS (revert arm holds) | canary FAILS canary_rows=10 refused_frames=10; precondition canary_rows > 0 and frame_refused member=ue2 |
+| nat-on | `d445a-nat-on/d445a-fl-t8/t8-exclusion/20261113T191640Z` | PASS (revert arm holds) | sources FAILS (every UE identity_unresolved as 10.46.0.1, the NATed source); precondition identity_unresolved from the NATed 10.46.0.1 |
+| nefd-down | `d445a-nefd-down/d445a-fl-t8/t8-exclusion/20261113T193839Z` | PASS (revert arm holds) | chain FAILS (no AF exclusion after the Accept); straggler_timeout round 4 after 30000 ms; preconditions hold (Accept, udmd x3, no AF exclusion, amfd `Event notification delivery failed` on ue3's leg sub-2a31f3b4-7b8a-4e4c-a884-53494bf13805) |
+| eth0 | `d445a-eth0/d445a-fl-t8/t8-exclusion/20261113T210533Z` | PASS (revert arm holds) | sources FAILS (identity_unresolved ue2 peer=10.10.4.88); ul_delta FAILS (13 511 bytes from 10.10.4.88, no PDU session); preconditions hold (ue2 on eth0 reached the AF, identity_unresolved for ue2, ul_delta fails on the eth0 bytes, UPF member series present) |
+| udm-fallback | `d445a-udm-fallback/d445a-fl-t8/t8-exclusion/20261113T201739Z` | PASS (revert arm holds) | preconditions hold (Accept, udmd could not reach the AMF, udmd forwarded no leg, no amfd 2xx LoC); INFO: ue3 was still excluded through udmd's UECM fallback (lossOfConnectReason=DEREGISTERED) |
+
+The `main` scorecard matches the library's seed-480 line (`r10/r1=0.184`, `r10/local=0.465`, `r10/pooled=1.069`) to the printed precision, and `oracle_bit_identical=true` means the AF's seeded math on the EKS node matched the pinned oracle. The poisoned arm's `median 0.937` and `trimmed-mean 1.042` both sit at or below the 1.1 cap in the seed table, and krum selected UE 005 worst in every round, as expected.
+
+nefd carries the `[demo:d445a-fl-t8]` UE ID retrieval block and resolves UEs by address at each T8 line (from `main/scenario/nef.log`):
+
+```
+[demo:d445a-fl-t8] ueid: on (mode=t8-exclusion; POST /3gpp-ueid/v1/retrieve, OAuth2 scope nnef-ueid required, BSF http://bsf.nextg-demo.svc.cluster.local:7777, UDM http://udm.nextg-demo.svc.cluster.local:7777, keys http://nrf.nextg-demo.svc.cluster.local:7777/nnrf-oauth2/v1/jwks)
+[demo:d445a-fl-t8] ueid ipv4=10.45.0.4 afId=d445a-fl-af af=... externalId=ue003@fl.nextg
+Monitoring event subscription created: id=d248427d-..., scsAsId=d445a-fl-af, type=LOSS_OF_CONNECTIVITY
+[demo:d445a-fl-t8] T8 delivery sub=d248427d-... monitoringType=LOSS_OF_CONNECTIVITY lossOfConnectReason=DEREGISTERED status=204
+```
+
+The AF runs unprivileged on EKS: `main/scenario/af-status.txt` is `Uid 65534`, `CapEff/CapPrm/CapBnd 0`, `NoNewPrivs 1`. `ip netns add` worked under the pod's non-privileged capability set (`NET_ADMIN SYS_ADMIN NET_RAW CHOWN SETUID SETGID SETPCAP` plus `drop: [ALL]`); the privileged fallback was not needed.
+
+### Harness defects surfaced by the run
+
+- `#1492` [d77aca49](https://github.com/NextgCoreLab/nextgcore/commit/d77aca49) - three `cmd | grep -q` patterns were run under `set -uo pipefail`: a pipeline whose consumer or producer exits non-zero reported a miss even on a match. First caught in `build-images.sh`'s `nr-fl-server --no-t8` check.
+- `#1492` [7d94bc46](https://github.com/NextgCoreLab/nextgcore/commit/7d94bc46) - `check_chain` gated both the amfd and nefd 2xx delivery lines on `< round 4`. The live run stamped nefd's `T8 delivery` 364 microseconds AFTER the AF's `round=4` line: the AF answers 204, excludes ue3 and runs round 4 before nefd logs the response. The docstring itself said the lines are not ordered against round 4, but the code was. Now bounded below by the Accept only; the amfd "no other leg" check keeps the (Accept, round 4) window where it is what it means. The departure ids (readmission mints new ones) pin each line to this episode.
+- `#1492` [e6f4a81f](https://github.com/NextgCoreLab/nextgcore/commit/e6f4a81f) - probe cycle 1 used a regex `"(A|B) "` whose first alternative required a space after `gpsi=`; the real log is `gpsi=extid-ue003@fl.nextg`. Cycles 2-10 passed because the previous cycle's readmit line matched alt B. Drop the trailing space; cycle 1's `member_joined` matches too.
+- `#1492` [00d27996](https://github.com/NextgCoreLab/nextgcore/commit/00d27996) - `deploy-eks.sh`'s `verify_images.py` expects every deployed NF Ready in 90 s, but `profile_rollout` (from the 5g profile) does not wait for demo-added NFs like `nef`. The d445a gates arm hit this: nef's `wait-nrf` init container stalled for 2 m 20 s mid-wait, so nef was still in init when verify_images started. The demo profile now wraps `profile_rollout` and waits for every `PROFILE_CORE_NFS` entry not already on the 5g list.
+- `#1492` [cec73d25](https://github.com/NextgCoreLab/nextgcore/commit/cec73d25) - the gates arm's `retrieve()` had `local auth=()` and then expanded `"${auth[@]}"`. Under `set -u`, an empty-array expansion is "unbound variable" on some bash builds, so the no-token request sent an empty curl invocation; two gates then reported FAIL for an unrelated reason. Fixed to the `${auth[@]+"${auth[@]}"}` idiom.
+- `#1492` [1827d9cd](https://github.com/NextgCoreLab/nextgcore/commit/1827d9cd) - the nefd bogus-mode gate's `grep -m1 -oE 'alt1|alt2'` matched both alternatives on one log line; -o printed each match separated by a newline. The emitted gate text then had two lines, and `check_gates` read the second as a new gate row (no PASS/FAIL prefix, verdict FAIL). Pipe the match through `head -1`.
+
+No base-core bug was surfaced; the only observed non-deterministic cluster behaviour was a one-time `PayloadNotForwarded` cause for ue1 on the first eth0 attempt (12 min registration retry before success); the rerun with reused images cleared it.
 
 ## Honesty labels and limitations
 
