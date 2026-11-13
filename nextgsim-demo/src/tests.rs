@@ -460,3 +460,15 @@ fn route_cli_claims_only_demo_commands() {
         Some(Err(DemoCliError::NotInstalled))
     );
 }
+
+/// `off` names the demo-off arm (`k8s/demo-check.sh <key> off`), so no demo may
+/// register it as a mode (nextgsim#464).
+#[test]
+#[should_panic(expected = "reserved for the demo-off arm")]
+fn a_mode_named_off_is_a_programming_error() {
+    DemoRegistry::new(&[DemoSpec {
+        key: "d1-x",
+        modes: &["on", "off"],
+        requires: &[],
+    }]);
+}

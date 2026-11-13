@@ -181,8 +181,10 @@ both, from kubelet- or docker-timestamped logs:
    after its `Simulated motion started` line, computed from the deployed
    route), gNB A's `nr-cli ue-release` sends it to CM-IDLE;
 3. it reselects B while idle; after the route's end the check asks nwdafd for
-   its UE_MOBILITY prediction (`ue-mobility.http`), which is what amfd will be
-   told;
+   its UE_MOBILITY prediction (`ue-mobility.http`). This is corroboration
+   only: a separate request a few seconds before amfd's, with its own window.
+   The evidence for amfd's own exchange is its `predicted=` line and its
+   `predicted` hint counter (nextgcore#1494);
 4. 20 downlink pings from the UPF make smfd send the N1N2MessageTransfer, and
    amfd pages;
 5. `analyze.py` checks the arm (its header lists every check).
@@ -196,7 +198,7 @@ both, from kubelet- or docker-timestamped logs:
 | demo off | `k8s/demo-check.sh d440c-nwdaf-paging off` | the base core on the same topology: `Paging sent to 3/3 gNB(s) serving the registration area`, no demo line, no NWDAF query, no `nextg_demo_enabled` |
 | invalid | `k8s/demo-check.sh d440c-nwdaf-paging bogus` | amfd (and every gNB) fails startup with `UnknownMode`; the run FAILS to deploy |
 | `nwdaf-down` | `DEMO_VARIANT=nwdaf-down k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd scaled to 0 before the downlink: a fail-open line, the whole area paged within the budget |
-| revert | `DEMO_VARIANT=revert k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd's knob off (the #466 ingest patched out): its answer is 204, amfd pages the whole area, and the success chain does not hold |
+| revert | `DEMO_VARIANT=revert k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd's knob off, which stands in for the #466 ingest patched out (no AMF subscription, UE_MOBILITY not served): its answer is 204, amfd pages the whole area, and the success chain does not hold |
 
 Every arm also checks the common chain: nine handovers before the release,
 the idle reselection, the page answered on attempt 1 through gNB B
@@ -243,9 +245,18 @@ adds gnb-b and gnb-c (the base gNB is A), nwdafd, and gNB A's and the UE's
 configs. Its configs are `config/demo-nwdaf-paging/` with the compose
 addresses replaced by Service names and the demo block removed: the run's mode
 goes in at render time. The overlay's `test-scenario.sh` checks nothing else
-differs, so the cluster rides the committed seed-464 route.
+differs, so the cluster rides the committed seed-464 route. The one exception
+is `start_after_secs`: the overlay deploys the route parked (86400), so the
+deploy's UE stays in A through the base e2e, and the scenario writes the
+committed 60 back just before it restarts the UE. So nwdafd's history starts
+with the deploy's registration in A: A -> A once beside the three A -> B,
+which makes the prediction B at about 75%, not 100%.
 
 ### Compose
+
+**Not yet run.** The builder host has no docker compose, so no compose arm has
+passed yet; the EKS run is the acceptance. The stack and its check are wired as
+below and checked statically only.
 
 ```bash
 # nextgcore-rust/{amf,nwdaf}:d440c and nextgsim-gnb:d440c built with the demo
@@ -265,7 +276,8 @@ start-up. The stack publishes no port (the check asserts it before `up`).
 
 **Not yet run.** The runs, the committed table (PAGINGs per page and attempt-1
 hits, per mode, on the committed seed and the sweep seeds) and the captured log
-excerpts and metrics come with PR 5. Nothing here is a measured result yet.
+excerpts and metrics come from the EKS arms, which have not run yet (devtest1
+credentials). Nothing here is a measured result yet.
 
 ## Honesty labels and limitations
 

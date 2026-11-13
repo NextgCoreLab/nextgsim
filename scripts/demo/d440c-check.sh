@@ -27,6 +27,8 @@
 #   DEMO_ARTEFACTS  where captures go (default /tmp/demo-artefacts/d440c/<mode>[+<variant>])
 #   D440C_KEEP=1    leave the stack running afterwards
 # Exit status: 0 when analyze.py passes, 1 otherwise.
+# Not yet run: written for compose and checked statically; it needs
+# nextgcore#1496's analyze.py.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -130,5 +132,11 @@ demo_compose exec -T upf ping -c 20 -i 0.5 -W 3 "$ue_ip" > "$S/ping.txt" 2>&1 ||
 tail -2 "$S/ping.txt"
 sleep 5
 capture
-python3 "$analyze" "$S" "$mode" "${variant:-none}" | tee "$S/analyze.txt"
-[ "${PIPESTATUS[0]}" = 0 ] || { demo_fail "analyze.py: the $mode${variant:++$variant} arm does not hold (see $S/analyze.txt)"; exit 1; }
+# Not `analyze.py | tee` under set -e: a failing pipeline would exit before the
+# message below.
+if ! python3 "$analyze" "$S" "$mode" "${variant:-none}" > "$S/analyze.txt"; then
+    cat "$S/analyze.txt"
+    demo_fail "analyze.py: the $mode${variant:++$variant} arm does not hold (see $S/analyze.txt)"
+    exit 1
+fi
+cat "$S/analyze.txt"
