@@ -8,8 +8,10 @@
 #   onnx rows: the same test with --include-ignored and ORT_DYLIB_PATH, run by
 #   the CI model-verify job on the pinned ONNX Runtime 1.23.2 (d440b reference
 #   model, a one-step constant-velocity graph: about 1 s ahead, not ML).
-#   The 1..=50 rows are asserted exactly, the 1..=2000 rows loosely (rate
-#   within 1 pp, mean within 0.05).
+#   Every row is asserted exactly (the replay is deterministic), and every
+#   line is checked against itself: its rate and Wilson interval must be what
+#   its own hits and calls give, its mean possible for its hit count, and each
+#   McNemar p-value what its counts give.
 #
 # Reading it
 #   AMF model: amfd paging.strategy recommended-first. Attempt 1 goes to the
@@ -18,7 +20,12 @@
 #   hits = first-attempt hits; interval = Wilson 95% for the hit rate.
 #   Routes: constant-turn routes are ct's own motion model (ct is in-model);
 #   straight routes are lsq's; turn-change routes are neither's. The 50-seed
-#   block is one draw. Read the 2000-seed rows for comparisons.
+#   block is one draw. Read the 2000-seed rows for comparisons, and compare
+#   modes within a family: a family whose route leaves coverage redraws on its
+#   own (477 straight, 803 turn-change of 2000 seeds are not paired with their
+#   constant-turn run), so families are not like-for-like with each other.
+#   McNemar: an exact two-sided test on the seeds only one of ct and lsq hit
+#   on attempt 1 (same seeds, same family).
 #   Non-normative: positions are simulator ground truth (TS 38.300 §16.20.2).
 #
 | family        | seeds     | mode        | calls |  hits | hit rate | 95% interval   | mean PAGINGs |
@@ -43,3 +50,8 @@
 | constant-turn | 1..=2000  | onnx        |  2000 |  1270 |   63.5% |  61.4.. 65.6% |   3.28 |
 | straight      | 1..=2000  | onnx        |  2000 |  1335 |   66.8% |  64.7.. 68.8% |   3.09 |
 | turn-change   | 1..=2000  | onnx        |  2000 |  1304 |   65.2% |  63.1.. 67.3% |   3.18 |
+#
+# McNemar, ct vs lsq, 1..=2000 per family (seeds only one of them hit on attempt 1)
+| mcnemar | constant-turn | 1..=2000  | ct vs lsq | ct-only 184 | lsq-only 40 | p=2.9e-23 |
+| mcnemar | straight      | 1..=2000  | ct vs lsq | ct-only 6 | lsq-only 37 | p=1.6e-6 |
+| mcnemar | turn-change   | 1..=2000  | ct vs lsq | ct-only 90 | lsq-only 112 | p=1.4e-1 |

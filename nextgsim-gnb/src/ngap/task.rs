@@ -2865,8 +2865,10 @@ impl NgapTask {
     /// as with no recommendation. The mode is read here, so an `nr-cli` switch
     /// applies from the next release.
     ///
-    /// Not asked when the release follows a handover (cause "successful
-    /// handover" or "handover cancelled", TS 38.413 §9.3.1.2): the UE stays
+    /// Not asked when the release follows a handover, or a handover
+    /// preparation that failed at this target (cause "successful handover",
+    /// "handover cancelled", "ho-failure-in-target-5GC-ngran-node-or-target-
+    /// system" or "tngrelocprep-expiry", TS 38.413 §9.3.1.2): the UE stays
     /// CM-CONNECTED at another gNB or this one, so there is no idle UE to page.
     ///
     /// Known limit: the wait runs on the NGAP task, so while it lasts this
@@ -2889,7 +2891,10 @@ impl NgapTask {
         if matches!(
             cause,
             NgSetupFailureCause::RadioNetwork(
-                RadioNetworkCause::SuccessfulHandover | RadioNetworkCause::HandoverCancelled
+                RadioNetworkCause::SuccessfulHandover
+                    | RadioNetworkCause::HandoverCancelled
+                    | RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem
+                    | RadioNetworkCause::TngrelocPrepExpiry
             )
         ) {
             return None;
@@ -11122,7 +11127,8 @@ mod tests {
     }
 
     /// #462 (#535 review): the source gNB's release after a handover (cause
-    /// "successful handover" or "handover cancelled") is not a UE going idle,
+    /// "successful handover" or "handover cancelled"), and a target's release
+    /// after its preparation failed, are not a UE going idle,
     /// so the NWDAF is not asked and the Release Complete carries no IE.
     #[cfg(feature = "demo-d440a-ai-paging")]
     #[tokio::test]
@@ -11131,6 +11137,8 @@ mod tests {
         for (i, rn) in [
             RadioNetworkCause::SuccessfulHandover,
             RadioNetworkCause::HandoverCancelled,
+            RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+            RadioNetworkCause::TngrelocPrepExpiry,
         ]
         .into_iter()
         .enumerate()

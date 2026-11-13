@@ -23,15 +23,23 @@
 //! scores at least as well as ct); turn-change routes (the turn rate redrawn
 //! at release) are neither's. The table reports all three families, and the
 //! #535 review's finding that a 50-seed block is seed-specific is why each
-//! family also has a 2000-seed row with a 95% Wilson interval.
+//! family also has a 2000-seed row with a 95% Wilson interval and a paired
+//! exact McNemar test of ct against lsq.
+//!
+//! **Compare modes within a family, not families with each other.** Seed N
+//! takes the same first draw in every family, but a family whose route leaves
+//! coverage redraws on its own stream, so many seeds are not paired across
+//! families (`the_route_families_are_paired_by_seed` counts them), and each
+//! family is conditioned on staying in coverage under its own motion. Within a
+//! family every mode sees exactly the same routes.
 //!
 //! The table counts, per mode, the first-attempt hits and the mean PAGING
 //! messages per mobile-terminated call. It is checked in
-//! (`config/demo-ai-paging/d440a-replay-table.txt`): the committed 50-seed
-//! rows are asserted exactly, the 2000-seed rows loosely (hit rate within 1
-//! percentage point, mean PAGINGs within 0.05), so a libm difference across
-//! platforms that flips one seed does not fail them. Nothing asserts that one
-//! predictor beats another.
+//! (`config/demo-ai-paging/d440a-replay-table.txt`), and every row is asserted
+//! exactly (the replay is deterministic). Every committed line is also checked
+//! against itself: its rate and interval must be what its own hits and calls
+//! give, and its mean must be possible for its hit count. Nothing asserts that
+//! one predictor beats another.
 //!
 //! What it does not model: amfd itself, the NGAP round trips, the UE's
 //! connected-mode mobility (the serving gNB at release is where the
@@ -92,8 +100,10 @@ struct Seeds {
     large_sample_count: u64,
 }
 
-/// How a route turns. The draws are made in one order for every family, so
-/// seed N of every family starts at the same point, heading and speed.
+/// How a route turns. Every family makes its draws in one order, so seed N
+/// takes the same *first* draw in each; a family whose route leaves coverage
+/// redraws on its own, and from then on that seed's routes differ between
+/// families (see `the_route_families_are_paired_by_seed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Family {
     /// One turn rate for the whole route: `ct`'s own motion model.
@@ -483,28 +493,122 @@ pub(crate) fn committed_line(family: Family, seeds: &std::ops::Range<u64>, mode:
     )
 }
 
-/// A table line's hit rate (percent) and mean PAGINGs.
-fn rate_and_mean(line: &str) -> (f64, f64) {
-    let cells: Vec<&str> = line.split('|').map(str::trim).collect();
-    // | family | seeds | mode | calls | hits | rate% | lo..hi% | mean |
-    let rate = cells[6].trim_end_matches('%').parse().expect("a rate");
-    let mean = cells[8].parse().expect("a mean");
-    (rate, mean)
+/// The cells of a table line, trimmed.
+fn cells(line: &str) -> Vec<&str> {
+    line.split('|').map(str::trim).collect()
 }
 
-/// `computed` agrees with `committed` loosely: the hit rate within 1
-/// percentage point and the mean PAGINGs within 0.05.
-pub(crate) fn assert_loosely(computed: &str, committed: &str) {
-    assert!(
-        !committed.ends_with("(no such line in the committed table)"),
-        "{committed}"
-    );
-    let (r1, m1) = rate_and_mean(computed);
-    let (r2, m2) = rate_and_mean(committed);
-    assert!(
-        (r1 - r2).abs() <= 1.0 && (m1 - m2).abs() <= 0.05,
-        "computed {computed}\ncommitted {committed}"
-    );
+/// Checks a committed data line against itself: the rate and interval are
+/// what its own hits and calls give (formatted as [`table_line`] formats
+/// them), and its mean PAGINGs are possible for its hit count. A first attempt
+/// pages at least one gNB and a recommendation names at most two (page-all:
+/// all six), and a miss costs six more.
+pub(crate) fn check_self_consistent(line: &str) -> Result<(), String> {
+    let c = cells(line);
+    // | family | seeds | mode | calls | hits | rate% | lo..hi% | mean |
+    if c.len() != 10 {
+        return Err(format!("not a data line: {line}"));
+    }
+    let calls: usize = c[4].parse().map_err(|_| format!("calls: {line}"))?;
+    let hits: usize = c[5].parse().map_err(|_| format!("hits: {line}"))?;
+    let mean: f64 = c[8].parse().map_err(|_| format!("mean: {line}"))?;
+    if calls == 0 || hits > calls {
+        return Err(format!("{hits} hits of {calls} calls: {line}"));
+    }
+    let rate = format!("{:.1}%", 100.0 * hits as f64 / calls as f64);
+    let (lo, hi) = wilson_95(hits, calls);
+    let interval = format!("{lo:>5.1}..{hi:>5.1}%");
+    if c[6] != rate {
+        return Err(format!(
+            "rate {} but {hits}/{calls} is {rate}: {line}",
+            c[6]
+        ));
+    }
+    if c[7] != interval.trim() {
+        return Err(format!(
+            "interval {} but Wilson gives {}: {line}",
+            c[7],
+            interval.trim()
+        ));
+    }
+    let miss = (calls - hits) as f64 / calls as f64;
+    let (first_lo, first_hi) = if c[3] == "page-all" {
+        (6.0, 6.0)
+    } else {
+        (1.0, 2.0)
+    };
+    let (min, max) = (first_lo + 6.0 * miss, first_hi + 6.0 * miss);
+    if mean < min - 0.005 || mean > max + 0.005 {
+        return Err(format!(
+            "mean {mean} outside {min:.2}..{max:.2} for {hits}/{calls}: {line}"
+        ));
+    }
+    Ok(())
+}
+
+/// The exact two-sided McNemar p-value for `b` and `c` discordant pairs: the
+/// binomial(b + c, 1/2) probability of a split at least this uneven.
+pub(crate) fn mcnemar_exact(b: usize, c: usize) -> f64 {
+    let n = b + c;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = b.min(c);
+    // Sum C(n, i) / 2^n for i in 0..=k, in log space.
+    let ln_half_n = n as f64 * 0.5_f64.ln();
+    let mut ln_c = 0.0_f64;
+    let mut tail = 0.0_f64;
+    for i in 0..=k {
+        if i > 0 {
+            ln_c += ((n - i + 1) as f64).ln() - (i as f64).ln();
+        }
+        tail += (ln_c + ln_half_n).exp();
+    }
+    (2.0 * tail).min(1.0)
+}
+
+/// The key a McNemar line starts with.
+fn mcnemar_key(family: Family, seeds: &std::ops::Range<u64>, a: &str, b: &str) -> String {
+    format!(
+        "| mcnemar | {:<13} | {:<9} | {a} vs {b} |",
+        family.name(),
+        format!("{}..={}", seeds.start, seeds.end - 1)
+    )
+}
+
+/// The McNemar line for modes `a` and `b` on the same seeds of `family`: the
+/// seeds only `a`'s first attempt hit, only `b`'s, and the exact p-value.
+pub(crate) fn mcnemar_line(
+    family: Family,
+    seeds: &std::ops::Range<u64>,
+    (a, oa): (&str, &[Outcome]),
+    (b, ob): (&str, &[Outcome]),
+) -> String {
+    assert_eq!(oa.len(), ob.len());
+    let only_a = oa
+        .iter()
+        .zip(ob)
+        .filter(|(x, y)| x.first_attempt_hit && !y.first_attempt_hit)
+        .count();
+    let only_b = oa
+        .iter()
+        .zip(ob)
+        .filter(|(x, y)| !x.first_attempt_hit && y.first_attempt_hit)
+        .count();
+    format!(
+        "{} {a}-only {only_a} | {b}-only {only_b} | p={:.1e} |",
+        mcnemar_key(family, seeds, a, b),
+        mcnemar_exact(only_a, only_b)
+    )
+}
+
+/// The committed line starting with `key`.
+fn committed_with_key(key: &str) -> String {
+    let text = std::fs::read_to_string(TABLE).expect("read the committed table");
+    text.lines().find(|l| l.starts_with(key)).map_or_else(
+        || format!("{key} (no such line in the committed table)"),
+        str::to_string,
+    )
 }
 
 pub(crate) fn run_mode(
@@ -533,21 +637,20 @@ pub(crate) fn run_seeds(
         .collect()
 }
 
-/// Every table line for `(name, mode)`: the committed 50 constant-turn seeds
-/// (asserted exactly) and each family's large sample (asserted loosely).
+/// Every table line for `(name, mode)`, with the committed one: the 50
+/// constant-turn seeds and each family's large sample.
 pub(crate) fn table_lines(
     file: &ScenarioFile,
     name: &str,
     mode: Option<Predictor>,
     prepare: &dyn Fn(&mut NwdafManager),
-) -> Vec<(String, String, bool)> {
+) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let seeds = file.replay_seeds();
     let o = run_seeds(file, Family::ConstantTurn, seeds.clone(), mode, prepare);
     out.push((
         table_line(Family::ConstantTurn, &seeds, name, &o),
         committed_line(Family::ConstantTurn, &seeds, name),
-        true,
     ));
     let large = file.large_sample_seeds();
     for family in Family::ALL {
@@ -555,7 +658,6 @@ pub(crate) fn table_lines(
         out.push((
             table_line(family, &large, name, &o),
             committed_line(family, &large, name),
-            false,
         ));
     }
     out
@@ -598,8 +700,9 @@ mod tests {
     }
 
     /// #462: the five-arm table's four model-free modes, replayed from the
-    /// committed seeds, are the committed table: the 50 constant-turn seeds
-    /// exactly, and each route family's 2000-seed row loosely. `page-all` is
+    /// committed seeds, are exactly the committed table: the 50 constant-turn
+    /// seeds, each route family's 2000-seed row, and each family's McNemar
+    /// line for ct against lsq. `page-all` is
     /// the check that the replay is honest: with no IE every first attempt
     /// pages the whole area, so its hit rate is 100% at 6 PAGINGs per call.
     #[test]
@@ -627,52 +730,159 @@ mod tests {
             }
             lines.extend(table_lines(&file, name, mode, &|_| {}));
         }
-        for (line, _, _) in &lines {
+        let large = file.large_sample_seeds();
+        for family in Family::ALL {
+            let ct = run_seeds(
+                &file,
+                family,
+                large.clone(),
+                Some(Predictor::ConstantTurn),
+                &|_| {},
+            );
+            let lsq = run_seeds(
+                &file,
+                family,
+                large.clone(),
+                Some(Predictor::LeastSquares),
+                &|_| {},
+            );
+            let line = mcnemar_line(family, &large, ("ct", &ct), ("lsq", &lsq));
+            let key = mcnemar_key(family, &large, "ct", "lsq");
+            lines.push((line, committed_with_key(&key)));
+        }
+        for (line, _) in &lines {
             println!("{line}");
         }
-        for (line, committed, exact) in &lines {
-            if *exact {
-                assert_eq!(line, committed);
-            } else {
-                assert_loosely(line, committed);
-            }
+        for (line, committed) in &lines {
+            assert_eq!(line, committed);
         }
     }
 
-    /// #462 (#535 review): the families share their draws, so seed N starts
-    /// at the same point, heading and speed in each; the straight route has no
-    /// turn, and the turn-change route agrees with the constant-turn one up to
-    /// release and then turns differently.
+    /// #462 (#535 review round 2): every data line of the committed table,
+    /// onnx rows included, is consistent with itself, and every McNemar line's
+    /// p-value is the one its own counts give. So a hand edit cannot make the
+    /// table say what its hits do not, even where the replay cannot run.
+    #[test]
+    fn every_committed_line_is_self_consistent() {
+        let text = std::fs::read_to_string(TABLE).expect("read the table");
+        let (mut data, mut tests) = (0, 0);
+        for line in text
+            .lines()
+            .filter(|l| l.starts_with("| ") && !l.contains("---"))
+        {
+            let c = cells(line);
+            if c[1] == "family" {
+                continue; // the header
+            }
+            if c[1] == "mcnemar" {
+                // | mcnemar | family | seeds | a vs b | a-only N | b-only M | p=P |
+                let n = |cell: &str| cell.rsplit(' ').next().unwrap().parse::<usize>().unwrap();
+                let p = format!("p={:.1e}", mcnemar_exact(n(c[5]), n(c[6])));
+                assert_eq!(c[7], p, "{line}");
+                tests += 1;
+            } else {
+                check_self_consistent(line).unwrap_or_else(|e| panic!("{e}"));
+                data += 1;
+            }
+        }
+        assert_eq!((data, tests), (20, 3), "every committed row was checked");
+    }
+
+    /// The self-consistency check refuses the #535 round-2 probe's tampered
+    /// line (rate, hits and interval that disagree) and accepts the real one.
+    #[test]
+    fn a_tampered_line_is_refused() {
+        let real = committed_line(Family::Straight, &(1..2001), "ct");
+        assert!(check_self_consistent(&real).is_ok(), "{real}");
+        let tampered = real
+            .replace("|  1911 |", "|  1500 |")
+            .replace("95.5%", "96.5%")
+            .replace(" 94.6.. 96.4%", " 10.0.. 20.0%");
+        assert_ne!(tampered, real);
+        assert!(check_self_consistent(&tampered).is_err(), "{tampered}");
+        // Only the rate moved: still refused.
+        assert!(check_self_consistent(&real.replace("95.5%", "96.5%")).is_err());
+        // An impossible mean for the hit count: refused.
+        assert!(check_self_consistent(&real.replace("  1.73 |", "  4.00 |")).is_err());
+    }
+
+    /// The exact McNemar p-value of known splits.
+    #[test]
+    fn the_mcnemar_p_value_is_the_exact_binomial_one() {
+        assert_eq!(mcnemar_exact(0, 0), 1.0);
+        assert_eq!(mcnemar_exact(5, 5), 1.0);
+        // 2 * (1 + 10 + 45) / 1024 for a 2:8 split of 10.
+        assert!((mcnemar_exact(2, 8) - 112.0 / 1024.0).abs() < 1e-12);
+        assert!((mcnemar_exact(8, 2) - mcnemar_exact(2, 8)).abs() < 1e-15);
+    }
+
+    /// The seeds of 1..=2000 whose straight and turn-change runs are not
+    /// paired with the constant-turn run (another start, speed or page time,
+    /// because that family redrew to stay in coverage).
+    const UNPAIRED_STRAIGHT: usize = 477;
+    const UNPAIRED_TURN_CHANGE: usize = 803;
+
+    /// #462 (#535 review rounds 1-2): seed N takes the same first draw in
+    /// every family. Where the families are paired, the straight route has no
+    /// turn and the turn-change route agrees with the constant-turn one up to
+    /// release and then turns differently. Where a family redrew to stay in
+    /// coverage the seed is not paired; those seeds are counted, not skipped
+    /// silently, and the counts are the ones the scenario and table quote.
     #[test]
     fn the_route_families_are_paired_by_seed() {
         let file = scenario_file();
-        let mut differs_after_release = 0;
-        for seed in 1..=20 {
+        let same = |a: &Run, b: &Run| {
+            a.start == b.start
+                && a.route.speed_mps == b.route.speed_mps
+                && a.page_at_s == b.page_at_s
+        };
+        let (mut unpaired_st, mut unpaired_tc, mut differs_after_release) = (0, 0, 0);
+        for seed in file.large_sample_seeds() {
             let ct = file.run_family(seed, Family::ConstantTurn);
             let st = file.run_family(seed, Family::Straight);
             let tc = file.run_family(seed, Family::TurnChange);
-            if ct.start != st.start || ct.start != tc.start {
-                continue; // a family redrew to stay in coverage
+            if same(&ct, &st) {
+                // Straight: every position within whole-metre rounding (of it
+                // and of both ends, so 2.5 m) of the
+                // line from the start to the page-time position.
+                let (a, b) = (st.position(0), st.position(st.page_at_s));
+                let (dx, dy) = (f64::from(b.x - a.x), f64::from(b.y - a.y));
+                let len = dx.hypot(dy);
+                for t in 0..=st.page_at_s {
+                    let p = st.position(t);
+                    let off = (dx * f64::from(p.y - a.y) - dy * f64::from(p.x - a.x)).abs() / len;
+                    assert!(
+                        off <= 2.5,
+                        "seed {seed} t {t}: straight route is {off:.1} m off its line"
+                    );
+                }
+            } else {
+                unpaired_st += 1;
             }
-            // Straight: collinear waypoints (cross product within rounding).
-            let (p0, p1, p2) = (st.position(0), st.position(5), st.position(10));
-            let cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
-            assert!(
-                cross.abs() <= 60,
-                "seed {seed}: straight route turns ({cross})"
-            );
-            for t in 0..=ct.release_at_s {
-                let (a, b) = (ct.position(t), tc.position(t));
-                assert!(
-                    (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1,
-                    "seed {seed} t {t}"
-                );
-            }
-            if ct.position(ct.page_at_s) != tc.position(tc.page_at_s) {
-                differs_after_release += 1;
+            if same(&ct, &tc) {
+                for t in 0..=ct.release_at_s {
+                    let (a, b) = (ct.position(t), tc.position(t));
+                    assert!(
+                        (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1,
+                        "seed {seed} t {t}"
+                    );
+                }
+                if ct.position(ct.page_at_s) != tc.position(tc.page_at_s) {
+                    differs_after_release += 1;
+                }
+            } else {
+                unpaired_tc += 1;
             }
         }
-        assert!(differs_after_release >= 10, "{differs_after_release}");
+        println!("unpaired: straight {unpaired_st}, turn-change {unpaired_tc} of 2000");
+        assert_eq!(
+            (unpaired_st, unpaired_tc),
+            (UNPAIRED_STRAIGHT, UNPAIRED_TURN_CHANGE),
+            "the counts the scenario and table quote"
+        );
+        // Bounded: at least half of each family is paired.
+        assert!(unpaired_st < 1000 && unpaired_tc < 1000);
+        assert!(differs_after_release >= 500, "{differs_after_release}");
     }
 
     /// The Wilson interval of a few known cases.
@@ -736,15 +946,11 @@ mod tests {
             "every prediction served by the verified model"
         );
         let lines = table_lines(&file, "onnx", Some(Predictor::Onnx), &load);
-        for (line, _, _) in &lines {
+        for (line, _) in &lines {
             println!("{line}");
         }
-        for (line, committed, exact) in &lines {
-            if *exact {
-                assert_eq!(line, committed);
-            } else {
-                assert_loosely(line, committed);
-            }
+        for (line, committed) in &lines {
+            assert_eq!(line, committed, "exact, as every row");
         }
     }
 }
