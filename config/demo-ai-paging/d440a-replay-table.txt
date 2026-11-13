@@ -2,4 +2,4 @@
 | last-served |    50 |                 29 |    58.0% |              3.52 |
 | ct          |    50 |                 49 |    98.0% |              1.60 |
 | lsq         |    50 |                 43 |    86.0% |              2.22 |
-| onnx        | (from the model-verify CI job, pinned ONNX Runtime 1.23.2) |
+| onnx        |    50 |                 33 |    66.0% |              3.14 |
