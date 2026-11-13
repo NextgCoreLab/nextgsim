@@ -536,6 +536,8 @@ impl NwdafTask {
                         "predictions": stats.predictions,
                         "exhausted": stats.exhausted,
                         "a3_would_trigger": stats.a3_would_trigger,
+                        "a3_fallbacks": stats.a3_fallbacks,
+                        "stranded": stats.stranded,
                         "lead_ms": stats.lead_ms,
                     }),
                 );
@@ -705,14 +707,16 @@ impl NwdafTask {
             Event::A3WouldTrigger {
                 ue_id,
                 target_nci,
-                t_ms,
+                t_lo_ms,
+                t_hi_ms,
                 serving_dbm,
                 neighbour_dbm,
             } => demo_log!(
                 info,
                 D441D_KEY,
-                "A3 would trigger t={t_ms} ue={ue_id} target={} serving={serving_dbm} dBm \
-                 neighbour={neighbour_dbm} dBm",
+                "A3 would trigger t={t_lo_ms}..{t_hi_ms} ue={ue_id} target={} \
+                 serving={serving_dbm} dBm neighbour={neighbour_dbm} dBm (the UE's A3 on its \
+                 2.5 s cycle, at an unknown phase)",
                 cell(target_nci)
             ),
             Event::LeadTime {
@@ -724,9 +728,26 @@ impl NwdafTask {
             } => demo_log!(
                 info,
                 D441D_KEY,
-                "lead time ue={ue_id} target={} predictive_t={predictive_ms} a3_t={a3_ms} \
-                 lead_ms={lead_ms}",
-                cell(target_nci)
+                "lead time ue={ue_id} target={} predictive_t={predictive_ms} \
+                 a3_t={}..{} lead_ms={}..{}",
+                cell(target_nci),
+                a3_ms.0,
+                a3_ms.1,
+                lead_ms.0,
+                lead_ms.1
+            ),
+            Event::Stranded {
+                ue_id,
+                target_nci,
+                a3_ms,
+            } => demo_log!(
+                warn,
+                D441D_KEY,
+                "stranded ue={ue_id} target={}: A3 fired at t={}..{} and neither the predictor \
+                 nor the A3 fallback moved the UE",
+                cell(target_nci),
+                a3_ms.0,
+                a3_ms.1
             ),
         }
     }
@@ -829,6 +850,12 @@ impl Task for NwdafTask {
                     }
                     #[cfg(feature = "demo-d441d-predictive-ho")]
                     NwdafMessage::ServedUes { ue_ids } => self.d441d_served(&ue_ids, now_ms()),
+                    #[cfg(feature = "demo-d441d-predictive-ho")]
+                    NwdafMessage::A3Fallback { ue_id } => {
+                        if let Some(st) = self.d441d.as_mut() {
+                            st.engine.on_a3_fallback(ue_id);
+                        }
+                    }
                 },
                 Some(TaskMessage::Shutdown) => {
                     info!("NWDAF task received shutdown signal");
@@ -1622,8 +1649,8 @@ mod tests {
             }
         }
 
-        /// The run loop routes RRC's `ServedUes` to the engine: `nwdaf-status`
-        /// then counts the served UE.
+        /// The run loop routes RRC's `ServedUes` and `A3Fallback` to the engine:
+        /// `nwdaf-status` then counts the served UEs and the fallback.
         #[tokio::test]
         async fn the_run_loop_routes_served_ues_to_the_engine() {
             let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
@@ -1636,12 +1663,17 @@ mod tests {
             }))
             .await
             .unwrap();
+            tx.send(TaskMessage::Message(NwdafMessage::A3Fallback { ue_id: 4 }))
+                .await
+                .unwrap();
             let (reply, answer) = oneshot::channel();
             tx.send(TaskMessage::Message(NwdafMessage::Status { reply }))
                 .await
                 .unwrap();
             let status: serde_json::Value = serde_json::from_str(&answer.await.unwrap()).unwrap();
             assert_eq!(status["handover"]["served_ues"], 2, "{status}");
+            assert_eq!(status["handover"]["a3_fallbacks"], 1, "{status}");
+            assert_eq!(status["handover"]["stranded"], 0, "{status}");
             tx.send(TaskMessage::Shutdown).await.unwrap();
             run.await.unwrap();
         }

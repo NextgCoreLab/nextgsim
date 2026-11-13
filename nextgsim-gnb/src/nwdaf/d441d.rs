@@ -7,26 +7,35 @@
 //! Two things are evaluated per UE, on the levels the RLS link already computes:
 //!
 //! - **The predictor** (modes `lsq`, `onnx`). Once a tick, for each UE this gNB
-//!   serves: the NWDAF trajectory prediction `HORIZON_MS` ahead must be
-//!   mobility ([`nextgsim_nwdaf::is_predicted_mobility`]: confidence above 0.7
-//!   and moving), the measured serving level must be falling, and at the
-//!   predicted position a positioned neighbour must beat this cell by the same
-//!   A3 margin the UE is configured with (`a3-Offset` plus hysteresis,
-//!   TS 38.331 §5.5.4.4), under the distance model alone. The predictor knows the
-//!   neighbour positions and the distance model, not the shadowing field.
-//! - **The shadow A3 evaluator** (every mode). On every heartbeat measurement:
-//!   inequality A3-1 between this cell's measured level and each neighbour's
-//!   level at the UE's position, held for `timeToTrigger`. The neighbour level
-//!   is the one the UE measures: the same [`ShadowedModel`] over the
-//!   [`DistanceModel`], keyed by the neighbour's NCI, with this gNB's
-//!   `shadowing` block (every gNB of a run uses the same one). It keeps running
-//!   after the UE has been handed away, because the UE still heartbeats this
-//!   cell, so the A3 time is known even when the predictive handover came first.
-//!   This is a gNB-side replica of the UE's A3 entering condition, at heartbeat
-//!   cadence, and not the UE's report itself.
+//!   serves and is not already handing over: the NWDAF trajectory prediction
+//!   `HORIZON_MS` ahead must be mobility ([`nextgsim_nwdaf::is_predicted_mobility`]:
+//!   confidence above 0.7 and moving), the measured serving level must be
+//!   falling, and at the predicted position a positioned neighbour must beat this
+//!   cell by the same A3 margin the UE is configured with (`a3-Offset` plus
+//!   hysteresis, TS 38.331 §5.5.4.4), under the distance model alone. The
+//!   predictor knows the neighbour positions and the distance model, not the
+//!   shadowing field.
+//! - **The shadow A3 replica** (every mode). The UE evaluates A3 only on its RRC
+//!   cycle (every [`UE_EVAL_PERIOD_MS`], `nextgsim-ue` `RRC_CYCLE_INTERVAL_MS`),
+//!   on the level of the latest heartbeat ack, and resolves `timeToTrigger` at
+//!   the next evaluation that still holds. The replica does the same: inequality
+//!   A3-1 between this cell's level and each neighbour's level at the UE's
+//!   heartbeat position, sampled on that grid. The gNB cannot know the UE's
+//!   cycle phase, so it runs the grid at [`PHASE_COUNT`] phases
+//!   [`PHASE_STEP_MS`] apart and reports the A3 time as the range
+//!   `[earliest - PHASE_STEP_MS, latest + PHASE_STEP_MS)` over them: the UE's own
+//!   report falls inside it whatever its phase (the integration test
+//!   `d441d_replica_brackets_the_ue_a3` pins this against the UE's evaluator).
+//!   The neighbour level is the one the UE measures: the same [`ShadowedModel`]
+//!   over the [`DistanceModel`], keyed by the neighbour's NCI, with this gNB's
+//!   `shadowing` block. Every gNB of a run must carry the same block; each logs
+//!   it at startup, which is what a run checks. The replica keeps running after
+//!   the UE has been handed away, because the UE still heartbeats this cell, so
+//!   the A3 time is known even when the predictive handover came first.
 //!
 //! Lead time is `A3 time - predictive time` for one UE, one target, one serving
-//! episode. It is not asserted positive: shadowing can bring A3 forward.
+//! episode, and is a range because the A3 time is. It is not asserted positive:
+//! shadowing can bring A3 forward.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
@@ -53,6 +62,31 @@ pub const RETRY_AFTER_MS: u64 = 3000;
 
 /// `timeToTrigger` of the A3 reporting configuration this gNB signals.
 pub const A3_TTT_MS: u64 = crate::rrc::meas::A3_TIME_TO_TRIGGER_MS as u64;
+
+/// How often the UE evaluates its measurement events: its RRC cycle
+/// (`nextgsim-ue` `RRC_CYCLE_INTERVAL_MS`, which `perform_cycle` runs on).
+pub const UE_EVAL_PERIOD_MS: u64 = 2500;
+
+/// Spacing of the UE-phase grid the replica runs.
+pub const PHASE_STEP_MS: u64 = 100;
+
+/// Phases of the grid: one UE evaluation period.
+pub const PHASE_COUNT: u64 = UE_EVAL_PERIOD_MS / PHASE_STEP_MS;
+
+/// In a predictive mode, how long after the UE's A3 report RRC waits for a
+/// predictive handover before acting on A3 itself (the `fallback=a3` path): one
+/// predictor tick.
+pub const A3_FALLBACK_GRACE_MS: u64 = TICK_MS;
+
+/// A served UE whose replica A3 completed this long ago with no predictive
+/// handover and no A3 fallback is reported stranded: the fallback would have
+/// acted by then (the report is due by the replica's latest time, the fallback
+/// one grace later, plus one UE cycle for a report that came late).
+pub const STRANDED_AFTER_MS: u64 = A3_FALLBACK_GRACE_MS + UE_EVAL_PERIOD_MS;
+
+/// A UE handed away by the predictor whose A3 never completes is forgotten
+/// after this long (it left radio range, say).
+pub const EVICT_AFTER_MS: u64 = 60_000;
 
 /// How many serving-level samples the RSRP trend is fitted over (the trajectory
 /// fit's own window).
@@ -106,17 +140,20 @@ pub enum Event {
         /// The last target.
         target_nci: u64,
     },
-    /// The shadow A3 evaluator's entering condition held for `timeToTrigger`.
+    /// The replica's A3 has fired at every phase: the UE's A3 report is in
+    /// `[t_lo_ms, t_hi_ms)`, whatever its cycle phase.
     A3WouldTrigger {
         /// The UE.
         ue_id: i32,
-        /// The neighbour that entered.
+        /// The neighbour that entered first.
         target_nci: u64,
-        /// When, in ms.
-        t_ms: u64,
-        /// This cell's level at the UE, dBm.
+        /// The earliest phase's trigger less [`PHASE_STEP_MS`], ms.
+        t_lo_ms: u64,
+        /// The latest phase's trigger plus [`PHASE_STEP_MS`], ms.
+        t_hi_ms: u64,
+        /// This cell's level at the UE at the earliest trigger, dBm.
         serving_dbm: i32,
-        /// The neighbour's level at the UE, dBm.
+        /// The neighbour's level then, dBm.
         neighbour_dbm: i32,
     },
     /// Both times are known for one serving episode.
@@ -127,10 +164,20 @@ pub enum Event {
         target_nci: u64,
         /// The first predictive attempt, ms.
         predictive_ms: u64,
-        /// The shadow A3 trigger, ms.
-        a3_ms: u64,
-        /// `a3_ms - predictive_ms`.
-        lead_ms: i64,
+        /// The A3 range, ms.
+        a3_ms: (u64, u64),
+        /// `a3_ms - predictive_ms`, as a range.
+        lead_ms: (i64, i64),
+    },
+    /// A served UE that neither the predictor nor the A3 fallback moved,
+    /// [`STRANDED_AFTER_MS`] after its A3 completed: a predictive-arm failure.
+    Stranded {
+        /// The UE.
+        ue_id: i32,
+        /// The neighbour A3 named.
+        target_nci: u64,
+        /// The A3 range, ms.
+        a3_ms: (u64, u64),
     },
 }
 
@@ -141,35 +188,73 @@ struct Neighbour {
     model: ShadowedModel,
 }
 
+/// The replica's A3 evaluation at one UE phase.
+#[derive(Default)]
+struct PhaseState {
+    /// The next evaluation instant, ms.
+    next_eval: Option<u64>,
+    /// A3-1 entering since, per neighbour NCI.
+    entering_since: HashMap<u64, u64>,
+    /// `(t, target, serving dBm, neighbour dBm)` once triggered.
+    fired: Option<(u64, u64, i32, i32)>,
+}
+
 #[derive(Default)]
 struct UeState {
     /// When this gNB's RRC last reported the UE as newly served.
     served_since_ms: Option<u64>,
     /// `(t, dBm)` of this cell at the UE, newest last.
     rsrp: VecDeque<(u64, i32)>,
-    /// A3-1 entering since, per neighbour NCI.
-    entering_since: HashMap<u64, u64>,
-    /// The shadow A3 trigger of this episode.
-    a3: Option<(u64, u64)>,
+    /// The previous heartbeat: `(t, this cell's dBm, position)`. The UE's
+    /// evaluations up to the next heartbeat read it.
+    last: Option<(u64, i32, SimCoord)>,
+    /// The replica, one entry per phase.
+    phases: Vec<PhaseState>,
+    /// The replica's completed A3 of this episode: `(target, t_lo, t_hi)`.
+    a3: Option<(u64, u64, u64)>,
     /// The first predictive attempt of this episode: `(target, t)`.
     predicted: Option<(u64, u64)>,
     attempts: u32,
     last_attempt_ms: Option<u64>,
     last_target: Option<u64>,
     exhausted: bool,
+    /// RRC acted on A3 for this episode (`fallback=a3`).
+    fell_back: bool,
+    /// The stranded event was emitted for this episode.
+    stranded: bool,
 }
 
-/// Counters for `nwdaf-status`.
+impl UeState {
+    fn new_episode(served_since_ms: Option<u64>) -> Self {
+        Self {
+            served_since_ms,
+            phases: (0..PHASE_COUNT).map(|_| PhaseState::default()).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Some phase of the replica has fired: the UE's A3 may already be out.
+    fn a3_started(&self) -> bool {
+        self.phases.iter().any(|p| p.fired.is_some())
+    }
+}
+
+/// Counters for `nwdaf-status`: the predictive arm's scorecard at this gNB.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct Stats {
     /// Predictive recommendations sent to RRC.
     pub predictions: u64,
     /// UEs whose attempts ran out.
     pub exhausted: u64,
-    /// Shadow A3 triggers.
+    /// Replica A3 triggers.
     pub a3_would_trigger: u64,
-    /// The latest lead times, ms, newest last.
-    pub lead_ms: Vec<i64>,
+    /// UEs RRC handed over on A3 because no predictive handover came
+    /// (`fallback=a3`).
+    pub a3_fallbacks: u64,
+    /// UEs left with no handover at all.
+    pub stranded: u64,
+    /// The latest lead times, `[min, max]` ms, newest last.
+    pub lead_ms: Vec<(i64, i64)>,
 }
 
 /// The D441D decision core of one gNB.
@@ -224,6 +309,15 @@ fn distance(a: &SimCoord, b: &Vector3) -> f64 {
         f64::from(a.z) - b.z,
     );
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+/// The first instant of phase `phase` (ms offset into the UE period) at or
+/// after `t`.
+fn first_eval_at_or_after(phase: u64, t: u64) -> u64 {
+    if t <= phase {
+        return phase;
+    }
+    phase + (t - phase).div_ceil(UE_EVAL_PERIOD_MS) * UE_EVAL_PERIOD_MS
 }
 
 /// The least-squares prediction for `ue_id` from `nwdaf`'s history, anchored at
@@ -303,26 +397,54 @@ impl Engine {
         self.served.len()
     }
 
-    /// RRC's served set. A UE that newly appears starts a serving episode: its
-    /// dwell clock, attempts, and A3 and predictive times start afresh.
+    /// How many UEs the engine holds state for (served, handed away by the
+    /// predictor, or with an A3 in progress).
+    pub fn tracked_count(&self) -> usize {
+        self.ues.len()
+    }
+
+    /// Whether `ue_id`'s state is worth keeping: served, handed away by the
+    /// predictor, or with an A3 in progress that has not completed.
+    fn keep(&self, ue_id: i32, st: &UeState) -> bool {
+        self.served.contains(&ue_id)
+            || (st.a3.is_none() && (st.predicted.is_some() || st.a3_started()))
+    }
+
+    /// RRC's served set: the connected UEs not already handing over. A UE that
+    /// newly appears starts a serving episode (its dwell clock, attempts, A3 and
+    /// predictive times start afresh); one that leaves is forgotten unless the
+    /// predictor handed it away or its A3 is in progress.
     pub fn set_served(&mut self, ue_ids: &[i32], now_ms: u64) {
         let now: BTreeSet<i32> = ue_ids.iter().copied().collect();
         for &ue in now.difference(&self.served) {
-            let st = self.ues.entry(ue).or_default();
-            st.served_since_ms = Some(now_ms);
-            st.entering_since.clear();
-            st.a3 = None;
-            st.predicted = None;
-            st.attempts = 0;
-            st.last_attempt_ms = None;
-            st.last_target = None;
-            st.exhausted = false;
+            let rsrp = self.ues.remove(&ue).map(|s| s.rsrp).unwrap_or_default();
+            let mut st = UeState::new_episode(Some(now_ms));
+            st.rsrp = rsrp;
+            self.ues.insert(ue, st);
         }
         self.served = now;
+        let drop: Vec<i32> = self
+            .ues
+            .iter()
+            .filter(|(id, st)| !self.keep(**id, st))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in drop {
+            self.ues.remove(&id);
+        }
+    }
+
+    /// RRC acted on A3 for `ue_id` because no predictive handover came
+    /// (`fallback=a3`).
+    pub fn on_a3_fallback(&mut self, ue_id: i32) {
+        self.stats.a3_fallbacks += 1;
+        if let Some(st) = self.ues.get_mut(&ue_id) {
+            st.fell_back = true;
+        }
     }
 
     /// One heartbeat measurement of `ue_id`: this cell's level at the UE and
-    /// where it is. Feeds the RSRP trend and the shadow A3 evaluator.
+    /// where it is. Feeds the RSRP trend and the A3 replica.
     pub fn on_measurement(
         &mut self,
         ue_id: i32,
@@ -331,50 +453,91 @@ impl Engine {
         now_ms: u64,
     ) -> Vec<Event> {
         let served = self.served.contains(&ue_id);
-        let st = self.ues.entry(ue_id).or_default();
+        // A UE this gNB neither serves nor tracks is not this gNB's to evaluate
+        // (every gNB hears every UE); nothing is kept for it.
+        let Some(st) = self.ues.get_mut(&ue_id) else {
+            return Vec::new();
+        };
         st.rsrp.push_back((now_ms, serving_dbm));
         while st.rsrp.len() > RSRP_WINDOW {
             st.rsrp.pop_front();
         }
-        // Served here, or handed away by the predictor and not yet seen by A3.
-        if st.a3.is_some() || !(served || st.predicted.is_some()) {
+        let previous = st.last.replace((now_ms, serving_dbm, pos));
+        if st.a3.is_some() {
             return Vec::new();
         }
-        let mut fired: Option<(u64, i32)> = None;
-        for nb in &self.neighbours {
-            let mn = nb.model.estimate_dbm(&nb.pos, &pos);
-            // A3-1, in 0.5 dB units: Mn - Hys > Mp + Off.
-            if 2 * mn - self.hys_half > 2 * serving_dbm + self.off_half {
-                let since = *st.entering_since.entry(nb.nci).or_insert(now_ms);
-                if now_ms.saturating_sub(since) >= A3_TTT_MS
-                    && fired.is_none_or(|(_, best)| mn > best)
-                {
-                    fired = Some((nb.nci, mn));
+        // The UE's evaluations between the previous heartbeat and this one read
+        // the previous heartbeat's levels.
+        if let Some((t_prev, mp, p_prev)) = previous {
+            let levels: Vec<(u64, i32)> = self
+                .neighbours
+                .iter()
+                .map(|nb| (nb.nci, nb.model.estimate_dbm(&nb.pos, &p_prev)))
+                .collect();
+            for (i, ph) in st.phases.iter_mut().enumerate() {
+                let phase = i as u64 * PHASE_STEP_MS;
+                let mut tau = ph
+                    .next_eval
+                    .unwrap_or_else(|| first_eval_at_or_after(phase, t_prev));
+                while tau < now_ms && ph.fired.is_none() {
+                    let mut best: Option<(u64, i32)> = None;
+                    for &(nci, mn) in &levels {
+                        // A3-1, in 0.5 dB units: Mn - Hys > Mp + Off.
+                        if 2 * mn - self.hys_half > 2 * mp + self.off_half {
+                            let since = *ph.entering_since.entry(nci).or_insert(tau);
+                            if tau.saturating_sub(since) >= A3_TTT_MS
+                                && best.is_none_or(|(_, b)| mn > b)
+                            {
+                                best = Some((nci, mn));
+                            }
+                        } else {
+                            ph.entering_since.remove(&nci);
+                        }
+                    }
+                    if let Some((nci, mn)) = best {
+                        ph.fired = Some((tau, nci, mp, mn));
+                    }
+                    tau += UE_EVAL_PERIOD_MS;
                 }
-            } else {
-                st.entering_since.remove(&nb.nci);
+                ph.next_eval = Some(tau);
             }
         }
-        let Some((target_nci, neighbour_dbm)) = fired else {
+        if st.phases.iter().any(|p| p.fired.is_none()) {
             return Vec::new();
-        };
-        st.a3 = Some((target_nci, now_ms));
+        }
+        let fired: Vec<(u64, u64, i32, i32)> = st.phases.iter().filter_map(|p| p.fired).collect();
+        let first = *fired.iter().min_by_key(|f| f.0).expect("every phase fired");
+        // A UE phase between two grid phases can read one heartbeat like the
+        // later and the next like the earlier, so it may fire up to one grid
+        // step before the earliest grid phase, and before the latest plus one.
+        let t_lo = first.0.saturating_sub(PHASE_STEP_MS);
+        let t_hi = fired.iter().map(|f| f.0).max().unwrap_or(first.0) + PHASE_STEP_MS;
+        st.a3 = Some((first.1, t_lo, t_hi));
+        let predicted = st.predicted;
         self.stats.a3_would_trigger += 1;
         let mut events = vec![Event::A3WouldTrigger {
             ue_id,
-            target_nci,
-            t_ms: now_ms,
-            serving_dbm,
-            neighbour_dbm,
+            target_nci: first.1,
+            t_lo_ms: t_lo,
+            t_hi_ms: t_hi,
+            serving_dbm: first.2,
+            neighbour_dbm: first.3,
         }];
-        if let Some((target, t)) = st.predicted {
-            events.push(self.lead(ue_id, target, t, now_ms));
+        if let Some((target, t)) = predicted {
+            events.push(self.lead(ue_id, target, t, (t_lo, t_hi)));
+        }
+        // Handed away and seen by A3: nothing more to measure for it here.
+        if !served {
+            self.ues.remove(&ue_id);
         }
         events
     }
 
-    fn lead(&mut self, ue_id: i32, target_nci: u64, predictive_ms: u64, a3_ms: u64) -> Event {
-        let lead_ms = a3_ms as i64 - predictive_ms as i64;
+    fn lead(&mut self, ue_id: i32, target_nci: u64, predictive_ms: u64, a3: (u64, u64)) -> Event {
+        let lead_ms = (
+            a3.0 as i64 - predictive_ms as i64,
+            a3.1 as i64 - predictive_ms as i64,
+        );
         self.stats.lead_ms.push(lead_ms);
         if self.stats.lead_ms.len() > LEADS_KEPT {
             self.stats.lead_ms.remove(0);
@@ -383,25 +546,58 @@ impl Engine {
             ue_id,
             target_nci,
             predictive_ms,
-            a3_ms,
+            a3_ms: a3,
             lead_ms,
         }
     }
 
     /// One predictor tick. `predict` gives a UE's trajectory prediction
     /// [`HORIZON_MS`] ahead and what produced it. With `predictive` false (mode
-    /// `a3`) nothing is predicted.
+    /// `a3`) nothing is predicted (and nothing can be stranded: A3 acts).
     pub fn tick<F>(&mut self, now_ms: u64, predictive: bool, mut predict: F) -> Vec<Event>
     where
         F: FnMut(i32) -> Option<(TrajectoryPrediction, Predictor)>,
     {
         let mut events = Vec::new();
+        // Forget UEs handed away whose A3 never completed.
+        let stale: Vec<i32> = self
+            .ues
+            .iter()
+            .filter(|(id, st)| {
+                !self.served.contains(id)
+                    && st
+                        .predicted
+                        .is_some_and(|(_, t)| now_ms.saturating_sub(t) > EVICT_AFTER_MS)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            self.ues.remove(&id);
+        }
         if !predictive {
             return events;
         }
         let served: Vec<i32> = self.served.iter().copied().collect();
         for ue_id in served {
-            let st = self.ues.entry(ue_id).or_default();
+            let Some(st) = self.ues.get_mut(&ue_id) else {
+                continue;
+            };
+            // Stranded: A3 completed, nothing moved the UE.
+            if let Some((target, lo, hi)) = st.a3 {
+                if st.predicted.is_none()
+                    && !st.fell_back
+                    && !st.stranded
+                    && now_ms.saturating_sub(hi) >= STRANDED_AFTER_MS
+                {
+                    st.stranded = true;
+                    self.stats.stranded += 1;
+                    events.push(Event::Stranded {
+                        ue_id,
+                        target_nci: target,
+                        a3_ms: (lo, hi),
+                    });
+                }
+            }
             if st.exhausted {
                 continue;
             }
@@ -437,13 +633,12 @@ impl Engine {
                 continue;
             };
             let serving = -distance(&self.own_pos, end);
+            let (hys, off) = (f64::from(self.hys_half), f64::from(self.off_half));
             let target = self
                 .neighbours
                 .iter()
                 .map(|nb| (nb.nci, -distance(&nb.pos, end)))
-                .filter(|(_, mn)| {
-                    2.0 * mn - f64::from(self.hys_half) > 2.0 * serving + f64::from(self.off_half)
-                })
+                .filter(|(_, mn)| 2.0 * mn - hys > 2.0 * serving + off)
                 .max_by(|a, b| a.1.total_cmp(&b.1));
             let Some((target_nci, _)) = target else {
                 continue;
@@ -465,8 +660,8 @@ impl Engine {
                 confidence: prediction.confidence,
                 attempt,
             });
-            if let (true, Some((_, a3_ms))) = (first, a3) {
-                events.push(self.lead(ue_id, target_nci, now_ms, a3_ms));
+            if let (true, Some((_, lo, hi))) = (first, a3) {
+                events.push(self.lead(ue_id, target_nci, now_ms, (lo, hi)));
             }
         }
         events
@@ -546,7 +741,7 @@ mod tests {
     struct Run {
         predictive_ms: Option<u64>,
         a3_ms: Option<u64>,
-        lead_ms: Option<i64>,
+        lead_ms: Option<(i64, i64)>,
         predictions: u32,
     }
 
@@ -588,71 +783,84 @@ mod tests {
                         run.predictive_ms.get_or_insert(now);
                         engine.set_served(&[], now); // handed over
                     }
-                    Event::A3WouldTrigger { target_nci, .. } => {
+                    Event::A3WouldTrigger {
+                        target_nci,
+                        t_lo_ms,
+                        ..
+                    } => {
                         assert_eq!(target_nci, EAST);
-                        run.a3_ms = Some(now);
+                        run.a3_ms = Some(t_lo_ms);
                     }
                     Event::LeadTime { lead_ms, .. } => run.lead_ms = Some(lead_ms),
-                    Event::Exhausted { .. } => panic!("one attempt hands the UE away"),
+                    other => panic!("{other:?}"),
                 }
             }
         }
         run
     }
 
-    /// A3-1 has to hold for timeToTrigger: one sample past the margin is not
-    /// enough, two a heartbeat apart are; and once triggered it is not
-    /// re-reported in the episode. A sample back inside the margin restarts it.
+    /// A heartbeat at `t` (ms) with this cell at `mp` dBm and the UE at x.
+    fn hb(e: &mut Engine, t: u64, mp: i32, x: i32) -> Vec<Event> {
+        e.on_measurement(1, mp, SimCoord::new(x, 0, 0), t)
+    }
+
+    /// The replica samples A3-1 on the UE's 2.5 s grid at every phase and
+    /// reports the range: with the condition holding from t 10 000 on, the
+    /// earliest phase fires at its second true evaluation, 12 500, and the
+    /// latest at 14 900, so the UE's A3 is in [12 400, 15 000) (one grid step of
+    /// slack each side, for a UE phase between two grid phases). It fires once.
+    /// A neighbour exactly 4 dB better (the margin, not past it) never fires.
     #[test]
-    fn the_shadow_a3_needs_the_margin_for_time_to_trigger() {
-        let config = west(0.0, 1);
-        let mut e = Engine::from_config(&config).unwrap();
+    fn the_replica_fires_on_the_ues_evaluation_grid() {
+        let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
         e.set_served(&[1], 0);
-        // At x 62 east is -58, west -62: 4 dB, not past 3 + 1 dB.
-        assert!(e
-            .on_measurement(1, -62, SimCoord::new(62, 0, 0), 0)
-            .is_empty());
-        // At x 63: east -57 vs west -63, 6 dB > 4 dB: entering, TTT starts.
-        assert!(e
-            .on_measurement(1, -63, SimCoord::new(63, 0, 0), 1000)
-            .is_empty());
-        // Back to 4 dB: the run is broken.
-        assert!(e
-            .on_measurement(1, -62, SimCoord::new(62, 0, 0), 2000)
-            .is_empty());
-        assert!(e
-            .on_measurement(1, -63, SimCoord::new(63, 0, 0), 3000)
-            .is_empty());
-        let ev = e.on_measurement(1, -64, SimCoord::new(64, 0, 0), 4000);
+        // x 62: east -58 vs west -62, 4 dB: not past 3 + 1 dB.
+        for t in (0..10).map(|s| s * 1000) {
+            assert!(hb(&mut e, t, -62, 62).is_empty(), "t {t}");
+        }
+        // x 64: east -56 vs west -64, 8 dB, from 10 s on.
+        let mut fired = Vec::new();
+        for t in (10..30).map(|s| s * 1000) {
+            fired.extend(hb(&mut e, t, -64, 64));
+        }
         assert_eq!(
-            ev,
+            fired,
             vec![Event::A3WouldTrigger {
                 ue_id: 1,
                 target_nci: EAST,
-                t_ms: 4000,
+                t_lo_ms: 12_400,
+                t_hi_ms: 15_000,
                 serving_dbm: -64,
                 neighbour_dbm: -56,
             }]
         );
-        assert!(e
-            .on_measurement(1, -70, SimCoord::new(70, 0, 0), 5000)
-            .is_empty());
         assert_eq!(e.stats().a3_would_trigger, 1);
     }
 
-    /// The neighbour level the evaluator uses is the shadowed one the UE
+    /// One evaluation past the margin is not enough. A single heartbeat past it
+    /// is read by at most one evaluation per phase (evaluations are 2.5 s apart,
+    /// a heartbeat's level stands for 1 s), so no phase holds it for
+    /// timeToTrigger: nothing fires.
+    #[test]
+    fn the_replica_needs_two_evaluations_past_the_margin() {
+        let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+        e.set_served(&[1], 0);
+        for s in 0..40u64 {
+            let (mp, x) = if s == 10 { (-64, 64) } else { (-60, 60) };
+            assert!(hb(&mut e, s * 1000, mp, x).is_empty(), "s {s}");
+        }
+    }
+
+    /// The neighbour level the replica uses is the shadowed one the UE
     /// measures, keyed by the neighbour's NCI: at a point where shadowing moves
     /// east's level across the margin, the verdict differs from σ 0.
     #[test]
-    fn the_shadow_a3_sees_the_neighbours_shadowed_level() {
-        // Find a seed and a point near the crossing where east's offset alone
-        // decides: σ 0 says no (east 4 dB better), the shadowed level says yes.
+    fn the_replica_sees_the_neighbours_shadowed_level() {
         let mut found = None;
         'seeds: for seed in 1..200u64 {
             let c = west(6.0, seed);
             for x in 55..62 {
-                let p = pos(x, 0);
-                let mn = level(&c, EAST, pos(120, 0), p);
+                let mn = level(&c, EAST, pos(120, 0), pos(x, 0));
                 if 2 * mn - 2 > 2 * (-x) + 6 {
                     found = Some((c, x));
                     break 'seeds;
@@ -665,24 +873,20 @@ mod tests {
             e.set_served(&[1], 0);
             // This cell's own level is passed in unshadowed in both, so only
             // the neighbour's level differs.
-            e.on_measurement(1, -x, SimCoord::new(x, 0, 0), 0);
-            let fired = !e
-                .on_measurement(1, -x, SimCoord::new(x, 0, 0), 1000)
-                .is_empty();
+            let fired = (0..10u64).any(|s| !hb(&mut e, s * 1000, -x, x).is_empty());
             assert_eq!(fired, expect, "x {x}");
         }
     }
 
-    /// A UE that is neither served here nor handed away by the predictor is not
-    /// evaluated: the target gNB hears every UE too.
+    /// A UE this gNB never served is not evaluated, and nothing is kept for it:
+    /// the target gNB hears every UE too.
     #[test]
-    fn the_shadow_a3_ignores_a_ue_this_gnb_never_served() {
+    fn the_replica_ignores_a_ue_this_gnb_never_served() {
         let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
-        for t in 0..5 {
-            assert!(e
-                .on_measurement(9, -80, SimCoord::new(80, 0, 0), t * 1000)
-                .is_empty());
+        for t in 0..10 {
+            assert!(hb(&mut e, t * 1000, -80, 80).is_empty());
         }
+        assert_eq!(e.tracked_count(), 0);
     }
 
     fn straight(engine: &mut Engine, nwdaf: &mut NwdafManager, ue: i32, from_s: u64, to_s: u64) {
@@ -707,6 +911,26 @@ mod tests {
         now: u64,
     ) -> impl FnMut(i32) -> Option<(TrajectoryPrediction, Predictor)> + '_ {
         move |id| lsq_prediction(nwdaf, id, HORIZON_MS, now).map(|p| (p, Predictor::Lsq))
+    }
+
+    /// A fixed prediction ending at `end_x`, moving east at 5 m/s.
+    fn ending_at(end_x: f64) -> impl FnMut(i32) -> Option<(TrajectoryPrediction, Predictor)> {
+        move |_id| {
+            Some((
+                TrajectoryPrediction {
+                    ue_id: 1,
+                    waypoints: (1..=10u32)
+                        .map(|i| {
+                            let x = end_x - f64::from(10 - i);
+                            (Vector3::new(x, 0.0, 0.0), u64::from(i) * 200)
+                        })
+                        .collect(),
+                    confidence: 0.95,
+                    horizon_ms: HORIZON_MS,
+                },
+                Predictor::Lsq,
+            ))
+        }
     }
 
     /// On a straight walk east at 5 m/s the predictor names east once the
@@ -737,7 +961,7 @@ mod tests {
         assert_eq!(e.stats().a3_would_trigger, 0, "A3 has not seen it yet");
     }
 
-    /// A UE that stands still, or wanders with no trend, is not predicted.
+    /// A UE that wanders with no trend is not predicted.
     #[test]
     fn the_predictor_needs_mobility() {
         let mut nwdaf = NwdafManager::new(100);
@@ -800,26 +1024,9 @@ mod tests {
             let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
             e.set_served(&[1], 0);
             for (s, x) in [(0u64, 40), (1, 45), (2, 50)] {
-                e.on_measurement(1, -x, SimCoord::new(x, 0, 0), s * 1000);
+                hb(&mut e, s * 1000, -x, x);
             }
-            let fired = !e
-                .tick(5000, true, |_| {
-                    Some((
-                        TrajectoryPrediction {
-                            ue_id: 1,
-                            waypoints: (1..=10u32)
-                                .map(|i| {
-                                    let x = end_x - f64::from(10 - i);
-                                    (Vector3::new(x, 0.0, 0.0), u64::from(i) * 200)
-                                })
-                                .collect(),
-                            confidence: 0.95,
-                            horizon_ms: HORIZON_MS,
-                        },
-                        Predictor::Lsq,
-                    ))
-                })
-                .is_empty();
+            let fired = !e.tick(5000, true, ending_at(end_x)).is_empty();
             assert_eq!(fired, expect, "end x {end_x}");
         }
     }
@@ -830,9 +1037,10 @@ mod tests {
     fn a_newly_served_ue_dwells_before_the_predictor_moves_it() {
         let mut nwdaf = NwdafManager::new(100);
         let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
-        straight(&mut e, &mut nwdaf, 1, 0, 8);
+        straight(&mut e, &mut nwdaf, 1, 0, 4);
         // Served (handed in) at 4 s: at 7 s it has dwelt 3 s.
         e.set_served(&[1], 4000);
+        straight(&mut e, &mut nwdaf, 1, 4, 8);
         assert!(e.tick(7000, true, lsq(&nwdaf, 7000)).is_empty());
         straight(&mut e, &mut nwdaf, 1, 8, 10);
         let ev = e.tick(9000, true, lsq(&nwdaf, 9000));
@@ -854,8 +1062,8 @@ mod tests {
         let mut attempts = Vec::new();
         let mut exhausted = 0;
         for s in 7..30u64 {
-            // The UE stays where it was last measured moving: the fit still
-            // predicts east, as for a UE whose handover keeps failing.
+            // The fit still predicts east, as for a UE whose handover keeps
+            // failing.
             for ev in e.tick(s * 1000, true, lsq(&nwdaf, 7000)) {
                 match ev {
                     Event::Prediction { attempt, .. } => attempts.push((s, attempt)),
@@ -881,60 +1089,125 @@ mod tests {
     }
 
     /// The predictive time is kept for the A3 that follows the handover, and the
-    /// lead time is emitted with its sign whichever comes second.
+    /// lead time is emitted as a range with its sign, whichever comes second.
     #[test]
-    fn the_lead_time_is_emitted_with_its_sign() {
+    fn the_lead_time_is_a_range_with_its_sign() {
         let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
         e.set_served(&[1], 0);
-        let pred = |x: f64| {
-            move |_id: i32| {
-                Some((
-                    TrajectoryPrediction {
-                        ue_id: 1,
-                        waypoints: (1..=10u32)
-                            .map(|i| (Vector3::new(x + f64::from(i), 0.0, 0.0), u64::from(i) * 200))
-                            .collect(),
-                        confidence: 0.95,
-                        horizon_ms: HORIZON_MS,
-                    },
-                    Predictor::Lsq,
-                ))
-            }
-        };
         for (s, x) in [(0u64, 40), (1, 45), (2, 50)] {
-            e.on_measurement(1, -x, SimCoord::new(x, 0, 0), s * 1000);
+            hb(&mut e, s * 1000, -x, x);
         }
-        e.tick(5000, true, pred(70.0));
+        e.tick(5000, true, ending_at(70.0));
         e.set_served(&[], 5500); // handed away; heartbeats go on
-        e.on_measurement(1, -64, SimCoord::new(64, 0, 0), 7000);
-        let ev = e.on_measurement(1, -65, SimCoord::new(65, 0, 0), 8000);
+        let mut ev = Vec::new();
+        for s in 6..14u64 {
+            ev.extend(hb(&mut e, s * 1000, -65, 65));
+        }
+        // True from the 6 s heartbeat: phase 1000 evaluates at 6000, so the
+        // earliest fires at 8500 and the latest at 10 900: [8400, 11 000).
         assert!(
             ev.contains(&Event::LeadTime {
                 ue_id: 1,
                 target_nci: EAST,
                 predictive_ms: 5000,
-                a3_ms: 8000,
-                lead_ms: 3000,
+                a3_ms: (8400, 11_000),
+                lead_ms: (3400, 6000),
             }),
             "{ev:?}"
+        );
+        assert_eq!(
+            e.tracked_count(),
+            0,
+            "handed away and seen by A3: forgotten"
         );
         // A3 first, prediction later: a negative lead, on the prediction.
         let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
         e.set_served(&[1], 0);
-        for (s, x) in [(0u64, 60), (1, 63), (2, 64)] {
-            e.on_measurement(1, -x, SimCoord::new(x, 0, 0), s * 1000);
+        for s in 0..6u64 {
+            hb(&mut e, s * 1000, -64 - s as i32, 64);
         }
-        let ev = e.tick(6000, true, pred(70.0));
+        let ev = e.tick(6000, true, ending_at(70.0));
         assert!(
             ev.contains(&Event::LeadTime {
                 ue_id: 1,
                 target_nci: EAST,
                 predictive_ms: 6000,
-                a3_ms: 2000,
-                lead_ms: -4000,
+                a3_ms: (2400, 5000),
+                lead_ms: (-3600, -1000),
             }),
             "{ev:?}"
         );
+    }
+
+    /// A served UE whose A3 completed with no predictive handover and no A3
+    /// fallback is reported stranded once, STRANDED_AFTER_MS later; an A3
+    /// fallback for it means it is not.
+    #[test]
+    fn a_ue_nothing_moves_is_stranded_once() {
+        for fell_back in [false, true] {
+            let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+            e.set_served(&[1], 0);
+            let mut stranded = Vec::new();
+            for s in 0..20u64 {
+                hb(&mut e, s * 1000, -64, 64); // A3 in [2400, 5000)
+                if s == 6 && fell_back {
+                    e.on_a3_fallback(1);
+                }
+                // The predictor never fires (e.g. a turn keeps confidence low).
+                stranded.extend(e.tick(s * 1000, true, |_| None));
+            }
+            if fell_back {
+                assert!(stranded.is_empty(), "{stranded:?}");
+                assert_eq!(e.stats().a3_fallbacks, 1);
+            } else {
+                assert_eq!(
+                    stranded,
+                    vec![Event::Stranded {
+                        ue_id: 1,
+                        target_nci: EAST,
+                        a3_ms: (2400, 5000),
+                    }]
+                );
+                // Due at 5000 + STRANDED_AFTER_MS = 8500: the 9 s tick.
+                assert_eq!(e.stats().stranded, 1);
+            }
+        }
+    }
+
+    /// Mode `a3` is never stranded: A3 acts there.
+    #[test]
+    fn mode_a3_is_never_stranded() {
+        let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+        e.set_served(&[1], 0);
+        for s in 0..20u64 {
+            hb(&mut e, s * 1000, -64, 64);
+            assert!(e.tick(s * 1000, false, |_| None).is_empty());
+        }
+        assert_eq!(e.stats().stranded, 0);
+    }
+
+    /// State is kept only while it means something: a UE that leaves the served
+    /// set unpredicted and with no A3 in progress is forgotten at once; one the
+    /// predictor handed away is forgotten when its A3 completes, or after
+    /// EVICT_AFTER_MS if it never does.
+    #[test]
+    fn ue_state_is_evicted() {
+        let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+        e.set_served(&[1, 2], 0);
+        hb(&mut e, 0, -40, 40);
+        e.set_served(&[2], 1000);
+        assert_eq!(e.tracked_count(), 1, "UE 1 left unpredicted");
+        // UE 2 is handed away by the predictor and never heard again.
+        for (s, x) in [(1u64, 40), (2, 45), (3, 50)] {
+            e.on_measurement(2, -x, SimCoord::new(x, 0, 0), s * 1000);
+        }
+        assert_eq!(e.tick(5000, true, ending_at(70.0)).len(), 1);
+        e.set_served(&[], 5500);
+        assert_eq!(e.tracked_count(), 1, "kept for its A3");
+        e.tick(5000 + EVICT_AFTER_MS, true, |_| None);
+        assert_eq!(e.tracked_count(), 1, "not yet");
+        e.tick(5001 + EVICT_AFTER_MS, true, |_| None);
+        assert_eq!(e.tracked_count(), 0);
     }
 
     /// A config with no positioned neighbour cannot run the demo.
@@ -951,12 +1224,12 @@ mod tests {
     /// - With σ 0 the predictor leads A3 (the geometry alone).
     /// - On every seed the predictor triggers once and A3 follows; the A3 time
     ///   moves with the seed (shadowing is what the arms differ on).
-    /// - The lead is positive on most seeds (at least 20 of 24), and the
-    ///   median is positive. It is not asserted positive on every seed.
+    /// - The lead's lower bound is positive on most seeds (at least 20 of 24),
+    ///   and its median is positive. It is not asserted positive on every seed.
     #[test]
     fn the_seeded_replay_leads_a3_on_most_seeds() {
         let base = replay(&west(0.0, 1), true);
-        assert!(base.lead_ms.unwrap() > 0, "{base:?}");
+        assert!(base.lead_ms.unwrap().0 > 0, "{base:?}");
         let mut leads = Vec::new();
         let mut a3_times = BTreeSet::new();
         for seed in 1..=24u64 {
@@ -971,10 +1244,10 @@ mod tests {
             );
         }
         leads.sort_unstable();
-        let positive = leads.iter().filter(|l| **l > 0).count();
-        eprintln!("D441D replay leads (ms, sorted, 24 seeds): {leads:?}");
+        let positive = leads.iter().filter(|l| l.0 > 0).count();
+        eprintln!("D441D replay leads ([min, max] ms, sorted, 24 seeds): {leads:?}");
         assert!(a3_times.len() > 1, "the A3 time must move with the seed");
         assert!(positive >= 20, "{positive}/24 positive: {leads:?}");
-        assert!(leads[12] > 0, "median {leads:?}");
+        assert!(leads[12].0 > 0, "median {leads:?}");
     }
 }

@@ -61,27 +61,47 @@ position and this cell's level at the UE. Two evaluators run on it:
   not know the shadowing field. Its recommendation goes to RRC on the existing
   NWDAF path (`handle_nwdaf_handover` → `execute_handover`), and from there as
   HANDOVER REQUIRED.
-- **The shadow A3 evaluator** runs in every mode. It checks inequality A3-1
-  between this cell's level and each neighbour's, held for `timeToTrigger`
-  (640 ms). The neighbour's level is the one the UE measures: the same shadowed
-  distance model, keyed by the neighbour's NCI, with the same `shadowing`
-  block (every gNB of a run uses one).
+- **The shadow A3 replica** runs in every mode. The UE evaluates its A3 event
+  only once per RRC cycle, every 2.5 s (`RRC_CYCLE_INTERVAL_MS`), on the level
+  of the latest heartbeat ack. It reports at the next evaluation that still
+  holds `timeToTrigger` (640 ms). The replica evaluates inequality A3-1 the same
+  way, on that grid.
 
-  It keeps running after a predictive handover, because the UE still
-  heartbeats this cell. That is how the A3 time is known even when the
-  prediction came first. It is a gNB-side replica of the UE's A3 entering
-  condition at heartbeat cadence (1 s), not the UE's report itself.
+  The gNB cannot know the UE's cycle phase. So it runs the grid at 25 phases
+  100 ms apart and reports A3 as a range: `[earliest - 100 ms, latest + 100 ms)`,
+  2.6 s wide. The UE's own first report falls inside it at any phase. The
+  integration test `d441d_replica_brackets_the_ue_a3` checks this against the
+  UE's real `MeasurementManager`, at off-grid phases, on 24 seeds.
+
+  The neighbour's level is the one the UE measures: the same shadowed distance
+  model, keyed by the neighbour's NCI, with the same `shadowing` block. Every
+  gNB of a run must carry the same block. Each gNB logs it at startup, and a run
+  checks that the lines agree. The replica keeps running after a predictive
+  handover, because the UE still heartbeats this cell. That is how the A3 time
+  is known even when the prediction came first.
 
 The guards:
 
+- **Who is predicted:** RRC reports the UEs it has connected and is not
+  already handing over. A context in setup, or a handover-in that has not
+  arrived, is not included. A UE whose HANDOVER COMMAND has gone out is not
+  recommended again.
 - **Ping-pong:** a UE served for less than 5 s is not predicted away.
 - **Retries:** a UE still served 3 s after an attempt is tried again, at most
   3 times. Then one `exhausted` line is logged, and nothing more until the UE
   is served again.
+- **A3 fallback:** in `lsq` and `onnx`, the UE's real A3 MeasurementReport is
+  logged and held. If no predictive handover has started within 1 s of the
+  first report, RRC acts on A3 after all. It logs
+  `[demo:d441d-predictive-ho] A3 fallback=a3 n=<count> UE[<id>] PCI <pci>: ...`
+  and counts it in the scorecard. This is a predictive-arm failure: A3 moved
+  the UE, not the predictor.
+- **Stranded:** a served UE whose replica A3 completed 3.5 s ago, with neither
+  a predictive handover nor an A3 fallback, is logged as
+  `stranded ue=.. target=..` and counted.
 
-In modes `lsq` and `onnx`, A3 is in shadow: an A3 MeasurementReport naming a
-neighbour is logged and not acted on. In mode `a3`, and with the demo off, the
-#162 A3 path is unchanged.
+In modes `lsq` and `onnx`, A3 is in shadow, apart from the fallback above. In
+mode `a3`, and with the demo off, the #162 A3 path is unchanged.
 
 ### Components and toggles
 
@@ -121,7 +141,9 @@ The demo follows the #458 toggle convention:
   `show` / `demo metrics` (`nextg_demo_enabled`). A switch applies from the next
   tick and is audited.
 - **Status.** `nr-cli <gnb> nwdaf-status` gains a `handover` section: mode,
-  served UEs, predictions, exhausted, A3 triggers, and the last lead times.
+  served UEs, predictions, exhausted, A3 triggers, A3 fallbacks, stranded, and
+  the last lead times as `[min, max]` ranges. These counts are the predictive
+  arm's scorecard at this gNB.
 - **Shadowing** is a separate base block, identical in every mode.
 
 ### The log chain (strings the code emits)
@@ -134,14 +156,14 @@ Predictive arm, at the source gNB, then amfd (the amfd string is the one
 RRC: NWDAF-recommended handover for UE <id> to cell 32 (confidence 0.98)
 Sent Handover Required: amf_ue_ngap_id=..., ran_ue_ngap_id=...
 (amfd) HandoverNotify from association <target> (amf_ue_ngap_id=..., ran_ue_ngap_id=...)
-[demo:d441d-predictive-ho] A3 would trigger t=<ms> ue=<id> target=32 serving=<dBm> dBm neighbour=<dBm> dBm
-[demo:d441d-predictive-ho] lead time ue=<id> target=32 predictive_t=<ms> a3_t=<ms> lead_ms=<ms>
+[demo:d441d-predictive-ho] A3 would trigger t=<lo>..<hi> ue=<id> target=32 serving=<dBm> dBm neighbour=<dBm> dBm (the UE's A3 on its 2.5 s cycle, at an unknown phase)
+[demo:d441d-predictive-ho] lead time ue=<id> target=32 predictive_t=<ms> a3_t=<lo>..<hi> lead_ms=<min>..<max>
 ```
 
 In the A3 arm, the handover follows the UE's A3 MeasurementReport
 (`measurement-triggered N2 handover to PCI 32`). There is no `NWDAF-recommended`
-line, and the shadow `A3 would trigger` line calibrates the evaluator against
-the real report.
+line. The real report's time falls inside the replica's `A3 would trigger`
+range, which is what the arm checks the replica against.
 
 ## How to run it
 
@@ -172,12 +194,19 @@ UE handed away at the prediction, on seeds 1..=24 at σ 4 dB. It is a positive
 control for the logic, not a result of the demo:
 
 - the predictor triggers once on every seed;
-- the lead is positive on every seed: 1 to 4 s, median 3 s;
+- the lead's lower bound is positive on every seed: 2.4 to 5.4 s, median 4.4 s.
+  The upper bound is 2.6 s more;
 - the A3 time moves with the seed.
 
-On 100 further seeds (25..=124), the lead was positive on 100 at σ 4 dB (median
-2 s), and on 96 at σ 8 dB (median 2 s, minimum 0). It does not model amfd, the
-NGAP round trip or a ping-pong at the target.
+On 100 further seeds (25..=124), the lower bound was positive on all 100:
+
+| σ | lower bound: median | lower bound: range | upper bound: median |
+|---|---|---|---|
+| 4 dB | 3.4 s | 2.4..5.4 s | 6.0 s |
+| 8 dB | 3.4 s | 1.4..7.4 s | 6.0 s |
+
+The replay does not model amfd, the NGAP round trip, the A3 fallback, or a
+ping-pong at the target.
 
 ## Honesty labels and limitations
 
@@ -191,10 +220,16 @@ NGAP round trip or a ping-pong at the target.
   such: `predictor=fallback` when no verified model served the prediction.
 - The prediction-to-handover trigger is gNB implementation. AI/ML models are
   outside 3GPP scope (TS 38.300 §16.20).
-- The shadow A3 is a replica of the UE's condition at 1 s cadence, so its time
-  can differ from the UE's report by up to one heartbeat.
+- The shadow A3 is a gNB-side replica of the UE's condition on the UE's 2.5 s
+  evaluation cycle, at an unknown phase. Its time, and so the lead, is a 2.6 s
+  range that contains the UE's report. It is not a single value.
+- The replica assumes every gNB of a run uses the same `shadowing` block. If
+  the seeds differ, the neighbour's level is wrong with no other sign. Compare
+  the gNBs' startup lines.
 - Lead time is measured at the source gNB, because the core cannot tell the
   arms apart. It is not asserted positive on every seed.
 - A lead is not free. A UE handed over before A3 lands where the source is
   still the stronger cell. The ping-pong and failure columns are where that
   shows.
+- `fallback=a3` and `stranded` are failures of the predictive arm, counted as
+  such. A fallback handover is still a real N2 handover, but A3 triggered it.

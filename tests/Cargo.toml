@@ -37,6 +37,9 @@ up-security = ["nextgsim-gnb/up-security", "nextgsim-ue/up-security"]
 # octet of its IP packet, so there is no configuration in which enabling one alone
 # is useful — and the test asserts exactly the QFI→DRB split the pair produces.
 sdap-dataplane = ["nextgsim-gnb/sdap-dataplane", "nextgsim-ue/sdap-dataplane"]
+# Demo D441D (nextgsim#467): the gNB's shadow A3 replica checked against the
+# UE's own A3 evaluator on the same seeded series (src/d441d_a3_replica.rs).
+demo-d441d-predictive-ho = ["nextgsim-gnb/demo-d441d-predictive-ho"]
 
 [dependencies]
 # Internal crates
@@ -90,6 +93,11 @@ futures = "0.3"
 [lib]
 name = "integration_tests"
 path = "src/lib.rs"
+
+[[test]]
+name = "d441d_a3_replica"
+path = "src/d441d_a3_replica.rs"
+required-features = ["demo-d441d-predictive-ho"]
 
 [[test]]
 name = "ue_registration"
