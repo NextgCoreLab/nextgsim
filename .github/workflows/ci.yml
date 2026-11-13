@@ -455,6 +455,10 @@ jobs:
       # startup line and their tests are behind `demo-d440a-ai-paging`.
       - name: cargo test (demo-d440a-ai-paging)
         run: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
+      # Demo d440c-nwdaf-paging (#464): the gNB's PAGING assistance log, its
+      # registration and their tests are behind `demo-d440c-nwdaf-paging`.
+      - name: cargo test (demo-d440c-nwdaf-paging)
+        run: cargo test -p nextgsim-gnb --features demo-d440c-nwdaf-paging
       - name: D444A revert arms (each patch must fail its named test)
         run: scripts/demo/d444a-reverts.sh
       # Demo d445a-fl-t8 (#480): the nr-fl-server AF (FL listener, NEF client,
@@ -483,6 +487,7 @@ jobs:
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
           cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
           cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets
+          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets
           cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
