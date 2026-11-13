@@ -84,6 +84,17 @@ pub const D441D_KEY: &str = "d441d-predictive-ho";
 ///   served is labelled `predictor=fallback`.
 pub const D441D_MODES: &[&str] = &["a3", "lsq", "onnx"];
 
+/// D440C, NWDAF UE-mobility analytics steer AMF paging (nextgsim#464).
+/// Registered under the `demo-d440c-nwdaf-paging` cargo feature.
+pub const D440C_KEY: &str = "d440c-nwdaf-paging";
+
+/// D440C's modes, the ones amfd registers for the same key (nextgcore#1469), so
+/// one `demo:` block reads the same on every node. On the gNB each mode only
+/// turns the PAGING assistance log on: what is sent is amfd's decision.
+/// `ran-recommendation` is not registered on amfd until #462's amfd demo lands,
+/// so it is not here either (no mode is accepted before it does what it names).
+pub const D440C_MODES: &[&str] = &["nwdaf-mobility", "registration-area"];
+
 /// The demos compiled into this binary.
 #[allow(clippy::vec_init_then_push)] // one push per demo feature
 pub fn registry() -> DemoRegistry {
@@ -125,6 +136,12 @@ pub fn registry() -> DemoRegistry {
     specs.push(DemoSpec {
         key: D441D_KEY,
         modes: D441D_MODES,
+        requires: &[],
+    });
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    specs.push(DemoSpec {
+        key: D440C_KEY,
+        modes: D440C_MODES,
         requires: &[],
     });
     DemoRegistry::new(&specs)
@@ -299,6 +316,49 @@ pub fn d441d_startup(config: &nextgsim_common::config::GnbConfig) -> Result<(), 
     Ok(())
 }
 
+/// D440C's gNB line for a PAGING's Assistance Data for Paging (nextgsim#464):
+/// `PAGING assistance: cells=[0x20,0x10] attempt 1/5 next-scope=changed`.
+///
+/// Cells are NR Cell Identities in the order received (the most recently
+/// visited first, TS 38.413 §9.3.1.71), an E-UTRA cell as `eutra:0x..`; `cells=[]`
+/// when the IE carries only the Paging Attempt Information. `attempt -` when it
+/// carries none, and no `next-scope=` when the AMF signalled none (its last
+/// attempt). The PLMN is not printed: amfd lists only cells of its own PLMN.
+#[cfg(feature = "demo-d440c-nwdaf-paging")]
+pub fn d440c_assistance_line(
+    assistance: &nextgsim_ngap::procedures::paging::AssistanceDataForPagingValue,
+) -> String {
+    use nextgsim_ngap::procedures::paging::{NextPagingAreaScopeValue, RecommendedCellCgi};
+    let cells: Vec<String> = assistance
+        .recommended_cells
+        .iter()
+        .map(|c| match &c.cgi {
+            RecommendedCellCgi::Nr {
+                nr_cell_identity, ..
+            } => format!("{nr_cell_identity:#x}"),
+            RecommendedCellCgi::Eutra {
+                eutra_cell_identity,
+                ..
+            } => format!("eutra:{eutra_cell_identity:#x}"),
+        })
+        .collect();
+    let attempt = match &assistance.paging_attempt_information {
+        None => "attempt -".to_string(),
+        Some(pai) => {
+            let scope = match pai.next_paging_area_scope {
+                None => "",
+                Some(NextPagingAreaScopeValue::Same) => " next-scope=same",
+                Some(NextPagingAreaScopeValue::Changed) => " next-scope=changed",
+            };
+            format!(
+                "attempt {}/{}{scope}",
+                pai.paging_attempt_count, pai.intended_number_of_paging_attempts
+            )
+        }
+    };
+    format!("PAGING assistance: cells=[{}] {attempt}", cells.join(","))
+}
+
 /// Whether D446A is active in this process (its feature compiled in, and both
 /// gates on). Always false in a build without `demo-d446a-agent-conflict`.
 pub fn d446a_active() -> bool {
@@ -343,7 +403,8 @@ mod tests {
         feature = "demo-d446a-agent-conflict",
         feature = "model-registry",
         feature = "nkef-sba",
-        feature = "demo-d441a-congestion-loop"
+        feature = "demo-d441a-congestion-loop",
+        feature = "demo-d440c-nwdaf-paging"
     )))]
     #[test]
     fn a_default_build_rejects_every_demo_key() {
@@ -874,5 +935,152 @@ mod tests {
                 "nextg_demo_enabled{demo=\"d441a-congestion-loop\",mode=\"prediction\"} 1"
             ));
         }
+    }
+
+    fn d440c(yaml: &str) -> Result<DemoRuntime, DemoConfigError> {
+        let root: serde_yaml::Value = serde_yaml::from_str(yaml).unwrap();
+        DemoRuntime::from_root(&root, registry())
+    }
+
+    fn d440c_block(on: bool, mode: &str) -> String {
+        format!(
+            "demo:\n  enabled: {on}\n  d440c-nwdaf-paging:\n    enabled: true\n    mode: {mode}\n"
+        )
+    }
+
+    /// nextgsim#464: without its feature the d440c block is an unknown key, so a
+    /// gNB built without the demo refuses a config that asks for it.
+    #[cfg(not(feature = "demo-d440c-nwdaf-paging"))]
+    #[test]
+    fn without_its_feature_the_d440c_block_fails_startup() {
+        let err = d440c(&d440c_block(true, "nwdaf-mobility")).unwrap_err();
+        assert!(
+            matches!(&err, DemoConfigError::UnknownKey { key, .. } if key == D440C_KEY),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    mod d440c {
+        use super::*;
+
+        /// nextgsim#464: amfd's two modes are accepted and active, with the
+        /// banner; `bogus` and the not-yet-implemented `ran-recommendation` fail
+        /// startup with `UnknownMode`, as on amfd.
+        #[test]
+        fn the_amfd_modes_are_accepted_and_no_other() {
+            for mode in D440C_MODES {
+                let rt = d440c(&d440c_block(true, mode)).unwrap();
+                assert_eq!(rt.mode(D440C_KEY).as_deref(), Some(*mode));
+                assert_eq!(
+                    rt.snapshot().banner().unwrap(),
+                    format!("DEMO MODE ACTIVE: d440c-nwdaf-paging={mode}")
+                );
+            }
+            for mode in ["bogus", "ran-recommendation"] {
+                assert_eq!(
+                    d440c(&d440c_block(true, mode)).unwrap_err(),
+                    DemoConfigError::UnknownMode {
+                        demo: D440C_KEY.into(),
+                        mode: mode.into(),
+                        known: D440C_MODES.to_vec(),
+                    }
+                );
+            }
+        }
+
+        /// No block, the kill switch off, and the kill switch off with the key
+        /// enabled: nothing active, no metric series.
+        #[test]
+        fn every_demo_off_shape_is_inactive() {
+            for yaml in [
+                "nci: 16\n".to_string(),
+                "demo:\n  enabled: false\n".to_string(),
+                d440c_block(false, "nwdaf-mobility"),
+            ] {
+                let rt = d440c(&yaml).unwrap();
+                assert!(rt.snapshot().is_empty(), "{yaml}");
+                assert_eq!(rt.mode(D440C_KEY), None);
+                let mut metrics = String::new();
+                rt.render_metrics(&mut metrics);
+                assert!(metrics.is_empty(), "{metrics}");
+            }
+        }
+
+        /// The shipped config/demo-nwdaf-paging/ gNB configs are accepted, in
+        /// mode nwdaf-mobility.
+        #[test]
+        fn the_d440c_demo_configs_enable_nwdaf_mobility() {
+            let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/demo-nwdaf-paging");
+            for name in ["gnb-a.yaml", "gnb-b.yaml", "gnb-c.yaml"] {
+                let text = std::fs::read_to_string(format!("{dir}/{name}")).expect("read");
+                let rt = d440c(&text).expect(name);
+                assert_eq!(
+                    rt.mode(D440C_KEY).as_deref(),
+                    Some("nwdaf-mobility"),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// nextgsim#464: the D440C line names the cells in received order, the
+    /// attempt and the next scope, and says when either part is absent.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    #[test]
+    fn the_d440c_assistance_line_names_cells_attempt_and_scope() {
+        use nextgsim_ngap::procedures::paging::{
+            AssistanceDataForPagingValue as A, NextPagingAreaScopeValue as S,
+            PagingAttemptInfoValue as P, RecommendedCellCgi as C, RecommendedCellValue as R,
+        };
+        let nr = |nci| R {
+            cgi: C::Nr {
+                plmn_identity: [0x99, 0xF9, 0x07],
+                nr_cell_identity: nci,
+            },
+            time_stayed_in_cell: None,
+        };
+        let pai = |k, n, s| {
+            Some(P {
+                paging_attempt_count: k,
+                intended_number_of_paging_attempts: n,
+                next_paging_area_scope: s,
+            })
+        };
+        let line = |a: A| d440c_assistance_line(&a);
+        assert_eq!(
+            line(A {
+                recommended_cells: vec![nr(0x20), nr(0x10)],
+                paging_attempt_information: pai(1, 5, Some(S::Changed)),
+            }),
+            "PAGING assistance: cells=[0x20,0x10] attempt 1/5 next-scope=changed"
+        );
+        assert_eq!(
+            line(A {
+                recommended_cells: vec![],
+                paging_attempt_information: pai(2, 5, Some(S::Same)),
+            }),
+            "PAGING assistance: cells=[] attempt 2/5 next-scope=same"
+        );
+        assert_eq!(
+            line(A {
+                recommended_cells: vec![R {
+                    cgi: C::Eutra {
+                        plmn_identity: [0x99, 0xF9, 0x07],
+                        eutra_cell_identity: 0xABC,
+                    },
+                    time_stayed_in_cell: Some(3),
+                }],
+                paging_attempt_information: None,
+            }),
+            "PAGING assistance: cells=[eutra:0xabc] attempt -"
+        );
+        assert_eq!(
+            line(A {
+                recommended_cells: vec![nr(0x10)],
+                paging_attempt_information: pai(5, 5, None),
+            }),
+            "PAGING assistance: cells=[0x10] attempt 5/5"
+        );
     }
 }
