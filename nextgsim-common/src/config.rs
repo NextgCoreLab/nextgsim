@@ -1184,9 +1184,10 @@ impl AgentRuleConfig {
 /// One neighbouring gNB cell of the D440A paging grid (nextgsim#462).
 ///
 /// The identity is what TS 38.413 needs to name the cell and its node in
-/// *Information on Recommended Cells and RAN Nodes for Paging*: the NR CGI
-/// (§9.3.1.71, this gNB's PLMN plus `nci`) and the Global gNB ID (§9.3.1.101,
-/// the top `gnb_id_length` bits of `nci`).
+/// *Information on Recommended Cells and RAN Nodes for Paging* (§9.3.1.100):
+/// in *Recommended Cells for Paging* (§9.3.1.71), the NR CGI (§9.3.1.7, this
+/// gNB's PLMN plus `nci`); in *Recommended RAN Nodes for Paging* (§9.3.1.101),
+/// the Global gNB ID (§9.3.1.6, the leftmost `gnb_id_length` bits of `nci`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PagingGridEntry {

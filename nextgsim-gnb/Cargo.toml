@@ -55,9 +55,13 @@ sdap-dataplane = []
 demo-d446a-agent-conflict = ["nextgsim-agent"]
 
 # Demo D440A (nextgsim#462, convention #458): model-predicted paging. Off by
-# default; demo-only code. It needs the 6G NWDAF task for its predictors (#462
-# PR 3b). Active only with the demo: block on as well.
-demo-d440a-ai-paging = ["6g"]
+# default; demo-only code, inert unless the config's `demo:` block also enables
+# `d440a-ai-paging`. At UE CONTEXT RELEASE the NWDAF task predicts the UE's next
+# gNB (modes last-served, ct, lsq, onnx) and the Release Complete carries it in
+# Information on Recommended Cells and RAN Nodes for Paging; mode page-all sends
+# no IE. Needs the 6G NWDAF task, and `model-registry` for the `onnx` arm (a
+# d440b-verified model).
+demo-d440a-ai-paging = ["6g", "model-registry"]
 
 # Demo D441D (nextgsim#467, convention #458): predictive N2 handover from the
 # gNB NWDAF vs A3, a seeded A/B. Off by default; demo-only code, inert unless

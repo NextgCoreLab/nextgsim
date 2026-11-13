@@ -65,7 +65,8 @@ impl GnbApp {
             .with_context(|| format!("Failed to read configuration from {config_path}"))?;
         nextgsim_gnb::demo::init(&config_text)
             .with_context(|| format!("Invalid demo block in {config_path}"))?;
-        nextgsim_gnb::demo::d440a_startup(&config);
+        nextgsim_gnb::demo::d440a_startup(&config)
+            .with_context(|| format!("Invalid D440A demo configuration in {config_path}"))?;
         // Demo D441D (#467): with the demo active, the NWDAF task and a
         // positioned neighbour are required; an unusable config fails here.
         nextgsim_gnb::demo::d441d_startup(&config)

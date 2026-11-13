@@ -1,0 +1,71 @@
+# D440A (nextgsim#462): the committed scenario. The grid, the ranges and the
+# route seeds below were fixed before the first replay ran, and nothing is
+# tuned after (the ticket's honesty label). Read by the seeded replay
+# (nextgsim-gnb, `cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
+# d440a::replay`), which writes the five-arm table checked in next to this file
+# as d440a-replay-table.txt; the live harness reuses the `live` seeds.
+#
+# Non-normative: the positions are simulator ground truth, and the model,
+# horizon and paging order are implementation choices (TS 38.300 §16.20.2).
+
+# Six gNBs, one cell each, one TAC, 120 m apart in a 3 x 2 grid. Every gNB
+# lists the other five as its paging_grid. NCI 0xN0 with a 32-bit gNB ID is gNB
+# N (TS 38.413 §9.3.1.6), the numbering the two-gNB M0 stack already uses.
+grid:
+  - { nci: 0x10, position: { x: 0, y: 0, z: 0 } }
+  - { nci: 0x20, position: { x: 120, y: 0, z: 0 } }
+  - { nci: 0x30, position: { x: 240, y: 0, z: 0 } }
+  - { nci: 0x40, position: { x: 0, y: 120, z: 0 } }
+  - { nci: 0x50, position: { x: 120, y: 120, z: 0 } }
+  - { nci: 0x60, position: { x: 240, y: 120, z: 0 } }
+gnb_id_length: 32
+
+# One route per seed and route family, sampled into sim_route waypoints. The
+# generator is a motion model, and a predictor that shares it is scored
+# in-model (nextgsim#535 review):
+# - constant-turn: one turn rate drawn from turn_rate_rad_s for the whole
+#   route. This is exactly ct's model; the committed 50-seed rows use it.
+# - straight: the turn rate set to 0. This is lsq's model.
+# - turn-change: the turn rate is drawn again at release, so the idle UE does
+#   not do what any predictor saw it do while connected.
+# Seed N takes the same first draw in every family. A route that would leave
+# the grid's bounding box by more than `coverage_margin_m` (where the distance
+# channel model loses the nearest cell) is redrawn from the same seed's stream,
+# and each family redraws on its own: at 1..=2000, 477 straight and 803
+# turn-change seeds are not paired with their constant-turn run. Each family
+# is also conditioned on staying in coverage under its own motion. So compare
+# modes within a family (every mode sees the same routes), not families with
+# each other.
+#
+# The UE is connected for `connected_s` (its heartbeats are the predictor's
+# history), is released at that moment, keeps moving idle, and is paged
+# `page_after_release_s` later.
+scenario:
+  start_x_m: [20, 220]
+  start_y_m: [20, 100]
+  speed_mps: [2.0, 6.0]
+  turn_rate_rad_s: [-0.06, 0.06]
+  connected_s: 15
+  page_after_release_s: [10, 30]
+  waypoint_every_s: 2
+  route_s: 50
+  coverage_margin_m: 60
+
+# Idle reselection as the UE does it (TS 38.304 §5.2.4.6, nextgsim-ue
+# cell_selection.rs): the distance model's -1 dB per metre, R_s = Q_meas,s +
+# q_hyst, reselect once R_n > R_s has held for t_reselection. config/gnb.yaml
+# broadcasts q_hyst 4 dB and t_reselection 1 s.
+reselection:
+  q_hyst_db: 4
+  t_reselection_s: 1
+
+seeds:
+  # Run by the live harness, each mode on each seed.
+  live: [1, 2, 3, 4, 5]
+  # Replayed in-process, each mode on each seed: seeds first..first+count-1.
+  replay_first: 1
+  replay_count: 50
+  # The large sample every family is also replayed on, with a 95% interval
+  # (added after the #535 review showed seeds 1..=50 are seed-specific).
+  large_sample_first: 1
+  large_sample_count: 2000

@@ -387,6 +387,10 @@ pub struct UeContextReleaseCompleteParams {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
+    /// Information on Recommended Cells and RAN Nodes for Paging (TS 38.413
+    /// §9.3.1.100), optional. `None` sends the two IDs only, byte-identical to
+    /// the message before the IE was supported.
+    pub recommended_paging: Option<RecommendedPagingInfo>,
 }
 
 /// Parsed UE Context Release Complete data
@@ -396,6 +400,186 @@ pub struct UeContextReleaseCompleteData {
     pub amf_ue_ngap_id: u64,
     /// RAN UE NGAP ID
     pub ran_ue_ngap_id: u32,
+    /// Information on Recommended Cells and RAN Nodes for Paging, when present
+    /// and of the shapes [`RecommendedPagingInfo`] models.
+    pub recommended_paging: Option<RecommendedPagingInfo>,
+}
+
+/// The most cells or RAN nodes a recommendation may list
+/// (`maxnoofRecommendedCells`, `maxnoofRecommendedRANNodes`, TS 38.413 §9.4.7).
+pub const MAX_RECOMMENDED_PAGING_ITEMS: usize = 16;
+
+/// Information on Recommended Cells and RAN Nodes for Paging (TS 38.413
+/// §9.3.1.100). Both lists are mandatory, so each holds 1..=16 entries.
+///
+/// The order is the RAN's and is significant (§9.3.1.71, §9.3.1.101): visited
+/// entries in the order the UE visited them, most recent first, each followed
+/// by the non-visited entries associated with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecommendedPagingInfo {
+    /// *Recommended Cells for Paging* (§9.3.1.71).
+    pub cells: Vec<RecommendedCell>,
+    /// *Recommended RAN Nodes for Paging* (§9.3.1.101).
+    pub ran_nodes: Vec<RecommendedRanNode>,
+}
+
+/// One *Recommended Cell Item* (§9.3.1.71): an NR CGI (§9.3.1.7) as the
+/// NG-RAN CGI (§9.3.1.73), and, for a visited cell, the time stayed in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecommendedCell {
+    /// The cell's PLMN Identity, as encoded on the wire (3 octets, TS 38.413
+    /// §9.3.3.5).
+    pub plmn: [u8; 3],
+    /// The NR Cell Identity, 36 bits.
+    pub nci: u64,
+    /// *Time Stayed in Cell* in seconds (0..=4095; a longer stay is sent as
+    /// 4095). Included for visited cells only.
+    pub time_stayed_s: Option<u16>,
+}
+
+/// One *Recommended RAN Node Item* (§9.3.1.101) whose AMF Paging Target is a
+/// Global RAN Node ID (§9.3.1.5) of the Global gNB ID kind (§9.3.1.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecommendedRanNode {
+    /// The gNB's PLMN Identity, as encoded on the wire.
+    pub plmn: [u8; 3],
+    /// The gNB ID, the leftmost `gnb_id_len` bits of its cells' NCIs.
+    pub gnb_id: u32,
+    /// The gNB ID length in bits, 22..=32.
+    pub gnb_id_len: u8,
+}
+
+/// The `width` low bits of `value`, most significant first.
+fn msb_bits(value: u64, width: usize) -> bitvec::vec::BitVec<u8, bitvec::order::Msb0> {
+    (0..width).rev().map(|i| (value >> i) & 1 == 1).collect()
+}
+
+/// A bit string read back as an unsigned integer, most significant bit first.
+fn bits_value(bits: &bitvec::slice::BitSlice<u8, bitvec::order::Msb0>) -> u64 {
+    bits.iter().fold(0u64, |v, b| (v << 1) | u64::from(*b))
+}
+
+/// The generated IE for `info`, checked against TS 38.413's bounds: 1..=16
+/// cells and nodes, a 36-bit NCI, a 22..32-bit gNB ID that fits its length,
+/// and a time stayed of at most 4095 s.
+fn build_recommended_paging(
+    info: &RecommendedPagingInfo,
+) -> Result<InfoOnRecommendedCellsAndRANNodesForPaging, UeContextReleaseError> {
+    let bad = |what: String| UeContextReleaseError::InvalidIeValue(what);
+    for (name, n) in [
+        ("cells", info.cells.len()),
+        ("RAN nodes", info.ran_nodes.len()),
+    ] {
+        if !(1..=MAX_RECOMMENDED_PAGING_ITEMS).contains(&n) {
+            return Err(bad(format!(
+                "recommended paging lists {n} {name}; TS 38.413 §9.3.1.100 needs 1..={MAX_RECOMMENDED_PAGING_ITEMS}"
+            )));
+        }
+    }
+    let mut cells = Vec::with_capacity(info.cells.len());
+    for c in &info.cells {
+        if c.nci > 0xF_FFFF_FFFF {
+            return Err(bad(format!(
+                "recommended cell NCI {:#x} is wider than 36 bits",
+                c.nci
+            )));
+        }
+        if let Some(t) = c.time_stayed_s {
+            if t > 4095 {
+                return Err(bad(format!("time stayed in cell {t} s is above 4095")));
+            }
+        }
+        cells.push(RecommendedCellItem {
+            ngran_cgi: NGRAN_CGI::NR_CGI(NR_CGI {
+                plmn_identity: PLMNIdentity(c.plmn.to_vec()),
+                nr_cell_identity: NRCellIdentity(msb_bits(c.nci, 36)),
+                ie_extensions: None,
+            }),
+            time_stayed_in_cell: c.time_stayed_s.map(RecommendedCellItemTimeStayedInCell),
+            ie_extensions: None,
+        });
+    }
+    let mut nodes = Vec::with_capacity(info.ran_nodes.len());
+    for n in &info.ran_nodes {
+        if !(22..=32).contains(&n.gnb_id_len) {
+            return Err(bad(format!(
+                "recommended gNB ID length {} is outside 22..32 (TS 38.413 §9.3.1.6)",
+                n.gnb_id_len
+            )));
+        }
+        if u64::from(n.gnb_id) >> n.gnb_id_len != 0 {
+            return Err(bad(format!(
+                "recommended gNB ID {:#x} does not fit {} bits",
+                n.gnb_id, n.gnb_id_len
+            )));
+        }
+        nodes.push(RecommendedRANNodeItem {
+            amf_paging_target: AMFPagingTarget::GlobalRANNodeID(GlobalRANNodeID::GlobalGNB_ID(
+                GlobalGNB_ID {
+                    plmn_identity: PLMNIdentity(n.plmn.to_vec()),
+                    gnb_id: GNB_ID::GNB_ID(GNB_ID_gNB_ID(msb_bits(
+                        u64::from(n.gnb_id),
+                        usize::from(n.gnb_id_len),
+                    ))),
+                    ie_extensions: None,
+                },
+            )),
+            ie_extensions: None,
+        });
+    }
+    Ok(InfoOnRecommendedCellsAndRANNodesForPaging {
+        recommended_cells_for_paging: RecommendedCellsForPaging {
+            recommended_cell_list: RecommendedCellList(cells),
+            ie_extensions: None,
+        },
+        recommend_ran_nodes_for_paging: RecommendedRANNodesForPaging {
+            recommended_ran_node_list: RecommendedRANNodeList(nodes),
+            ie_extensions: None,
+        },
+        ie_extensions: None,
+    })
+}
+
+/// The IE read back into [`RecommendedPagingInfo`]. Entries of a kind it does
+/// not model (an E-UTRA CGI, an ng-eNB, N3IWF or TAI target, a choice
+/// extension) are left out; `None` when either list is then empty.
+fn parse_recommended_paging(
+    ie: &InfoOnRecommendedCellsAndRANNodesForPaging,
+) -> Option<RecommendedPagingInfo> {
+    let plmn = |p: &PLMNIdentity| <[u8; 3]>::try_from(p.0.as_slice()).ok();
+    let cells: Vec<RecommendedCell> = ie
+        .recommended_cells_for_paging
+        .recommended_cell_list
+        .0
+        .iter()
+        .filter_map(|c| match &c.ngran_cgi {
+            NGRAN_CGI::NR_CGI(cgi) => Some(RecommendedCell {
+                plmn: plmn(&cgi.plmn_identity)?,
+                nci: bits_value(&cgi.nr_cell_identity.0),
+                time_stayed_s: c.time_stayed_in_cell.as_ref().map(|t| t.0),
+            }),
+            _ => None,
+        })
+        .collect();
+    let ran_nodes: Vec<RecommendedRanNode> = ie
+        .recommend_ran_nodes_for_paging
+        .recommended_ran_node_list
+        .0
+        .iter()
+        .filter_map(|n| match &n.amf_paging_target {
+            AMFPagingTarget::GlobalRANNodeID(GlobalRANNodeID::GlobalGNB_ID(g)) => match &g.gnb_id {
+                GNB_ID::GNB_ID(id) => Some(RecommendedRanNode {
+                    plmn: plmn(&g.plmn_identity)?,
+                    gnb_id: bits_value(&id.0) as u32,
+                    gnb_id_len: id.0.len() as u8,
+                }),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect();
+    (!cells.is_empty() && !ran_nodes.is_empty())
+        .then_some(RecommendedPagingInfo { cells, ran_nodes })
 }
 
 /// Build a UE Context Release Complete PDU
@@ -409,7 +593,7 @@ pub struct UeContextReleaseCompleteData {
 pub fn build_ue_context_release_complete(
     params: &UeContextReleaseCompleteParams,
 ) -> Result<NGAP_PDU, UeContextReleaseError> {
-    let protocol_ies = vec![
+    let mut protocol_ies = vec![
         // IE: AMF-UE-NGAP-ID (mandatory)
         UEContextReleaseCompleteProtocolIEs_Entry {
             id: ProtocolIE_ID(ID_AMF_UE_NGAP_ID),
@@ -427,6 +611,18 @@ pub fn build_ue_context_release_complete(
             ),
         },
     ];
+    // IE: Information on Recommended Cells and RAN Nodes for Paging (optional,
+    // criticality ignore, TS 38.413 §9.2.2.6), after the two IDs as the
+    // message's IE table orders it.
+    if let Some(info) = &params.recommended_paging {
+        protocol_ies.push(UEContextReleaseCompleteProtocolIEs_Entry {
+            id: ProtocolIE_ID(ID_INFO_ON_RECOMMENDED_CELLS_AND_RAN_NODES_FOR_PAGING),
+            criticality: Criticality(Criticality::IGNORE),
+            value: UEContextReleaseCompleteProtocolIEs_EntryValue::Id_InfoOnRecommendedCellsAndRANNodesForPaging(
+                build_recommended_paging(info)?,
+            ),
+        });
+    }
 
     let complete = UEContextReleaseComplete {
         protocol_i_es: UEContextReleaseCompleteProtocolIEs(protocol_ies),
@@ -474,6 +670,7 @@ pub fn parse_ue_context_release_complete(
 
     let mut amf_ue_ngap_id: Option<u64> = None;
     let mut ran_ue_ngap_id: Option<u32> = None;
+    let mut recommended_paging: Option<RecommendedPagingInfo> = None;
 
     for ie in &complete.protocol_i_es.0 {
         match &ie.value {
@@ -482,6 +679,9 @@ pub fn parse_ue_context_release_complete(
             }
             UEContextReleaseCompleteProtocolIEs_EntryValue::Id_RAN_UE_NGAP_ID(id) => {
                 ran_ue_ngap_id = Some(id.0);
+            }
+            UEContextReleaseCompleteProtocolIEs_EntryValue::Id_InfoOnRecommendedCellsAndRANNodesForPaging(info) => {
+                recommended_paging = parse_recommended_paging(info);
             }
             _ => {
                 // Ignore other IEs
@@ -496,6 +696,7 @@ pub fn parse_ue_context_release_complete(
         ran_ue_ngap_id: ran_ue_ngap_id.ok_or_else(|| {
             UeContextReleaseError::MissingMandatoryIe("RAN-UE-NGAP-ID".to_string())
         })?,
+        recommended_paging,
     })
 }
 
@@ -881,6 +1082,7 @@ mod tests {
         UeContextReleaseCompleteParams {
             amf_ue_ngap_id: 12345,
             ran_ue_ngap_id: 1,
+            recommended_paging: None,
         }
     }
 
@@ -1076,6 +1278,172 @@ mod tests {
         assert!(
             req.protocol_i_es.0.iter().all(|e| e.id.0 != 133),
             "absent when empty"
+        );
+    }
+
+    /// nextgcore amfd's `NEXTGSIM_RELEASE_COMPLETE_WITH_RECOMMENDATION`
+    /// (`nextgcore-amfd/src/ngap_asn1.rs`, #1448): the 63 octets its decode test
+    /// pins, captured from a scratch encoding through this crate's generated
+    /// types. Copied verbatim, so this encoder and amfd's decoder are pinned to
+    /// one vector (nextgsim#462).
+    const NEXTGCORE_PINNED_RELEASE_COMPLETE: [u8; 63] = [
+        0x20, 0x29, 0x00, 0x3b, 0x00, 0x00, 0x03, 0x00, 0x0a, 0x40, 0x02, 0x00, 0x07, 0x00, 0x55,
+        0x40, 0x02, 0x00, 0x03, 0x00, 0x20, 0x40, 0x28, 0x01, 0x40, 0x00, 0xf1, 0x10, 0x00, 0x00,
+        0x00, 0x01, 0x00, 0x00, 0x1e, 0x00, 0x00, 0xf1, 0x10, 0x00, 0x00, 0x00, 0x02, 0x00, 0x40,
+        0x00, 0x00, 0xf1, 0x10, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0xf1, 0x10, 0x50, 0x00,
+        0x00, 0x00, 0x02,
+    ];
+
+    /// The content amfd's vector documents: AMF UE NGAP ID 7, RAN UE NGAP ID 3;
+    /// cells NR CGI 001/01 NCI 0x10 (visited, 30 s) then NCI 0x20 (non-visited);
+    /// RAN nodes gNB 1 (visited) then gNB 2, 32-bit gNB IDs.
+    fn pinned_recommendation() -> RecommendedPagingInfo {
+        const PLMN: [u8; 3] = [0x00, 0xF1, 0x10];
+        RecommendedPagingInfo {
+            cells: vec![
+                RecommendedCell {
+                    plmn: PLMN,
+                    nci: 0x10,
+                    time_stayed_s: Some(30),
+                },
+                RecommendedCell {
+                    plmn: PLMN,
+                    nci: 0x20,
+                    time_stayed_s: None,
+                },
+            ],
+            ran_nodes: vec![
+                RecommendedRanNode {
+                    plmn: PLMN,
+                    gnb_id: 1,
+                    gnb_id_len: 32,
+                },
+                RecommendedRanNode {
+                    plmn: PLMN,
+                    gnb_id: 2,
+                    gnb_id_len: 32,
+                },
+            ],
+        }
+    }
+
+    /// #462: the recommendation encodes to exactly the octets nextgcore amfd's
+    /// decode test pins (TS 38.413 §9.3.1.100, both lists, in the §9.3.1.71 /
+    /// §9.3.1.101 order), and decodes back to the same content.
+    #[test]
+    fn the_recommendation_encodes_to_the_vector_amfd_decodes() {
+        let params = UeContextReleaseCompleteParams {
+            amf_ue_ngap_id: 7,
+            ran_ue_ngap_id: 3,
+            recommended_paging: Some(pinned_recommendation()),
+        };
+        let bytes = encode_ue_context_release_complete(&params).expect("encode");
+        assert_eq!(
+            bytes,
+            NEXTGCORE_PINNED_RELEASE_COMPLETE.to_vec(),
+            "{bytes:02x?}"
+        );
+        let parsed = decode_ue_context_release_complete(&bytes).expect("decode");
+        assert_eq!((parsed.amf_ue_ngap_id, parsed.ran_ue_ngap_id), (7, 3));
+        assert_eq!(parsed.recommended_paging, Some(pinned_recommendation()));
+    }
+
+    /// #462: without a recommendation the message is the two IDs only, the
+    /// octets it had before the IE was supported (the pinned vector with its
+    /// third IE taken out: count 2, length 15).
+    #[test]
+    fn without_a_recommendation_the_release_complete_is_unchanged() {
+        let params = UeContextReleaseCompleteParams {
+            amf_ue_ngap_id: 7,
+            ran_ue_ngap_id: 3,
+            recommended_paging: None,
+        };
+        let bytes = encode_ue_context_release_complete(&params).expect("encode");
+        assert_eq!(
+            bytes,
+            vec![
+                0x20, 0x29, 0x00, 0x0f, 0x00, 0x00, 0x02, 0x00, 0x0a, 0x40, 0x02, 0x00, 0x07, 0x00,
+                0x55, 0x40, 0x02, 0x00, 0x03
+            ]
+        );
+        assert_eq!(
+            decode_ue_context_release_complete(&bytes)
+                .unwrap()
+                .recommended_paging,
+            None
+        );
+    }
+
+    /// #462: the bounds TS 38.413 sets are refused at encode, not truncated:
+    /// an empty or 17-entry list, a 37-bit NCI, a gNB ID length outside 22..32
+    /// or a gNB ID wider than its length, and a time stayed above 4095 s.
+    /// 16 entries and the 22- and 32-bit lengths encode and round-trip.
+    #[test]
+    fn a_recommendation_out_of_bounds_is_refused() {
+        let encode = |info: RecommendedPagingInfo| {
+            encode_ue_context_release_complete(&UeContextReleaseCompleteParams {
+                amf_ue_ngap_id: 1,
+                ran_ue_ngap_id: 1,
+                recommended_paging: Some(info),
+            })
+        };
+        let base = pinned_recommendation();
+        let mut cases: Vec<(&str, RecommendedPagingInfo)> = Vec::new();
+        let mut v = base.clone();
+        v.cells.clear();
+        cases.push(("no cell", v));
+        let mut v = base.clone();
+        v.ran_nodes.clear();
+        cases.push(("no node", v));
+        let mut v = base.clone();
+        v.cells = vec![base.cells[1]; 17];
+        cases.push(("17 cells", v));
+        let mut v = base.clone();
+        v.ran_nodes = vec![base.ran_nodes[1]; 17];
+        cases.push(("17 nodes", v));
+        let mut v = base.clone();
+        v.cells[0].nci = 1 << 36;
+        cases.push(("37-bit NCI", v));
+        let mut v = base.clone();
+        v.cells[0].time_stayed_s = Some(4096);
+        cases.push(("4096 s", v));
+        for len in [21, 33] {
+            let mut v = base.clone();
+            v.ran_nodes[0].gnb_id_len = len;
+            cases.push(("gNB ID length", v));
+        }
+        let mut v = base.clone();
+        v.ran_nodes[0].gnb_id = 1 << 22;
+        v.ran_nodes[0].gnb_id_len = 22;
+        cases.push(("gNB ID wider than 22 bits", v));
+        for (name, info) in cases {
+            assert!(
+                matches!(encode(info), Err(UeContextReleaseError::InvalidIeValue(_))),
+                "{name} must be refused"
+            );
+        }
+
+        let mut v = base.clone();
+        v.cells = (1..=16)
+            .map(|i| RecommendedCell {
+                plmn: base.cells[0].plmn,
+                nci: i << 4,
+                time_stayed_s: Some(4095),
+            })
+            .collect();
+        v.ran_nodes = (1..=16)
+            .map(|i| RecommendedRanNode {
+                plmn: base.cells[0].plmn,
+                gnb_id: (i as u32) | 0x20_0000,
+                gnb_id_len: if i % 2 == 0 { 22 } else { 32 },
+            })
+            .collect();
+        let bytes = encode(v.clone()).expect("16 entries and both length bounds encode");
+        assert_eq!(
+            decode_ue_context_release_complete(&bytes)
+                .unwrap()
+                .recommended_paging,
+            Some(v)
         );
     }
 }

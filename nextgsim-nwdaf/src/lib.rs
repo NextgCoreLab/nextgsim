@@ -79,6 +79,7 @@
 pub mod analytics_id;
 pub mod anlf;
 pub mod anomaly;
+pub mod constant_turn;
 pub mod coordination;
 pub mod data_collection;
 pub mod dccf;
