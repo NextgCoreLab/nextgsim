@@ -381,19 +381,54 @@ struct EventState {
     /// Per cell, when its leaving condition first held while it *was* in
     /// `cells_triggered`. §5.5.4.1 applies `timeToTrigger` to both directions.
     leaving_since: BTreeMap<TriggeringCell, Instant>,
-    /// Number of reports sent for this event
+    /// `numberOfReportsSent` of the measurement reporting entry (§5.5.4.1):
+    /// how many reports THIS triggering has sent, which is what `reportAmount`
+    /// bounds — see [`EventState::reset_report_entry`] for when it starts over.
     reports_sent: u32,
-    /// Last report time
+    /// The periodical reporting timer of the same entry (§5.5.5): when the last
+    /// report of this triggering went out, `None` while no entry exists.
     last_report: Option<Instant>,
 }
 
 impl EventState {
-    /// Forget every cell, keeping the report counters: used when the reference
-    /// the events are measured against changes under them.
+    /// The measurement reporting entry of `VarMeasReportList` for this measId
+    /// starts from nothing: no reports sent and no periodical reporting timer.
+    ///
+    /// TS 38.331 §5.5.4.1 has three actions that land here, and they are one
+    /// state in this manager because nothing distinguishes an absent entry from
+    /// a fresh one — reporting is gated on `cellsTriggeredList` being non-empty,
+    /// not on the entry existing:
+    ///
+    /// - a **first** cell triggers the measId: include an entry and set
+    ///   `numberOfReportsSent` to 0;
+    /// - a **subsequent** cell triggers it: set `numberOfReportsSent` to 0;
+    /// - `cellsTriggeredList` becomes **empty**: remove the entry and stop its
+    ///   periodical reporting timer.
+    ///
+    /// Clearing `last_report` with the count is not incidental: the first two
+    /// actions go on to "initiate the measurement reporting procedure, as
+    /// specified in 5.5.5", i.e. the new triggering reports at once rather than
+    /// waiting out the previous one's `reportInterval`.
+    ///
+    /// Keeping the count across triggerings — which is what this code used to
+    /// do — capped a UE at `reportAmount` reports per measId for its whole
+    /// life, however many times the event fired (issue #541).
+    fn reset_report_entry(&mut self) {
+        self.reports_sent = 0;
+        self.last_report = None;
+    }
+
+    /// Forget every cell, and with them the reporting entry they held open:
+    /// used when the reference the events are measured against changes under
+    /// them — a reconfiguration with sync, or losing the serving cell
+    /// altogether. (TS 36.331 §5.5.6.1 removes every `VarMeasReportList` entry
+    /// on an E-UTRA handover in as many words; in NR the same follows from
+    /// §5.5.4.1, since an empty `cellsTriggeredList` has no entry.)
     fn clear_triggers(&mut self) {
         self.cells_triggered.clear();
         self.entering_since.clear();
         self.leaving_since.clear();
+        self.reset_report_entry();
     }
 }
 
@@ -647,6 +682,7 @@ impl MeasurementManager {
 
             // §5.5.4.1: include a cell once its entering condition has held for
             // timeToTrigger, exclude it once its leaving condition has.
+            let mut new_triggering = false;
             for verdict in &verdicts {
                 let cell = verdict.cell;
                 if state.cells_triggered.contains(&cell) {
@@ -663,12 +699,31 @@ impl MeasurementManager {
                 } else if verdict.entering {
                     let since = *state.entering_since.entry(cell).or_insert(now);
                     if now.duration_since(since) >= ttt {
-                        state.cells_triggered.insert(cell);
+                        new_triggering |= state.cells_triggered.insert(cell);
                         state.entering_since.remove(&cell);
                     }
                 } else {
                     state.entering_since.remove(&cell);
                 }
+            }
+
+            // §5.5.4.1's two reset points, both of which this used to miss, and
+            // which together are what makes `reportAmount` bound ONE triggering
+            // (issue #541):
+            //
+            // - a cell has just entered cellsTriggeredList — the first one
+            //   creating the measurement reporting entry, a subsequent one
+            //   resetting it — so numberOfReportsSent starts this triggering at
+            //   0 and the report goes out now;
+            // - cellsTriggeredList has emptied, so the entry and its periodical
+            //   reporting timer are gone and the NEXT triggering starts at 0
+            //   rather than wherever this one stopped.
+            //
+            // A periodical measId has no cellsTriggeredList at all, so the empty
+            // list is its normal state and neither point applies: its own
+            // reportAmount stops it for good (§5.5.5), as before.
+            if new_triggering || (!periodic && state.cells_triggered.is_empty()) {
+                state.reset_report_entry();
             }
 
             if periodic || !state.cells_triggered.is_empty() {
@@ -1915,5 +1970,361 @@ mod tests {
         manager.evaluate_events();
 
         assert!(is_triggered(&manager, 2));
+    }
+
+    // ====================================================================
+    // The measurement reporting entry of `VarMeasReportList` (issue #541):
+    // `reportAmount` bounds ONE triggering, not the UE's life. The entry
+    // holding `numberOfReportsSent` and the periodical reporting timer is
+    // created when a cell first triggers the measId, reset to zero when a
+    // further cell triggers it, and removed once `cellsTriggeredList` is
+    // empty again (TS 38.331 §5.5.4.1, §5.5.5).
+    // ====================================================================
+
+    /// `numberOfReportsSent` for `meas_id` (§5.5.4.1). Zero when the measId has
+    /// no measurement reporting entry, which is how "the entry was removed"
+    /// reads from outside.
+    fn reports_sent(manager: &MeasurementManager, meas_id: u8) -> u32 {
+        manager
+            .event_states
+            .get(&meas_id)
+            .map_or(0, |state| state.reports_sent)
+    }
+
+    /// One evaluation, and how many reports it produced.
+    fn reports_now(manager: &mut MeasurementManager) -> usize {
+        manager.evaluate_events();
+        manager.take_pending_reports().len()
+    }
+
+    /// A `measId` for `event` carrying the `reportAmount` of 8 the gNB signals
+    /// (`nextgsim-gnb`'s `A3_REPORT_AMOUNT`), with no report interval and no
+    /// `timeToTrigger`, so the count is the only thing that can stop a report.
+    ///
+    /// The thresholds are the ones [`EVENT_CASES`]'s levels are written
+    /// against: -90 dBm for the serving-cell events and A4, A5's pair at
+    /// -90/-100 dBm, B1's at -100 dBm and B2's at -90/-110 dBm. A3 and A6 take
+    /// the default 3 dB offset, so a neighbour enters 4 dB above the reference
+    /// and leaves below 2 dB above it.
+    fn counted_config(event: MeasEventType) -> MeasConfig {
+        let mut config = MeasConfig {
+            meas_id: 1,
+            report_amount: 8,
+            report_interval: 0,
+            ..Default::default()
+        };
+        config.trigger_config.trigger_type = ReportTriggerType::Event(event);
+        config.trigger_config.hysteresis = 2; // 1 dB
+        config.trigger_config.time_to_trigger = 0;
+        match event {
+            MeasEventType::A1 | MeasEventType::A2 | MeasEventType::A4 => {
+                config.trigger_config.threshold = Some(-90);
+            }
+            MeasEventType::A5 | MeasEventType::B2 => {
+                config.trigger_config.threshold1 = Some(-90);
+                config.trigger_config.threshold2 = Some(if event == MeasEventType::A5 {
+                    -100
+                } else {
+                    -110
+                });
+            }
+            MeasEventType::B1 => config.trigger_config.threshold = Some(-100),
+            MeasEventType::A6 => config.trigger_config.a6_offset = Some(6), // 3 dB
+            MeasEventType::A3 => {}
+        }
+        config
+    }
+
+    /// A UE camped on cell 1 at -80 dBm, with the SCell A6 measures against
+    /// (§5.5.4.7) configured only for A6 — it is a plain neighbour to the other
+    /// events, and one strong enough to hold A5 triggered on its own.
+    fn counted_manager(event: MeasEventType) -> MeasurementManager {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        if event == MeasEventType::A6 {
+            manager.set_scell(Some(2));
+            manager.update_measurement(2, -95);
+        }
+        manager
+    }
+
+    /// The EARFCN and PCI of the inter-RAT neighbour B1/B2 trigger on.
+    fn eutra_neighbour() -> EutraCellKey {
+        EutraCellKey::new(1850, 42)
+    }
+
+    /// Per event: levels that satisfy its entering inequality, and levels that
+    /// satisfy its leaving one, on [`counted_manager`]'s cells.
+    #[allow(clippy::type_complexity)]
+    const EVENT_CASES: [(
+        MeasEventType,
+        fn(&mut MeasurementManager),
+        fn(&mut MeasurementManager),
+    ); 8] = [
+        // A1-1: Ms - Hys > Thresh, so the serving cell enters above -89 dBm;
+        // A1-2: Ms + Hys < Thresh, and it leaves below -91 dBm.
+        (
+            MeasEventType::A1,
+            |m| m.update_measurement(1, -80),
+            |m| m.update_measurement(1, -95),
+        ),
+        // A2 is A1's mirror: enters below -91 dBm, leaves above -89 dBm.
+        (
+            MeasEventType::A2,
+            |m| m.update_measurement(1, -95),
+            |m| m.update_measurement(1, -80),
+        ),
+        // A3: a neighbour enters 4 dB over the -80 dBm PCell, leaves under 2 dB.
+        (
+            MeasEventType::A3,
+            |m| m.update_measurement(3, -60),
+            |m| m.update_measurement(3, -90),
+        ),
+        // A4: a neighbour over the -90 dBm threshold, Hys 1 dB.
+        (
+            MeasEventType::A4,
+            |m| m.update_measurement(3, -80),
+            |m| m.update_measurement(3, -95),
+        ),
+        // A5: a weak PCell (under -91 dBm) AND a neighbour over -99 dBm.
+        (
+            MeasEventType::A5,
+            |m| {
+                m.update_measurement(1, -95);
+                m.update_measurement(3, -80);
+            },
+            |m| m.update_measurement(3, -105),
+        ),
+        // A6: a neighbour 4 dB over the -95 dBm SCell.
+        (
+            MeasEventType::A6,
+            |m| m.update_measurement(3, -90),
+            |m| m.update_measurement(3, -95),
+        ),
+        // B1: an inter-RAT neighbour over the -100 dBm threshold.
+        (
+            MeasEventType::B1,
+            |m| m.update_eutra_measurement(eutra_neighbour(), -95),
+            |m| m.update_eutra_measurement(eutra_neighbour(), -105),
+        ),
+        // B2: a weak PCell AND an inter-RAT neighbour over -109 dBm.
+        (
+            MeasEventType::B2,
+            |m| {
+                m.update_measurement(1, -95);
+                m.update_eutra_measurement(eutra_neighbour(), -105);
+            },
+            |m| m.update_eutra_measurement(eutra_neighbour(), -120),
+        ),
+    ];
+
+    /// `reportAmount` is honoured *within* one triggering: the 8 reports the
+    /// gNB configures go out and the 9th evaluation of the same, unbroken
+    /// triggering sends nothing, because §5.5.5 only restarts the periodical
+    /// reporting timer while `numberOfReportsSent` is below `reportAmount`.
+    #[test]
+    fn report_amount_bounds_one_triggering() {
+        let mut manager = counted_manager(MeasEventType::A3);
+        manager.add_config(counted_config(MeasEventType::A3));
+        EVENT_CASES[2].1(&mut manager); // the A3 neighbour enters
+
+        for n in 1..=8 {
+            assert_eq!(reports_now(&mut manager), 1, "report {n} of reportAmount 8");
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "the 8 reports of this triggering are spent"
+            );
+        }
+        assert_eq!(
+            manager.triggered_cells(1),
+            vec![TriggeringCell::Nr(3)],
+            "the cell is still triggered: only the count stopped the reports"
+        );
+        assert_eq!(reports_sent(&manager, 1), 8);
+    }
+
+    /// A periodical measId has no `cellsTriggeredList` at all, so the empty
+    /// list that ends an event-triggered triggering is its *normal* state and
+    /// must not restart its count: §5.5.5 has a periodical report that reaches
+    /// `reportAmount` remove the reporting entry **and** the measId itself, so
+    /// it stops for good. The #541 reset is bounded away from this arm.
+    #[test]
+    fn report_amount_still_stops_a_periodical_measurement_for_good() {
+        let mut manager = MeasurementManager::new();
+        manager.set_serving_cell(Some(1));
+        manager.update_measurement(1, -80);
+        let mut config = counted_config(MeasEventType::A3);
+        config.trigger_config.trigger_type = ReportTriggerType::Periodic;
+        manager.add_config(config);
+
+        for n in 1..=8 {
+            assert_eq!(reports_now(&mut manager), 1, "periodical report {n} of 8");
+        }
+        for _ in 0..3 {
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "reportAmount is final for a periodical measId"
+            );
+        }
+    }
+
+    /// §5.5.4.1: an emptied `cellsTriggeredList` removes the measurement
+    /// reporting entry, and a cell triggering the measId again creates it afresh
+    /// with `numberOfReportsSent` 0. Before #541 the counter outlived the
+    /// triggering, so a UE sent 8 reports per measId for its whole life however
+    /// many times the event fired.
+    #[test]
+    fn a_cell_leaving_and_re_entering_starts_a_new_report_count() {
+        let mut manager = counted_manager(MeasEventType::A3);
+        manager.add_config(counted_config(MeasEventType::A3));
+        let (_, enter, leave) = EVENT_CASES[2];
+
+        for cycle in 1..=3 {
+            enter(&mut manager);
+            for n in 1..=8 {
+                assert_eq!(
+                    reports_now(&mut manager),
+                    1,
+                    "triggering {cycle}: report {n}"
+                );
+            }
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "triggering {cycle}: reportAmount reached"
+            );
+
+            leave(&mut manager);
+            assert_eq!(reports_now(&mut manager), 0, "triggering {cycle}: left");
+            assert!(
+                manager.triggered_cells(1).is_empty(),
+                "triggering {cycle}: the cell satisfied A3-2"
+            );
+            assert_eq!(
+                reports_sent(&manager, 1),
+                0,
+                "triggering {cycle}: the reporting entry goes with the last \
+                 triggered cell"
+            );
+        }
+    }
+
+    /// Every event keeps its count in the same `EventState`, so the reset is
+    /// checked for each of them rather than for A3 alone: exhaust
+    /// `reportAmount` on one triggering, let the triggering cell leave, and the
+    /// next triggering must report again.
+    #[test]
+    fn every_event_resets_its_report_count_on_a_new_triggering() {
+        for (event, enter, leave) in EVENT_CASES {
+            let mut manager = counted_manager(event);
+            manager.add_config(counted_config(event));
+
+            enter(&mut manager);
+            for n in 1..=8 {
+                assert_eq!(reports_now(&mut manager), 1, "{event:?}: report {n}");
+            }
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "{event:?}: reportAmount bounds the triggering"
+            );
+
+            leave(&mut manager);
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "{event:?}: no report on leave"
+            );
+            assert!(
+                manager.triggered_cells(1).is_empty(),
+                "{event:?}: the leaving inequality emptied cellsTriggeredList"
+            );
+
+            enter(&mut manager);
+            assert_eq!(
+                reports_now(&mut manager),
+                1,
+                "{event:?}: the next triggering reports from zero"
+            );
+        }
+    }
+
+    /// A reconfiguration with sync changes the cell every event is written
+    /// against, which empties every `cellsTriggeredList` and so removes every
+    /// measurement reporting entry with it (§5.5.4.1; TS 36.331 §5.5.6.1 says
+    /// the same for E-UTRA in as many words). The reports the UE sent while on
+    /// the source cell must not count against the target's.
+    #[test]
+    fn a_reconfiguration_with_sync_drops_the_reporting_entries() {
+        let mut manager = counted_manager(MeasEventType::A3);
+        manager.add_config(counted_config(MeasEventType::A3));
+
+        manager.update_measurement(2, -60); // enters A3 against the -80 dBm PCell
+        for n in 1..=8 {
+            assert_eq!(
+                reports_now(&mut manager),
+                1,
+                "report {n} on the source cell"
+            );
+        }
+        assert_eq!(reports_sent(&manager, 1), 8);
+        assert_eq!(reports_now(&mut manager), 0, "the source count is spent");
+
+        // The handover: `reconfigurationWithSync` applied, cell 2 is the PCell.
+        manager.set_serving_cell(Some(2));
+        assert_eq!(
+            reports_sent(&manager, 1),
+            0,
+            "the reporting entry went with the sync"
+        );
+
+        manager.update_measurement(2, -80); // the target, now the PCell
+        manager.update_measurement(3, -60); // a neighbour over A3-1 on it
+        assert_eq!(
+            reports_now(&mut manager),
+            1,
+            "the UE reports on the target cell from zero reports sent"
+        );
+    }
+
+    /// The UE's whole life rather than one triggering: twelve
+    /// measurement-triggered handovers in a row, each from its own A3 report.
+    /// D440C's seeded lap needs nine (nextgsim#464) and the gNB pins
+    /// `reportAmount` to 8, so before #541 the ninth report never went out and
+    /// the UE sat on a decaying cell until T310 expired.
+    #[test]
+    fn a_ue_hands_over_more_times_than_report_amount() {
+        const HANDOVERS: i32 = 12;
+
+        let mut manager = MeasurementManager::new();
+        manager.add_config(counted_config(MeasEventType::A3));
+        let mut serving = 1;
+        manager.set_serving_cell(Some(serving));
+        manager.update_measurement(serving, -80);
+
+        for hop in 1..=HANDOVERS {
+            let target = serving + 1;
+            manager.update_measurement(target, -60); // 4 dB over the PCell and more
+
+            manager.evaluate_events();
+            let reports = manager.take_pending_reports();
+            assert_eq!(reports.len(), 1, "handover {hop}: one A3 report");
+            assert_eq!(
+                reports[0].triggered_cells,
+                vec![TriggeringCell::Nr(target)],
+                "handover {hop}: the report names the target cell"
+            );
+
+            // The gNB's HandoverCommand, applied: the target is the PCell, and
+            // the cell just left stays a measured neighbour.
+            manager.update_measurement(target, -80);
+            serving = target;
+            manager.set_serving_cell(Some(serving));
+        }
     }
 }

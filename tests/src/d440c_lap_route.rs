@@ -29,12 +29,17 @@
 //!     -- --ignored --nocapture print_the_lap_route
 //! ```
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use nextgsim_common::config::{SimPosition, SimRoute, UeConfig};
+use nextgsim_common::config::{GnbConfig, SimPosition, SimRoute, UeConfig};
+use nextgsim_gnb::rrc::meas::a3_meas_config_params;
 use nextgsim_rls::cell_search::MIN_ALLOWED_DBM;
 use nextgsim_rls::channel::{ChannelModel, DistanceModel};
 use nextgsim_rls::protocol::SimCoord;
+use nextgsim_ue::rrc::task::RRC_CYCLE_INTERVAL_MS;
+use nextgsim_ue::rrc::{
+    MeasConfig, MeasEventType, MeasurementManager, ReportTriggerType, TriggeringCell,
+};
 
 /// The seed of the committed `config/demo-nwdaf-paging/ue-lap.yaml` route.
 const COMMITTED_SEED: u64 = 464;
@@ -380,6 +385,124 @@ fn the_checks_refuse_a_route_without_the_laps_or_the_dwell() {
         assert!(
             refused.is_err(),
             "{what}: the checks must refuse this route"
+        );
+    }
+}
+
+/// The A3 **reporting** configuration the demo's gNBs signal, in the units the
+/// UE's `MeasurementManager` works in.
+///
+/// Read off `gnb-a.yaml` through the gNB's own `a3_meas_config_params`, so the
+/// margin, `timeToTrigger`, `reportInterval` and `reportAmount` here are the
+/// ones the UE is really given — including the `reportAmount` of 8 that this
+/// test exists for — rather than numbers of the test's own. All three gNB
+/// configs leave the margin at its default, so A is representative; the
+/// offset and hysteresis are signalled in whole dB and 0.5 dB and read in
+/// 0.5 dB units, the same conversion `d441d_a3_replica` makes.
+fn signalled_a3_config() -> MeasConfig {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../config/demo-nwdaf-paging/gnb-a.yaml"
+    );
+    let text = std::fs::read_to_string(path).expect("gnb-a.yaml is readable");
+    let gnb: GnbConfig = serde_yaml::from_str(&text).expect("gnb-a.yaml is a gNB config");
+    let params = a3_meas_config_params(&gnb).expect("the demo's A3 margin is signallable");
+
+    let mut config = MeasConfig {
+        meas_id: params.meas_id,
+        meas_object_id: params.meas_object_id,
+        report_config_id: params.report_config_id,
+        // `reportAmount: infinity` is `None` on the wire and 0 in the UE.
+        report_amount: params.report_amount.unwrap_or(0),
+        report_interval: u64::from(params.report_interval_ms),
+        max_report_cells: params.max_report_cells,
+        ..Default::default()
+    };
+    config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A3);
+    config.trigger_config.a3_offset = Some((params.a3_offset_db * 2.0).round() as i32);
+    config.trigger_config.hysteresis = (params.hysteresis_db * 2.0).round() as i32;
+    config.trigger_config.time_to_trigger = u64::from(params.time_to_trigger_ms);
+    config
+}
+
+/// The cells the UE serves on along `config`'s route up to `until_secs`, as its
+/// **own** measurement evaluator decides them: `MeasurementManager` with the
+/// signalled A3 configuration, fed the levels of [`levels`] once per RRC cycle
+/// on a synthetic clock, with the gNB handing over to whichever cell each
+/// `MeasurementReport` leads with.
+///
+/// [`Tracker`] models the A3 rule; this runs it. The difference that matters
+/// here is `reportAmount`, which only the real evaluator has.
+fn measurement_driven_handovers(config: &UeConfig, until_secs: f64) -> Vec<usize> {
+    let mut manager = MeasurementManager::new();
+    manager.add_config(signalled_a3_config());
+    manager.set_serving_cell(Some(A as i32));
+    let mut visited = vec![A];
+
+    let clock = Instant::now();
+    let mut ms = 0u64;
+    while ms as f64 / 1000.0 <= until_secs {
+        for (cell, level) in levels(config.sim_position_at(Duration::from_millis(ms)))
+            .iter()
+            .enumerate()
+        {
+            match level {
+                Some(dbm) => manager.update_measurement(cell as i32, *dbm),
+                // Out of range: not an applicable cell any more (§5.5.4.1).
+                None => manager.remove_measurement(cell as i32),
+            }
+        }
+        manager.evaluate_events_at(clock + Duration::from_millis(ms));
+
+        for report in manager.take_pending_reports() {
+            // The gNB's decision, as D440C's gNBs make it: hand over to the
+            // strongest cell the report's cellsTriggeredList names, which the UE
+            // applies as a reconfiguration with sync.
+            if let Some(target) = report
+                .triggered_cells
+                .first()
+                .and_then(TriggeringCell::nr_cell_id)
+            {
+                manager.set_serving_cell(Some(target));
+                visited.push(target as usize);
+            }
+        }
+        ms += RRC_CYCLE_INTERVAL_MS;
+    }
+    visited
+}
+
+/// The lap's nine connected handovers, driven through the UE's real measurement
+/// evaluator rather than [`Tracker`]'s model of it, so `reportAmount` is in the
+/// loop (nextgsim#541).
+///
+/// The gNB pins A3 to `reportAmount` 8 and three laps need nine reports. While
+/// `numberOfReportsSent` was never reset, the eighth handover was the UE's last
+/// for its whole life: the ninth A3 entry produced no `MeasurementReport`, so
+/// the UE stayed on the decaying cell until T310 expired. That is the EKS
+/// failure this file did not catch, because it modelled the A3 inequality and
+/// not the reporting entry of TS 38.331 §5.5.4.1.
+#[test]
+fn the_ue_reports_every_lap_handover_despite_report_amount() {
+    assert!(
+        signalled_a3_config().report_amount < 3 * LAPS as u32,
+        "the lap must need more reports than one triggering's reportAmount, \
+         or this test proves nothing"
+    );
+    let mut expected = vec![A];
+    for _ in 0..LAPS {
+        expected.extend([B, C, A]);
+    }
+
+    for seed in std::iter::once(COMMITTED_SEED).chain(SWEEP_SEEDS) {
+        let r = lap_route(seed);
+        let config = config_with(&r);
+        let visited = measurement_driven_handovers(&config, arrival_secs(&r, r.laps_end) + 10.0);
+        assert_eq!(
+            names(&visited),
+            names(&expected),
+            "seed {seed}: the UE's own A3 reporting must hand it over \
+             A->B->C->A {LAPS} times"
         );
     }
 }
