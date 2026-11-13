@@ -585,6 +585,14 @@ impl MeasurementManager {
 
     /// Evaluate measurement events and generate reports if needed
     pub fn evaluate_events(&mut self) {
+        self.evaluate_events_at(Instant::now());
+    }
+
+    /// [`Self::evaluate_events`] at `now`: the instant `timeToTrigger` and
+    /// `reportInterval` are measured against. Lets a caller replay a series on
+    /// its own clock (nextgsim#467 compares the gNB's A3 replica with this
+    /// evaluator on a seeded series); the RRC cycle passes `Instant::now()`.
+    pub fn evaluate_events_at(&mut self, now: Instant) {
         let serving_cell_id = match self.serving_cell_id {
             Some(id) => id,
             None => return,
@@ -599,7 +607,7 @@ impl MeasurementManager {
         // Evaluate each measurement configuration
         let configs: Vec<_> = self.configs.values().cloned().collect();
         for config in configs {
-            self.evaluate_event(&config, serving_cell_id, serving_rsrp);
+            self.evaluate_event(&config, serving_cell_id, serving_rsrp, now);
         }
     }
 
@@ -608,6 +616,7 @@ impl MeasurementManager {
         config: &MeasConfig,
         serving_cell_id: i32,
         serving_rsrp: Option<i32>,
+        now: Instant,
     ) {
         let meas_id = config.meas_id;
         let trigger = &config.trigger_config;
@@ -623,7 +632,6 @@ impl MeasurementManager {
             }
         };
 
-        let now = Instant::now();
         let mut generate_report = false;
         let mut triggered_cells: Vec<TriggeringCell> = Vec::new();
 
@@ -665,7 +673,8 @@ impl MeasurementManager {
 
             if periodic || !state.cells_triggered.is_empty() {
                 let should_report = state.last_report.is_none_or(|last| {
-                    last.elapsed() >= Duration::from_millis(config.report_interval)
+                    now.saturating_duration_since(last)
+                        >= Duration::from_millis(config.report_interval)
                 });
                 let reports_remaining =
                     config.report_amount == 0 || state.reports_sent < config.report_amount;

@@ -21,7 +21,7 @@ pub const D446A_MODES: &[&str] = &["load-balancing", "energy-saving"];
 /// D446E). At most one of them may be active on one gNB: two would each drive
 /// handovers of the same UEs and neither demo's chain would mean anything.
 pub const HANDOVER_DEMOS: &[&str] = &[
-    "d441d-ue-mobility-handover",
+    D441D_KEY,
     D446A_KEY,
     "d446d-agent-mobility",
     "d446e-agent-actuation",
@@ -70,6 +70,20 @@ pub const D441A_KEY: &str = "d441a-congestion-loop";
 /// `no-loop`: no export (the baseline), the capacity-C queue still in place.
 pub const D441A_MODES: &[&str] = &["statistics", "prediction", "no-loop"];
 
+/// D441D, predictive N2 handover from the gNB NWDAF vs A3 (nextgsim#467).
+/// Registered under the `demo-d441d-predictive-ho` cargo feature.
+pub const D441D_KEY: &str = "d441d-predictive-ho";
+
+/// D441D's modes, all on the same route and shadowing seeds:
+/// - `a3`: the baseline. No predictor; the gNB acts on the UE's A3
+///   MeasurementReport exactly as with no demo.
+/// - `lsq`: the least-squares trajectory predictor triggers the handover; A3 is
+///   evaluated in shadow and not acted on.
+/// - `onnx`: the same with a d440b-verified ONNX model (needs
+///   `d440b-model-verify` in mode `verify`); a prediction no verified model
+///   served is labelled `predictor=fallback`.
+pub const D441D_MODES: &[&str] = &["a3", "lsq", "onnx"];
+
 /// D440C, NWDAF UE-mobility analytics steer AMF paging (nextgsim#464).
 /// Registered under the `demo-d440c-nwdaf-paging` cargo feature.
 pub const D440C_KEY: &str = "d440c-nwdaf-paging";
@@ -116,6 +130,14 @@ pub fn registry() -> DemoRegistry {
         modes: D441A_MODES,
         requires: &[],
     });
+    // Its `onnx` mode alone needs d440b, which a per-demo `requires` cannot
+    // say: [`check_d441d_dependencies`] checks it.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    specs.push(DemoSpec {
+        key: D441D_KEY,
+        modes: D441D_MODES,
+        requires: &[],
+    });
     #[cfg(feature = "demo-d440c-nwdaf-paging")]
     specs.push(DemoSpec {
         key: D440C_KEY,
@@ -139,6 +161,22 @@ pub enum GnbDemoError {
         /// The other.
         second: String,
     },
+    /// D441D is active but the gNB config cannot run it.
+    #[error("demo d441d-predictive-ho cannot start: {0}")]
+    D441d(String),
+}
+
+/// D441D's `onnx` mode needs `d440b-model-verify` active in mode `verify` on
+/// the same gNB (nextgsim#467): the model it predicts with must be one the
+/// d440b checks verified. Startup fails otherwise.
+pub fn check_d441d_dependencies(active: &ActiveDemos) -> Result<(), GnbDemoError> {
+    if active.mode(D441D_KEY) == Some("onnx") && active.mode(D440B_KEY) != Some("verify") {
+        return Err(GnbDemoError::Config(DemoConfigError::MissingDependency {
+            demo: D441D_KEY.to_string(),
+            requires: format!("{D440B_KEY} (mode verify)"),
+        }));
+    }
+    Ok(())
 }
 
 /// Fails when more than one of [`HANDOVER_DEMOS`] is active.
@@ -162,6 +200,7 @@ pub fn init(config_yaml: &str) -> Result<&'static DemoRuntime, GnbDemoError> {
         })?;
     let runtime = DemoRuntime::from_root(&root, registry())?;
     check_handover_demo_exclusive(&runtime.snapshot())?;
+    check_d441d_dependencies(&runtime.snapshot())?;
     nextgsim_demo::install(runtime)
         .map_err(|_| GnbDemoError::Config(DemoConfigError::AlreadyInstalled))
 }
@@ -204,6 +243,77 @@ pub fn d440a_startup(config: &nextgsim_common::config::GnbConfig) {
         cells.len(),
         cells.join(", ")
     );
+}
+
+/// Whether D441D is active in this process (its feature compiled in, and both
+/// gates on). Always false in a build without `demo-d441d-predictive-ho`.
+pub fn d441d_active() -> bool {
+    cfg!(feature = "demo-d441d-predictive-ho") && nextgsim_demo::active_mode(D441D_KEY).is_some()
+}
+
+/// What D441D needs of the gNB config, and the startup line it logs
+/// (nextgsim#467): the NWDAF task on, and at least one positioned handover
+/// neighbour. `Ok(None)` when the demo is not active.
+#[cfg(feature = "demo-d441d-predictive-ho")]
+pub fn d441d_check_config(
+    config: &nextgsim_common::config::GnbConfig,
+    mode: Option<&str>,
+) -> Result<Option<String>, GnbDemoError> {
+    use crate::nwdaf::d441d;
+    let Some(mode) = mode else {
+        return Ok(None);
+    };
+    if !config.nwdaf_enabled {
+        return Err(GnbDemoError::D441d(
+            "nwdaf_enabled is false: the predictor and the shadow A3 run in the NWDAF task".into(),
+        ));
+    }
+    d441d::Engine::from_config(config).map_err(GnbDemoError::D441d)?;
+    let cells: Vec<String> = config
+        .handover_neighbours
+        .iter()
+        .filter_map(|n| {
+            n.position
+                .map(|p| format!("cell {:#x} at ({}, {}, {})", n.nci, p.x, p.y, p.z))
+        })
+        .collect();
+    let s = config.shadowing;
+    Ok(Some(format!(
+        "predictive handover mode={mode}: this cell {:#x} at ({}, {}, {}), {} positioned \
+         neighbour(s): [{}]; A3 margin a3-Offset {} dB + hysteresis {} dB for {} ms; \
+         horizon {} ms, dwell {} ms, at most {} attempt(s) {} ms apart; shadowing sigma {} \
+         dB seed {} decorrelation {} m",
+        config.nci,
+        config.sim_position.x,
+        config.sim_position.y,
+        config.sim_position.z,
+        cells.len(),
+        cells.join(", "),
+        config.cho_a3_offset_db,
+        config.cho_hysteresis_db,
+        d441d::A3_TTT_MS,
+        d441d::HORIZON_MS,
+        d441d::MIN_DWELL_MS,
+        d441d::MAX_ATTEMPTS,
+        d441d::RETRY_AFTER_MS,
+        s.sigma_db,
+        s.seed,
+        s.decorrelation_m
+    )))
+}
+
+/// D441D's startup check and line, against the installed demo state. An error
+/// fails startup. Silent and `Ok` when the demo is off.
+pub fn d441d_startup(config: &nextgsim_common::config::GnbConfig) -> Result<(), GnbDemoError> {
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    if let Some(line) =
+        d441d_check_config(config, nextgsim_demo::active_mode(D441D_KEY).as_deref())?
+    {
+        nextgsim_demo::demo_log!(info, D441D_KEY, "{line}");
+    }
+    #[cfg(not(feature = "demo-d441d-predictive-ho"))]
+    let _ = config;
+    Ok(())
 }
 
 /// D440C's gNB line for a PAGING's Assistance Data for Paging (nextgsim#464):
@@ -288,6 +398,7 @@ mod tests {
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
     #[cfg(not(any(
+        feature = "demo-d441d-predictive-ho",
         feature = "demo-d440a-ai-paging",
         feature = "demo-d446a-agent-conflict",
         feature = "model-registry",
@@ -505,6 +616,236 @@ mod tests {
             rt.render_metrics(&mut metrics);
             assert!(metrics
                 .contains("nextg_demo_enabled{demo=\"d440b-model-verify\",mode=\"fallback\"} 1"));
+        }
+    }
+
+    fn d441d_block(on: bool, mode: &str) -> String {
+        format!(
+            "demo:\n  enabled: {on}\n  d441d-predictive-ho:\n    enabled: true\n    mode: {mode}\n"
+        )
+    }
+
+    /// Without its feature the d441d block is an unknown key.
+    #[cfg(not(feature = "demo-d441d-predictive-ho"))]
+    #[test]
+    fn without_its_feature_the_d441d_block_fails_startup() {
+        let root: serde_yaml::Value = serde_yaml::from_str(&d441d_block(true, "lsq")).unwrap();
+        let err = DemoRuntime::from_root(&root, registry()).unwrap_err();
+        assert!(
+            matches!(&err, DemoConfigError::UnknownKey { key, .. } if key == D441D_KEY),
+            "{err}"
+        );
+    }
+
+    /// #467: the handover-demo list names D441D by the ticket's key, so the
+    /// conflict check covers it.
+    #[test]
+    fn the_handover_demos_name_d441d_by_its_key() {
+        assert!(HANDOVER_DEMOS.contains(&"d441d-predictive-ho"));
+        assert!(!HANDOVER_DEMOS.contains(&"d441d-ue-mobility-handover"));
+    }
+
+    /// #467: each config/demo-predictive-ho file is its base config with only
+    /// the D441D changes: the NWDAF task on, the neighbour's position, and the
+    /// shadowing and demo blocks (the UE: only its motion).
+    #[test]
+    fn the_d441d_configs_change_only_what_the_demo_needs() {
+        use serde_yaml::Value;
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config");
+        let load = |f: &str| -> Value {
+            serde_yaml::from_str(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap()).unwrap()
+        };
+        for (demo, base) in [
+            ("gnb-west.yaml", "gnb.yaml"),
+            ("gnb-east.yaml", "gnb-n2ho-target.yaml"),
+        ] {
+            let mut d = load(&format!("demo-predictive-ho/{demo}"));
+            let m = d.as_mapping_mut().unwrap();
+            assert_eq!(m.get("nwdaf_enabled"), Some(&Value::Bool(true)), "{demo}");
+            m.insert("nwdaf_enabled".into(), Value::Bool(false));
+            assert!(
+                m.remove("demo").is_some() && m.remove("shadowing").is_some(),
+                "{demo}"
+            );
+            let nb = m["handover_neighbours"][0].as_mapping_mut().unwrap();
+            assert!(nb.remove("position").is_some(), "{demo}");
+            assert_eq!(
+                d,
+                load(base),
+                "{demo} must be {base} plus the D441D changes"
+            );
+        }
+        let mut ue = load("demo-predictive-ho/ue.yaml");
+        let mut base = load("ue-n2ho.yaml");
+        for key in ["sim_position", "sim_movement", "sim_route"] {
+            ue.as_mapping_mut().unwrap().remove(key);
+            base.as_mapping_mut().unwrap().remove(key);
+        }
+        assert_eq!(
+            ue, base,
+            "the D441D UE differs from ue-n2ho.yaml only in its motion"
+        );
+    }
+
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    mod d441d {
+        use super::*;
+        use nextgsim_common::config::GnbConfig;
+
+        fn rt(yaml: &str) -> Result<DemoRuntime, DemoConfigError> {
+            DemoRuntime::from_root(&serde_yaml::from_str(yaml).unwrap(), registry())
+        }
+
+        /// Each of the three modes is accepted and active, with its banner.
+        #[test]
+        fn each_mode_is_accepted_and_active() {
+            for mode in ["a3", "lsq"] {
+                let rt = rt(&d441d_block(true, mode)).unwrap();
+                assert_eq!(rt.mode(D441D_KEY).as_deref(), Some(mode));
+                assert_eq!(
+                    rt.snapshot().banner().unwrap(),
+                    format!("DEMO MODE ACTIVE: d441d-predictive-ho={mode}")
+                );
+                assert!(check_d441d_dependencies(&rt.snapshot()).is_ok());
+            }
+            let onnx = format!(
+                "{}  d440b-model-verify:\n    enabled: true\n    mode: verify\n",
+                d441d_block(true, "onnx")
+            );
+            let rt = rt(&onnx).unwrap();
+            assert_eq!(rt.mode(D441D_KEY).as_deref(), Some("onnx"));
+            assert!(check_d441d_dependencies(&rt.snapshot()).is_ok());
+        }
+
+        /// `mode: bogus` fails startup with the named error.
+        #[test]
+        fn an_unknown_mode_fails_startup() {
+            assert_eq!(
+                rt(&d441d_block(true, "bogus")).unwrap_err(),
+                DemoConfigError::UnknownMode {
+                    demo: D441D_KEY.into(),
+                    mode: "bogus".into(),
+                    known: D441D_MODES.to_vec(),
+                }
+            );
+        }
+
+        /// `onnx` without d440b in mode `verify` (absent, or in `fallback`)
+        /// fails startup with `MissingDependency`.
+        #[test]
+        fn onnx_needs_d440b_in_verify() {
+            for extra in [
+                "",
+                "  d440b-model-verify:\n    enabled: true\n    mode: fallback\n",
+            ] {
+                let rt = rt(&format!("{}{extra}", d441d_block(true, "onnx"))).unwrap();
+                let err = check_d441d_dependencies(&rt.snapshot()).unwrap_err();
+                assert!(
+                    matches!(&err, GnbDemoError::Config(DemoConfigError::MissingDependency { demo, requires })
+                        if demo == D441D_KEY && requires.starts_with(D440B_KEY)),
+                    "{err}"
+                );
+            }
+        }
+
+        /// No block, the kill switch off, and the kill switch off with the key
+        /// enabled: nothing active, `demo show` says so, no metric series.
+        #[test]
+        fn every_demo_off_shape_is_inactive() {
+            for yaml in [
+                "nci: 16\n".to_string(),
+                "demo:\n  enabled: false\n".to_string(),
+                d441d_block(false, "lsq"),
+            ] {
+                let rt = rt(&yaml).unwrap();
+                assert!(rt.snapshot().is_empty(), "{yaml}");
+                assert_eq!(rt.mode(D441D_KEY), None);
+                assert!(rt.show(D441D_KEY).unwrap().contains("active=false mode=-"));
+                let mut metrics = String::new();
+                rt.render_metrics(&mut metrics);
+                assert!(metrics.is_empty(), "{metrics}");
+            }
+        }
+
+        /// `set mode=bogus` is refused and the mode stays; a valid switch applies
+        /// and shows in the metric.
+        #[test]
+        fn a_runtime_switch_is_checked() {
+            let rt = rt(&d441d_block(true, "lsq")).unwrap();
+            let err = rt
+                .handle_cli("d441d-predictive-ho set mode=bogus", "test")
+                .unwrap_err();
+            assert!(err.to_string().contains("unknown mode \"bogus\""), "{err}");
+            assert_eq!(rt.mode(D441D_KEY).as_deref(), Some("lsq"));
+            rt.handle_cli("d441d-predictive-ho set mode=a3", "test")
+                .unwrap();
+            assert_eq!(rt.mode(D441D_KEY).as_deref(), Some("a3"));
+            let mut metrics = String::new();
+            rt.render_metrics(&mut metrics);
+            assert!(
+                metrics.contains("nextg_demo_enabled{demo=\"d441d-predictive-ho\",mode=\"a3\"} 1")
+            );
+        }
+
+        /// The demo with #483's D446A on one gNB fails startup with the
+        /// conflict error (both call `execute_handover`).
+        #[cfg(feature = "demo-d446a-agent-conflict")]
+        #[test]
+        fn d441d_with_d446a_on_one_gnb_conflicts() {
+            let yaml = format!(
+                "{}  d446a-agent-conflict:\n    enabled: true\n    mode: load-balancing\n",
+                d441d_block(true, "lsq")
+            );
+            let err = check_handover_demo_exclusive(&rt(&yaml).unwrap().snapshot()).unwrap_err();
+            assert!(
+                matches!(&err, GnbDemoError::HandoverDemoConflict { first, second }
+                    if first == D441D_KEY && second == D446A_KEY),
+                "{err}"
+            );
+        }
+
+        fn shipped(name: &str) -> (String, GnbConfig) {
+            let path = format!(
+                "{}/../config/demo-predictive-ho/{name}",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let text = std::fs::read_to_string(&path).expect("read");
+            let config: GnbConfig = serde_yaml::from_str(&text).expect(name);
+            (text, config)
+        }
+
+        /// The shipped gNB configs are accepted, in mode lsq, and pass the
+        /// startup check, which logs the neighbour each one names.
+        #[test]
+        fn the_shipped_configs_start_in_lsq() {
+            for (name, other) in [("gnb-west.yaml", "0x20"), ("gnb-east.yaml", "0x10")] {
+                let (text, config) = shipped(name);
+                let rt = DemoRuntime::from_root(&serde_yaml::from_str(&text).unwrap(), registry())
+                    .expect(name);
+                assert_eq!(rt.mode(D441D_KEY).as_deref(), Some("lsq"), "{name}");
+                let line = d441d_check_config(&config, Some("lsq")).unwrap().unwrap();
+                assert!(
+                    line.contains(&format!("1 positioned neighbour(s): [cell {other} at")),
+                    "{line}"
+                );
+                assert!(config.shadowing.is_enabled(), "{name}");
+            }
+        }
+
+        /// The startup check refuses a config the demo cannot run, and is silent
+        /// with the demo off.
+        #[test]
+        fn the_startup_check_needs_the_nwdaf_and_a_positioned_neighbour() {
+            let (_, config) = shipped("gnb-west.yaml");
+            assert!(d441d_check_config(&config, None).unwrap().is_none());
+            let mut no_nwdaf = config.clone();
+            no_nwdaf.nwdaf_enabled = false;
+            let err = d441d_check_config(&no_nwdaf, Some("lsq")).unwrap_err();
+            assert!(err.to_string().contains("nwdaf_enabled"), "{err}");
+            let mut no_pos = config;
+            no_pos.handover_neighbours[0].position = None;
+            let err = d441d_check_config(&no_pos, Some("a3")).unwrap_err();
+            assert!(err.to_string().contains("position"), "{err}");
         }
     }
 

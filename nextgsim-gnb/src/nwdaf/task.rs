@@ -57,6 +57,25 @@ pub struct NwdafTask {
     /// Whether the first ONNX / fallback prediction has been logged.
     #[cfg(feature = "model-registry")]
     first_served: (bool, bool),
+    /// Demo D441D's decision core, built when the demo is active at startup
+    /// (nextgsim#467); `None` otherwise, and the task behaves as without it.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d: Option<D441dState>,
+}
+
+/// D441D's per-task state: the engine and the mode its last tick ran under.
+#[cfg(feature = "demo-d441d-predictive-ho")]
+struct D441dState {
+    engine: crate::nwdaf::d441d::Engine,
+    mode: Option<String>,
+}
+
+/// Milliseconds since the Unix epoch, the clock measurements are stamped with.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 impl NwdafTask {
@@ -125,6 +144,8 @@ impl NwdafTask {
             }
             (None, None) => {}
         }
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        let d441d = Self::d441d_state(&task_base.config, demo);
         Self {
             task_base,
             nwdaf,
@@ -133,6 +154,8 @@ impl NwdafTask {
             demo,
             served_mode: mode,
             first_served: (false, false),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d,
         }
     }
 
@@ -192,6 +215,18 @@ impl NwdafTask {
         rsrq: Option<f32>,
         position: (f32, f32, f32),
     ) {
+        self.handle_ue_measurement_at(ue_id, rsrp, rsrq, position, now_ms());
+    }
+
+    /// [`Self::handle_ue_measurement`], stamped `timestamp_ms`.
+    fn handle_ue_measurement_at(
+        &mut self,
+        ue_id: i32,
+        rsrp: Option<f32>,
+        rsrq: Option<f32>,
+        position: (f32, f32, f32),
+        timestamp_ms: u64,
+    ) {
         let Some(rsrp) = rsrp else {
             debug!(
                 "NWDAF: UE {ue_id} report carries no RSRP (pos=({}, {}, {})); \
@@ -214,13 +249,13 @@ impl NwdafTask {
             position: Vector3::new(position.0 as f64, position.1 as f64, position.2 as f64),
             velocity: None,
             serving_cell_id: self.task_base.config.cell_id() as i32,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
+            timestamp_ms,
         };
 
         self.nwdaf.record_measurement(measurement);
+
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        self.d441d_measurement(ue_id, rsrp, position, timestamp_ms);
 
         // Check for anomalies
         let anomalies = self.nwdaf.recent_anomalies();
@@ -467,6 +502,257 @@ impl NwdafTask {
     }
 }
 
+impl NwdafTask {
+    /// The next message, or `None` when `tick` (if any) fires first.
+    async fn recv_or_tick(
+        rx: &mut mpsc::Receiver<TaskMessage<NwdafMessage>>,
+        tick: &mut Option<tokio::time::Interval>,
+    ) -> Option<Option<TaskMessage<NwdafMessage>>> {
+        match tick {
+            Some(t) => tokio::select! {
+                m = rx.recv() => Some(m),
+                _ = t.tick() => None,
+            },
+            None => Some(rx.recv().await),
+        }
+    }
+
+    /// The `nwdaf-status` JSON: the manager's status, plus a `handover`
+    /// section while D441D is active (nextgsim#467).
+    #[cfg(feature = "model-registry")]
+    fn status_json(&self) -> String {
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        if let Some(st) = &self.d441d {
+            let mut v = serde_json::to_value(self.nwdaf.status())
+                .unwrap_or_else(|e| serde_json::json!({ "error": e.to_string() }));
+            if let Some(obj) = v.as_object_mut() {
+                let stats = st.engine.stats();
+                obj.insert(
+                    "handover".into(),
+                    serde_json::json!({
+                        "demo": crate::demo::D441D_KEY,
+                        "mode": self.demo.and_then(|d| d.mode(crate::demo::D441D_KEY)),
+                        "served_ues": st.engine.served_count(),
+                        "predictions": stats.predictions,
+                        "exhausted": stats.exhausted,
+                        "a3_would_trigger": stats.a3_would_trigger,
+                        "a3_fallbacks": stats.a3_fallbacks,
+                        "stranded": stats.stranded,
+                        "lead_ms": stats.lead_ms,
+                    }),
+                );
+            }
+            return v.to_string();
+        }
+        self.nwdaf.status().to_json()
+    }
+
+    /// D441D's state for this gNB, when the demo is active at startup. A config
+    /// the engine cannot run was refused at startup (`demo::d441d_startup`); if
+    /// one gets here anyway the demo stays inert and says so.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_state(
+        config: &nextgsim_common::config::GnbConfig,
+        demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    ) -> Option<D441dState> {
+        use crate::demo::D441D_KEY;
+        let mode = demo.and_then(|d| d.mode(D441D_KEY))?;
+        match crate::nwdaf::d441d::Engine::from_config(config) {
+            Ok(engine) => Some(D441dState {
+                engine,
+                mode: Some(mode),
+            }),
+            Err(e) => {
+                nextgsim_demo::demo_log!(error, D441D_KEY, "inert: {e}");
+                None
+            }
+        }
+    }
+
+    /// Feed one measurement to D441D's shadow A3 evaluator.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_measurement(
+        &mut self,
+        ue_id: i32,
+        rsrp: f32,
+        position: (f32, f32, f32),
+        timestamp_ms: u64,
+    ) {
+        let Some(st) = self.d441d.as_mut() else {
+            return;
+        };
+        // The RLS producer sends integer levels and positions as f32.
+        let pos = nextgsim_rls::SimCoord::new(
+            position.0.round() as i32,
+            position.1.round() as i32,
+            position.2.round() as i32,
+        );
+        let events = st
+            .engine
+            .on_measurement(ue_id, rsrp.round() as i32, pos, timestamp_ms);
+        for e in events {
+            self.d441d_act(e);
+        }
+    }
+
+    /// RRC's served set, for D441D.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_served(&mut self, ue_ids: &[i32], now: u64) {
+        if let Some(st) = self.d441d.as_mut() {
+            st.engine.set_served(ue_ids, now);
+        }
+    }
+
+    /// One D441D predictor tick at `now`, under the mode read now, so a
+    /// runtime switch applies from this tick. Returns what it acted on.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_tick(&mut self, now: u64) -> Vec<crate::nwdaf::d441d::Event> {
+        use crate::demo::{D440B_KEY, D441D_KEY};
+        use crate::nwdaf::d441d::{lsq_prediction, Predictor, HORIZON_MS};
+        use nextgsim_demo::demo_log;
+
+        let Some(mut st) = self.d441d.take() else {
+            return Vec::new();
+        };
+        let mode = self.demo.and_then(|d| d.mode(D441D_KEY));
+        if mode != st.mode {
+            demo_log!(
+                warn,
+                D441D_KEY,
+                "mode is now {} (was {}); applies from this tick",
+                mode.as_deref().unwrap_or("-"),
+                st.mode.as_deref().unwrap_or("-")
+            );
+            st.mode = mode.clone();
+        }
+        let predictive = matches!(mode.as_deref(), Some("lsq" | "onnx"));
+        let onnx = mode.as_deref() == Some("onnx");
+        // Only a model the d440b checks verified may predict (#463).
+        let verified = self.demo.and_then(|d| d.mode(D440B_KEY)).as_deref() == Some("verify");
+        let nwdaf = &self.nwdaf;
+        let events = st.engine.tick(now, predictive, |ue| {
+            if onnx && verified {
+                let before = nwdaf.serving_stats().onnx_inferences();
+                let p = nwdaf.predict_trajectory(ue, HORIZON_MS)?;
+                let by_model = nwdaf.serving_stats().onnx_inferences() > before;
+                Some((
+                    p,
+                    if by_model {
+                        Predictor::Onnx
+                    } else {
+                        Predictor::Fallback
+                    },
+                ))
+            } else {
+                let p = lsq_prediction(nwdaf, ue, HORIZON_MS, now)?;
+                Some((
+                    p,
+                    if onnx {
+                        Predictor::Fallback
+                    } else {
+                        Predictor::Lsq
+                    },
+                ))
+            }
+        });
+        self.d441d = Some(st);
+        for e in &events {
+            self.d441d_act(e.clone());
+        }
+        events
+    }
+
+    /// Log one D441D event and act on it: a prediction goes to RRC as an NWDAF
+    /// handover recommendation, the path `handle_nwdaf_handover` takes to
+    /// `execute_handover`.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_act(&mut self, event: crate::nwdaf::d441d::Event) {
+        use crate::demo::D441D_KEY;
+        use crate::nwdaf::d441d::{Event, MAX_ATTEMPTS};
+        use nextgsim_demo::demo_log;
+
+        let cell = |nci: u64| (nci & 0xF_FFFF_FFFF) as i32;
+        match event {
+            Event::Prediction {
+                ue_id,
+                target_nci,
+                predictor,
+                confidence,
+                attempt,
+            } => {
+                demo_log!(
+                    info,
+                    D441D_KEY,
+                    "NWDAF: handover prediction ue={ue_id} predictor={} target={} conf={confidence:.2} \
+                     attempt={attempt}/{MAX_ATTEMPTS}",
+                    predictor.as_str(),
+                    cell(target_nci)
+                );
+                let msg = RrcMessage::NwdafHandoverRecommendation {
+                    ue_id,
+                    target_cell: cell(target_nci),
+                    confidence,
+                };
+                if let Err(e) = self.task_base.rrc_tx.try_send(msg) {
+                    warn!("NWDAF: Failed to send handover recommendation to RRC: {e}");
+                }
+            }
+            Event::Exhausted { ue_id, target_nci } => demo_log!(
+                warn,
+                D441D_KEY,
+                "NWDAF: handover prediction exhausted ue={ue_id} target={}: still served after \
+                 {MAX_ATTEMPTS} attempt(s); none until it is served afresh",
+                cell(target_nci)
+            ),
+            Event::A3WouldTrigger {
+                ue_id,
+                target_nci,
+                t_lo_ms,
+                t_hi_ms,
+                serving_dbm,
+                neighbour_dbm,
+            } => demo_log!(
+                info,
+                D441D_KEY,
+                "A3 would trigger t={t_lo_ms}..{t_hi_ms} ue={ue_id} target={} \
+                 serving={serving_dbm} dBm neighbour={neighbour_dbm} dBm (the UE's A3 on its \
+                 2.5 s cycle, at an unknown phase)",
+                cell(target_nci)
+            ),
+            Event::LeadTime {
+                ue_id,
+                target_nci,
+                predictive_ms,
+                a3_ms,
+                lead_ms,
+            } => demo_log!(
+                info,
+                D441D_KEY,
+                "lead time ue={ue_id} target={} predictive_t={predictive_ms} \
+                 a3_t={}..{} lead_ms={}..{}",
+                cell(target_nci),
+                a3_ms.0,
+                a3_ms.1,
+                lead_ms.0,
+                lead_ms.1
+            ),
+            Event::Stranded {
+                ue_id,
+                target_nci,
+                a3_ms,
+            } => demo_log!(
+                warn,
+                D441D_KEY,
+                "stranded ue={ue_id} target={}: A3 fired at t={}..{} and neither the predictor \
+                 nor the A3 fallback moved the UE",
+                cell(target_nci),
+                a3_ms.0,
+                a3_ms.1
+            ),
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl Task for NwdafTask {
     type Message = NwdafMessage;
@@ -491,6 +777,19 @@ impl Task for NwdafTask {
             info!("NWDAF task subscribed to the 6G topic bus");
         }
 
+        // D441D's predictor tick (nextgsim#467): only with the demo active, so
+        // every other run waits on its channel exactly as before.
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        let mut tick = self.d441d.as_ref().map(|_| {
+            let mut t = tokio::time::interval(std::time::Duration::from_millis(
+                crate::nwdaf::d441d::TICK_MS,
+            ));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
+        #[cfg(not(feature = "demo-d441d-predictive-ho"))]
+        let mut tick: Option<tokio::time::Interval> = None;
+
         loop {
             // The bus arm is selected over only when a subscription exists, so a
             // build with the feature on but no 6G task init behaves as before.
@@ -498,18 +797,23 @@ impl Task for NwdafTask {
             let msg = {
                 if let Some(ref mut bus_rx) = bus_rx {
                     tokio::select! {
-                        received = rx.recv() => received,
+                        received = Self::recv_or_tick(&mut rx, &mut tick) => received,
                         bus_event = bus_rx.recv() => {
                             Self::log_bus_event(bus_event);
                             continue;
                         }
                     }
                 } else {
-                    rx.recv().await
+                    Self::recv_or_tick(&mut rx, &mut tick).await
                 }
             };
             #[cfg(not(feature = "event-bus"))]
-            let msg = rx.recv().await;
+            let msg = Self::recv_or_tick(&mut rx, &mut tick).await;
+            let Some(msg) = msg else {
+                #[cfg(feature = "demo-d441d-predictive-ho")]
+                let _ = self.d441d_tick(now_ms());
+                continue;
+            };
 
             match msg {
                 Some(TaskMessage::Message(msg)) => match msg {
@@ -542,7 +846,15 @@ impl Task for NwdafTask {
                     #[cfg(feature = "model-registry")]
                     NwdafMessage::Status { reply } => {
                         // A dropped receiver is a CLI that gave up waiting.
-                        let _ = reply.send(self.nwdaf.status().to_json());
+                        let _ = reply.send(self.status_json());
+                    }
+                    #[cfg(feature = "demo-d441d-predictive-ho")]
+                    NwdafMessage::ServedUes { ue_ids } => self.d441d_served(&ue_ids, now_ms()),
+                    #[cfg(feature = "demo-d441d-predictive-ho")]
+                    NwdafMessage::A3Fallback { ue_id } => {
+                        if let Some(st) = self.d441d.as_mut() {
+                            st.engine.on_a3_fallback(ue_id);
+                        }
                     }
                 },
                 Some(TaskMessage::Shutdown) => {
@@ -1201,6 +1513,180 @@ mod tests {
                     "the fallback arm must fail the consumer"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    mod d441d {
+        use super::*;
+        use crate::demo::registry;
+        use crate::nwdaf::d441d::{Event, Predictor};
+        use nextgsim_demo::DemoRuntime;
+
+        fn demo(yaml: &str) -> Option<&'static DemoRuntime> {
+            let rt =
+                DemoRuntime::from_root(&serde_yaml::from_str(yaml).unwrap(), registry()).unwrap();
+            Some(Box::leak(Box::new(rt)))
+        }
+
+        fn block(mode: &str, d440b: Option<&str>) -> String {
+            let mut y = format!(
+                "demo:\n  enabled: true\n  d441d-predictive-ho:\n    enabled: true\n    mode: {mode}\n"
+            );
+            if let Some(m) = d440b {
+                y += &format!("  d440b-model-verify:\n    enabled: true\n    mode: {m}\n");
+            }
+            y
+        }
+
+        /// gnb-west of the shipped configs, shadowing off so the levels are the
+        /// distance model's.
+        fn west() -> GnbConfig {
+            let text = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../config/demo-predictive-ho/gnb-west.yaml"
+            ))
+            .unwrap();
+            let mut c: GnbConfig = serde_yaml::from_str(&text).unwrap();
+            c.shadowing.sigma_db = 0.0;
+            c
+        }
+
+        /// A task in `demo`, serving UE 1 walking east at 5 m/s from x 20 for
+        /// `secs` heartbeats, through the measurement path the RLS feeds.
+        fn walked(
+            demo: Option<&'static DemoRuntime>,
+            secs: u64,
+        ) -> (NwdafTask, mpsc::Receiver<TaskMessage<RrcMessage>>) {
+            let (task_base, _app_rx, _ngap_rx, rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(west(), DEFAULT_CHANNEL_CAPACITY);
+            let mut task = NwdafTask::with_demo(task_base, 100, demo);
+            task.d441d_served(&[1], 0);
+            for s in 0..secs {
+                let x = 20.0 + 5.0 * s as f32;
+                task.handle_ue_measurement_at(1, Some(-x), None, (x, 0.0, 0.0), s * 1000);
+            }
+            (task, rrc_rx)
+        }
+
+        fn recommendations(
+            rx: &mut mpsc::Receiver<TaskMessage<RrcMessage>>,
+        ) -> Vec<(i32, i32, f32)> {
+            let mut out = Vec::new();
+            while let Ok(TaskMessage::Message(RrcMessage::NwdafHandoverRecommendation {
+                ue_id,
+                target_cell,
+                confidence,
+            })) = rx.try_recv()
+            {
+                out.push((ue_id, target_cell, confidence));
+            }
+            out
+        }
+
+        /// The wiring: heartbeat measurements reach the engine, a tick predicts,
+        /// and the prediction reaches RRC as an NWDAF recommendation for
+        /// gnb-east's cell (0x20) above RRC's 0.7 threshold. `nwdaf-status`
+        /// carries the handover section.
+        #[test]
+        fn a_predictive_tick_recommends_the_neighbour_to_rrc() {
+            let (mut task, mut rrc_rx) = walked(demo(&block("lsq", None)), 8);
+            assert!(recommendations(&mut rrc_rx).is_empty());
+            let events = task.d441d_tick(7000);
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [Event::Prediction {
+                        predictor: Predictor::Lsq,
+                        attempt: 1,
+                        ..
+                    }]
+                ),
+                "{events:?}"
+            );
+            let recs = recommendations(&mut rrc_rx);
+            assert_eq!(recs.len(), 1, "{recs:?}");
+            assert_eq!((recs[0].0, recs[0].1), (1, 0x20));
+            assert!(recs[0].2 > 0.7, "{recs:?}");
+            let status: serde_json::Value = serde_json::from_str(&task.status_json()).unwrap();
+            assert_eq!(status["handover"]["predictions"], 1, "{status}");
+            assert_eq!(status["handover"]["mode"], "lsq", "{status}");
+        }
+
+        /// Mode `a3` predicts nothing, and a runtime switch to `lsq` applies
+        /// from the next tick.
+        #[test]
+        fn mode_a3_predicts_nothing_until_switched() {
+            let rt = demo(&block("a3", None));
+            let (mut task, mut rrc_rx) = walked(rt, 8);
+            assert!(task.d441d_tick(7000).is_empty());
+            assert!(recommendations(&mut rrc_rx).is_empty());
+            rt.unwrap()
+                .handle_cli("d441d-predictive-ho set mode=lsq", "test")
+                .unwrap();
+            assert_eq!(task.d441d_tick(7000).len(), 1);
+            assert_eq!(recommendations(&mut rrc_rx).len(), 1);
+        }
+
+        /// `onnx` with no verified model to predict with is labelled fallback,
+        /// whether d440b is in `verify` with no model configured or not active.
+        #[test]
+        fn onnx_without_a_verified_model_is_labelled_fallback() {
+            for d440b in [Some("verify"), None] {
+                let (mut task, mut rrc_rx) = walked(demo(&block("onnx", d440b)), 8);
+                let events = task.d441d_tick(7000);
+                assert!(
+                    matches!(
+                        events.as_slice(),
+                        [Event::Prediction {
+                            predictor: Predictor::Fallback,
+                            ..
+                        }]
+                    ),
+                    "{d440b:?}: {events:?}"
+                );
+                assert_eq!(recommendations(&mut rrc_rx).len(), 1);
+            }
+        }
+
+        /// The run loop routes RRC's `ServedUes` and `A3Fallback` to the engine:
+        /// `nwdaf-status` then counts the served UEs and the fallback.
+        #[tokio::test]
+        async fn the_run_loop_routes_served_ues_to_the_engine() {
+            let (task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(west(), DEFAULT_CHANNEL_CAPACITY);
+            let mut task = NwdafTask::with_demo(task_base, 100, demo(&block("lsq", None)));
+            let (tx, rx) = mpsc::channel(8);
+            let run = tokio::spawn(async move { task.run(rx).await });
+            tx.send(TaskMessage::Message(NwdafMessage::ServedUes {
+                ue_ids: vec![4, 9],
+            }))
+            .await
+            .unwrap();
+            tx.send(TaskMessage::Message(NwdafMessage::A3Fallback { ue_id: 4 }))
+                .await
+                .unwrap();
+            let (reply, answer) = oneshot::channel();
+            tx.send(TaskMessage::Message(NwdafMessage::Status { reply }))
+                .await
+                .unwrap();
+            let status: serde_json::Value = serde_json::from_str(&answer.await.unwrap()).unwrap();
+            assert_eq!(status["handover"]["served_ues"], 2, "{status}");
+            assert_eq!(status["handover"]["a3_fallbacks"], 1, "{status}");
+            assert_eq!(status["handover"]["stranded"], 0, "{status}");
+            tx.send(TaskMessage::Shutdown).await.unwrap();
+            run.await.unwrap();
+        }
+
+        /// With the demo off the task has no D441D state: no tick, no section.
+        #[test]
+        fn with_the_demo_off_nothing_runs() {
+            let (mut task, mut rrc_rx) = walked(demo("nci: 16\n"), 8);
+            assert!(task.d441d.is_none());
+            assert!(task.d441d_tick(7000).is_empty());
+            assert!(recommendations(&mut rrc_rx).is_empty());
+            let status: serde_json::Value = serde_json::from_str(&task.status_json()).unwrap();
+            assert!(status.get("handover").is_none(), "{status}");
         }
     }
 }

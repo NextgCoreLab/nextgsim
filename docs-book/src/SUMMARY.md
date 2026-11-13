@@ -35,6 +35,7 @@
 - [D441A: RAN-fed User Data Congestion loop](demos/d441a-congestion-loop.md)
 - [D441E: MTLF→AnLF model provisioning and retrain](demos/d441e-model-retrain.md)
 - [D445A: network-assisted federated learning over PDU sessions](demos/d445a-fl-t8.md)
+- [D441D: predictive N2 handover vs A3](demos/d441d-predictive-ho.md)
 - [D440C: NWDAF UE-mobility analytics steer AMF paging](demos/d440c-nwdaf-paging.md)
 
 # Community

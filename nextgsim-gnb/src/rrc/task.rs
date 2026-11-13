@@ -183,6 +183,29 @@ pub struct RrcTask {
     /// (`AgentMessage::ConnectedUes`, nextgsim#483). `None` until the first
     /// report; never set unless the D446A demo is active.
     reported_connected_ues: Option<Vec<i32>>,
+    /// The process's demo state, read for D441D's mode at each A3 decision
+    /// (nextgsim#467). The installed one; a test passes its own.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    /// The served-UE set last reported to the NWDAF task
+    /// (`NwdafMessage::ServedUes`, D441D). `None` until the first report.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    reported_served_ues: Option<Vec<i32>>,
+    /// D441D: UEs this source gNB has sent a HANDOVER COMMAND to and still
+    /// holds (until the UE Context Release), so neither the predictor nor the
+    /// A3 fallback starts a second handover for them.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_executing: std::collections::HashSet<i32>,
+    /// D441D: when the predictor last started a handover of each UE.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_predictive_at: std::collections::HashMap<i32, std::time::Instant>,
+    /// D441D: shadowed A3 reports awaiting the fallback decision:
+    /// `(PCI, first report)`.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_a3_pending: std::collections::HashMap<i32, (u16, std::time::Instant)>,
+    /// D441D: A3 fallbacks acted on.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_fallbacks: u64,
     ue_manager: RrcUeContextManager,
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
@@ -290,6 +313,18 @@ impl RrcTask {
         Self {
             handback_holds: std::collections::HashMap::new(),
             reported_connected_ues: None,
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_demo: nextgsim_demo::installed(),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            reported_served_ues: None,
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_executing: std::collections::HashSet::new(),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_predictive_at: std::collections::HashMap::new(),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_a3_pending: std::collections::HashMap::new(),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_fallbacks: 0,
             task_base,
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
@@ -1264,6 +1299,160 @@ impl RrcTask {
         }
     }
 
+    /// D441D's mode, if the demo is active (nextgsim#467).
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_mode(&self) -> Option<String> {
+        self.d441d_demo.and_then(|d| d.mode(crate::demo::D441D_KEY))
+    }
+
+    /// Whether A3 is evaluated in shadow only: D441D active in a predictive
+    /// mode (`lsq`, `onnx`). In mode `a3`, and with the demo off, A3 acts.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn a3_in_shadow(&self) -> Option<String> {
+        self.d441d_mode().filter(|m| m != "a3")
+    }
+
+    /// An A3 report naming neighbour `pci`, in D441D's predictive modes: not
+    /// acted on now (the predictor decides), but remembered, so that if no
+    /// predictive handover starts within [`A3_FALLBACK_GRACE_MS`] of it the
+    /// sweep acts on A3 after all (`fallback=a3`) rather than leaving the UE on
+    /// a cell A3 says to leave. Returns whether the report is shadowed.
+    ///
+    /// [`A3_FALLBACK_GRACE_MS`]: crate::nwdaf::d441d::A3_FALLBACK_GRACE_MS
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_shadow_a3_report(&mut self, ue_id: i32, pci: u16) -> bool {
+        let Some(mode) = self.a3_in_shadow() else {
+            return false;
+        };
+        let grace = crate::nwdaf::d441d::A3_FALLBACK_GRACE_MS;
+        let pending = self
+            .d441d_a3_pending
+            .entry(ue_id)
+            .or_insert((pci, std::time::Instant::now()));
+        pending.0 = pci;
+        info!(
+            "[demo:{}] A3 MeasurementReport of UE[{ue_id}] for PCI {pci} not acted on \
+             (a3_mode=shadow, mode={mode}): the predictor decides; A3 acts (fallback=a3) if no \
+             predictive handover starts within {grace} ms of the first report",
+            crate::demo::D441D_KEY
+        );
+        true
+    }
+
+    /// Called from `complete_reestablishment`, the one place a re-establishment
+    /// is committed (every accepted request leaves a pending one, so every
+    /// verified Complete passes there; a Complete reaching only the connection
+    /// manager is one whose re-establishment expired, which commits nothing).
+    ///
+    /// D441D: `context` re-established here (TS 38.331 §5.3.7), for example
+    /// after a handover that failed at the target after the HANDOVER COMMAND
+    /// (T304). It is this gNB's UE again: no longer executing a handover, and
+    /// any A3 report held from before is stale. Without this it would drop out
+    /// of the served set and the fallback for the rest of the context's life.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_reestablished(&mut self, context: i32) {
+        let was_executing = self.d441d_executing.remove(&context);
+        self.d441d_a3_pending.remove(&context);
+        if was_executing {
+            info!(
+                "[demo:{}] UE[{context}] re-established after its HANDOVER COMMAND: the \
+                 handover failed, so the UE is served here again",
+                crate::demo::D441D_KEY
+            );
+        }
+    }
+
+    /// D441D's A3 fallback sweep (from the 100 ms sweep): each shadowed A3
+    /// report whose grace has run out is acted on, unless a predictive handover
+    /// started within the grace of it or the UE is already handing over or
+    /// gone. Each fallback is logged with its count and reported to the NWDAF
+    /// scorecard.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    async fn d441d_a3_fallback_sweep(&mut self) {
+        use crate::nwdaf::d441d::A3_FALLBACK_GRACE_MS;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let grace = Duration::from_millis(A3_FALLBACK_GRACE_MS);
+        // Forget what no longer has a context.
+        let live: std::collections::HashSet<i32> = self.ue_manager.ue_ids().into_iter().collect();
+        self.d441d_executing.retain(|id| live.contains(id));
+        self.d441d_predictive_at
+            .retain(|id, t| live.contains(id) && now.duration_since(*t) < Duration::from_secs(60));
+        let due: Vec<(i32, u16, Instant)> = self
+            .d441d_a3_pending
+            .iter()
+            .filter(|(_, (_, first))| now.duration_since(*first) >= grace)
+            .map(|(id, (pci, first))| (*id, *pci, *first))
+            .collect();
+        for (ue_id, pci, first) in due {
+            self.d441d_a3_pending.remove(&ue_id);
+            if !live.contains(&ue_id) || self.d441d_executing.contains(&ue_id) {
+                continue;
+            }
+            let predicted = self
+                .d441d_predictive_at
+                .get(&ue_id)
+                .is_some_and(|t| *t + grace >= first);
+            if predicted {
+                debug!(
+                    "[demo:{}] UE[{ue_id}]: a predictive handover started within the grace of \
+                     its A3 report; no fallback",
+                    crate::demo::D441D_KEY
+                );
+                continue;
+            }
+            self.d441d_fallbacks += 1;
+            warn!(
+                "[demo:{}] A3 fallback=a3 n={} UE[{ue_id}] PCI {pci}: no predictive handover \
+                 within {A3_FALLBACK_GRACE_MS} ms of its A3 report; acting on A3",
+                crate::demo::D441D_KEY,
+                self.d441d_fallbacks
+            );
+            if let Some(sixg) = self.task_base.sixg.as_ref() {
+                let _ = sixg
+                    .nwdaf_tx
+                    .try_send(crate::tasks::NwdafMessage::A3Fallback { ue_id });
+            }
+            self.a3_handover_to_neighbour(ue_id, pci).await;
+        }
+    }
+
+    /// Reports the served-UE set to the NWDAF task when it changed since the
+    /// last report (D441D, nextgsim#467): the UEs its predictor may move. Only
+    /// while the demo is active, without waiting: a full inbox leaves the report
+    /// pending for the next sweep.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn report_served_ues_to_nwdaf(&mut self) {
+        if self.d441d_mode().is_none() {
+            return;
+        }
+        let Some(sixg) = self.task_base.sixg.as_ref() else {
+            return;
+        };
+        // Connected UEs only (a context in setup, or one created for a
+        // handover-in that has not arrived, is not the predictor's to move),
+        // and not one already handing over.
+        let mut ue_ids: Vec<i32> = self
+            .ue_manager
+            .connected_ue_ids()
+            .into_iter()
+            .filter(|id| !self.d441d_executing.contains(id))
+            .collect();
+        ue_ids.sort_unstable();
+        if self.reported_served_ues.as_ref() == Some(&ue_ids) {
+            return;
+        }
+        if sixg
+            .nwdaf_tx
+            .try_send(crate::tasks::NwdafMessage::ServedUes {
+                ue_ids: ue_ids.clone(),
+            })
+            .is_ok()
+        {
+            self.reported_served_ues = Some(ue_ids);
+        }
+    }
+
     /// Handles `RrcMessage::ExpectHandoverArrival` (TS 38.413 §8.4.3, issue #156):
     /// records that this UE was admitted on a handover-in with C-RNTI `c_rnti`, so
     /// the next `RRCReconfigurationComplete` from it is an ARRIVAL.
@@ -1305,6 +1494,11 @@ impl RrcTask {
         );
         self.send_rrc_message(ue_id, RrcChannel::DlDcch, pdu).await;
         self.handover_manager.mark_executing(ue_id);
+        // D441D: executing until the UE Context Release removes the context.
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        if self.d441d_mode().is_some() {
+            self.d441d_executing.insert(ue_id);
+        }
     }
 
     /// The UL-DCCH PDU of an RLS id with a pending re-establishment binding
@@ -1432,6 +1626,8 @@ impl RrcTask {
         info!(
             "UE[{context}]: RRCReestablishmentComplete verified; the re-establishment is committed"
         );
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        self.d441d_reestablished(context);
         if let Some(kgnb) = rekeyed {
             let _ = self
                 .task_base
@@ -3311,6 +3507,18 @@ impl RrcTask {
             );
             return;
         }
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        if self.d441d_mode().is_some() {
+            if self.d441d_executing.contains(&ue_id) {
+                debug!(
+                    "RRC: NWDAF recommendation for UE {ue_id} ignored: its handover is \
+                     already executing"
+                );
+                return;
+            }
+            self.d441d_predictive_at
+                .insert(ue_id, std::time::Instant::now());
+        }
         info!(
             "RRC: NWDAF-recommended handover for UE {ue_id} to cell {target_cell} \
              (confidence {confidence:.2})"
@@ -3441,6 +3649,17 @@ impl RrcTask {
                 .await;
             return;
         }
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        if self.d441d_shadow_a3_report(ue_id, pci) {
+            return;
+        }
+        self.a3_handover_to_neighbour(ue_id, pci).await;
+    }
+
+    /// The A3 winner is not this gNB's SCell: an inter-gNB handover to the
+    /// configured `handover_neighbours` cell with that PCI, unless a handback
+    /// hold applies (#324, #483).
+    async fn a3_handover_to_neighbour(&mut self, ue_id: i32, pci: u16) {
         if self.handback_held(ue_id, i32::from(pci)) {
             return;
         }
@@ -3631,6 +3850,11 @@ impl Task for RrcTask {
                     // the broadcast is off (#422 review)
                     self.expire_pending_reestablishments().await;
                     self.report_connected_ues_to_agent();
+                    #[cfg(feature = "demo-d441d-predictive-ho")]
+                    {
+                        self.d441d_a3_fallback_sweep().await;
+                        self.report_served_ues_to_nwdaf();
+                    }
                 }
                 _ = si_timer.tick() => {
                     if si_period_ms > 0 {
@@ -4252,11 +4476,13 @@ mod tests {
                 nci: 0x20,
                 tac: 1,
                 gnb_id_length: None,
+                position: None,
             },
             nextgsim_common::config::HandoverNeighbourConfig {
                 nci: 0x30,
                 tac: 1,
                 gnb_id_length: None,
+                position: None,
             },
         ];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
@@ -6705,6 +6931,7 @@ mod tests {
             nci: 1050,
             tac: 7,
             gnb_id_length: None,
+            position: None,
         }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
@@ -6749,6 +6976,7 @@ mod tests {
             nci: 1050,
             tac: 7,
             gnb_id_length: None,
+            position: None,
         }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
@@ -6785,6 +7013,7 @@ mod tests {
                 nci: 1050,
                 tac: 7,
                 gnb_id_length: None,
+                position: None,
             }];
             let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
                 GnbTaskBase::new(config, 16);
@@ -6809,6 +7038,313 @@ mod tests {
                 "offset {offset}, hysteresis {hysteresis}"
             );
         }
+    }
+
+    /// D441D (#467): in a predictive mode (`lsq`, `onnx`) an A3 report naming a
+    /// configured neighbour is evaluated but not acted on: the predictor
+    /// decides. In mode `a3` the same report hands over, as with no demo.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_shadows_the_a3_handover_in_its_predictive_modes() {
+        for (mode, expect) in [("lsq", false), ("onnx", false), ("a3", true)] {
+            let mut config = test_config();
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+                position: None,
+            }];
+            let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task = RrcTask::new(task_base);
+            let yaml = format!(
+                "demo:\n  enabled: true\n  d441d-predictive-ho:\n    enabled: true\n    mode: {mode}\n"
+            );
+            let rt = nextgsim_demo::DemoRuntime::from_root(
+                &serde_yaml::from_str(&yaml).unwrap(),
+                crate::demo::registry(),
+            )
+            .unwrap();
+            task.d441d_demo = Some(Box::leak(Box::new(rt)));
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                    ctx.on_setup_complete();
+                }
+                while ngap_rx.try_recv().is_ok() {}
+                let pdu = measurement_report_pdu(-100, 42, -80);
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            });
+            let mut handed_over = false;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                handed_over |=
+                    matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_)));
+            }
+            assert_eq!(handed_over, expect, "mode {mode}");
+        }
+    }
+
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_runtime(on: bool, mode: &str) -> &'static nextgsim_demo::DemoRuntime {
+        let yaml = format!(
+            "demo:\n  enabled: {on}\n  d441d-predictive-ho:\n    enabled: true\n    mode: {mode}\n"
+        );
+        let rt = nextgsim_demo::DemoRuntime::from_root(
+            &serde_yaml::from_str(&yaml).unwrap(),
+            crate::demo::registry(),
+        )
+        .unwrap();
+        Box::leak(Box::new(rt))
+    }
+
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn connect(task: &mut RrcTask, ue_id: i32) {
+        let ctx = task.ue_manager.create_ue(ue_id);
+        ctx.on_setup_request();
+        ctx.on_setup_sent();
+        ctx.on_setup_complete();
+    }
+
+    /// D441D (#467): while the demo is active RRC reports to the NWDAF the UEs
+    /// it has connected and is not already handing over, once per change; a
+    /// context still in setup (or a handover-in not yet arrived) is not in it.
+    /// With the demo off it reports nothing.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_reports_the_served_ues_to_the_nwdaf_on_change() {
+        for active in [true, false] {
+            let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(test_config(), 16);
+            let mut sixg = task_base.init_6g_tasks(16);
+            let mut task = RrcTask::new(task_base);
+            task.d441d_demo = Some(d441d_runtime(active, "lsq"));
+            connect(&mut task, 5);
+            connect(&mut task, 3);
+            connect(&mut task, 8);
+            task.ue_manager.create_ue(9); // setup in progress
+            task.d441d_executing.insert(8); // HANDOVER COMMAND sent
+            task.report_served_ues_to_nwdaf();
+            task.report_served_ues_to_nwdaf(); // unchanged: not re-sent
+            task.ue_manager.delete_ue(5);
+            task.report_served_ues_to_nwdaf();
+            let mut seen = Vec::new();
+            while let Ok(TaskMessage::Message(crate::tasks::NwdafMessage::ServedUes { ue_ids })) =
+                sixg.nwdaf_rx.try_recv()
+            {
+                seen.push(ue_ids);
+            }
+            let want: Vec<Vec<i32>> = if active {
+                vec![vec![3, 5], vec![3]]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(seen, want, "active {active}");
+        }
+    }
+
+    /// D441D (#467): an NWDAF recommendation for a UE whose handover is already
+    /// executing starts no second HANDOVER REQUIRED.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_does_not_re_recommend_an_executing_handover() {
+        for executing in [true, false] {
+            let mut config = test_config();
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+                position: None,
+            }];
+            let (task, mut ngap_rx, _rls_rx) = rrc_task_with_connected_ue(config, 7);
+            let mut task = task;
+            task.d441d_demo = Some(d441d_runtime(true, "lsq"));
+            if executing {
+                // What the source does on the AMF's HANDOVER COMMAND.
+                run_async(task.handle_send_handover_command(7, OctetString::from_slice(&[0])));
+                assert!(task.d441d_executing.contains(&7));
+            }
+            run_async(task.handle_nwdaf_handover(7, 1050, 0.95));
+            let mut sent = false;
+            while let Ok(m) = ngap_rx.try_recv() {
+                sent |= matches!(m, TaskMessage::Message(NgapMessage::InitiateHandover(_)));
+            }
+            assert_eq!(sent, !executing, "executing {executing}");
+        }
+    }
+
+    /// D441D (#467), the A3 fallback: in mode lsq a shadowed A3 report is acted
+    /// on once its grace has run out with no predictive handover (counted, and
+    /// reported to the NWDAF scorecard); not when a predictive handover started
+    /// within the grace, and not when the handover is already executing.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_acts_on_a3_when_no_predictive_handover_comes() {
+        use std::time::{Duration, Instant};
+        for case in ["none", "predicted", "predicted_late", "executing"] {
+            let mut config = test_config();
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+                position: None,
+            }];
+            let (mut task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut sixg = task_base.init_6g_tasks(16);
+            let mut task = RrcTask::new(task_base);
+            task.d441d_demo = Some(d441d_runtime(true, "lsq"));
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                    ctx.on_setup_complete();
+                }
+                while ngap_rx.try_recv().is_ok() {}
+                let pdu = measurement_report_pdu(-100, 42, -80);
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+                task.d441d_a3_fallback_sweep().await;
+            });
+            let initiated = |rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>| {
+                let mut n = 0;
+                while let Ok(m) = rx.try_recv() {
+                    n += usize::from(matches!(
+                        m,
+                        TaskMessage::Message(NgapMessage::InitiateHandover(_))
+                    ));
+                }
+                n
+            };
+            assert_eq!(
+                initiated(&mut ngap_rx),
+                0,
+                "{case}: shadowed within the grace"
+            );
+            // The grace runs out.
+            let first = Instant::now() - Duration::from_millis(1500);
+            task.d441d_a3_pending.get_mut(&7).expect("pending").1 = first;
+            match case {
+                "predicted" => {
+                    task.d441d_predictive_at
+                        .insert(7, first - Duration::from_millis(500));
+                }
+                // After the report but within the grace: the predictor acted
+                // in time, so A3 does not.
+                "predicted_late" => {
+                    task.d441d_predictive_at
+                        .insert(7, first + Duration::from_millis(300));
+                }
+                "executing" => {
+                    task.d441d_executing.insert(7);
+                }
+                _ => {}
+            }
+            run_async(task.d441d_a3_fallback_sweep());
+            let want = usize::from(case == "none");
+            assert_eq!(initiated(&mut ngap_rx), want, "{case}");
+            assert_eq!(task.d441d_fallbacks, want as u64, "{case}");
+            let mut notified = 0;
+            while let Ok(TaskMessage::Message(crate::tasks::NwdafMessage::A3Fallback { ue_id })) =
+                sixg.nwdaf_rx.try_recv()
+            {
+                assert_eq!(ue_id, 7);
+                notified += 1;
+            }
+            assert_eq!(notified, want, "{case}");
+            assert!(task.d441d_a3_pending.is_empty(), "{case}: decided once");
+        }
+    }
+
+    /// D441D (#467): a UE whose handover failed after the HANDOVER COMMAND (T304
+    /// at the target) and that re-establishes here on the same context is this
+    /// gNB's again: back in the served set, and a shadowed A3 report from it is
+    /// acted on by the fallback once the grace has run out.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_a_failed_handover_re_established_here_is_served_again() {
+        use std::time::{Duration, Instant};
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+            position: None,
+        }];
+        let nci = config.nci;
+        let (mut task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut sixg = task_base.init_6g_tasks(16);
+        let mut task = RrcTask::new(task_base);
+        task.d441d_demo = Some(d441d_runtime(true, "lsq"));
+        let served = |sixg: &mut crate::tasks::GnbSixgReceivers| {
+            let mut last = None;
+            while let Ok(m) = sixg.nwdaf_rx.try_recv() {
+                if let TaskMessage::Message(crate::tasks::NwdafMessage::ServedUes { ue_ids }) = m {
+                    last = Some(ue_ids);
+                }
+            }
+            last
+        };
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(1) {
+                ctx.on_setup_complete();
+            }
+            task.report_served_ues_to_nwdaf();
+            assert_eq!(served(&mut sixg), Some(vec![1]));
+            // The AMF's HANDOVER COMMAND goes out; the handover then fails.
+            task.handle_send_handover_command(1, OctetString::from_slice(&[0]))
+                .await;
+            task.report_served_ues_to_nwdaf();
+            assert_eq!(served(&mut sixg), Some(vec![]), "executing");
+            // An A3 report while it is executing is held, for the old episode.
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+            assert!(task.d441d_a3_pending.contains_key(&1));
+            while rls_rx.try_recv().is_ok() {}
+            // The UE re-establishes here on the same context.
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+            )
+            .await;
+        });
+        assert!(
+            !task.d441d_executing.contains(&1),
+            "re-established: not executing"
+        );
+        assert!(
+            task.d441d_a3_pending.is_empty(),
+            "the report held from before the re-establishment is dropped"
+        );
+        task.report_served_ues_to_nwdaf();
+        assert_eq!(served(&mut sixg), Some(vec![1]), "served again");
+        while ngap_rx.try_recv().is_ok() {}
+        run_async(async {
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+            task.d441d_a3_pending.get_mut(&1).expect("held").1 =
+                Instant::now() - Duration::from_millis(1500);
+            task.d441d_a3_fallback_sweep().await;
+        });
+        let mut initiated = 0;
+        while let Ok(m) = ngap_rx.try_recv() {
+            initiated += usize::from(matches!(
+                m,
+                TaskMessage::Message(NgapMessage::InitiateHandover(_))
+            ));
+        }
+        assert_eq!(initiated, 1, "the A3 fallback acts for it");
+        assert_eq!(task.d441d_fallbacks, 1);
     }
 
     /// The negative control: a neighbour that does NOT beat the serving cell by the A3
