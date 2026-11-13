@@ -84,8 +84,10 @@ pub const A3_FALLBACK_GRACE_MS: u64 = TICK_MS;
 /// one grace later, plus one UE cycle for a report that came late).
 pub const STRANDED_AFTER_MS: u64 = A3_FALLBACK_GRACE_MS + UE_EVAL_PERIOD_MS;
 
-/// A UE handed away by the predictor whose A3 never completes is forgotten
-/// after this long (it left radio range, say).
+/// A UE no longer served whose A3 never completes (handed away by the
+/// predictor, or with only some replica phases fired) is forgotten this long
+/// after its last heartbeat or prediction, whichever is later (it left radio
+/// range, say).
 pub const EVICT_AFTER_MS: u64 = 60_000;
 
 /// How many serving-level samples the RSRP trend is fitted over (the trajectory
@@ -507,9 +509,11 @@ impl Engine {
         }
         let fired: Vec<(u64, u64, i32, i32)> = st.phases.iter().filter_map(|p| p.fired).collect();
         let first = *fired.iter().min_by_key(|f| f.0).expect("every phase fired");
-        // A UE phase between two grid phases can read one heartbeat like the
-        // later and the next like the earlier, so it may fire up to one grid
-        // step before the earliest grid phase, and before the latest plus one.
+        // Heartbeats are 1 s apart, so a 100 ms window holds at most one: a UE
+        // phase between grid phases h and h + 100 samples exactly what one of
+        // them samples, every cycle (a pure shift). It fires within 100 ms of
+        // that phase: up to one step before the earliest, and before the latest
+        // plus one.
         let t_lo = first.0.saturating_sub(PHASE_STEP_MS);
         let t_hi = fired.iter().map(|f| f.0).max().unwrap_or(first.0) + PHASE_STEP_MS;
         st.a3 = Some((first.1, t_lo, t_hi));
@@ -559,15 +563,18 @@ impl Engine {
         F: FnMut(i32) -> Option<(TrajectoryPrediction, Predictor)>,
     {
         let mut events = Vec::new();
-        // Forget UEs handed away whose A3 never completed.
+        // Forget UEs no longer served whose A3 never completed (handed away by
+        // the predictor, or left with only some replica phases fired), once
+        // nothing has happened for them for EVICT_AFTER_MS: no heartbeat and no
+        // prediction (out of range, say).
         let stale: Vec<i32> = self
             .ues
             .iter()
             .filter(|(id, st)| {
+                let last_heard = st.last.map(|(t, _, _)| t);
+                let last_event = last_heard.max(st.predicted.map(|(_, t)| t));
                 !self.served.contains(id)
-                    && st
-                        .predicted
-                        .is_some_and(|(_, t)| now_ms.saturating_sub(t) > EVICT_AFTER_MS)
+                    && last_event.is_some_and(|t| now_ms.saturating_sub(t) > EVICT_AFTER_MS)
             })
             .map(|(id, _)| *id)
             .collect();
@@ -598,7 +605,9 @@ impl Engine {
                     });
                 }
             }
-            if st.exhausted {
+            // Exhausted, or A3 already moved it (`fallback=a3`): no prediction
+            // is sent or scored for this episode any more.
+            if st.exhausted || st.fell_back {
                 continue;
             }
             let since = st.served_since_ms.unwrap_or(now_ms);
@@ -1208,6 +1217,48 @@ mod tests {
         assert_eq!(e.tracked_count(), 1, "not yet");
         e.tick(5001 + EVICT_AFTER_MS, true, |_| None);
         assert_eq!(e.tracked_count(), 0);
+    }
+
+    /// A UE that leaves unpredicted while only some replica phases have fired is
+    /// kept for its A3, and forgotten EVICT_AFTER_MS after its last heartbeat if
+    /// it stops being heard.
+    #[test]
+    fn a_ue_with_a_partial_a3_is_evicted_once_unheard() {
+        let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+        e.set_served(&[1], 0);
+        for s in 0..10u64 {
+            hb(&mut e, s * 1000, -62, 62);
+        }
+        // Past the margin from 10 s; by the 13 s heartbeat the earliest phases
+        // (12 500..) have fired, the latest (14 900) not yet.
+        for s in 10..=13u64 {
+            assert!(hb(&mut e, s * 1000, -64, 64).is_empty());
+        }
+        e.set_served(&[], 13_100);
+        assert_eq!(e.tracked_count(), 1, "kept: its A3 is in progress");
+        e.tick(13_000 + EVICT_AFTER_MS, true, |_| None);
+        assert_eq!(e.tracked_count(), 1, "not yet");
+        e.tick(13_001 + EVICT_AFTER_MS, true, |_| None);
+        assert_eq!(e.tracked_count(), 0);
+    }
+
+    /// Once RRC has acted on A3 for the episode (`fallback=a3`), the predictor
+    /// neither sends nor scores a prediction for it.
+    #[test]
+    fn no_prediction_after_an_a3_fallback() {
+        for fell_back in [false, true] {
+            let mut e = Engine::from_config(&west(0.0, 1)).unwrap();
+            e.set_served(&[1], 0);
+            for (s, x) in [(0u64, 40), (1, 45), (2, 50)] {
+                hb(&mut e, s * 1000, -x, x);
+            }
+            if fell_back {
+                e.on_a3_fallback(1);
+            }
+            let ev = e.tick(5000, true, ending_at(70.0));
+            assert_eq!(ev.is_empty(), fell_back, "fell_back {fell_back}: {ev:?}");
+            assert_eq!(e.stats().predictions, u64::from(!fell_back));
+        }
     }
 
     /// A config with no positioned neighbour cannot run the demo.

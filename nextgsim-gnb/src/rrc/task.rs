@@ -1339,6 +1339,29 @@ impl RrcTask {
         true
     }
 
+    /// Called from `complete_reestablishment`, the one place a re-establishment
+    /// is committed (every accepted request leaves a pending one, so every
+    /// verified Complete passes there; a Complete reaching only the connection
+    /// manager is one whose re-establishment expired, which commits nothing).
+    ///
+    /// D441D: `context` re-established here (TS 38.331 §5.3.7), for example
+    /// after a handover that failed at the target after the HANDOVER COMMAND
+    /// (T304). It is this gNB's UE again: no longer executing a handover, and
+    /// any A3 report held from before is stale. Without this it would drop out
+    /// of the served set and the fallback for the rest of the context's life.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_reestablished(&mut self, context: i32) {
+        let was_executing = self.d441d_executing.remove(&context);
+        self.d441d_a3_pending.remove(&context);
+        if was_executing {
+            info!(
+                "[demo:{}] UE[{context}] re-established after its HANDOVER COMMAND: the \
+                 handover failed, so the UE is served here again",
+                crate::demo::D441D_KEY
+            );
+        }
+    }
+
     /// D441D's A3 fallback sweep (from the 100 ms sweep): each shadowed A3
     /// report whose grace has run out is acted on, unless a predictive handover
     /// started within the grace of it or the UE is already handing over or
@@ -1603,6 +1626,8 @@ impl RrcTask {
         info!(
             "UE[{context}]: RRCReestablishmentComplete verified; the re-establishment is committed"
         );
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        self.d441d_reestablished(context);
         if let Some(kgnb) = rekeyed {
             let _ = self
                 .task_base
@@ -7156,7 +7181,7 @@ mod tests {
     #[test]
     fn d441d_acts_on_a3_when_no_predictive_handover_comes() {
         use std::time::{Duration, Instant};
-        for case in ["none", "predicted", "executing"] {
+        for case in ["none", "predicted", "predicted_late", "executing"] {
             let mut config = test_config();
             config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
                 nci: 1050,
@@ -7203,6 +7228,12 @@ mod tests {
                     task.d441d_predictive_at
                         .insert(7, first - Duration::from_millis(500));
                 }
+                // After the report but within the grace: the predictor acted
+                // in time, so A3 does not.
+                "predicted_late" => {
+                    task.d441d_predictive_at
+                        .insert(7, first + Duration::from_millis(300));
+                }
                 "executing" => {
                     task.d441d_executing.insert(7);
                 }
@@ -7222,6 +7253,98 @@ mod tests {
             assert_eq!(notified, want, "{case}");
             assert!(task.d441d_a3_pending.is_empty(), "{case}: decided once");
         }
+    }
+
+    /// D441D (#467): a UE whose handover failed after the HANDOVER COMMAND (T304
+    /// at the target) and that re-establishes here on the same context is this
+    /// gNB's again: back in the served set, and a shadowed A3 report from it is
+    /// acted on by the fallback once the grace has run out.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_a_failed_handover_re_established_here_is_served_again() {
+        use std::time::{Duration, Instant};
+        let mut config = test_config();
+        config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+            nci: 1050,
+            tac: 7,
+            gnb_id_length: None,
+            position: None,
+        }];
+        let nci = config.nci;
+        let (mut task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, mut rls_rx, _sctp_rx) =
+            GnbTaskBase::new(config, 16);
+        let mut sixg = task_base.init_6g_tasks(16);
+        let mut task = RrcTask::new(task_base);
+        task.d441d_demo = Some(d441d_runtime(true, "lsq"));
+        let served = |sixg: &mut crate::tasks::GnbSixgReceivers| {
+            let mut last = None;
+            while let Ok(m) = sixg.nwdaf_rx.try_recv() {
+                if let TaskMessage::Message(crate::tasks::NwdafMessage::ServedUes { ue_ids }) = m {
+                    last = Some(ue_ids);
+                }
+            }
+            last
+        };
+        run_async(async {
+            establish_with_security(&mut task, 1, [0xA1; 16], 6).await;
+            if let Some(ctx) = task.ue_manager.try_find_ue_mut(1) {
+                ctx.on_setup_complete();
+            }
+            task.report_served_ues_to_nwdaf();
+            assert_eq!(served(&mut sixg), Some(vec![1]));
+            // The AMF's HANDOVER COMMAND goes out; the handover then fails.
+            task.handle_send_handover_command(1, OctetString::from_slice(&[0]))
+                .await;
+            task.report_served_ues_to_nwdaf();
+            assert_eq!(served(&mut sixg), Some(vec![]), "executing");
+            // An A3 report while it is executing is held, for the old episode.
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+            assert!(task.d441d_a3_pending.contains_key(&1));
+            while rls_rx.try_recv().is_ok() {}
+            // The UE re-establishes here on the same context.
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlCcch,
+                reestablishment_request_pdu(nci, &[0xA1; 16], false),
+            )
+            .await;
+            task.handle_uplink_rrc(
+                1,
+                RrcChannel::UlDcch,
+                OctetString::from_slice(&reestablishment_complete_pdu(0)),
+            )
+            .await;
+        });
+        assert!(
+            !task.d441d_executing.contains(&1),
+            "re-established: not executing"
+        );
+        assert!(
+            task.d441d_a3_pending.is_empty(),
+            "the report held from before the re-establishment is dropped"
+        );
+        task.report_served_ues_to_nwdaf();
+        assert_eq!(served(&mut sixg), Some(vec![1]), "served again");
+        while ngap_rx.try_recv().is_ok() {}
+        run_async(async {
+            let pdu = measurement_report_pdu(-100, 42, -80);
+            task.handle_uplink_rrc(1, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                .await;
+            task.d441d_a3_pending.get_mut(&1).expect("held").1 =
+                Instant::now() - Duration::from_millis(1500);
+            task.d441d_a3_fallback_sweep().await;
+        });
+        let mut initiated = 0;
+        while let Ok(m) = ngap_rx.try_recv() {
+            initiated += usize::from(matches!(
+                m,
+                TaskMessage::Message(NgapMessage::InitiateHandover(_))
+            ));
+        }
+        assert_eq!(initiated, 1, "the A3 fallback acts for it");
+        assert_eq!(task.d441d_fallbacks, 1);
     }
 
     /// The negative control: a neighbour that does NOT beat the serving cell by the A3

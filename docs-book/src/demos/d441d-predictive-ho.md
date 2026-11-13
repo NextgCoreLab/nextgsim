@@ -85,7 +85,9 @@ The guards:
 - **Who is predicted:** RRC reports the UEs it has connected and is not
   already handing over. A context in setup, or a handover-in that has not
   arrived, is not included. A UE whose HANDOVER COMMAND has gone out is not
-  recommended again.
+  recommended again. If that handover fails at the target (T304) and the UE
+  re-establishes here on the same context, it is served here again, and any
+  A3 report held from before is dropped.
 - **Ping-pong:** a UE served for less than 5 s is not predicted away.
 - **Retries:** a UE still served 3 s after an attempt is tried again, at most
   3 times. Then one `exhausted` line is logged, and nothing more until the UE
@@ -95,7 +97,8 @@ The guards:
   first report, RRC acts on A3 after all. It logs
   `[demo:d441d-predictive-ho] A3 fallback=a3 n=<count> UE[<id>] PCI <pci>: ...`
   and counts it in the scorecard. This is a predictive-arm failure: A3 moved
-  the UE, not the predictor.
+  the UE, not the predictor. After a fallback the predictor sends and scores
+  nothing more for that UE in the episode.
 - **Stranded:** a served UE whose replica A3 completed 3.5 s ago, with neither
   a predictive handover nor an A3 fallback, is logged as
   `stranded ue=.. target=..` and counted.
