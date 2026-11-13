@@ -1,9 +1,10 @@
 //! The D440A seeded replay (nextgsim#462): every mode on the same committed
 //! route seeds, through the same [`recommend`] the live NWDAF task runs.
 //!
-//! For each seed of `config/demo-ai-paging/d440a-scenario.yaml`:
-//! 1. the route is built from the seed (a constant-turn arc sampled into
-//!    `sim_route` waypoints) and the UE's position is read from it with
+//! For each seed of `config/demo-ai-paging/d440a-scenario.yaml` and each
+//! route family ([`Family`]):
+//! 1. the route is built from the seed (an arc sampled into `sim_route`
+//!    waypoints) and the UE's position is read from it with
 //!    [`SimRoute::position_at`], the function the live UE's heartbeat uses;
 //! 2. the UE camps by the R-criterion the UE implements (q_hyst, Treselection,
 //!    the distance model's -1 dB per metre), sampled once a second;
@@ -16,10 +17,21 @@
 //!    retransmission pages all six. `page-all` sends no IE, so attempt 1 is
 //!    all six.
 //!
+//! **The route generator is a motion model, and it favours the predictor that
+//! shares it.** Constant-turn routes are exactly `ct`'s model, so `ct` is
+//! scored in-model there; straight routes are `lsq`'s model (on them lsq
+//! scores at least as well as ct); turn-change routes (the turn rate redrawn
+//! at release) are neither's. The table reports all three families, and the
+//! #535 review's finding that a 50-seed block is seed-specific is why each
+//! family also has a 2000-seed row with a 95% Wilson interval.
+//!
 //! The table counts, per mode, the first-attempt hits and the mean PAGING
 //! messages per mobile-terminated call. It is checked in
-//! (`config/demo-ai-paging/d440a-replay-table.txt`) and asserted
-//! reproducible. Nothing asserts that one predictor beats another.
+//! (`config/demo-ai-paging/d440a-replay-table.txt`): the committed 50-seed
+//! rows are asserted exactly, the 2000-seed rows loosely (hit rate within 1
+//! percentage point, mean PAGINGs within 0.05), so a libm difference across
+//! platforms that flips one seed does not fail them. Nothing asserts that one
+//! predictor beats another.
 //!
 //! What it does not model: amfd itself, the NGAP round trips, the UE's
 //! connected-mode mobility (the serving gNB at release is where the
@@ -76,6 +88,54 @@ struct Seeds {
     live: Vec<u64>,
     replay_first: u64,
     replay_count: u64,
+    large_sample_first: u64,
+    large_sample_count: u64,
+}
+
+/// How a route turns. The draws are made in one order for every family, so
+/// seed N of every family starts at the same point, heading and speed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Family {
+    /// One turn rate for the whole route: `ct`'s own motion model.
+    ConstantTurn,
+    /// Turn rate 0: `lsq`'s own motion model.
+    Straight,
+    /// The turn rate is redrawn at release: what the UE does idle is not what
+    /// any predictor saw it do connected.
+    TurnChange,
+}
+
+impl Family {
+    /// Every family, in table order.
+    pub(crate) const ALL: [Family; 3] = [Self::ConstantTurn, Self::Straight, Self::TurnChange];
+
+    /// The table's name for it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ConstantTurn => "constant-turn",
+            Self::Straight => "straight",
+            Self::TurnChange => "turn-change",
+        }
+    }
+}
+
+/// The position after `t` seconds along an arc from `(x0, y0)` with `heading`,
+/// `speed` and turn rate `omega`, and the heading there.
+fn arc(x0: f64, y0: f64, heading: f64, speed: f64, omega: f64, t: f64) -> (f64, f64, f64) {
+    if omega.abs() < 1e-9 {
+        (
+            x0 + speed * t * heading.cos(),
+            y0 + speed * t * heading.sin(),
+            heading,
+        )
+    } else {
+        let r = speed / omega;
+        (
+            x0 + r * ((heading + omega * t).sin() - heading.sin()),
+            y0 - r * ((heading + omega * t).cos() - heading.cos()),
+            heading + omega * t,
+        )
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,9 +215,18 @@ impl ScenarioFile {
         self.seeds.replay_first..self.seeds.replay_first + self.seeds.replay_count
     }
 
-    /// The run for `seed`. A draw whose route leaves the coverage box is
-    /// redrawn from the same stream, so the seed still fixes the route.
+    pub(crate) fn large_sample_seeds(&self) -> std::ops::Range<u64> {
+        self.seeds.large_sample_first..self.seeds.large_sample_first + self.seeds.large_sample_count
+    }
+
+    /// The constant-turn run for `seed` (the committed 50-seed rows).
     pub(crate) fn run(&self, seed: u64) -> Run {
+        self.run_family(seed, Family::ConstantTurn)
+    }
+
+    /// The run for `seed` in `family`. A draw whose route leaves the coverage
+    /// box is redrawn from the same stream, so the seed still fixes the route.
+    pub(crate) fn run_family(&self, seed: u64, family: Family) -> Run {
         let s = &self.scenario;
         let cells = self.cells();
         let (lo_x, hi_x, lo_y, hi_y) = cells.iter().fold(
@@ -183,19 +252,36 @@ impl ScenarioFile {
             let speed = rng.range(s.speed_mps);
             let omega = rng.range(s.turn_rate_rad_s);
             let page_after = rng.range_u32(s.page_after_release_s);
+            // Drawn last, so the constant-turn family's draws are the ones its
+            // committed rows were made with.
+            let omega_idle = if family == Family::TurnChange {
+                rng.range(s.turn_rate_rad_s)
+            } else {
+                omega
+            };
+            let omega = if family == Family::Straight {
+                0.0
+            } else {
+                omega
+            };
+            let omega_idle = if family == Family::Straight {
+                0.0
+            } else {
+                omega_idle
+            };
+            let t_release = f64::from(s.connected_s);
             let at = |t: f64| {
-                let (dx, dy) = if omega.abs() < 1e-9 {
-                    (speed * t * heading.cos(), speed * t * heading.sin())
+                let (x, y) = if t <= t_release {
+                    let (x, y, _) = arc(x0, y0, heading, speed, omega, t);
+                    (x, y)
                 } else {
-                    let r = speed / omega;
-                    (
-                        r * ((heading + omega * t).sin() - heading.sin()),
-                        -r * ((heading + omega * t).cos() - heading.cos()),
-                    )
+                    let (xr, yr, hr) = arc(x0, y0, heading, speed, omega, t_release);
+                    let (x, y, _) = arc(xr, yr, hr, speed, omega_idle, t - t_release);
+                    (x, y)
                 };
                 SimPosition {
-                    x: (x0 + dx).round() as i32,
-                    y: (y0 + dy).round() as i32,
+                    x: x.round() as i32,
+                    y: y.round() as i32,
                     z: 0,
                 }
             };
@@ -347,25 +433,78 @@ pub(crate) fn replay(
     }
 }
 
-/// The table's line for one mode.
-pub(crate) fn table_line(mode: &str, outcomes: &[Outcome]) -> String {
+/// The Wilson score 95% interval of `hits` in `n`, in percent.
+pub(crate) fn wilson_95(hits: usize, n: usize) -> (f64, f64) {
+    let (n, p, z) = (n as f64, hits as f64 / n as f64, 1.96_f64);
+    let denom = 1.0 + z * z / n;
+    let centre = (p + z * z / (2.0 * n)) / denom;
+    let half = z * (p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt() / denom;
+    (
+        100.0 * (centre - half).max(0.0),
+        100.0 * (centre + half).min(1.0),
+    )
+}
+
+/// The key a table line starts with: family, seed range, mode.
+fn key(family: Family, seeds: &std::ops::Range<u64>, mode: &str) -> String {
+    format!(
+        "| {:<13} | {:<9} | {mode:<11} |",
+        family.name(),
+        format!("{}..={}", seeds.start, seeds.end - 1)
+    )
+}
+
+/// The table's line for one family, seed range and mode.
+pub(crate) fn table_line(
+    family: Family,
+    seeds: &std::ops::Range<u64>,
+    mode: &str,
+    outcomes: &[Outcome],
+) -> String {
     let n = outcomes.len();
     let hits = outcomes.iter().filter(|o| o.first_attempt_hit).count();
     let pagings: usize = outcomes.iter().map(|o| o.pagings).sum();
+    let (lo, hi) = wilson_95(hits, n);
     format!(
-        "| {mode:<11} | {n:>5} | {hits:>18} | {:>7.1}% | {:>17.2} |",
+        "{} {n:>5} | {hits:>5} | {:>6.1}% | {lo:>5.1}..{hi:>5.1}% | {:>6.2} |",
+        key(family, seeds, mode),
         100.0 * hits as f64 / n as f64,
         pagings as f64 / n as f64
     )
 }
 
-/// The committed table's line for `mode`.
-pub(crate) fn committed_line(mode: &str) -> String {
+/// The committed table's line for `family`, `seeds` and `mode`.
+pub(crate) fn committed_line(family: Family, seeds: &std::ops::Range<u64>, mode: &str) -> String {
     let text = std::fs::read_to_string(TABLE).expect("read the committed table");
-    text.lines()
-        .find(|l| l.starts_with(&format!("| {mode:<11} |")))
-        .unwrap_or_else(|| panic!("no line for {mode} in {TABLE}"))
-        .to_string()
+    let k = key(family, seeds, mode);
+    text.lines().find(|l| l.starts_with(&k)).map_or_else(
+        || format!("{k} (no such line in the committed table)"),
+        str::to_string,
+    )
+}
+
+/// A table line's hit rate (percent) and mean PAGINGs.
+fn rate_and_mean(line: &str) -> (f64, f64) {
+    let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+    // | family | seeds | mode | calls | hits | rate% | lo..hi% | mean |
+    let rate = cells[6].trim_end_matches('%').parse().expect("a rate");
+    let mean = cells[8].parse().expect("a mean");
+    (rate, mean)
+}
+
+/// `computed` agrees with `committed` loosely: the hit rate within 1
+/// percentage point and the mean PAGINGs within 0.05.
+pub(crate) fn assert_loosely(computed: &str, committed: &str) {
+    assert!(
+        !committed.ends_with("(no such line in the committed table)"),
+        "{committed}"
+    );
+    let (r1, m1) = rate_and_mean(computed);
+    let (r2, m2) = rate_and_mean(committed);
+    assert!(
+        (r1 - r2).abs() <= 1.0 && (m1 - m2).abs() <= 0.05,
+        "computed {computed}\ncommitted {committed}"
+    );
 }
 
 pub(crate) fn run_mode(
@@ -373,9 +512,53 @@ pub(crate) fn run_mode(
     mode: Option<Predictor>,
     prepare: &dyn Fn(&mut NwdafManager),
 ) -> Vec<Outcome> {
-    file.replay_seeds()
-        .map(|seed| replay(file, &file.run(seed), mode, prepare))
+    run_seeds(
+        file,
+        Family::ConstantTurn,
+        file.replay_seeds(),
+        mode,
+        prepare,
+    )
+}
+
+pub(crate) fn run_seeds(
+    file: &ScenarioFile,
+    family: Family,
+    seeds: std::ops::Range<u64>,
+    mode: Option<Predictor>,
+    prepare: &dyn Fn(&mut NwdafManager),
+) -> Vec<Outcome> {
+    seeds
+        .map(|seed| replay(file, &file.run_family(seed, family), mode, prepare))
         .collect()
+}
+
+/// Every table line for `(name, mode)`: the committed 50 constant-turn seeds
+/// (asserted exactly) and each family's large sample (asserted loosely).
+pub(crate) fn table_lines(
+    file: &ScenarioFile,
+    name: &str,
+    mode: Option<Predictor>,
+    prepare: &dyn Fn(&mut NwdafManager),
+) -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    let seeds = file.replay_seeds();
+    let o = run_seeds(file, Family::ConstantTurn, seeds.clone(), mode, prepare);
+    out.push((
+        table_line(Family::ConstantTurn, &seeds, name, &o),
+        committed_line(Family::ConstantTurn, &seeds, name),
+        true,
+    ));
+    let large = file.large_sample_seeds();
+    for family in Family::ALL {
+        let o = run_seeds(file, family, large.clone(), mode, prepare);
+        out.push((
+            table_line(family, &large, name, &o),
+            committed_line(family, &large, name),
+            false,
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -414,13 +597,15 @@ mod tests {
         assert_ne!(file.run(1).route, file.run(2).route);
     }
 
-    /// #462: the five-arm table's four model-free rows, replayed from the
-    /// committed seeds, are exactly the committed table. `page-all` is the
-    /// check that the replay is honest: with no IE every first attempt pages
-    /// the whole area, so its hit rate is 100% at 6 PAGINGs per call.
+    /// #462: the five-arm table's four model-free modes, replayed from the
+    /// committed seeds, are the committed table: the 50 constant-turn seeds
+    /// exactly, and each route family's 2000-seed row loosely. `page-all` is
+    /// the check that the replay is honest: with no IE every first attempt
+    /// pages the whole area, so its hit rate is 100% at 6 PAGINGs per call.
     #[test]
     fn the_replay_reproduces_the_committed_table() {
         let file = scenario_file();
+        assert!(file.seeds.large_sample_count >= 2000);
         let mut lines = Vec::new();
         for (name, mode) in MODES {
             let outcomes = run_mode(&file, mode, &|_| {});
@@ -440,14 +625,66 @@ mod tests {
                     "{name}: served by its own predictor"
                 );
             }
-            lines.push((name, table_line(name, &outcomes)));
+            lines.extend(table_lines(&file, name, mode, &|_| {}));
         }
-        for (_, line) in &lines {
+        for (line, _, _) in &lines {
             println!("{line}");
         }
-        for (name, line) in &lines {
-            assert_eq!(*line, committed_line(name), "{name}");
+        for (line, committed, exact) in &lines {
+            if *exact {
+                assert_eq!(line, committed);
+            } else {
+                assert_loosely(line, committed);
+            }
         }
+    }
+
+    /// #462 (#535 review): the families share their draws, so seed N starts
+    /// at the same point, heading and speed in each; the straight route has no
+    /// turn, and the turn-change route agrees with the constant-turn one up to
+    /// release and then turns differently.
+    #[test]
+    fn the_route_families_are_paired_by_seed() {
+        let file = scenario_file();
+        let mut differs_after_release = 0;
+        for seed in 1..=20 {
+            let ct = file.run_family(seed, Family::ConstantTurn);
+            let st = file.run_family(seed, Family::Straight);
+            let tc = file.run_family(seed, Family::TurnChange);
+            if ct.start != st.start || ct.start != tc.start {
+                continue; // a family redrew to stay in coverage
+            }
+            // Straight: collinear waypoints (cross product within rounding).
+            let (p0, p1, p2) = (st.position(0), st.position(5), st.position(10));
+            let cross = (p1.x - p0.x) * (p2.y - p0.y) - (p1.y - p0.y) * (p2.x - p0.x);
+            assert!(
+                cross.abs() <= 60,
+                "seed {seed}: straight route turns ({cross})"
+            );
+            for t in 0..=ct.release_at_s {
+                let (a, b) = (ct.position(t), tc.position(t));
+                assert!(
+                    (a.x - b.x).abs() <= 1 && (a.y - b.y).abs() <= 1,
+                    "seed {seed} t {t}"
+                );
+            }
+            if ct.position(ct.page_at_s) != tc.position(tc.page_at_s) {
+                differs_after_release += 1;
+            }
+        }
+        assert!(differs_after_release >= 10, "{differs_after_release}");
+    }
+
+    /// The Wilson interval of a few known cases.
+    #[test]
+    fn the_wilson_interval_is_the_textbook_one() {
+        let (lo, hi) = wilson_95(50, 50);
+        assert!((lo - 92.9).abs() < 0.1 && hi == 100.0, "{lo} {hi}");
+        let (lo, hi) = wilson_95(1000, 2000);
+        assert!(
+            (lo - 47.8).abs() < 0.1 && (hi - 52.2).abs() < 0.1,
+            "{lo} {hi}"
+        );
     }
 
     /// #462: the replay's recommendations are the ones the live path would
@@ -488,17 +725,26 @@ mod tests {
             "/../tools/d440b-model/nwdaf-trajectory-cv.onnx"
         ));
         let file = scenario_file();
-        let outcomes = run_mode(&file, Some(Predictor::Onnx), &|nwdaf| {
+        let load = |nwdaf: &mut NwdafManager| {
             nwdaf
                 .load_verified_trajectory_model(&model)
                 .expect("the reference model verifies");
-        });
+        };
+        let outcomes = run_mode(&file, Some(Predictor::Onnx), &load);
         assert!(
             outcomes.iter().all(|o| o.served_by == "onnx"),
             "every prediction served by the verified model"
         );
-        let line = table_line("onnx", &outcomes);
-        println!("{line}");
-        assert_eq!(line, committed_line("onnx"));
+        let lines = table_lines(&file, "onnx", Some(Predictor::Onnx), &load);
+        for (line, _, _) in &lines {
+            println!("{line}");
+        }
+        for (line, committed, exact) in &lines {
+            if *exact {
+                assert_eq!(line, committed);
+            } else {
+                assert_loosely(line, committed);
+            }
+        }
     }
 }

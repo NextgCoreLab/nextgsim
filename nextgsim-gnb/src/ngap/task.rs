@@ -2809,7 +2809,7 @@ impl NgapTask {
         // NWDAF task while the context still says how long the UE stayed. None
         // with the demo off or in mode page-all.
         #[cfg(feature = "demo-d440a-ai-paging")]
-        let recommended_paging = self.d440a_recommendation(ue_id).await;
+        let recommended_paging = self.d440a_recommendation(ue_id, &release_cmd.cause).await;
         #[cfg(not(feature = "demo-d440a-ai-paging"))]
         let recommended_paging = None;
 
@@ -2864,49 +2864,84 @@ impl NgapTask {
     /// answer sends the Release Complete without the IE, which the AMF pages
     /// as with no recommendation. The mode is read here, so an `nr-cli` switch
     /// applies from the next release.
+    ///
+    /// Not asked when the release follows a handover (cause "successful
+    /// handover" or "handover cancelled", TS 38.413 §9.3.1.2): the UE stays
+    /// CM-CONNECTED at another gNB or this one, so there is no idle UE to page.
+    ///
+    /// Known limit: the wait runs on the NGAP task, so while it lasts this
+    /// gNB's other NGAP messages queue behind it. The NWDAF answers from
+    /// memory in well under a millisecond, but a slow or stalled NWDAF task
+    /// costs up to the timeout per release, serially. Acceptable for a demo
+    /// gNB; a production path would answer from a cache the NWDAF task
+    /// updates.
     #[cfg(feature = "demo-d440a-ai-paging")]
     async fn d440a_recommendation(
         &self,
         ue_id: i32,
+        cause: &NgSetupFailureCause,
     ) -> Option<nextgsim_ngap::procedures::ue_context_release::RecommendedPagingInfo> {
         use crate::demo::D440A_KEY;
         use crate::nwdaf::d440a;
+        use nextgsim_ngap::procedures::ng_setup::RadioNetworkCause;
         let mode = (self.d440a_mode)()?;
         let predictor = d440a::Predictor::for_mode(&mode)?;
+        if matches!(
+            cause,
+            NgSetupFailureCause::RadioNetwork(
+                RadioNetworkCause::SuccessfulHandover | RadioNetworkCause::HandoverCancelled
+            )
+        ) {
+            return None;
+        }
         let time_stayed = self
             .ue_contexts
             .get(&ue_id)
             .map(|c| c.d440a_since.elapsed().as_secs().min(4095) as u16);
-        let answer = match &self.task_base.sixg {
-            Some(sixg) => {
-                let (reply, answer) = tokio::sync::oneshot::channel();
-                let asked = async {
-                    sixg.nwdaf_tx
-                        .send(crate::tasks::NwdafMessage::D440aRecommend {
-                            ue_id,
-                            predictor,
-                            reply,
-                        })
-                        .await
-                        .ok()?;
-                    answer.await.ok()
-                };
-                tokio::time::timeout(d440a::RECOMMEND_TIMEOUT, asked)
-                    .await
-                    .ok()
-                    .flatten()
-            }
-            None => None,
-        };
-        if answer.is_none() {
+        let Some(sixg) = &self.task_base.sixg else {
             nextgsim_demo::demo_log!(
                 warn,
                 D440A_KEY,
-                "mode={mode}: no paging recommendation for ue_id={ue_id} from the NWDAF task \
-                 within {} ms (is nwdaf_enabled set?); the Release Complete carries no IE",
-                d440a::RECOMMEND_TIMEOUT.as_millis()
+                "mode={mode}: no NWDAF task on this gNB (is nwdaf_enabled set?); the Release \
+                 Complete for ue_id={ue_id} carries no IE"
             );
-        }
+            return None;
+        };
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let asked = async {
+            sixg.nwdaf_tx
+                .send(crate::tasks::NwdafMessage::D440aRecommend {
+                    ue_id,
+                    predictor,
+                    reply,
+                })
+                .await
+                .map_err(|_| true)?;
+            answer.await.map_err(|_| true)
+        };
+        let answer = match tokio::time::timeout(d440a::RECOMMEND_TIMEOUT, asked).await {
+            Ok(Ok(rec)) => Some(rec),
+            // The channel or the reply was dropped: no NWDAF task is running.
+            Ok(Err(_)) => {
+                nextgsim_demo::demo_log!(
+                    warn,
+                    D440A_KEY,
+                    "mode={mode}: no NWDAF task running on this gNB (is nwdaf_enabled set?); \
+                     the Release Complete for ue_id={ue_id} carries no IE"
+                );
+                None
+            }
+            Err(_) => {
+                nextgsim_demo::demo_log!(
+                    warn,
+                    D440A_KEY,
+                    "mode={mode}: the NWDAF task did not answer for ue_id={ue_id} within {} \
+                     ms; the Release Complete carries no IE",
+                    d440a::RECOMMEND_TIMEOUT.as_millis()
+                );
+                None
+            }
+        };
         answer.map(|rec| rec.paging_info(time_stayed))
     }
 
@@ -10932,6 +10967,26 @@ mod tests {
         Vec<u8>,
         nextgsim_ngap::procedures::ue_context_release::UeContextReleaseCompleteData,
     ) {
+        d440a_release_with(
+            task,
+            ue_id,
+            sctp_rx,
+            NgSetupFailureCause::Nas(NasCause::NormalRelease),
+        )
+        .await
+    }
+
+    /// [`d440a_release`] with the Release Command's `cause`.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    async fn d440a_release_with(
+        task: &mut NgapTask,
+        ue_id: i32,
+        sctp_rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+        cause: NgSetupFailureCause,
+    ) -> (
+        Vec<u8>,
+        nextgsim_ngap::procedures::ue_context_release::UeContextReleaseCompleteData,
+    ) {
         use nextgsim_ngap::procedures::ue_context_release::{
             decode_ue_context_release_complete, UeContextReleaseCommandData, UeNgapIds,
         };
@@ -10944,7 +10999,7 @@ mod tests {
                     amf_ue_ngap_id: 4242,
                     ran_ue_ngap_id,
                 },
-                cause: NgSetupFailureCause::Nas(NasCause::NormalRelease),
+                cause,
             },
         )
         .await;
@@ -11064,6 +11119,38 @@ mod tests {
             .await
             .expect("the release is bounded by the recommendation timeout");
         assert_eq!(complete.recommended_paging, None);
+    }
+
+    /// #462 (#535 review): the source gNB's release after a handover (cause
+    /// "successful handover" or "handover cancelled") is not a UE going idle,
+    /// so the NWDAF is not asked and the Release Complete carries no IE.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn a_release_after_a_handover_asks_for_no_recommendation() {
+        use nextgsim_ngap::procedures::ng_setup::RadioNetworkCause;
+        for (i, rn) in [
+            RadioNetworkCause::SuccessfulHandover,
+            RadioNetworkCause::HandoverCancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ue = 60 + i as i32;
+            let (mut task, _base, mut sixg, mut sctp_rx) =
+                d440a_task(ue, || Some("ct".into())).await;
+            let (_, complete) = d440a_release_with(
+                &mut task,
+                ue,
+                &mut sctp_rx,
+                NgSetupFailureCause::RadioNetwork(rn),
+            )
+            .await;
+            assert_eq!(complete.recommended_paging, None, "{rn:?}");
+            assert!(
+                sixg.nwdaf_rx.try_recv().is_err(),
+                "{rn:?}: the NWDAF was not asked"
+            );
+        }
     }
 
     /// The D440A mode [`a_mode_switch_applies_from_the_next_release`] reads.

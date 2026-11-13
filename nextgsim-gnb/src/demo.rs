@@ -58,8 +58,10 @@ pub const D440A_KEY: &str = "d440a-ai-paging";
 /// - `page-all`: the predictor-off arm. No recommendation, so the AMF pages the
 ///   registration area, exactly as with no demo.
 /// - `last-served`: the Release Complete recommends this gNB alone.
-/// - `ct`: constant-turn extrapolation over a Kalman-filtered track (the live
-///   physics baseline; the ticket's default arm).
+/// - `ct`: the live physics baseline (the ticket's default arm): a per-axis
+///   constant-velocity Kalman filter, a least-squares turn-rate fit on the
+///   filtered heading, and a constant-turn arc extrapolation. Not a CT-state
+///   filter.
 /// - `lsq`: least-squares constant velocity (the control).
 /// - `onnx`: the d440b-verified ONNX model (needs `d440b-model-verify` in mode
 ///   `verify`); a prediction no verified model served is labelled

@@ -47,8 +47,10 @@ pub const RECOMMEND_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
 pub enum Predictor {
     /// The UE stays where it was served: this gNB alone is recommended.
     LastServed,
-    /// Constant-turn extrapolation over a Kalman-filtered track (the live
-    /// physics baseline, `nextgsim_nwdaf::constant_turn`).
+    /// The live physics baseline (`nextgsim_nwdaf::constant_turn`): a per-axis
+    /// constant-velocity Kalman filter, a least-squares turn-rate fit on the
+    /// filtered heading, and a constant-turn arc extrapolation. Not a
+    /// CT-state (turn rate in the state) filter.
     ConstantTurn,
     /// Least-squares constant velocity (the control, #467).
     LeastSquares,

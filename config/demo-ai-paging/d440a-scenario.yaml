@@ -20,8 +20,15 @@ grid:
   - { nci: 0x60, position: { x: 240, y: 120, z: 0 } }
 gnb_id_length: 32
 
-# One route per seed: a constant-turn arc from a start point, sampled into
-# sim_route waypoints. The UE is connected for `connected_s` (its heartbeats are
+# One route per seed and route family, sampled into sim_route waypoints. The
+# generator is a motion model, and a predictor that shares it is scored
+# in-model (nextgsim#535 review):
+# - constant-turn: one turn rate drawn from turn_rate_rad_s for the whole
+#   route. This is exactly ct's model; the committed 50-seed rows use it.
+# - straight: the same draws with the turn rate set to 0. This is lsq's model.
+# - turn-change: the turn rate is drawn again at release, so the idle UE does
+#   not do what any predictor saw it do while connected.
+# Seed N starts at the same point, heading and speed in every family. The UE is connected for `connected_s` (its heartbeats are
 # the predictor's history), is released at that moment, keeps moving idle, and
 # is paged `page_after_release_s` later. A route that would leave the grid's
 # bounding box by more than `coverage_margin_m` (where the distance channel
@@ -51,3 +58,7 @@ seeds:
   # Replayed in-process, each mode on each seed: seeds first..first+count-1.
   replay_first: 1
   replay_count: 50
+  # The large sample every family is also replayed on, with a 95% interval
+  # (added after the #535 review showed seeds 1..=50 are seed-specific).
+  large_sample_first: 1
+  large_sample_count: 2000

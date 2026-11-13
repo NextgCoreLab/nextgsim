@@ -1,5 +1,8 @@
 //! Constant-turn trajectory extrapolation over a Kalman-filtered track
-//! (nextgsim#462, the D440A `ct` baseline).
+//! (nextgsim#462, the D440A `ct` baseline): a per-axis constant-velocity
+//! Kalman filter, a least-squares turn-rate fit on the filtered heading, and a
+//! constant-turn arc extrapolation. Not a CT-state filter (the turn rate is
+//! not in the filter's state).
 //!
 //! The physics baseline a learned trajectory model is measured against: a UE
 //! is assumed to keep its current speed and its current rate of turn.

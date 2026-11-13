@@ -1,5 +1,45 @@
-| page-all    |    50 |                 50 |   100.0% |              6.00 |
-| last-served |    50 |                 29 |    58.0% |              3.52 |
-| ct          |    50 |                 49 |    98.0% |              1.60 |
-| lsq         |    50 |                 43 |    86.0% |              2.22 |
-| onnx        |    50 |                 33 |    66.0% |              3.14 |
+# D440A seeded replay table (nextgsim#462). Written by the replay, not by hand.
+#
+# Provenance
+#   Scenario: config/demo-ai-paging/d440a-scenario.yaml (6 gNBs, one TAC, 120 m
+#   apart; horizon 20000 ms; connected 15 s, paged 10..30 s after release).
+#   Model-free rows: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging \
+#     --lib d440a::replay -- --nocapture
+#   onnx rows: the same test with --include-ignored and ORT_DYLIB_PATH, run by
+#   the CI model-verify job on the pinned ONNX Runtime 1.23.2 (d440b reference
+#   model, a one-step constant-velocity graph: about 1 s ahead, not ML).
+#   The 1..=50 rows are asserted exactly, the 1..=2000 rows loosely (rate
+#   within 1 pp, mean within 0.05).
+#
+# Reading it
+#   AMF model: amfd paging.strategy recommended-first. Attempt 1 goes to the
+#   recommended gNBs; every retransmission goes to all six. PAGINGs counts every
+#   PAGING message of an MT call, and a missed first attempt costs six more.
+#   hits = first-attempt hits; interval = Wilson 95% for the hit rate.
+#   Routes: constant-turn routes are ct's own motion model (ct is in-model);
+#   straight routes are lsq's; turn-change routes are neither's. The 50-seed
+#   block is one draw. Read the 2000-seed rows for comparisons.
+#   Non-normative: positions are simulator ground truth (TS 38.300 §16.20.2).
+#
+| family        | seeds     | mode        | calls |  hits | hit rate | 95% interval   | mean PAGINGs |
+|---------------|-----------|-------------|-------|-------|----------|----------------|--------------|
+| constant-turn | 1..=50    | page-all    |    50 |    50 |  100.0% |  92.9..100.0% |   6.00 |
+| constant-turn | 1..=2000  | page-all    |  2000 |  2000 |  100.0% |  99.8..100.0% |   6.00 |
+| straight      | 1..=2000  | page-all    |  2000 |  2000 |  100.0% |  99.8..100.0% |   6.00 |
+| turn-change   | 1..=2000  | page-all    |  2000 |  2000 |  100.0% |  99.8..100.0% |   6.00 |
+| constant-turn | 1..=50    | last-served |    50 |    29 |   58.0% |  44.2.. 70.6% |   3.52 |
+| constant-turn | 1..=2000  | last-served |  2000 |  1127 |   56.4% |  54.2.. 58.5% |   3.62 |
+| straight      | 1..=2000  | last-served |  2000 |  1178 |   58.9% |  56.7.. 61.0% |   3.47 |
+| turn-change   | 1..=2000  | last-served |  2000 |  1166 |   58.3% |  56.1.. 60.4% |   3.50 |
+| constant-turn | 1..=50    | ct          |    50 |    49 |   98.0% |  89.5.. 99.6% |   1.60 |
+| constant-turn | 1..=2000  | ct          |  2000 |  1864 |   93.2% |  92.0.. 94.2% |   1.88 |
+| straight      | 1..=2000  | ct          |  2000 |  1911 |   95.5% |  94.6.. 96.4% |   1.73 |
+| turn-change   | 1..=2000  | ct          |  2000 |  1779 |   89.0% |  87.5.. 90.3% |   2.13 |
+| constant-turn | 1..=50    | lsq         |    50 |    43 |   86.0% |  73.8.. 93.0% |   2.22 |
+| constant-turn | 1..=2000  | lsq         |  2000 |  1720 |   86.0% |  84.4.. 87.5% |   2.28 |
+| straight      | 1..=2000  | lsq         |  2000 |  1942 |   97.1% |  96.3.. 97.7% |   1.64 |
+| turn-change   | 1..=2000  | lsq         |  2000 |  1801 |   90.0% |  88.7.. 91.3% |   2.04 |
+| constant-turn | 1..=50    | onnx        | (from the model-verify CI job) |
+| constant-turn | 1..=2000  | onnx        | (from the model-verify CI job) |
+| straight      | 1..=2000  | onnx        | (from the model-verify CI job) |
+| turn-change   | 1..=2000  | onnx        | (from the model-verify CI job) |
