@@ -1221,6 +1221,14 @@ pub struct HandoverNeighbourConfig {
     /// The neighbour's gNB ID length in bits (22..32). Absent: this gNB's own.
     #[serde(default)]
     pub gnb_id_length: Option<u8>,
+    /// Where the neighbour's antenna stands, in metres (its own `sim_position`).
+    ///
+    /// Read only by a gNB built with the `demo-d441d-predictive-ho` feature and
+    /// with that demo active (nextgsim#467): its predictor and its shadow A3
+    /// evaluator need to know where a target cell is, which an A3 report never
+    /// says. Ignored otherwise, so absent (the default) changes nothing.
+    #[serde(default)]
+    pub position: Option<SimPosition>,
 }
 
 impl HandoverNeighbourConfig {
@@ -3600,6 +3608,21 @@ mod tests {
         assert!(!base.sim_motion_started(Duration::from_secs(3600)));
     }
 
+    /// #467: a handover neighbour may say where it stands; absent, it does not,
+    /// and a misspelt coordinate is refused (`SimPosition` denies unknown keys).
+    #[test]
+    fn a_handover_neighbour_position_is_optional() {
+        let n: HandoverNeighbourConfig =
+            serde_yaml::from_str("nci: 0x20\ntac: 1\nposition: { x: 120, y: 0 }\n").unwrap();
+        assert_eq!(n.position, Some(SimPosition { x: 120, y: 0, z: 0 }));
+        let n: HandoverNeighbourConfig = serde_yaml::from_str("nci: 0x20\ntac: 1\n").unwrap();
+        assert_eq!(n.position, None);
+        assert!(serde_yaml::from_str::<HandoverNeighbourConfig>(
+            "nci: 0x20\ntac: 1\nposition: { x: 120, Y: 0 }\n"
+        )
+        .is_err());
+    }
+
     /// #324: a handover neighbour's PCI is `nci % 1008` and its gNB ID the top
     /// `gnb_id_length` bits, defaulting to this gNB's length.
     #[test]
@@ -3608,6 +3631,7 @@ mod tests {
             nci: 0x000000020,
             tac: 1,
             gnb_id_length: None,
+            position: None,
         };
         assert_eq!(n.phys_cell_id(), 32);
         assert_eq!(n.gnb_id(32), 2);
@@ -3615,6 +3639,7 @@ mod tests {
             nci: 0x123456789,
             tac: 1,
             gnb_id_length: Some(24),
+            position: None,
         };
         assert_eq!(n.gnb_id(32), 0x123456);
         assert_eq!(n.phys_cell_id(), (0x123456789u64 % 1008) as u16);

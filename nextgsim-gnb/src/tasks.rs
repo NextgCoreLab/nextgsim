@@ -1260,6 +1260,14 @@ pub enum NwdafMessage {
         /// Where the JSON goes.
         reply: tokio::sync::oneshot::Sender<String>,
     },
+    /// The UEs this gNB's RRC holds a context for (demo D441D, nextgsim#467):
+    /// the ones its predictor may hand over. Sent by RRC on change, only while
+    /// the demo is active.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    ServedUes {
+        /// Sorted UE IDs.
+        ue_ids: Vec<i32>,
+    },
 }
 
 /// Messages for the Network Knowledge Exposure Function (NKEF) task.

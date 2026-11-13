@@ -59,6 +59,12 @@ demo-d446a-agent-conflict = ["nextgsim-agent"]
 # PR 3b). Active only with the demo: block on as well.
 demo-d440a-ai-paging = ["6g"]
 
+# Demo D441D (nextgsim#467, convention #458): predictive N2 handover from the
+# gNB NWDAF vs A3, a seeded A/B. Off by default; demo-only code, inert unless
+# the config's `demo:` block also enables `d441d-predictive-ho`. Needs the 6G
+# NWDAF task, and `model-registry` for the `onnx` arm (a d440b-verified model).
+demo-d441d-predictive-ho = ["6g", "model-registry"]
+
 # Demo D441A (nextgsim#465, convention #458): a configured cell capacity C, a
 # token-bucket downlink queue at C, and an exporter that POSTs the measured (and,
 # in mode `prediction`, the OLS-predicted) cell occupancy to nwdafd's

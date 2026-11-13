@@ -183,6 +183,14 @@ pub struct RrcTask {
     /// (`AgentMessage::ConnectedUes`, nextgsim#483). `None` until the first
     /// report; never set unless the D446A demo is active.
     reported_connected_ues: Option<Vec<i32>>,
+    /// The process's demo state, read for D441D's mode at each A3 decision
+    /// (nextgsim#467). The installed one; a test passes its own.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    d441d_demo: Option<&'static nextgsim_demo::DemoRuntime>,
+    /// The served-UE set last reported to the NWDAF task
+    /// (`NwdafMessage::ServedUes`, D441D). `None` until the first report.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    reported_served_ues: Option<Vec<i32>>,
     ue_manager: RrcUeContextManager,
     connection_manager: RrcConnectionManager,
     pdu_id_counter: u32,
@@ -290,6 +298,10 @@ impl RrcTask {
         Self {
             handback_holds: std::collections::HashMap::new(),
             reported_connected_ues: None,
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            d441d_demo: nextgsim_demo::installed(),
+            #[cfg(feature = "demo-d441d-predictive-ho")]
+            reported_served_ues: None,
             task_base,
             ue_manager: RrcUeContextManager::new(),
             connection_manager: RrcConnectionManager::new(),
@@ -1261,6 +1273,49 @@ impl RrcTask {
             .is_ok()
         {
             self.reported_connected_ues = Some(ue_ids);
+        }
+    }
+
+    /// D441D's mode, if the demo is active (nextgsim#467).
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn d441d_mode(&self) -> Option<String> {
+        self.d441d_demo.and_then(|d| d.mode(crate::demo::D441D_KEY))
+    }
+
+    /// Whether A3 is evaluated in shadow only: D441D active in a predictive
+    /// mode (`lsq`, `onnx`). In mode `a3`, and with the demo off, A3 acts.
+    fn a3_in_shadow(&self) -> Option<String> {
+        #[cfg(feature = "demo-d441d-predictive-ho")]
+        return self.d441d_mode().filter(|m| m != "a3");
+        #[cfg(not(feature = "demo-d441d-predictive-ho"))]
+        None
+    }
+
+    /// Reports the served-UE set to the NWDAF task when it changed since the
+    /// last report (D441D, nextgsim#467): the UEs its predictor may move. Only
+    /// while the demo is active, without waiting: a full inbox leaves the report
+    /// pending for the next sweep.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    fn report_served_ues_to_nwdaf(&mut self) {
+        if self.d441d_mode().is_none() {
+            return;
+        }
+        let Some(sixg) = self.task_base.sixg.as_ref() else {
+            return;
+        };
+        let mut ue_ids = self.ue_manager.ue_ids();
+        ue_ids.sort_unstable();
+        if self.reported_served_ues.as_ref() == Some(&ue_ids) {
+            return;
+        }
+        if sixg
+            .nwdaf_tx
+            .try_send(crate::tasks::NwdafMessage::ServedUes {
+                ue_ids: ue_ids.clone(),
+            })
+            .is_ok()
+        {
+            self.reported_served_ues = Some(ue_ids);
         }
     }
 
@@ -3441,6 +3496,14 @@ impl RrcTask {
                 .await;
             return;
         }
+        if let Some(mode) = self.a3_in_shadow() {
+            info!(
+                "[demo:{}] A3 MeasurementReport of UE[{ue_id}] for PCI {pci} not acted on \
+                 (a3_mode=shadow, mode={mode}): the predictor decides",
+                crate::demo::D441D_KEY
+            );
+            return;
+        }
         if self.handback_held(ue_id, i32::from(pci)) {
             return;
         }
@@ -3631,6 +3694,8 @@ impl Task for RrcTask {
                     // the broadcast is off (#422 review)
                     self.expire_pending_reestablishments().await;
                     self.report_connected_ues_to_agent();
+                    #[cfg(feature = "demo-d441d-predictive-ho")]
+                    self.report_served_ues_to_nwdaf();
                 }
                 _ = si_timer.tick() => {
                     if si_period_ms > 0 {
@@ -4252,11 +4317,13 @@ mod tests {
                 nci: 0x20,
                 tac: 1,
                 gnb_id_length: None,
+                position: None,
             },
             nextgsim_common::config::HandoverNeighbourConfig {
                 nci: 0x30,
                 tac: 1,
                 gnb_id_length: None,
+                position: None,
             },
         ];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
@@ -6705,6 +6772,7 @@ mod tests {
             nci: 1050,
             tac: 7,
             gnb_id_length: None,
+            position: None,
         }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
@@ -6749,6 +6817,7 @@ mod tests {
             nci: 1050,
             tac: 7,
             gnb_id_length: None,
+            position: None,
         }];
         let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
             GnbTaskBase::new(config, 16);
@@ -6785,6 +6854,7 @@ mod tests {
                 nci: 1050,
                 tac: 7,
                 gnb_id_length: None,
+                position: None,
             }];
             let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
                 GnbTaskBase::new(config, 16);
@@ -6808,6 +6878,91 @@ mod tests {
                 handed_over, expect,
                 "offset {offset}, hysteresis {hysteresis}"
             );
+        }
+    }
+
+    /// D441D (#467): in a predictive mode (`lsq`, `onnx`) an A3 report naming a
+    /// configured neighbour is evaluated but not acted on: the predictor
+    /// decides. In mode `a3` the same report hands over, as with no demo.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_shadows_the_a3_handover_in_its_predictive_modes() {
+        for (mode, expect) in [("lsq", false), ("onnx", false), ("a3", true)] {
+            let mut config = test_config();
+            config.handover_neighbours = vec![nextgsim_common::config::HandoverNeighbourConfig {
+                nci: 1050,
+                tac: 7,
+                gnb_id_length: None,
+                position: None,
+            }];
+            let (task_base, _app_rx, mut ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, 16);
+            let mut task = RrcTask::new(task_base);
+            let yaml = format!(
+                "demo:\n  enabled: true\n  d441d-predictive-ho:\n    enabled: true\n    mode: {mode}\n"
+            );
+            let rt = nextgsim_demo::DemoRuntime::from_root(
+                &serde_yaml::from_str(&yaml).unwrap(),
+                crate::demo::registry(),
+            )
+            .unwrap();
+            task.d441d_demo = Some(Box::leak(Box::new(rt)));
+            run_async(async {
+                establish_pending_setup(&mut task, 7).await;
+                if let Some(ctx) = task.ue_manager.try_find_ue_mut(7) {
+                    ctx.on_setup_complete();
+                }
+                while ngap_rx.try_recv().is_ok() {}
+                let pdu = measurement_report_pdu(-100, 42, -80);
+                task.handle_uplink_rrc(7, RrcChannel::UlDcch, OctetString::from_slice(&pdu))
+                    .await;
+            });
+            let mut handed_over = false;
+            while let Ok(msg) = ngap_rx.try_recv() {
+                handed_over |=
+                    matches!(msg, TaskMessage::Message(NgapMessage::InitiateHandover(_)));
+            }
+            assert_eq!(handed_over, expect, "mode {mode}");
+        }
+    }
+
+    /// D441D (#467): while the demo is active RRC reports the UEs it holds to
+    /// the NWDAF task, once per change; with the demo off it reports nothing.
+    #[cfg(feature = "demo-d441d-predictive-ho")]
+    #[test]
+    fn d441d_reports_the_served_ues_to_the_nwdaf_on_change() {
+        for active in [true, false] {
+            let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(test_config(), 16);
+            let mut sixg = task_base.init_6g_tasks(16);
+            let mut task = RrcTask::new(task_base);
+            let yaml = format!(
+                "demo:\n  enabled: {active}\n  d441d-predictive-ho:\n    enabled: true\n    mode: lsq\n"
+            );
+            let rt = nextgsim_demo::DemoRuntime::from_root(
+                &serde_yaml::from_str(&yaml).unwrap(),
+                crate::demo::registry(),
+            )
+            .unwrap();
+            task.d441d_demo = Some(Box::leak(Box::new(rt)));
+            task.ue_manager.create_ue(5);
+            task.ue_manager.create_ue(3);
+            task.report_served_ues_to_nwdaf();
+            task.report_served_ues_to_nwdaf(); // unchanged: not re-sent
+            task.ue_manager.delete_ue(5);
+            task.report_served_ues_to_nwdaf();
+            let mut seen = Vec::new();
+            while let Ok(TaskMessage::Message(crate::tasks::NwdafMessage::ServedUes { ue_ids })) =
+                sixg.nwdaf_rx.try_recv()
+            {
+                seen.push(ue_ids);
+            }
+            let want: Vec<Vec<i32>> = if active {
+                vec![vec![3, 5], vec![3]]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(seen, want, "active {active}");
         }
     }
 
