@@ -111,7 +111,7 @@ exports these metrics:
 
 **Startup failures:**
 - `mode: bogus` fails with
-  `UnknownMode { demo: "d441e-model-retrain", mode: "bogus" }`;
+  `UnknownMode { demo: "d441e-model-retrain", mode: "bogus", known: ["retrain", "no-retrain"] }`;
 - the key in a build without the feature fails with `UnknownKey`;
 - an unknown `nwdaf.role` fails;
 - a malformed `nwdaf.anlf` block fails.
@@ -143,8 +143,10 @@ cargo test -p nextgcore-nwdafd                                        # demo-off
 
 nextgcore's `docker/rust/docker-compose.demo-d441e.yml` is standalone: an NRF
 and the two NWDAFs, nothing published, an `internal` network. Build nrfd and
-nwdafd with `--features demo-d441e-model-retrain` into images, then, from
-`nextgcore/docker/rust`:
+nwdafd in one cargo call, `cargo build --release -p nextgcore-nrfd -p
+nextgcore-nwdafd --features nextgcore-nwdafd/demo-d441e-model-retrain` (the
+feature is nwdafd's; nrfd has none), and package each with `Dockerfile.nf`.
+Then, from `nextgcore/docker/rust`:
 
 ```bash
 export D441E_NWDAF_IMAGE=<nwdaf image> D441E_NRF_IMAGE=<nrf image>
@@ -154,6 +156,11 @@ configs/demo-d441e/check.sh off-absent     # also off-disabled, off-key-only
 configs/demo-d441e/check.sh bogus-mode     # UnknownMode fails start-up
 configs/demo-d441e/reverts.sh              # flipped v2 byte; FeedbackRegistry feed patched out
 ```
+
+`reverts.sh` rebuilds nwdafd under each patch. It needs `D441E_CORE_IMAGE`, the
+base image `Dockerfile.nf` extends (default `nextgcore-core:latest`, built from
+`Dockerfile.core`), and a checkout whose tracked files match HEAD. It refuses a
+dirty tree, and it reverses each patch right after that patch's build.
 
 A seeded arm waits up to 10 minutes. The series is a function of unix time,
 and the NWDAFs are started 25-60 s into a 600 s cycle. The AnLF reports as soon
@@ -262,7 +269,10 @@ The MAE is reported, not asserted.
 
 nextgcore CI's `demo-d441e` job (run
 [43403156885](https://github.com/NextgCoreLab/nextgcore/actions/runs/43403156885),
-artefact `demo-d441e`) passed every arm on the compose stack:
+artefact `demo-d441e`) passed every arm on the compose stack. It ran on PR
+#1495's head `81e63125`, whose tree is identical to main `42626daa` (the same
+git tree object, so the same under `docker/`, `deploy/`, `k8s/`, `.github/` and
+nwdafd):
 - bogus-mode: both NWDAFs exit 1 with
   `UnknownMode { demo: "d441e-model-retrain", mode: "bogus", known: ["retrain", "no-retrain"] }`;
 - off-absent, off-disabled and off-key-only: the MLModelMonitor routes answer
