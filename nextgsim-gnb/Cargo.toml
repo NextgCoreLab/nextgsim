@@ -67,6 +67,14 @@ demo-d440a-ai-paging = ["6g"]
 # enables `d441a-congestion-loop`.
 demo-d441a-congestion-loop = ["6g", "sbi-client"]
 
+# Demo D440C (nextgsim#464, convention #458): NWDAF UE-mobility analytics steer
+# AMF paging. On the gNB the demo only LOGS the PAGING's Assistance Data for
+# Paging (`[demo:d440c-nwdaf-paging] PAGING assistance: cells=[..] attempt k/n`);
+# decoding the IE is base NGAP (TS 38.413 §9.3.1.69) and needs no feature. Off by
+# default; inert unless the config's `demo:` block also enables
+# `d440c-nwdaf-paging`. Implies `6g`, the gNB gate the ticket names.
+demo-d440c-nwdaf-paging = ["6g"]
+
 # Umbrella feature enabling the five optional 6G / AI-native research crates at
 # once. (The gNB FL aggregator was removed in nextgsim#480: federated learning
 # is an application-layer AF, `nr-fl-server`, on the N6 side, not a gNB task.)
