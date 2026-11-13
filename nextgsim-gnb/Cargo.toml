@@ -63,6 +63,12 @@ demo-d446a-agent-conflict = ["nextgsim-agent"]
 # d440b-verified model).
 demo-d440a-ai-paging = ["6g", "model-registry"]
 
+# Demo D441D (nextgsim#467, convention #458): predictive N2 handover from the
+# gNB NWDAF vs A3, a seeded A/B. Off by default; demo-only code, inert unless
+# the config's `demo:` block also enables `d441d-predictive-ho`. Needs the 6G
+# NWDAF task, and `model-registry` for the `onnx` arm (a d440b-verified model).
+demo-d441d-predictive-ho = ["6g", "model-registry"]
+
 # Demo D441A (nextgsim#465, convention #458): a configured cell capacity C, a
 # token-bucket downlink queue at C, and an exporter that POSTs the measured (and,
 # in mode `prediction`, the OLS-predicted) cell occupancy to nwdafd's
@@ -70,6 +76,14 @@ demo-d440a-ai-paging = ["6g", "model-registry"]
 # Off by default; demo-only code, inert unless the config's `demo:` block also
 # enables `d441a-congestion-loop`.
 demo-d441a-congestion-loop = ["6g", "sbi-client"]
+
+# Demo D440C (nextgsim#464, convention #458): NWDAF UE-mobility analytics steer
+# AMF paging. On the gNB the demo only LOGS the PAGING's Assistance Data for
+# Paging (`[demo:d440c-nwdaf-paging] PAGING assistance: cells=[..] attempt k/n`);
+# decoding the IE is base NGAP (TS 38.413 §9.3.1.69) and needs no feature. Off by
+# default; inert unless the config's `demo:` block also enables
+# `d440c-nwdaf-paging`. Implies `6g`, the gNB gate the ticket names.
+demo-d440c-nwdaf-paging = ["6g"]
 
 # Umbrella feature enabling the five optional 6G / AI-native research crates at
 # once. (The gNB FL aggregator was removed in nextgsim#480: federated learning

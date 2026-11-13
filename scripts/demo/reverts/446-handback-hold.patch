@@ -1,9 +1,9 @@
 --- a/nextgsim-gnb/src/rrc/task.rs
 +++ b/nextgsim-gnb/src/rrc/task.rs
-@@ -3398,9 +3398,7 @@
-                 .await;
-             return;
-         }
+@@ -3630,9 +3630,7 @@
+     /// configured `handover_neighbours` cell with that PCI, unless a handback
+     /// hold applies (#324, #483).
+     async fn a3_handover_to_neighbour(&mut self, ue_id: i32, pci: u16) {
 -        if self.handback_held(ue_id, i32::from(pci)) {
 -            return;
 -        }

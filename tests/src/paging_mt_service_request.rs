@@ -102,6 +102,7 @@ fn amf_paging_pdu(tai: Tai) -> Vec<u8> {
         paging_drx: None,
         paging_priority: None,
         paging_origin: None,
+        assistance_data: None,
     })
     .expect("encode NGAP Paging")
 }

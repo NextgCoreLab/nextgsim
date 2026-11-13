@@ -251,6 +251,11 @@ pub struct NgapTask {
     /// field so a test can drive a mode without the process-global demo state.
     #[cfg(feature = "demo-d440a-ai-paging")]
     d440a_mode: fn() -> Option<String>,
+    /// D440C's mode on this gNB, read at each PAGING (nextgsim#464): `Some` turns
+    /// the PAGING assistance log on. A field so a test can drive it without
+    /// installing the process-global demo state.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    d440c_mode: fn() -> Option<String>,
     /// Counter for generating downlink TEIDs
     #[allow(dead_code)]
     downlink_teid_counter: u32,
@@ -404,6 +409,8 @@ impl NgapTask {
             inbound_arbitration: |config| crate::demo::d446a_active() && config.agent_enabled,
             #[cfg(feature = "demo-d440a-ai-paging")]
             d440a_mode: || nextgsim_demo::active_mode(crate::demo::D440A_KEY),
+            #[cfg(feature = "demo-d440c-nwdaf-paging")]
+            d440c_mode: || nextgsim_demo::active_mode(crate::demo::D440C_KEY),
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_ngap_sessions: NgapMbsManager::new(),
@@ -4754,6 +4761,19 @@ impl NgapTask {
             matching.len()
         );
 
+        // Demo d440c-nwdaf-paging (nextgsim#464): show what the AMF's Assistance
+        // Data for Paging asked of this gNB (TS 38.413 §8.5.1.2: it "may be
+        // used"). Logged only; the paging below is unchanged.
+        #[cfg(feature = "demo-d440c-nwdaf-paging")]
+        if let (Some(_), Some(assistance)) = ((self.d440c_mode)(), &paging.assistance_data) {
+            nextgsim_demo::demo_log!(
+                info,
+                crate::demo::D440C_KEY,
+                "{}",
+                crate::demo::d440c_assistance_line(assistance)
+            );
+        }
+
         let msg = RrcMessage::Paging {
             ue_paging_tmsi,
             tai_list_for_paging,
@@ -7823,6 +7843,7 @@ mod tests {
             paging_drx: None,
             paging_priority: None,
             paging_origin: None,
+            assistance_data: None,
         };
         task.handle_paging(1, paging).await;
 
@@ -7863,6 +7884,7 @@ mod tests {
             paging_drx: None,
             paging_priority: None,
             paging_origin: None,
+            assistance_data: None,
         };
         task.handle_paging(1, paging).await;
 
@@ -7870,6 +7892,130 @@ mod tests {
             rrc_rx.try_recv().is_err(),
             "no RRC Paging should be emitted for an unserved TAI"
         );
+    }
+
+    /// nextgsim#464 review: a PAGING whose Assistance Data for Paging bytes do
+    /// not decode is a transfer syntax error (TS 38.413 §10.2). The gNB does not
+    /// page on it, and answers with an Error Indication, cause
+    /// transfer-syntax-error, through the unroutable-PDU path.
+    #[tokio::test]
+    async fn an_undecodable_assistance_ie_is_a_transfer_syntax_error_indication() {
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
+        while sctp_rx.try_recv().is_ok() {}
+        // amfd's attempt-2 PAGING with the IE value replaced by 0xffffff.
+        let hex = "001840200000030073400700080000000001006740070099f907000001000b4003ffffff";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&bytes))
+            .await;
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let ei = decode_error_indication(buffer.data()).expect("an Error Indication");
+                assert!(
+                    matches!(
+                        ei.cause,
+                        Some(NgSetupFailureCause::Protocol(
+                            ProtocolCause::TransferSyntaxError
+                        ))
+                    ),
+                    "{:?}",
+                    ei.cause
+                );
+            }
+            other => panic!("expected an Error Indication, got {other:?}"),
+        }
+    }
+
+    /// Demo d440c-nwdaf-paging (nextgsim#464): the gNB end of the chain, on the
+    /// bytes amfd sends.
+    #[cfg(feature = "demo-d440c-nwdaf-paging")]
+    mod d440c_paging_assistance {
+        use super::*;
+        use nextgsim_ngap::procedures::paging::decode_paging;
+        use std::sync::{Arc, Mutex};
+
+        /// amfd's NWDAF-steered attempt 1 of 5 (next scope `changed`) to TAI
+        /// 999-70 TAC 1, Recommended Cells [NCI 0x10, NCI 0x20]: the vector the
+        /// nextgsim-ngap paging tests decode, captured from nextgcore `9e3d841a`.
+        const AMFD_PAGING_CELLS_ATTEMPT_1: &str = "001840330000030073400700080000000001006740070099f907000001000b401660100099f90700000001000099f90700000002040220";
+        const LINE: &str = "[demo:d440c-nwdaf-paging] PAGING assistance: cells=[0x10,0x20] attempt 1/5 next-scope=changed";
+
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        #[derive(Clone, Default)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        /// One amfd PAGING through `handle_paging` with D440C's mode as given:
+        /// what the gNB logged, and whether it still paged over RRC.
+        async fn page(mode: fn() -> Option<String>) -> (String, bool) {
+            let config = GnbConfig {
+                plmn: Plmn::new(999, 70, false),
+                ..test_config()
+            };
+            let (task_base, _app_rx, _ngap_rx, mut rrc_rx, _gtp_rx, _rls_rx, _sctp_rx) =
+                GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+            let mut task = NgapTask::new(task_base);
+            task.create_amf_context(1);
+            task.d440c_mode = mode;
+            let paging = decode_paging(&unhex(AMFD_PAGING_CELLS_ATTEMPT_1)).expect("amfd PAGING");
+
+            let sink = Captured::default();
+            let writer = sink.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::DEBUG)
+                .finish();
+            {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                task.handle_paging(1, paging).await;
+            }
+            let paged = matches!(
+                rrc_rx.try_recv(),
+                Ok(TaskMessage::Message(RrcMessage::Paging { .. }))
+            );
+            let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+            (logs, paged)
+        }
+
+        /// Demo on: the gNB logs the cells amfd recommended, in amfd's order,
+        /// and the attempt, then pages exactly as without the IE.
+        #[tokio::test]
+        async fn demo_on_logs_amfds_cells_and_attempt_and_still_pages() {
+            let (logs, paged) = page(|| Some("nwdaf-mobility".into())).await;
+            assert!(logs.contains(LINE), "{logs}");
+            assert!(paged, "the PAGING must still reach RRC");
+        }
+
+        /// Demo off (feature built, block inactive): the same PAGING logs no
+        /// assistance line and no demo line, and still pages.
+        #[tokio::test]
+        async fn demo_off_logs_no_assistance_line_and_still_pages() {
+            let (logs, paged) = page(|| None).await;
+            assert!(
+                logs.contains("PAGING from AMF[1]: matched 1 served TAI"),
+                "{logs}"
+            );
+            assert!(!logs.contains("PAGING assistance"), "{logs}");
+            assert!(!logs.contains("[demo:"), "{logs}");
+            assert!(paged);
+        }
     }
 
     // ------------------------------------------------------------------

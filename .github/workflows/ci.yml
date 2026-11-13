@@ -460,6 +460,18 @@ jobs:
       # model-verify, which has the pinned ONNX Runtime).
       - name: cargo test (demo-d440a-ai-paging)
         run: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
+      # Demo d441d-predictive-ho (#467): the predictor tick, the shadow A3
+      # evaluator, the A3-in-shadow gate and the seeded replay are behind
+      # `demo-d441d-predictive-ho`; the conflict with D446A needs both features.
+      - name: cargo test (demo-d441d-predictive-ho)
+        run: |
+          cargo test -p nextgsim-gnb --features demo-d441d-predictive-ho
+          cargo test -p nextgsim-gnb --features demo-d441d-predictive-ho,demo-d446a-agent-conflict --lib d441d_with_d446a
+          cargo test -p nextgsim-integration-tests --features demo-d441d-predictive-ho --test d441d_a3_replica
+      # Demo d440c-nwdaf-paging (#464): the gNB's PAGING assistance log, its
+      # registration and their tests are behind `demo-d440c-nwdaf-paging`.
+      - name: cargo test (demo-d440c-nwdaf-paging)
+        run: cargo test -p nextgsim-gnb --features demo-d440c-nwdaf-paging
       - name: D444A revert arms (each patch must fail its named test)
         run: scripts/demo/d444a-reverts.sh
       # Demo d445a-fl-t8 (#480): the nr-fl-server AF (FL listener, NEF client,
@@ -488,7 +500,9 @@ jobs:
           cargo clippy -p nextgsim-gnb --features 6g --all-targets
           cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
           cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets
+          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets
           cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets
+          cargo clippy -p nextgsim-gnb --features demo-d441d-predictive-ho --all-targets
           cargo clippy -p nextgsim-ue --features 6g --all-targets
           cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
           cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets

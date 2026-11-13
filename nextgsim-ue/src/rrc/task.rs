@@ -253,8 +253,10 @@ impl Default for UacBarringConfig {
     }
 }
 
-/// RRC cycle interval in milliseconds
-const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
+/// RRC cycle interval in milliseconds. Measurement events are evaluated once
+/// per cycle (`perform_cycle`), so this is also the UE's A3 evaluation cadence;
+/// public so the gNB's D441D A3 replica can be pinned to it (nextgsim#467).
+pub const RRC_CYCLE_INTERVAL_MS: u64 = 2500;
 
 /// Cell selection interval in milliseconds
 const CELL_SELECTION_INTERVAL_MS: u64 = 1000;

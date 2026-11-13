@@ -67,6 +67,10 @@ impl GnbApp {
             .with_context(|| format!("Invalid demo block in {config_path}"))?;
         nextgsim_gnb::demo::d440a_startup(&config)
             .with_context(|| format!("Invalid D440A demo configuration in {config_path}"))?;
+        // Demo D441D (#467): with the demo active, the NWDAF task and a
+        // positioned neighbour are required; an unusable config fails here.
+        nextgsim_gnb::demo::d441d_startup(&config)
+            .with_context(|| format!("Invalid D441D configuration in {config_path}"))?;
         // Demo D441A (#465): with the demo active, the congestion_export block
         // must name a capacity and an NRF, and the exporter (its CCA key and
         // JWK) must build, or startup fails.
