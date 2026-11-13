@@ -39,7 +39,7 @@
 | constant-turn | 1..=2000  | lsq         |  2000 |  1720 |   86.0% |  84.4.. 87.5% |   2.28 |
 | straight      | 1..=2000  | lsq         |  2000 |  1942 |   97.1% |  96.3.. 97.7% |   1.64 |
 | turn-change   | 1..=2000  | lsq         |  2000 |  1801 |   90.0% |  88.7.. 91.3% |   2.04 |
-| constant-turn | 1..=50    | onnx        | (from the model-verify CI job) |
-| constant-turn | 1..=2000  | onnx        | (from the model-verify CI job) |
-| straight      | 1..=2000  | onnx        | (from the model-verify CI job) |
-| turn-change   | 1..=2000  | onnx        | (from the model-verify CI job) |
+| constant-turn | 1..=50    | onnx        |    50 |    33 |   66.0% |  52.2.. 77.6% |   3.14 |
+| constant-turn | 1..=2000  | onnx        |  2000 |  1270 |   63.5% |  61.4.. 65.6% |   3.28 |
+| straight      | 1..=2000  | onnx        |  2000 |  1335 |   66.8% |  64.7.. 68.8% |   3.09 |
+| turn-change   | 1..=2000  | onnx        |  2000 |  1304 |   65.2% |  63.1.. 67.3% |   3.18 |
