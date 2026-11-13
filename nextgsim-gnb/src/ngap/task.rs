@@ -7767,6 +7767,40 @@ mod tests {
         );
     }
 
+    /// nextgsim#464 review: a PAGING whose Assistance Data for Paging bytes do
+    /// not decode is a transfer syntax error (TS 38.413 §10.2). The gNB does not
+    /// page on it, and answers with an Error Indication, cause
+    /// transfer-syntax-error, through the unroutable-PDU path.
+    #[tokio::test]
+    async fn an_undecodable_assistance_ie_is_a_transfer_syntax_error_indication() {
+        let (mut task, mut sctp_rx, _ran) = seed_task_with_ue().await;
+        while sctp_rx.try_recv().is_ok() {}
+        // amfd's attempt-2 PAGING with the IE value replaced by 0xffffff.
+        let hex = "001840200000030073400700080000000001006740070099f907000001000b4003ffffff";
+        let bytes: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        task.handle_ngap_pdu(1, 0, OctetString::from_slice(&bytes))
+            .await;
+        match sctp_rx.try_recv() {
+            Ok(TaskMessage::Message(SctpMessage::SendMessage { buffer, .. })) => {
+                let ei = decode_error_indication(buffer.data()).expect("an Error Indication");
+                assert!(
+                    matches!(
+                        ei.cause,
+                        Some(NgSetupFailureCause::Protocol(
+                            ProtocolCause::TransferSyntaxError
+                        ))
+                    ),
+                    "{:?}",
+                    ei.cause
+                );
+            }
+            other => panic!("expected an Error Indication, got {other:?}"),
+        }
+    }
+
     /// Demo d440c-nwdaf-paging (nextgsim#464): the gNB end of the chain, on the
     /// bytes amfd sends.
     #[cfg(feature = "demo-d440c-nwdaf-paging")]

@@ -390,14 +390,26 @@ fn build_assistance_data_for_paging(
                 RecommendedCellCgi::Nr {
                     plmn_identity,
                     nr_cell_identity,
-                } => NGRAN_CGI::NR_CGI(build_nr_cgi(&NrCgi {
-                    plmn_identity: *plmn_identity,
-                    nr_cell_identity: *nr_cell_identity,
-                })),
+                } => {
+                    if *nr_cell_identity >= 1 << 36 {
+                        return Err(PagingError::InvalidIeValue(format!(
+                            "NR Cell Identity {nr_cell_identity:#x} is wider than 36 bits"
+                        )));
+                    }
+                    NGRAN_CGI::NR_CGI(build_nr_cgi(&NrCgi {
+                        plmn_identity: *plmn_identity,
+                        nr_cell_identity: *nr_cell_identity,
+                    }))
+                }
                 RecommendedCellCgi::Eutra {
                     plmn_identity,
                     eutra_cell_identity,
                 } => {
+                    if *eutra_cell_identity >= 1 << 28 {
+                        return Err(PagingError::InvalidIeValue(format!(
+                            "E-UTRA Cell Identity {eutra_cell_identity:#x} is wider than 28 bits"
+                        )));
+                    }
                     let mut bv: BitVec<u8, Msb0> = BitVec::new();
                     for i in (0..28).rev() {
                         bv.push((eutra_cell_identity >> i) & 1 == 1);
@@ -593,10 +605,13 @@ pub fn parse_paging(pdu: &NGAP_PDU) -> Result<PagingData, PagingError> {
 }
 
 /// The Assistance Data for Paging as received. The IE's criticality is
-/// `ignore` (TS 38.413 §9.2.4.1) and it "may be used" (§8.5.1.2), so nothing
-/// in it fails the PAGING: the APER decoder has already enforced the ASN.1
-/// bounds, and a cell whose identity has the wrong bit length (which the
-/// decoder cannot produce) is dropped rather than read as cell 0.
+/// `ignore` (TS 38.413 §9.2.4.1) and it "may be used" (§8.5.1.2), so an IE
+/// that decodes is never a reason to fail the PAGING: an extension value this
+/// codec does not know reads as absent, and a cell whose identity has the
+/// wrong bit length (which the decoder cannot produce) is dropped rather than
+/// read as cell 0. An IE whose bytes do not decode at all is a transfer syntax
+/// error (TS 38.413 §10.2): it fails the whole PDU decode in `decode_paging`,
+/// exactly as before this IE was read.
 fn parse_assistance_data_for_paging(
     value: &AssistanceDataForPaging,
 ) -> AssistanceDataForPagingValue {
@@ -898,11 +913,172 @@ mod tests {
             encode_paging(&params).expect("encode"),
             unhex(AMFD_PAGING_CELLS_ATTEMPT_1)
         );
+        for (vector, count, scope) in [
+            (
+                AMFD_PAGING_ATTEMPT_2,
+                2,
+                Some(NextPagingAreaScopeValue::Same),
+            ),
+            (AMFD_PAGING_ATTEMPT_5_LAST, 5, None),
+        ] {
+            params.assistance_data = Some(AssistanceDataForPagingValue {
+                recommended_cells: vec![],
+                paging_attempt_information: Some(PagingAttemptInfoValue {
+                    paging_attempt_count: count,
+                    intended_number_of_paging_attempts: 5,
+                    next_paging_area_scope: scope,
+                }),
+            });
+            assert_eq!(
+                encode_paging(&params).expect("encode"),
+                unhex(vector),
+                "{vector}"
+            );
+        }
         params.assistance_data = None;
         assert_eq!(
             encode_paging(&params).expect("encode"),
             unhex(AMFD_PAGING_DEFAULT)
         );
+    }
+
+    /// AMFD_PAGING_ATTEMPT_2 with its Next Paging Area Scope replaced by an
+    /// extension value this codec does not know (index `ext_index` past the root
+    /// {same, changed}): the PDU and IE lengths grow by one octet.
+    fn attempt_2_with_scope_extension(ext_index: u8) -> Vec<u8> {
+        // ...TAI IE | id 11, criticality ignore, length 4 | the value.
+        // Value bits: ADP ext 0, opt {cells 0, PAI 1, ext 0}; PAI ext 0, opt
+        // {scope 1, ext 0}; count ext 0, 4 bits 1; intended ext 0, 4 bits 4;
+        // scope ext 1, then a normally small number (0 + 6 bits) = ext_index.
+        let mut bytes =
+            unhex("001840210000030073400700080000000001006740070099f907000001000b400424124000");
+        // The 6-bit index sits in the last 5 bits of the third value octet and
+        // the first bit of the fourth.
+        let n = bytes.len();
+        bytes[n - 2] |= ext_index >> 1;
+        bytes[n - 1] = (ext_index & 1) << 7;
+        bytes
+    }
+
+    /// The raw Next Paging Area Scope the generated decoder reads from `bytes`.
+    fn raw_scope(bytes: &[u8]) -> Option<u8> {
+        let NGAP_PDU::InitiatingMessage(msg) = decode_ngap_pdu(bytes).unwrap() else {
+            panic!("not an InitiatingMessage")
+        };
+        let InitiatingMessageValue::Id_Paging(paging) = msg.value else {
+            panic!("not a PAGING")
+        };
+        paging
+            .protocol_i_es
+            .0
+            .iter()
+            .find_map(|ie| match &ie.value {
+                PagingProtocolIEs_EntryValue::Id_AssistanceDataForPaging(a) => a
+                    .paging_attempt_information
+                    .as_ref()
+                    .and_then(|p| p.next_paging_area_scope.as_ref())
+                    .map(|s| s.0),
+                _ => None,
+            })
+    }
+
+    /// Criticality ignore at work: a Next Paging Area Scope extension value
+    /// this codec does not know reads as absent, and the rest of the PAGING,
+    /// the attempt included, is decoded unchanged.
+    #[test]
+    fn an_unknown_next_paging_area_scope_extension_reads_as_absent() {
+        let base = decode_paging(&unhex(AMFD_PAGING_ATTEMPT_2)).expect("decode");
+        // The two fixtures really are two different values, neither in the root.
+        let raw: Vec<_> = [0, 1]
+            .iter()
+            .map(|&i| raw_scope(&attempt_2_with_scope_extension(i)))
+            .collect();
+        assert_ne!(raw[0], raw[1], "{raw:?}");
+        for r in &raw {
+            assert!(!matches!(r, Some(0) | Some(1) | None), "{raw:?}");
+        }
+        for ext_index in [0, 1] {
+            let parsed = decode_paging(&attempt_2_with_scope_extension(ext_index))
+                .unwrap_or_else(|e| panic!("extension index {ext_index}: {e}"));
+            assert_eq!(
+                parsed.assistance_data,
+                Some(AssistanceDataForPagingValue {
+                    recommended_cells: vec![],
+                    paging_attempt_information: Some(PagingAttemptInfoValue {
+                        paging_attempt_count: 2,
+                        intended_number_of_paging_attempts: 5,
+                        next_paging_area_scope: None,
+                    }),
+                }),
+                "extension index {ext_index}"
+            );
+            assert_eq!(parsed.tai_list_for_paging.len(), 1);
+            assert_eq!(
+                parsed.tai_list_for_paging[0].plmn_identity,
+                base.tai_list_for_paging[0].plmn_identity
+            );
+            assert_eq!(
+                parsed.tai_list_for_paging[0].tac,
+                base.tai_list_for_paging[0].tac
+            );
+            match (&parsed.ue_paging_identity, &base.ue_paging_identity) {
+                (UePagingIdentityValue::FiveGSTmsi(a), UePagingIdentityValue::FiveGSTmsi(b)) => {
+                    assert_eq!(
+                        (a.amf_set_id, a.amf_pointer, a.five_g_tmsi),
+                        (b.amf_set_id, b.amf_pointer, b.five_g_tmsi)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Undecodable IE bytes are a transfer syntax error (TS 38.413 §10.2), not a
+    /// criticality case: the PDU decode fails, as it did before this IE was read.
+    #[test]
+    fn undecodable_assistance_bytes_fail_the_pdu_decode() {
+        let bytes =
+            unhex("001840200000030073400700080000000001006740070099f907000001000b4003ffffff");
+        assert!(decode_paging(&bytes).is_err());
+    }
+
+    /// Cell identities wider than their BIT STRING (36 bits NR, 28 bits E-UTRA,
+    /// TS 38.413 §9.3.1.7, §9.3.1.9) are refused by name, not truncated.
+    #[test]
+    fn the_builder_refuses_over_wide_cell_identities() {
+        let mut params = create_test_params();
+        for (cgi, widest) in [
+            (
+                (|id: u64| RecommendedCellCgi::Nr {
+                    plmn_identity: PLMN_999_70,
+                    nr_cell_identity: id,
+                }) as fn(u64) -> RecommendedCellCgi,
+                (1u64 << 36) - 1,
+            ),
+            (
+                (|id: u64| RecommendedCellCgi::Eutra {
+                    plmn_identity: PLMN_999_70,
+                    eutra_cell_identity: id as u32,
+                }) as fn(u64) -> RecommendedCellCgi,
+                (1u64 << 28) - 1,
+            ),
+        ] {
+            let with = |id| {
+                Some(AssistanceDataForPagingValue {
+                    recommended_cells: vec![RecommendedCellValue {
+                        cgi: cgi(id),
+                        time_stayed_in_cell: None,
+                    }],
+                    paging_attempt_information: None,
+                })
+            };
+            params.assistance_data = with(widest);
+            assert!(encode_paging(&params).is_ok(), "{widest:#x} fits");
+            params.assistance_data = with(widest + 1);
+            match encode_paging(&params) {
+                Err(PagingError::InvalidIeValue(m)) => assert!(m.contains("wider than"), "{m}"),
+                other => panic!("{:#x}: expected InvalidIeValue, got {other:?}", widest + 1),
+            }
+        }
     }
 
     /// An E-UTRA cell and Time Stayed in Cell survive the round trip, and the
