@@ -194,6 +194,8 @@ struct Tracker {
     margin_db: i32,
     trigger: f64,
     visited: Vec<usize>,
+    /// When each cell after the first was entered, seconds from start-up.
+    entered_at: Vec<f64>,
 }
 
 impl Tracker {
@@ -204,6 +206,7 @@ impl Tracker {
             margin_db,
             trigger,
             visited: vec![serving],
+            entered_at: Vec::new(),
         }
     }
 
@@ -225,6 +228,7 @@ impl Tracker {
             self.serving = n;
             self.since = [None; 3];
             self.visited.push(n);
+            self.entered_at.push(t);
         }
     }
 }
@@ -381,6 +385,91 @@ fn the_checks_refuse_a_route_without_the_laps_or_the_dwell() {
             refused.is_err(),
             "{what}: the checks must refuse this route"
         );
+    }
+}
+
+/// The modelled run of `seed` with a `trigger` s A3 timeToTrigger: the
+/// connected handover times, the dwell, the release at the dwell's far point
+/// (where scenario.sh releases), the idle reselection after it, and what the
+/// first-order transition count over the reported cells (nwdafd's predictor,
+/// fed the registration cell and each handover's target) predicts out of the
+/// last one. One row of the docs' seed table.
+fn seed_row(seed: u64, trigger: f64) -> String {
+    let r = lap_route(seed);
+    let config = config_with(&r);
+    let at = |t: f64| config.sim_position_at(Duration::from_secs_f64(t));
+    let laps_end = arrival_secs(&r, r.laps_end);
+    let far = arrival_secs(&r, r.laps_end + 1);
+    let end = arrival_secs(&r, r.route.waypoints.len());
+    let mut connected = Tracker::new(A, 4, trigger);
+    let mut t = 0.0;
+    while t <= far {
+        connected.step(t, levels(at(t)));
+        t += 0.1;
+    }
+    let mut idle = Tracker::new(A, 4, trigger.max(1.0));
+    let mut t = far;
+    while t <= end + 10.0 {
+        idle.step(t, levels(at(t)));
+        t += 0.1;
+    }
+    let history = &connected.visited;
+    let last = *history.last().expect("registered");
+    let mut next = [0u32; 3];
+    for w in history.windows(2) {
+        if w[0] == last {
+            next[w[1]] += 1;
+        }
+    }
+    let total: u32 = next.iter().sum();
+    let (best, n) = (0..3)
+        .map(|c| (c, next[c]))
+        .max_by_key(|&(_, n)| n)
+        .expect("three cells");
+    format!(
+        "| {seed} | {} | {:.0} | {:.0}-{:.0} | {:.0} | {} | {:.0} | {} {}/{} |",
+        connected.entered_at.len(),
+        connected.entered_at.last().copied().unwrap_or(0.0),
+        laps_end,
+        arrival_secs(&r, r.dwell_end),
+        far,
+        names(&idle.visited).join("->"),
+        idle.entered_at.first().copied().unwrap_or(f64::NAN),
+        GNBS[best].0,
+        n,
+        total
+    )
+}
+
+/// The rows behave as the docs' table says on the committed seed: nine
+/// handovers, the release inside the dwell, A -> B idle, B predicted 3/3.
+#[test]
+fn the_seed_table_row_of_the_committed_seed() {
+    let row = seed_row(COMMITTED_SEED, 0.64);
+    let cols: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+    assert_eq!(cols[0], "464", "{row}");
+    assert_eq!(cols[1], "9", "nine handovers: {row}");
+    assert_eq!(cols[5], "A->B", "idle A -> B: {row}");
+    assert_eq!(cols[7], "B 3/3", "B predicted out of A: {row}");
+    let far: f64 = cols[4].parse().expect("far point");
+    let dwell: Vec<f64> = cols[3]
+        .split('-')
+        .map(|v| v.parse().expect("dwell"))
+        .collect();
+    assert!(
+        dwell[0] < far && far < dwell[1],
+        "release inside the dwell: {row}"
+    );
+}
+
+/// Prints the docs' seed table: the committed seed, then every sweep seed.
+#[test]
+#[ignore = "a generator, run by hand"]
+fn print_the_seed_table() {
+    println!("| seed | handovers | last handover (s) | dwell (s) | release (s) | idle | reselected (s) | predicted out of A |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for seed in std::iter::once(COMMITTED_SEED).chain(SWEEP_SEEDS) {
+        println!("{}", seed_row(seed, 0.64));
     }
 }
 
