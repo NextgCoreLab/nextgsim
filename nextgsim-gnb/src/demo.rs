@@ -54,12 +54,17 @@ pub const D440B_MODES: &[&str] = &["verify", "fallback"];
 /// `demo-d440a-ai-paging` cargo feature.
 pub const D440A_KEY: &str = "d440a-ai-paging";
 
-/// D440A's modes, so far. `page-all` is the predictor-off arm: no
-/// recommendation, so the AMF pages the registration area, exactly as with no
-/// demo. The predictor arms (`last-served`, `ct`, `lsq`, `onnx`) are registered
-/// by the PR that implements them (#462 PR 3b), so no mode is accepted before
-/// it does what it names.
-pub const D440A_MODES: &[&str] = &["page-all"];
+/// D440A's modes, one per arm of the table, all on the same route seeds:
+/// - `page-all`: the predictor-off arm. No recommendation, so the AMF pages the
+///   registration area, exactly as with no demo.
+/// - `last-served`: the Release Complete recommends this gNB alone.
+/// - `ct`: constant-turn extrapolation over a Kalman-filtered track (the live
+///   physics baseline; the ticket's default arm).
+/// - `lsq`: least-squares constant velocity (the control).
+/// - `onnx`: the d440b-verified ONNX model (needs `d440b-model-verify` in mode
+///   `verify`); a prediction no verified model served is labelled
+///   `predictor=fallback`.
+pub const D440A_MODES: &[&str] = &["page-all", "last-served", "ct", "lsq", "onnx"];
 
 /// D441A, the RAN-fed User Data Congestion loop (nextgsim#465). Registered under
 /// the `demo-d441a-congestion-loop` cargo feature.
@@ -81,6 +86,8 @@ pub fn registry() -> DemoRegistry {
         modes: D446A_MODES,
         requires: &[],
     });
+    // Its `onnx` mode alone needs d440b, which a per-demo `requires` cannot
+    // say: [`check_d440a_dependencies`] checks it.
     #[cfg(feature = "demo-d440a-ai-paging")]
     specs.push(DemoSpec {
         key: D440A_KEY,
@@ -122,6 +129,22 @@ pub enum GnbDemoError {
         /// The other.
         second: String,
     },
+    /// D440A is active but the gNB config cannot run it.
+    #[error("demo d440a-ai-paging cannot start: {0}")]
+    D440a(String),
+}
+
+/// D440A's `onnx` mode needs `d440b-model-verify` active in mode `verify` on
+/// the same gNB (nextgsim#462): the model it predicts with must be one the
+/// d440b checks verified. Startup fails otherwise.
+pub fn check_d440a_dependencies(active: &ActiveDemos) -> Result<(), GnbDemoError> {
+    if active.mode(D440A_KEY) == Some("onnx") && active.mode(D440B_KEY) != Some("verify") {
+        return Err(GnbDemoError::Config(DemoConfigError::MissingDependency {
+            demo: D440A_KEY.to_string(),
+            requires: format!("{D440B_KEY} (mode verify)"),
+        }));
+    }
+    Ok(())
 }
 
 /// Fails when more than one of [`HANDOVER_DEMOS`] is active.
@@ -145,6 +168,7 @@ pub fn init(config_yaml: &str) -> Result<&'static DemoRuntime, GnbDemoError> {
         })?;
     let runtime = DemoRuntime::from_root(&root, registry())?;
     check_handover_demo_exclusive(&runtime.snapshot())?;
+    check_d440a_dependencies(&runtime.snapshot())?;
     nextgsim_demo::install(runtime)
         .map_err(|_| GnbDemoError::Config(DemoConfigError::AlreadyInstalled))
 }
@@ -155,12 +179,28 @@ pub fn d440a_active() -> bool {
     cfg!(feature = "demo-d440a-ai-paging") && nextgsim_demo::active_mode(D440A_KEY).is_some()
 }
 
-/// What D440A reads of the gNB config at startup, logged once when the demo is
-/// active (nextgsim#462): the paging grid this gNB resolves recommendations
-/// against. Silent when the demo is off, so a default run logs nothing new.
-pub fn d440a_startup(config: &nextgsim_common::config::GnbConfig) {
-    if !d440a_active() {
-        return;
+/// What D440A needs of the gNB config in `mode`, and the startup line it logs
+/// (nextgsim#462). A predictor mode needs the NWDAF task (`nwdaf_enabled`),
+/// which holds the heartbeat history, and a non-empty `paging_grid` to name a
+/// next gNB from. `page-all` needs neither. `Ok(None)` when the demo is off.
+pub fn d440a_check_config(
+    config: &nextgsim_common::config::GnbConfig,
+    mode: Option<&str>,
+) -> Result<Option<String>, GnbDemoError> {
+    let Some(mode) = mode else {
+        return Ok(None);
+    };
+    if mode != "page-all" {
+        if !config.nwdaf_enabled {
+            return Err(GnbDemoError::D440a(format!(
+                "mode {mode} needs nwdaf_enabled: true (the predictor runs in the NWDAF task)"
+            )));
+        }
+        if config.paging_grid.is_empty() {
+            return Err(GnbDemoError::D440a(format!(
+                "mode {mode} needs a paging_grid: a recommendation names a neighbour from it"
+            )));
+        }
     }
     let cells: Vec<String> = config
         .paging_grid
@@ -176,17 +216,42 @@ pub fn d440a_startup(config: &nextgsim_common::config::GnbConfig) {
             )
         })
         .collect();
-    nextgsim_demo::demo_log!(
-        info,
-        D440A_KEY,
-        "paging grid: this gNB {:#x} at ({}, {}, {}), {} neighbour cell(s): [{}]",
+    let horizon = if mode == "page-all" {
+        String::new()
+    } else {
+        format!(", mode {mode}, horizon {} ms", D440A_HORIZON_MS)
+    };
+    Ok(Some(format!(
+        "paging grid: this gNB {:#x} at ({}, {}, {}), {} neighbour cell(s): [{}]{horizon}",
         config.gnb_id(),
         config.sim_position.x,
         config.sim_position.y,
         config.sim_position.z,
         cells.len(),
         cells.join(", ")
-    );
+    )))
+}
+
+/// The prediction horizon the startup line reports (the predictor's own
+/// constant, `nwdaf::d440a::HORIZON_MS`, in a D440A build).
+#[cfg(feature = "demo-d440a-ai-paging")]
+const D440A_HORIZON_MS: u32 = crate::nwdaf::d440a::HORIZON_MS;
+#[cfg(not(feature = "demo-d440a-ai-paging"))]
+const D440A_HORIZON_MS: u32 = 0;
+
+/// D440A's startup check and line, against the installed demo state
+/// (nextgsim#462). An error fails startup. Silent and `Ok` when the demo is
+/// off, so a default run logs nothing new.
+pub fn d440a_startup(config: &nextgsim_common::config::GnbConfig) -> Result<(), GnbDemoError> {
+    if !d440a_active() {
+        return Ok(());
+    }
+    if let Some(line) =
+        d440a_check_config(config, nextgsim_demo::active_mode(D440A_KEY).as_deref())?
+    {
+        nextgsim_demo::demo_log!(info, D440A_KEY, "{line}");
+    }
+    Ok(())
 }
 
 /// Whether D446A is active in this process (its feature compiled in, and both
@@ -253,30 +318,110 @@ mod tests {
         }
     }
 
-    /// #462: a D440A build registers its key with `page-all` only. A predictor
-    /// mode is refused until the PR that implements it registers it, and so is
-    /// `mode: bogus`; the kill switch leaves the demo inactive.
+    /// #462: a D440A build registers its key with its five modes; `mode:
+    /// bogus` is refused with `UnknownMode`, and the kill switch leaves the
+    /// demo inactive.
     #[cfg(feature = "demo-d440a-ai-paging")]
     #[test]
-    fn the_d440a_build_registers_page_all_and_no_unimplemented_mode() {
+    fn the_d440a_build_registers_its_five_modes() {
         let parse = |y: &str| serde_yaml::from_str::<serde_yaml::Value>(y).unwrap();
         let block = |on: bool, mode: &str| {
             format!(
                 "demo:\n  enabled: {on}\n  d440a-ai-paging:\n    enabled: true\n    mode: {mode}\n"
             )
         };
-        let rt = DemoRuntime::from_root(&parse(&block(true, "page-all")), registry()).unwrap();
-        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("page-all"));
-        for mode in ["ct", "onnx", "bogus"] {
-            let err = DemoRuntime::from_root(&parse(&block(true, mode)), registry()).unwrap_err();
+        for mode in ["page-all", "last-served", "ct", "lsq", "onnx"] {
+            let rt = DemoRuntime::from_root(&parse(&block(true, mode)), registry()).unwrap();
+            assert_eq!(rt.mode(D440A_KEY).as_deref(), Some(mode));
+        }
+        let err = DemoRuntime::from_root(&parse(&block(true, "bogus")), registry()).unwrap_err();
+        assert_eq!(
+            err,
+            DemoConfigError::UnknownMode {
+                demo: D440A_KEY.into(),
+                mode: "bogus".into(),
+                known: D440A_MODES.to_vec(),
+            }
+        );
+        let off = DemoRuntime::from_root(&parse(&block(false, "ct")), registry()).unwrap();
+        assert_eq!(off.mode(D440A_KEY), None, "the kill switch wins");
+    }
+
+    /// #462: `onnx` without d440b in mode `verify` fails startup with
+    /// `MissingDependency`; with it, or in any other mode, it does not.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn d440a_onnx_needs_d440b_in_verify() {
+        let rt = |extra: &str, mode: &str| {
+            let yaml = format!(
+                "demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: {mode}\n{extra}"
+            );
+            DemoRuntime::from_root(&serde_yaml::from_str(&yaml).unwrap(), registry()).unwrap()
+        };
+        let d440b = |m: &str| format!("  d440b-model-verify:\n    enabled: true\n    mode: {m}\n");
+        for extra in [String::new(), d440b("fallback")] {
+            let err = check_d440a_dependencies(&rt(&extra, "onnx").snapshot()).unwrap_err();
             assert!(
-                matches!(&err, DemoConfigError::UnknownMode { demo, mode: m, .. }
-                    if demo == D440A_KEY && m == mode),
-                "{mode}: {err:?}"
+                matches!(&err, GnbDemoError::Config(DemoConfigError::MissingDependency { demo, requires })
+                    if demo == D440A_KEY && requires == "d440b-model-verify (mode verify)"),
+                "{err}"
             );
         }
-        let off = DemoRuntime::from_root(&parse(&block(false, "page-all")), registry()).unwrap();
-        assert_eq!(off.mode(D440A_KEY), None, "the kill switch wins");
+        assert!(check_d440a_dependencies(&rt(&d440b("verify"), "onnx").snapshot()).is_ok());
+        assert!(check_d440a_dependencies(&rt("", "ct").snapshot()).is_ok());
+    }
+
+    /// #462: `nr-cli <gnb> demo d440a-ai-paging set mode=` switches the mode a
+    /// release reads (the NGAP task reads it at every release, so it applies
+    /// from the next one); `mode=bogus` is refused and the mode stays; `show`
+    /// reports it.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn a_d440a_runtime_switch_is_checked() {
+        let yaml = "demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: ct\n";
+        let rt = DemoRuntime::from_root(&serde_yaml::from_str(yaml).unwrap(), registry()).unwrap();
+        let err = rt
+            .handle_cli("d440a-ai-paging set mode=bogus", "test")
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown mode \"bogus\""), "{err}");
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("ct"));
+        rt.handle_cli("d440a-ai-paging set mode=lsq", "test")
+            .unwrap();
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("lsq"));
+        let show = rt.handle_cli("d440a-ai-paging show", "test").unwrap();
+        assert!(show.contains("mode=lsq"), "{show}");
+        let mut metrics = String::new();
+        rt.render_metrics(&mut metrics);
+        assert!(metrics.contains("nextg_demo_enabled{demo=\"d440a-ai-paging\",mode=\"lsq\"} 1"));
+    }
+
+    /// #462: a predictor mode needs the NWDAF task and a paging grid, or
+    /// startup fails by name; `page-all` needs neither (the M0 configs run it
+    /// with the NWDAF off). The line names the mode and horizon.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn a_d440a_predictor_mode_needs_the_nwdaf_and_a_grid() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/demo-ai-paging");
+        let text = std::fs::read_to_string(format!("{dir}/gnb-west.yaml")).unwrap();
+        let mut cfg: nextgsim_common::config::GnbConfig = serde_yaml::from_str(&text).unwrap();
+        assert!(!cfg.nwdaf_enabled && !cfg.paging_grid.is_empty());
+        assert_eq!(d440a_check_config(&cfg, None).unwrap(), None);
+        let line = d440a_check_config(&cfg, Some("page-all")).unwrap().unwrap();
+        assert!(
+            line.ends_with("1 neighbour cell(s): [gNB 0x2 cell 0x20 at (120, 0, 0)]"),
+            "{line}"
+        );
+        let err = d440a_check_config(&cfg, Some("ct")).unwrap_err();
+        assert!(
+            err.to_string().contains("needs nwdaf_enabled: true"),
+            "{err}"
+        );
+        cfg.nwdaf_enabled = true;
+        let line = d440a_check_config(&cfg, Some("ct")).unwrap().unwrap();
+        assert!(line.ends_with(", mode ct, horizon 20000 ms"), "{line}");
+        cfg.paging_grid.clear();
+        let err = d440a_check_config(&cfg, Some("lsq")).unwrap_err();
+        assert!(err.to_string().contains("needs a paging_grid"), "{err}");
     }
 
     /// #462: the shipped D440A configs' demo blocks are accepted by a D440A

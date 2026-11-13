@@ -173,6 +173,11 @@ pub struct NgapUeContext {
     /// The UE Radio Capability ID the AMF gave for this UE (RACS), kept so a
     /// mapping response and a later handover can be matched to it.
     pub ue_radio_capability_id: Option<Vec<u8>>,
+    /// Demo D440A (nextgsim#462): when this context was created (the UE's
+    /// arrival in this cell, by connection or handover), for *Time Stayed in
+    /// Cell* (TS 38.413 §9.3.1.71) in the paging recommendation.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    pub d440a_since: std::time::Instant,
 }
 
 impl NgapUeContext {
@@ -193,6 +198,8 @@ impl NgapUeContext {
             transactions: RrcTransactionAllocator::new(),
             ue_radio_capability: None,
             ue_radio_capability_id: None,
+            #[cfg(feature = "demo-d440a-ai-paging")]
+            d440a_since: std::time::Instant::now(),
         }
     }
 

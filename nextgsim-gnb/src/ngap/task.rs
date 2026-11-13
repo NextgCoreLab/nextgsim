@@ -247,6 +247,10 @@ pub struct NgapTask {
     /// (nextgsim#483): D446A active and the Agent task on. A field so a test can
     /// drive the wiring without installing the process-global demo state.
     inbound_arbitration: fn(&nextgsim_common::config::GnbConfig) -> bool,
+    /// The D440A mode a release reads (nextgsim#462): the installed demo's. A
+    /// field so a test can drive a mode without the process-global demo state.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    d440a_mode: fn() -> Option<String>,
     /// Counter for generating downlink TEIDs
     #[allow(dead_code)]
     downlink_teid_counter: u32,
@@ -398,6 +402,8 @@ impl NgapTask {
             next_handover_ue_id: FIRST_HANDOVER_UE_ID,
             agent_handover_intents: HashMap::new(),
             inbound_arbitration: |config| crate::demo::d446a_active() && config.agent_enabled,
+            #[cfg(feature = "demo-d440a-ai-paging")]
+            d440a_mode: || nextgsim_demo::active_mode(crate::demo::D440A_KEY),
             downlink_teid_counter: 0,
             is_initialized: false,
             mbs_ngap_sessions: NgapMbsManager::new(),
@@ -2799,16 +2805,36 @@ impl NgapTask {
             }
         };
 
+        // Demo D440A (nextgsim#462): the paging recommendation, asked of the
+        // NWDAF task while the context still says how long the UE stayed. None
+        // with the demo off or in mode page-all.
+        #[cfg(feature = "demo-d440a-ai-paging")]
+        let recommended_paging = self.d440a_recommendation(ue_id).await;
+        #[cfg(not(feature = "demo-d440a-ai-paging"))]
+        let recommended_paging = None;
+
         // Delete UE context
         self.delete_ue_context(ue_id).await;
 
         // Send UE Context Release Complete
-        let complete_params = UeContextReleaseCompleteParams {
+        let mut complete_params = UeContextReleaseCompleteParams {
             amf_ue_ngap_id,
             ran_ue_ngap_id,
+            recommended_paging,
         };
 
-        match encode_ue_context_release_complete(&complete_params) {
+        let mut encoded = encode_ue_context_release_complete(&complete_params);
+        if let (Err(e), Some(_)) = (&encoded, &complete_params.recommended_paging) {
+            // The IE is optional: a recommendation that does not encode must
+            // not cost the AMF its Release Complete.
+            error!(
+                "UE Context Release Complete for ue_id={ue_id}: the paging recommendation did \
+                 not encode ({e}); sent without it"
+            );
+            complete_params.recommended_paging = None;
+            encoded = encode_ue_context_release_complete(&complete_params);
+        }
+        match encoded {
             Ok(complete_bytes) => {
                 self.send_ngap_ue_associated(amf_id, stream, complete_bytes)
                     .await;
@@ -2816,11 +2842,72 @@ impl NgapTask {
                     "UE Context Release Complete sent to AMF for ue_id={}",
                     ue_id
                 );
+                #[cfg(feature = "demo-d440a-ai-paging")]
+                if let Some(info) = &complete_params.recommended_paging {
+                    nextgsim_demo::demo_log!(
+                        info,
+                        crate::demo::D440A_KEY,
+                        "UE Context Release Complete sent ue_id={ue_id} amf_ue_ngap_id={amf_ue_ngap_id} {}",
+                        crate::nwdaf::d440a::describe(info)
+                    );
+                }
             }
             Err(e) => {
                 error!("Failed to encode UE Context Release Complete: {}", e);
             }
         }
+    }
+
+    /// Demo D440A (nextgsim#462): the paging recommendation for the UE being
+    /// released, when the demo is active in a predictor mode. Asks the NWDAF
+    /// task and waits at most [`crate::nwdaf::d440a::RECOMMEND_TIMEOUT`]; no
+    /// answer sends the Release Complete without the IE, which the AMF pages
+    /// as with no recommendation. The mode is read here, so an `nr-cli` switch
+    /// applies from the next release.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    async fn d440a_recommendation(
+        &self,
+        ue_id: i32,
+    ) -> Option<nextgsim_ngap::procedures::ue_context_release::RecommendedPagingInfo> {
+        use crate::demo::D440A_KEY;
+        use crate::nwdaf::d440a;
+        let mode = (self.d440a_mode)()?;
+        let predictor = d440a::Predictor::for_mode(&mode)?;
+        let time_stayed = self
+            .ue_contexts
+            .get(&ue_id)
+            .map(|c| c.d440a_since.elapsed().as_secs().min(4095) as u16);
+        let answer = match &self.task_base.sixg {
+            Some(sixg) => {
+                let (reply, answer) = tokio::sync::oneshot::channel();
+                let asked = async {
+                    sixg.nwdaf_tx
+                        .send(crate::tasks::NwdafMessage::D440aRecommend {
+                            ue_id,
+                            predictor,
+                            reply,
+                        })
+                        .await
+                        .ok()?;
+                    answer.await.ok()
+                };
+                tokio::time::timeout(d440a::RECOMMEND_TIMEOUT, asked)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => None,
+        };
+        if answer.is_none() {
+            nextgsim_demo::demo_log!(
+                warn,
+                D440A_KEY,
+                "mode={mode}: no paging recommendation for ue_id={ue_id} from the NWDAF task \
+                 within {} ms (is nwdaf_enabled set?); the Release Complete carries no IE",
+                d440a::RECOMMEND_TIMEOUT.as_millis()
+            );
+        }
+        answer.map(|rec| rec.paging_info(time_stayed))
     }
 
     /// Handles Initial NAS delivery from RRC (Initial UE Message)
@@ -10794,6 +10881,224 @@ mod tests {
             "on expiry the context is released locally, or it holds a RAN-UE-NGAP-ID \
              forever and the id space is finite"
         );
+    }
+
+    /// D440A (nextgsim#462): a task for UE `ue_id` whose config has the D440A
+    /// paging grid (gNB 2's cell 0x20 at x = 120), its 6G channels in place, and
+    /// `mode` as the D440A mode.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[allow(clippy::type_complexity)]
+    async fn d440a_task(
+        ue_id: i32,
+        mode: fn() -> Option<String>,
+    ) -> (
+        NgapTask,
+        GnbTaskBase,
+        crate::tasks::GnbSixgReceivers,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) {
+        let mut config = test_config();
+        config.nwdaf_enabled = true;
+        config.paging_grid = vec![nextgsim_common::config::PagingGridEntry {
+            nci: 0x20,
+            gnb_id_length: None,
+            position: nextgsim_common::config::SimPosition { x: 120, y: 0, z: 0 },
+        }];
+        let (mut task_base, _app_rx, _ngap_rx, _rrc_rx, _gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(config, DEFAULT_CHANNEL_CAPACITY);
+        let sixg = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base.clone());
+        task.d440a_mode = mode;
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(4242);
+        }
+        (task, task_base, sixg, sctp_rx)
+    }
+
+    /// The UE CONTEXT RELEASE COMMAND for `ue_id`, handled, and the Release
+    /// Complete it put on the wire, decoded.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    async fn d440a_release(
+        task: &mut NgapTask,
+        ue_id: i32,
+        sctp_rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) -> (
+        Vec<u8>,
+        nextgsim_ngap::procedures::ue_context_release::UeContextReleaseCompleteData,
+    ) {
+        use nextgsim_ngap::procedures::ue_context_release::{
+            decode_ue_context_release_complete, UeContextReleaseCommandData, UeNgapIds,
+        };
+        let ran_ue_ngap_id = task.find_ue_context(ue_id).expect("ue").ran_ue_ngap_id as u32;
+        task.handle_ue_context_release_command(
+            1,
+            0,
+            UeContextReleaseCommandData {
+                ue_ngap_ids: UeNgapIds::Pair {
+                    amf_ue_ngap_id: 4242,
+                    ran_ue_ngap_id,
+                },
+                cause: NgSetupFailureCause::Nas(NasCause::NormalRelease),
+            },
+        )
+        .await;
+        drain_sctp(sctp_rx)
+            .into_iter()
+            .find_map(|b| decode_ue_context_release_complete(&b).ok().map(|d| (b, d)))
+            .expect("a UE CONTEXT RELEASE COMPLETE")
+    }
+
+    /// #462: in mode `ct` the release asks the real NWDAF task, which has the
+    /// UE walking east from x = 20 at 5 m/s, and the Release Complete carries
+    /// Information on Recommended Cells and RAN Nodes for Paging: this cell
+    /// (visited, with its time stayed) then cell 0x20, this gNB (visited) then
+    /// gNB 2 (TS 38.413 §9.3.1.71, §9.3.1.101).
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn a_predictor_mode_release_complete_carries_the_recommendation() {
+        use crate::tasks::{NwdafMessage, Task};
+        use nextgsim_ngap::procedures::ue_context_release::{
+            RecommendedCell, RecommendedPagingInfo, RecommendedRanNode,
+        };
+        let (mut task, task_base, sixg, mut sctp_rx) = d440a_task(21, || Some("ct".into())).await;
+        let mut nwdaf = crate::nwdaf::NwdafTask::new(task_base.clone());
+        let nwdaf_rx = sixg.nwdaf_rx;
+        let nwdaf_run = tokio::spawn(async move { nwdaf.run(nwdaf_rx).await });
+        let tx = task_base.sixg.as_ref().unwrap().nwdaf_tx.clone();
+        for i in 0..10 {
+            tx.send(NwdafMessage::UeMeasurement {
+                ue_id: 21,
+                rsrp: Some(-40.0),
+                rsrq: None,
+                position: (20.0 + 5.0 * i as f32, 0.0, 0.0),
+            })
+            .await
+            .unwrap();
+            // Distinct record times: the NWDAF stamps each with the wall clock.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+        }
+
+        let (_, complete) = d440a_release(&mut task, 21, &mut sctp_rx).await;
+
+        const PLMN: [u8; 3] = [0x00, 0xF1, 0x10];
+        let info = complete.recommended_paging.expect("the IE");
+        assert_eq!(
+            info,
+            RecommendedPagingInfo {
+                cells: vec![
+                    RecommendedCell {
+                        plmn: PLMN,
+                        nci: 0x10,
+                        time_stayed_s: info.cells[0].time_stayed_s,
+                    },
+                    RecommendedCell {
+                        plmn: PLMN,
+                        nci: 0x20,
+                        time_stayed_s: None,
+                    },
+                ],
+                ran_nodes: vec![
+                    RecommendedRanNode {
+                        plmn: PLMN,
+                        gnb_id: 1,
+                        gnb_id_len: 32,
+                    },
+                    RecommendedRanNode {
+                        plmn: PLMN,
+                        gnb_id: 2,
+                        gnb_id_len: 32,
+                    },
+                ],
+            }
+        );
+        assert!(
+            info.cells[0].time_stayed_s.is_some(),
+            "visited: time stayed"
+        );
+        assert!(task.find_ue_context(21).is_none(), "released");
+        nwdaf_run.abort();
+    }
+
+    /// #462: with the demo off and in mode `page-all` the NWDAF is not asked
+    /// and the Release Complete is the two IDs only, byte for byte what it was
+    /// before the IE was supported.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn page_all_and_demo_off_send_the_release_complete_unchanged() {
+        use nextgsim_ngap::procedures::ue_context_release::{
+            encode_ue_context_release_complete, UeContextReleaseCompleteParams,
+        };
+        let modes: [fn() -> Option<String>; 2] = [|| None, || Some("page-all".into())];
+        for (i, mode) in modes.into_iter().enumerate() {
+            let ue = 30 + i as i32;
+            let (mut task, _base, mut sixg, mut sctp_rx) = d440a_task(ue, mode).await;
+            let ran = task.find_ue_context(ue).unwrap().ran_ue_ngap_id as u32;
+            let (bytes, complete) = d440a_release(&mut task, ue, &mut sctp_rx).await;
+            assert_eq!(complete.recommended_paging, None);
+            let ids_only = encode_ue_context_release_complete(&UeContextReleaseCompleteParams {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id: ran,
+                recommended_paging: None,
+            })
+            .unwrap();
+            assert_eq!(bytes, ids_only, "mode {i}");
+            assert!(sixg.nwdaf_rx.try_recv().is_err(), "the NWDAF was not asked");
+        }
+    }
+
+    /// #462: an NWDAF task that does not answer (here: not running) costs the
+    /// release at most the timeout, and the Release Complete goes out without
+    /// the IE, so the AMF pages as with no recommendation.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn an_unanswered_recommendation_still_sends_the_release_complete() {
+        let (mut task, _base, _sixg, mut sctp_rx) = d440a_task(40, || Some("lsq".into())).await;
+        let bound = crate::nwdaf::d440a::RECOMMEND_TIMEOUT + Duration::from_secs(2);
+        let (_, complete) = tokio::time::timeout(bound, d440a_release(&mut task, 40, &mut sctp_rx))
+            .await
+            .expect("the release is bounded by the recommendation timeout");
+        assert_eq!(complete.recommended_paging, None);
+    }
+
+    /// The D440A mode [`a_mode_switch_applies_from_the_next_release`] reads.
+    /// Only that test touches it.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    static D440A_SWITCH_TEST_MODE: std::sync::Mutex<&str> = std::sync::Mutex::new("page-all");
+
+    /// #462: the mode is read at every release, as `nr-cli ... demo
+    /// d440a-ai-paging set mode=` needs: a release in `page-all` carries no IE,
+    /// and after a switch to `last-served` the next release carries this gNB.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[tokio::test]
+    async fn a_mode_switch_applies_from_the_next_release() {
+        use crate::tasks::Task;
+        let mode: fn() -> Option<String> =
+            || Some(D440A_SWITCH_TEST_MODE.lock().unwrap().to_string());
+        let (mut task, task_base, sixg, mut sctp_rx) = d440a_task(50, mode).await;
+        let mut nwdaf = crate::nwdaf::NwdafTask::new(task_base.clone());
+        let nwdaf_rx = sixg.nwdaf_rx;
+        let nwdaf_run = tokio::spawn(async move { nwdaf.run(nwdaf_rx).await });
+        task.create_ue_context(51, 1).await.expect("second ue");
+        if let Some(ctx) = task.find_ue_context_mut(51) {
+            ctx.amf_ue_ngap_id = Some(4243);
+        }
+        let (_, first) = d440a_release(&mut task, 50, &mut sctp_rx).await;
+        assert_eq!(first.recommended_paging, None, "page-all");
+        *D440A_SWITCH_TEST_MODE.lock().unwrap() = "last-served";
+        let (_, second) = d440a_release(&mut task, 51, &mut sctp_rx).await;
+        let info = second.recommended_paging.expect("the IE after the switch");
+        assert_eq!(
+            info.ran_nodes.iter().map(|n| n.gnb_id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        *D440A_SWITCH_TEST_MODE.lock().unwrap() = "page-all";
+        nwdaf_run.abort();
     }
 
     /// The AMF answering must disarm the timer, or the expiry would later act on a

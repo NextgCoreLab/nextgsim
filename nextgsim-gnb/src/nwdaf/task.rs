@@ -440,6 +440,24 @@ impl NwdafTask {
         }
     }
 
+    /// Demo D440A (nextgsim#462): the paging recommendation for a released UE,
+    /// from its heartbeat history and this gNB's paging grid, logged as
+    /// `[demo:d440a-ai-paging] paging recommendation ...` and answered to the
+    /// NGAP task. A dropped receiver is an NGAP task that stopped waiting.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    fn handle_d440a_recommend(
+        &mut self,
+        ue_id: i32,
+        predictor: crate::nwdaf::d440a::Predictor,
+        reply: oneshot::Sender<crate::nwdaf::d440a::Recommendation>,
+    ) {
+        use crate::nwdaf::d440a;
+        let grid = d440a::Grid::from_config(&self.task_base.config);
+        let rec = d440a::recommend(&self.nwdaf, &grid, ue_id, predictor);
+        nextgsim_demo::demo_log!(info, crate::demo::D440A_KEY, "{}", rec.log_line());
+        let _ = reply.send(rec);
+    }
+
     /// Handles a handover recommendation request
     fn handle_handover_recommendation(&mut self, ue_id: i32, target_cell: i32, confidence: f32) {
         debug!(
@@ -543,6 +561,14 @@ impl Task for NwdafTask {
                     NwdafMessage::Status { reply } => {
                         // A dropped receiver is a CLI that gave up waiting.
                         let _ = reply.send(self.nwdaf.status().to_json());
+                    }
+                    #[cfg(feature = "demo-d440a-ai-paging")]
+                    NwdafMessage::D440aRecommend {
+                        ue_id,
+                        predictor,
+                        reply,
+                    } => {
+                        self.handle_d440a_recommend(ue_id, predictor, reply);
                     }
                 },
                 Some(TaskMessage::Shutdown) => {

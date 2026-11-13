@@ -2,6 +2,8 @@
 //!
 //! This module wires the nextgsim-nwdaf crate into the gNB task framework.
 
+#[cfg(feature = "demo-d440a-ai-paging")]
+pub mod d440a;
 pub mod task;
 
 pub use task::NwdafTask;

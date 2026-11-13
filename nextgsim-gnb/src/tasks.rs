@@ -1260,6 +1260,17 @@ pub enum NwdafMessage {
         /// Where the JSON goes.
         reply: tokio::sync::oneshot::Sender<String>,
     },
+    /// Demo D440A (nextgsim#462): the NGAP task, releasing `ue_id`, asks for
+    /// the paging recommendation `predictor` makes from the UE's heartbeats.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    D440aRecommend {
+        /// The released UE.
+        ue_id: i32,
+        /// The demo mode's predictor, read once by the NGAP task.
+        predictor: crate::nwdaf::d440a::Predictor,
+        /// Where the recommendation goes.
+        reply: tokio::sync::oneshot::Sender<crate::nwdaf::d440a::Recommendation>,
+    },
 }
 
 /// Messages for the Network Knowledge Exposure Function (NKEF) task.

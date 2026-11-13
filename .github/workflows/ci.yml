@@ -378,6 +378,9 @@ jobs:
           cargo test -p nextgsim-ai --features model-registry --lib -- --include-ignored
           cargo test -p nextgsim-nwdaf --features model-registry --lib -- --include-ignored
           cargo test -p nextgsim-gnb --features 6g,model-registry --lib d440b -- --include-ignored
+          # #462: the D440A replay's onnx row, the reference model verified on
+          # this pinned runtime (it prints the row before asserting it).
+          cargo test -p nextgsim-gnb --features demo-d440a-ai-paging --lib d440a::replay -- --include-ignored --nocapture
       - name: The runtime arms really ran (not filtered or skipped)
         run: |
           set -euo pipefail
@@ -451,8 +454,10 @@ jobs:
         run: |
           cargo test -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt
           cargo test -p nextgsim-semantic --features demo-d444a-ambr-adapt
-      # Demo d440a-ai-paging (#462): the D440A registration, its paging grid
-      # startup line and their tests are behind `demo-d440a-ai-paging`.
+      # Demo d440a-ai-paging (#462): the D440A modes, the NWDAF paging
+      # recommendation, the Release Complete IE wiring and the seeded replay
+      # table are behind `demo-d440a-ai-paging` (the onnx row runs in
+      # model-verify, which has the pinned ONNX Runtime).
       - name: cargo test (demo-d440a-ai-paging)
         run: cargo test -p nextgsim-gnb --features demo-d440a-ai-paging
       - name: D444A revert arms (each patch must fail its named test)
