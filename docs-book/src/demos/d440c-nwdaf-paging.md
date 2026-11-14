@@ -196,8 +196,8 @@ both, from kubelet- or docker-timestamped logs:
 | `nwdaf-mobility` | `k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | the ordered chain below; gNB C gets no PAGING |
 | `registration-area` | `k8s/demo-check.sh d440c-nwdaf-paging registration-area` | `Paging sent to 3/3 ... scope=registration-area`, no NWDAF query, no Assistance Data |
 | demo off | `k8s/demo-check.sh d440c-nwdaf-paging off` | the base core on the same topology: `Paging sent to 3/3 gNB(s) serving the registration area`, no demo line, no NWDAF query, no `nextg_demo_enabled` |
-| invalid | `k8s/demo-check.sh d440c-nwdaf-paging bogus` | amfd (and every gNB) fails startup with `UnknownMode`; the run FAILS to deploy |
-| `nwdaf-down` | `DEMO_VARIANT=nwdaf-down k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd scaled to 0 before the downlink: a fail-open line, the whole area paged within the budget |
+| invalid | `k8s/demo-check.sh d440c-nwdaf-paging bogus` | amfd fails startup with `UnknownMode` and the run FAILS to deploy. The gNBs register the same modes and refuse `bogus` too (unit-tested), but on EKS they never start: their `wait-amf` init container waits for the crashing amfd, so only amfd's `UnknownMode` is in the capture |
+| `nwdaf-down` | `DEMO_VARIANT=nwdaf-down k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd scaled to 0 before the downlink: a fail-open line, the whole area paged within the budget. A scaled-down nwdafd deregisters from the NRF, so the fail-open reason seen is `no NWDAF (NRF discovery found none ...)`, not a connection error or timeout |
 | revert | `DEMO_VARIANT=revert k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd's knob off, which stands in for the #466 ingest patched out (no AMF subscription, UE_MOBILITY not served): its answer is 204, amfd pages the whole area, and the success chain does not hold |
 
 Every arm also checks the common chain: nine handovers before the release,
@@ -236,6 +236,11 @@ are the evidence instead.
 # tag, never an existing one; nr-cli goes to nextgsim's binaries/.
 deploy/eks/overlays/demo-d440c-nwdaf-paging/build-images.sh
 export CORE_IMAGE_TAG=<tag> SIM_IMAGE_TAG=<tag> SIM_SHA=<nextgsim sha>
+# The nr-ue must contain nextgsim#542 (#541: without it the UE stops sending
+# A3 reports after eight handovers and never finishes the laps). Either build
+# from a nextgsim that has #542, or build nr-ue alone from one and pass its
+# tag: UE_IMAGE_TAG overrides the ue image only (nextgcore#1496).
+export UE_IMAGE_TAG=<ue tag>
 flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility
 # ... one arm per lock hold, as in the table above
 ```
@@ -276,10 +281,162 @@ start-up. The stack publishes no port (the check asserts it before `up`).
 
 ## Results
 
-**Not yet run.** The runs, the committed table (PAGINGs per page and attempt-1
-hits, per mode, on the committed seed and the sweep seeds) and the captured log
-excerpts and metrics come from the EKS arms, which have not run yet (devtest1
-credentials). Nothing here is a measured result yet.
+Run on devtest1 EKS on 2026-11-14, namespace `nextg-demo`, seed 464. Each
+arm is one `k8s/demo-check.sh` run under `flock /tmp/eks-nextg-demo.lock`.
+The numbers and lines below are copied from each run's `analyze.txt` `RESULT`
+line, `scenario/*.log` and `scenario/amf.prom` (artefacts under
+`/tmp/eks-val/demos/d440c-nwdaf-paging/<arm>/<run>/` on the builder host).
+
+Images (ECR `nextg/*`):
+
+| Image | Tag | Built from |
+|---|---|---|
+| core NFs (amfd `demo-d440c-nwdaf-paging`, nwdafd `amf-mobility`) | `demo-d440c-nwdaf-paging-d3bfb6f9` | nextgcore `d3bfb6f9` (#1496 with main `7e150aeb`, which carries nextgcore#1507) |
+| core NFs, earlier | `demo-d440c-nwdaf-paging-71bb96ba-4a286315` | nextgcore `71bb96ba`, before nextgcore#1507 |
+| gNB (`demo-d440c-nwdaf-paging`) | `demo-d440c-nwdaf-paging-71bb96ba-4a286315` | nextgsim `4a28631` |
+| UE | `demo-d440c-f08a983e` | nextgsim `f08a983` (#542), passed as `UE_IMAGE_TAG` |
+
+### The arms
+
+| Arm | Run | Core | Verdict | PAGINGs (A/B/C) | Attempt-1 hit | Hint outcome | Scope |
+|---|---|---|---|---|---|---|---|
+| `nwdaf-mobility` | `20261114T224054Z` | `d3bfb6f9` | PASS | 2 (1/1/0) | yes, gNB B | `predicted` 1 | `nwdaf-mobility`, `targets=[gNB 0x2,gNB 0x1]` |
+| `registration-area` | `20261114T200827Z` | `71bb96ba` | PASS | 3 (1/1/1) | yes, gNB B | no series | `registration-area` |
+| demo off | `20261114T231812Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | no series | base line only, no demo line |
+| invalid (`bogus`) | `20261114T203654Z` | `71bb96ba` | FAILS to deploy, as expected | - | - | - | amfd `UnknownMode` |
+| `nwdaf-down` | `20261114T230643Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `error` 1 | `registration-area` |
+| revert | `20261114T225452Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `no_prediction` 1 | `registration-area` |
+
+`registration-area` and the invalid arm ran on the earlier core: neither makes
+an NWDAF query, and nextgcore#1507 changed only amfd's NWDAF discovery and
+query. Every arm that deployed answered 20/20 downlink pings, and the PAGING
+went out 10-89 ms after smfd's `PFCP Session Report Request` (budget 2000 ms).
+The demo's point is the PAGING count: 2 with `nwdaf-mobility` against 3 for
+the whole registration area, and gNB C, which the UE never camps on while
+idle, is not paged.
+
+### Baseline vs mode: the page
+
+`nwdaf-mobility` (`20261114T224054Z`), in order:
+
+```
+smfd  22:51:49.821 PFCP Session Report Request: SEID=0x0001000000000002, seq=48, peer=10.10.5.190:8805
+amfd  22:51:49.824 Discovered NWDAF instance: d512e14f-ab5e-4720-8dfa-8d002efbc700 (valid for 3600s)
+amfd  22:51:49.825 NWDAF UE mobility: ue=imsi-999700000000001 predicted=(999-70, 0x000000020) confidence=75%
+amfd  22:51:49.910 NWDAF UE mobility: predicted cell 0x000000020 is served by gNB 0x2 (association 1)
+amfd  22:51:49.910 NWDAF UE mobility: last known cell 0x000000010 is served by gNB 0x1 (association 3)
+amfd  22:51:49.910 Paging sent to 2/2 gNB(s) predicted by NWDAF UE mobility in the registration area: 5G-S-TMSI=(1, 0, 0xf9cbf78d), attempt 1
+amfd  22:51:49.910 [demo:d440c-nwdaf-paging] Paging sent to 2/2 ue=imsi-999700000000001 scope=nwdaf-mobility targets=[gNB 0x2,gNB 0x1] attempt 1
+gNB A 22:51:49.911 [demo:d440c-nwdaf-paging] PAGING assistance: cells=[0x10,0x20] attempt 1/5 next-scope=changed
+gNB B 22:51:49.912 [demo:d440c-nwdaf-paging] PAGING assistance: cells=[0x10,0x20] attempt 1/5 next-scope=changed
+UE    22:51:50.533 Paged by cell 1 in RRC_IDLE: 5G-S-TMSI [00, 40, f9, cb, f7, 8d]
+amfd  22:51:50.534 [demo:d440c-nwdaf-paging] page answered ue=imsi-999700000000001 via gNB 0x2 attempt 1
+amfd  22:51:50.534 Service Request from CM-IDLE: UE 2 -> 3, Service Accept in Initial Context Setup with 1 PDU session(s) (page answered, T3513 stopped)
+```
+
+gNB C logged no `PAGING from AMF` in this run. amfd's metrics:
+
+```
+nextg_demo_enabled{demo="d440c-nwdaf-paging",mode="nwdaf-mobility"} 1
+amf_paging_nwdaf_hints_total{outcome="predicted"} 1
+amf_paging_nwdaf_hints_total{outcome="no_prediction"} 0
+amf_paging_nwdaf_hints_total{outcome="error"} 0
+amf_paging_nwdaf_hints_total{outcome="timeout"} 0
+```
+
+The confidence is 75%, not 100%: nwdafd ingested the deploy UE's registration
+in A, so its history out of A is one A -> A and three A -> B (see "EKS" above).
+The check's own UE_MOBILITY GET, about 2 s before the downlink and for its own
+window, is corroboration only: `200`, one `locInfos` entry with
+`nrCellId "000000020"` and `"confidence":75`.
+
+`registration-area` (`20261114T200827Z`), the baseline:
+
+```
+amfd  20:16:23.224 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S-TMSI=(1, 0, 0xc1d6b2bd), attempt 1
+amfd  20:16:23.224 [demo:d440c-nwdaf-paging] Paging sent to 3/3 ue=imsi-999700000000001 scope=registration-area targets=[gNB 0x1,gNB 0x2,gNB 0x3] attempt 1
+amfd  20:16:23.662 [demo:d440c-nwdaf-paging] page answered ue=imsi-999700000000001 via gNB 0x2 attempt 1
+```
+
+Demo off (`20261114T231812Z`): `Paging sent to 3/3 gNB(s) serving the
+registration area: ..., attempt 1` and `... (page answered, T3513 stopped)`,
+with no `[demo:` line, no `DEMO MODE ACTIVE` banner, no `NWDAF UE mobility`
+line, and neither `nextg_demo_enabled` nor `amf_paging_nwdaf_hints_total` in
+amfd's metrics.
+
+Revert (`20261114T225452Z`): nwdafd's knob is off, so its answer is 204 (the
+check's GET: `204`). amfd counts `amf_paging_nwdaf_hints_total{outcome="no_prediction"} 1`
+and pages `3/3 ... scope=registration-area`. The success chain does not hold,
+as it must not.
+
+`nwdaf-down` (`20261114T230643Z`): no nwdaf pod left at the downlink, so the
+NRF lists no NWDAF (`Found 0 matching NF instances for type NWDAF`):
+
+```
+amfd  23:15:18.815 NWDAF UE mobility: ue=imsi-999700000000001 no prediction (no NWDAF (NRF discovery found none, NWDAF_SBI_ADDR unset)); paging the registration area
+amfd  23:15:18.889 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S-TMSI=(1, 0, 0x43f19b84), attempt 1
+```
+
+`error` 1, and the PAGING went out 76 ms after the downlink report.
+
+Invalid (`20261114T203654Z`), amfd:
+
+```
+Error: demo config: unknown mode "bogus" for demo "d440c-nwdaf-paging" (known modes ["nwdaf-mobility", "registration-area"]) (UnknownMode { ... })
+```
+
+amfd sits in CrashLoopBackOff, and the three gNBs in `Init:Error` behind
+`wait-amf`.
+
+### The seed table
+
+The route model (`print_the_seed_table` in `tests/src/d440c_lap_route.rs`;
+seconds from UE start-up, A3 trigger 0.64 s), with the EKS run of the committed
+seed beside it. Only seed 464 runs on EKS; the other rows are the model only.
+
+| seed | handovers | last handover (s) | dwell (s) | release (s) | idle | reselected (s) | predicted out of A |
+|---|---|---|---|---|---|---|---|
+| 464, EKS (every arm that deployed) | 9 | 207.5 | - | 236.6 | A->B | 270.0 | B, 75% |
+| 464 | 9 | 203 | 209-256 | 233 | A->B | 266 | B 3/3 |
+| 0 | 9 | 201 | 206-251 | 228 | A->B | 260 | B 3/3 |
+| 1 | 9 | 194 | 199-246 | 223 | A->B | 257 | B 3/3 |
+| 2 | 9 | 197 | 203-250 | 227 | A->B | 261 | B 3/3 |
+| 3 | 9 | 197 | 205-248 | 226 | A->B | 259 | B 3/3 |
+| 4 | 9 | 199 | 206-252 | 229 | A->B | 262 | B 3/3 |
+| 5 | 9 | 198 | 204-250 | 227 | A->B | 260 | B 3/3 |
+| 6 | 9 | 198 | 205-248 | 226 | A->B | 258 | B 3/3 |
+| 7 | 9 | 198 | 203-247 | 226 | A->B | 258 | B 3/3 |
+| 8 | 9 | 197 | 201-248 | 225 | A->B | 258 | B 3/3 |
+| 9 | 9 | 202 | 209-254 | 232 | A->B | 265 | B 3/3 |
+| 10 | 9 | 195 | 202-245 | 224 | A->B | 256 | B 3/3 |
+| 11 | 9 | 202 | 209-253 | 231 | A->B | 264 | B 3/3 |
+| 12 | 9 | 199 | 207-253 | 229 | A->B | 262 | B 3/3 |
+| 13 | 9 | 196 | 201-247 | 224 | A->B | 257 | B 3/3 |
+| 14 | 9 | 202 | 209-258 | 233 | A->B | 267 | B 3/3 |
+| 15 | 9 | 201 | 209-250 | 229 | A->B | 262 | B 3/3 |
+| 16 | 9 | 197 | 203-252 | 228 | A->B | 263 | B 3/3 |
+| 17 | 9 | 200 | 206-252 | 230 | A->B | 263 | B 3/3 |
+| 18 | 9 | 200 | 206-250 | 229 | A->B | 261 | B 3/3 |
+| 19 | 9 | 199 | 205-252 | 228 | A->B | 262 | B 3/3 |
+| 20 | 9 | 201 | 208-252 | 230 | A->B | 263 | B 3/3 |
+| 21 | 9 | 194 | 201-246 | 224 | A->B | 256 | B 3/3 |
+| 22 | 9 | 194 | 199-246 | 223 | A->B | 256 | B 3/3 |
+| 23 | 9 | 190 | 196-244 | 220 | A->B | 254 | B 3/3 |
+| 24 | 9 | 200 | 206-255 | 230 | A->B | 264 | B 3/3 |
+| 25 | 9 | 200 | 206-251 | 230 | A->B | 263 | B 3/3 |
+| 26 | 9 | 198 | 205-252 | 228 | A->B | 261 | B 3/3 |
+| 27 | 9 | 205 | 211-260 | 235 | A->B | 270 | B 3/3 |
+| 28 | 9 | 204 | 210-261 | 235 | A->B | 270 | B 3/3 |
+| 29 | 9 | 191 | 198-243 | 221 | A->B | 255 | B 3/3 |
+| 30 | 9 | 205 | 211-258 | 234 | A->B | 267 | B 3/3 |
+| 31 | 9 | 200 | 207-255 | 230 | A->B | 264 | B 3/3 |
+
+On EKS the motion starts at 60.0 s, as on the committed route. The run's
+times are 3-5 s after the model's for seed 464: the model takes the instant a
+rule is met, while the run's times are when the UE logs it (A3 reporting, the
+handover itself, `nr-cli ue-release`, Treselection). The release is at the
+dwell's far point either way. The model predicts B 3/3 out of A; the run says
+75% because of the deploy UE's extra A -> A (above).
 
 ## Honesty labels and limitations
 
