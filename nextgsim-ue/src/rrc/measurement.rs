@@ -424,11 +424,18 @@ impl EventState {
     /// altogether. (TS 36.331 §5.5.6.1 removes every `VarMeasReportList` entry
     /// on an E-UTRA handover in as many words; in NR the same follows from
     /// §5.5.4.1, since an empty `cellsTriggeredList` has no entry.)
-    fn clear_triggers(&mut self) {
+    ///
+    /// A `periodic` measId keeps its count: it has no `cellsTriggeredList`
+    /// for the change to empty, no clause resets it on a reconfiguration with
+    /// sync, and once it reaches `reportAmount` §5.5.5 removes the measId
+    /// for good, so a handover must not revive it.
+    fn clear_triggers(&mut self, periodic: bool) {
         self.cells_triggered.clear();
         self.entering_since.clear();
         self.leaving_since.clear();
-        self.reset_report_entry();
+        if !periodic {
+            self.reset_report_entry();
+        }
     }
 }
 
@@ -475,8 +482,14 @@ impl MeasurementManager {
         self.serving_cell_id = cell_id;
         // Every event's inequality is written against the serving cell, so a
         // change invalidates each cellsTriggeredList wholesale.
-        for state in self.event_states.values_mut() {
-            state.clear_triggers();
+        for (meas_id, state) in &mut self.event_states {
+            let periodic = self.configs.get(meas_id).is_some_and(|config| {
+                matches!(
+                    config.trigger_config.trigger_type,
+                    ReportTriggerType::Periodic
+                )
+            });
+            state.clear_triggers(periodic);
         }
     }
 
@@ -2169,6 +2182,24 @@ mod tests {
                 reports_now(&mut manager),
                 0,
                 "reportAmount is final for a periodical measId"
+            );
+        }
+
+        // A reconfiguration with sync empties the event-triggered measIds'
+        // lists, but a periodical measId has none, and §5.5.5 removed this
+        // one when it reached reportAmount: the handover must not revive it.
+        manager.set_serving_cell(Some(2));
+        manager.update_measurement(2, -80);
+        assert_eq!(
+            reports_sent(&manager, 1),
+            8,
+            "the serving-cell change keeps the periodical count"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                reports_now(&mut manager),
+                0,
+                "reportAmount is final across a handover too"
             );
         }
     }
