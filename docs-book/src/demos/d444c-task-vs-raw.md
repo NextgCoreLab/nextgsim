@@ -159,7 +159,7 @@ delta          64   128     15                 +0.0660              +0.1495
 delta          64   128     20                 +0.0680              +0.1440
 ```
 
-Reading it: at every point the three arms send the same bytes (2 per kept value, measured from the encoded vectors). The task encoder leads top-variance raw by 0.06 to 0.43 top-1 and mean-pool by 0.14 to 0.66; the lead is largest at small `keep`, where only the leading components fit. Accuracy rises with SNR for every arm and keep. All of this is the pinned generator's spectrum (see the honesty labels).
+Reading it: at every point the three arms send the same bytes (2 per kept value, measured from the encoded vectors). The task encoder leads top-variance raw by +0.0635 to +0.4290 top-1 and mean-pool by +0.1440 to +0.6565; at every SNR both leads are largest at keep 8 and smallest at keep 64. Top-1 accuracy is non-decreasing with SNR to within 0.01 for every arm and keep, and 20 dB ≥ 0 dB everywhere (the tested criterion). It is not strictly monotone: top-variance at keep 8 goes 0.5345 → 0.5340 (top-1) and 0.5303 → 0.5297 (macro) from 15 to 20 dB, and mean-pool at keep 32 goes 0.5038 → 0.5000 worst-class; that residual wiggle is held-out sampling noise (2000 samples). All of this is the pinned generator's spectrum (see the honesty labels).
 
 ### Mode `all`, seed 444 (stderr)
 

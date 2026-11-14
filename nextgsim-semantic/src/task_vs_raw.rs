@@ -187,6 +187,9 @@ pub fn score(
     samples: impl Iterator<Item = (u8, Vec<f32>, Vec<f32>)>,
 ) -> ClassificationScore {
     let mut score = ClassificationScore::new();
+    // `_sent` is unused here on purpose: it is the hook of the 479-top-k-scorer
+    // revert arm (scripts/demo/reverts/), which scores sent vs received with
+    // `top_k_accuracy`. Removing it breaks that patch (ARM BROKEN).
     for (label, _sent, received) in samples {
         score.record(label, classifier.predict(&received));
     }
@@ -347,7 +350,8 @@ pub fn registry() -> DemoRegistry {
 
 /// Read the example's config. `Ok((runtime, None))`: the demo is not active
 /// (no `demo:` block, the kill switch off, or the key off), so the example
-/// prints no table and no banner.
+/// prints no table and no banner. A root that is not a mapping (a bare scalar
+/// or list) is also "no demo", as `nextgsim_demo::DemoConfig::from_root` documents.
 pub fn prepare(yaml: &str) -> Result<(DemoRuntime, Option<Mode>), ConfigError> {
     let root: serde_yaml::Value =
         serde_yaml::from_str(yaml).map_err(|e| ConfigError::Yaml(e.to_string()))?;
