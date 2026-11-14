@@ -484,10 +484,12 @@ fn measurement_driven_handovers(config: &UeConfig, until_secs: f64) -> Vec<usize
 /// not the reporting entry of TS 38.331 §5.5.4.1.
 #[test]
 fn the_ue_reports_every_lap_handover_despite_report_amount() {
+    // `reportAmount: infinity` is stored as 0, and bounds nothing.
+    let report_amount = signalled_a3_config().report_amount;
     assert!(
-        signalled_a3_config().report_amount < 3 * LAPS as u32,
-        "the lap must need more reports than one triggering's reportAmount, \
-         or this test proves nothing"
+        (1..3 * LAPS as u32).contains(&report_amount),
+        "the lap must need more reports than one triggering's finite \
+         reportAmount, or this test proves nothing (got {report_amount})"
     );
     let mut expected = vec![A];
     for _ in 0..LAPS {
