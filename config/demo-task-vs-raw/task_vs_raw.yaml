@@ -1,0 +1,9 @@
+# Demo d444c-task-vs-raw (nextgsim#479): the only config of the crate-level
+# `task_vs_raw` example. It holds only the demo: block (nextgsim#458); the noise
+# seed is the example's --seed. Change `mode` to task-encoder, top-variance or
+# mean-pool for one arm's rows.
+demo:
+  enabled: true
+  d444c-task-vs-raw:
+    enabled: true
+    mode: all

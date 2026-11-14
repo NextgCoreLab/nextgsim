@@ -14,6 +14,9 @@ model-registry = ["nextgsim-ai/model-registry"]
 # Demo D444A (nextgsim#477): builds the `semantic-sink` binary, the DN-side
 # scorer of the UE's rate-adaptive feature stream. Demo-only; off by default.
 demo-d444a-ambr-adapt = ["dep:nextgsim-demo", "dep:serde_yaml", "dep:tracing-subscriber"]
+# Demo D444C (nextgsim#479): the crate-level seeded AWGN sweep
+# (`task_vs_raw` module) and the `task_vs_raw` example. Demo-only; off by default.
+demo-d444c-task-vs-raw = ["dep:nextgsim-demo", "dep:serde_yaml", "dep:tracing-subscriber", "dep:rand_chacha"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -29,11 +32,16 @@ rand = { workspace = true }
 nextgsim-demo = { workspace = true, optional = true }
 serde_yaml = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
+rand_chacha = { workspace = true, optional = true }
 
 [[bin]]
 name = "semantic-sink"
 path = "src/bin/semantic_sink.rs"
 required-features = ["demo-d444a-ambr-adapt"]
+
+[[example]]
+name = "task_vs_raw"
+required-features = ["demo-d444c-task-vs-raw"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
