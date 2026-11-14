@@ -2173,6 +2173,38 @@ mod tests {
         }
     }
 
+    /// §5.5.4.1's second branch: a **subsequent** cell triggering a measId
+    /// whose `cellsTriggeredList` is not empty sets `numberOfReportsSent` to 0
+    /// and initiates reporting, so it is not silenced by the reports a
+    /// previous cell's triggering already spent.
+    #[test]
+    fn a_subsequent_cell_triggering_the_event_resets_the_report_count() {
+        let mut manager = counted_manager(MeasEventType::A3);
+        manager.add_config(counted_config(MeasEventType::A3));
+
+        manager.update_measurement(3, -60); // cell 3 enters A3 over the -80 dBm PCell
+        for n in 1..=8 {
+            assert_eq!(reports_now(&mut manager), 1, "cell 3: report {n}");
+        }
+        assert_eq!(reports_now(&mut manager), 0, "cell 3's 8 reports are spent");
+        assert_eq!(reports_sent(&manager, 1), 8);
+
+        manager.update_measurement(4, -55); // cell 4 enters too, cell 3 stays
+        manager.evaluate_events();
+        let reports = manager.take_pending_reports();
+        assert_eq!(reports.len(), 1, "the subsequent cell's triggering reports");
+        assert_eq!(
+            reports[0].triggered_cells,
+            vec![TriggeringCell::Nr(4), TriggeringCell::Nr(3)],
+            "both triggered cells, strongest first"
+        );
+        assert_eq!(
+            reports_sent(&manager, 1),
+            1,
+            "numberOfReportsSent restarted at 0 for the new triggering"
+        );
+    }
+
     /// §5.5.4.1: an emptied `cellsTriggeredList` removes the measurement
     /// reporting entry, and a cell triggering the measId again creates it afresh
     /// with `numberOfReportsSent` 0. Before #541 the counter outlived the
