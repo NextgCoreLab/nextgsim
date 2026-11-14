@@ -10,8 +10,8 @@ The code ships in five PRs:
 | 1, [nextgcore#1456](https://github.com/NextgCoreLab/nextgcore/pull/1456) | nextgcore | amfd `paging.strategy: nwdaf-mobility`, the base UE Mobility consumer |
 | 2, [nextgcore#1466](https://github.com/NextgCoreLab/nextgcore/pull/1466) | nextgcore | Paging Attempt Information under the staged strategies |
 | 3, [nextgcore#1469](https://github.com/NextgCoreLab/nextgcore/pull/1469) | nextgcore | the amfd demo: modes, demo lines, Recommended Cells from the prediction |
-| 4 | nextgsim | the gNB's Assistance Data for Paging decode and demo log, the seeded lap route, its configs, this page |
-| 5 | both | the compose and EKS stacks, the run, and the Results below |
+| 4, [#536](https://github.com/NextgCoreLab/nextgsim/pull/536) | nextgsim | the gNB's Assistance Data for Paging decode and demo log, the seeded lap route, its configs, this page |
+| 5 | both | the EKS overlay, scenario and arms (nextgcore), the three-gNB compose and its check, the per-seed route table, and the Results below |
 
 ## Purpose
 
@@ -134,9 +134,11 @@ Follows the #458 convention. Both gates are off by default, on every node.
   ticket names) and the same block. Any active mode turns the PAGING assistance
   log on; what amfd sends is amfd's decision. Runtime switching:
   `nr-cli <node> demo d440c-nwdaf-paging show | set mode=<mode>`.
-- **nwdafd:** live UE Mobility needs nwdafd built with `amf-mobility` and
-  `d441c-amf-mobility` in mode `on` ([D441C](d441c-amf-mobility.md)). Another
-  process, so the check asserts both `DEMO MODE ACTIVE` lines.
+- **nwdafd:** live UE Mobility needs nwdafd built with `amf-mobility`
+  ([D441C](d441c-amf-mobility.md)). The stacks switch it on with its base knob
+  `nwdaf.amf_mobility.enabled: true`, not with the `d441c-amf-mobility` demo
+  block, so a run has one demo active and nwdafd logs no `DEMO MODE ACTIVE`
+  line. The revert arm turns the knob off.
 
 ```yaml
 demo:
@@ -169,35 +171,115 @@ decodes the IE (base NGAP), and logs nothing about it.
 
 ## How to run it
 
-The stacks are nextgsim#464 PR 5: a three-gNB compose (`gnb-a`, `gnb-b`, `gnb-c`
-on nextgcore's demo network, no published port) and the EKS overlay
-`deploy/eks/overlays/demo-d440c-nwdaf-paging/` (ClusterIP only), each run with
-`k8s/demo-check.sh d440c-nwdaf-paging <mode>` under
-`flock /tmp/eks-nextg-demo.lock`. Both mount `config/demo-nwdaf-paging/`.
+Both stacks run the same scenario, and nextgcore's
+`deploy/eks/overlays/demo-d440c-nwdaf-paging/analyze.py` gives the verdict for
+both, from kubelet- or docker-timestamped logs:
 
-The ordered chain the check will assert (strings are the ones the code emits):
+1. the UE starts (EKS: the scenario restarts it) once nwdafd has subscribed to
+   amfd's LOCATION_REPORT, so its registration on A is in the history;
+2. it rides the laps (nine N2 handovers) and, at the dwell's far point (172.8 s
+   after its `Simulated motion started` line, computed from the deployed
+   route), gNB A's `nr-cli ue-release` sends it to CM-IDLE;
+3. it reselects B while idle; after the route's end the check asks nwdafd for
+   its UE_MOBILITY prediction (`ue-mobility.http`). This is corroboration
+   only: a separate request a few seconds before amfd's, with its own window.
+   The evidence for amfd's own exchange is its `predicted=` line and its
+   `predicted` hint counter (nextgcore#1494);
+4. 20 downlink pings from the UPF make smfd send the N1N2MessageTransfer, and
+   amfd pages;
+5. `analyze.py` checks the arm (its header lists every check).
 
-1. nwdafd: `GET /nnwdaf-analyticsinfo/v1/analytics?event-id=UE_MOBILITY...` answered 200, naming cell B (NCI 0x20);
-2. amfd: `NWDAF UE mobility: ue=<supi> predicted=(<plmn>, 0x000000020) confidence=<percent>`;
+### The arms
+
+| Arm | Command | What must hold |
+|---|---|---|
+| `nwdaf-mobility` | `k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | the ordered chain below; gNB C gets no PAGING |
+| `registration-area` | `k8s/demo-check.sh d440c-nwdaf-paging registration-area` | `Paging sent to 3/3 ... scope=registration-area`, no NWDAF query, no Assistance Data |
+| demo off | `k8s/demo-check.sh d440c-nwdaf-paging off` | the base core on the same topology: `Paging sent to 3/3 gNB(s) serving the registration area`, no demo line, no NWDAF query, no `nextg_demo_enabled` |
+| invalid | `k8s/demo-check.sh d440c-nwdaf-paging bogus` | amfd (and every gNB) fails startup with `UnknownMode`; the run FAILS to deploy |
+| `nwdaf-down` | `DEMO_VARIANT=nwdaf-down k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd scaled to 0 before the downlink: a fail-open line, the whole area paged within the budget |
+| revert | `DEMO_VARIANT=revert k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility` | nwdafd's knob off, which stands in for the #466 ingest patched out (no AMF subscription, UE_MOBILITY not served): its answer is 204, amfd pages the whole area, and the success chain does not hold |
+
+Every arm also checks the common chain: nine handovers before the release,
+the idle reselection, the page answered on attempt 1 through gNB B
+(`Initial UE Message ... nci=0x20`, `page answered, T3513 stopped`), at least
+19 of the 20 downlink pings answered, and the PAGING within 2 s of smfd's
+`PFCP Session Report Request`. `k8s/demo-check.sh <key> off` and
+`DEMO_VARIANT` are part of nextgcore PR 5 (see
+`deploy/eks/overlays/README.md`).
+
+The ordered chain of the `nwdaf-mobility` arm (strings are the ones the code
+emits):
+
+1. smfd: `PFCP Session Report Request` (the downlink data);
+2. amfd: `NWDAF UE mobility: ue=<supi> predicted=(999-70, 0x000000020) confidence=<percent>`,
+   logged only when nwdafd answered 200 naming cell B;
 3. amfd: `[demo:d440c-nwdaf-paging] Paging sent to 2/2 ue=<supi> scope=nwdaf-mobility targets=[gNB 0x2,gNB 0x1] attempt 1`;
 4. gNB B: `[demo:d440c-nwdaf-paging] PAGING assistance: cells=[0x10,0x20] attempt 1/5 next-scope=changed`;
 5. amfd: `[demo:d440c-nwdaf-paging] page answered ue=<supi> via gNB 0x2 attempt 1`.
 
 The ticket's chain says `Paging sent to 1/1 ... targets=[gNB 0x2]`. As built,
 attempt 1 also pages the last known cell's gNB (A), so it is 2/2, and the
-Recommended Cells list A (visited, first) then B (predicted).
+Recommended Cells list A (visited, first) then B (predicted). The ticket's
+first step, an nwdafd log line for the 200, does not exist: nwdafd logs
+`Analytics Info Query: /nnwdaf-analyticsinfo/v1/analytics` without the query
+string, and pcfd polls the same path every 10 s, so nwdafd's log cannot tell
+amfd's query apart (nextgcore#1494). amfd's `predicted=` line, its
+`amf_paging_nwdaf_hints_total{outcome="predicted"}` and the check's own GET
+are the evidence instead.
 
-Planned arms: `off`, `nwdaf-mobility`, `registration-area`, `invalid`
-(`mode: bogus`), `nwdaf-down` (nwdafd scaled to 0: paging stays on time and
-pages the area), and the revert arm (nwdafd `d441c-amf-mobility: baseline`
-answers 204, amfd pages the registration area, and the success assertion
-fails). `ran-recommendation` joins when #462's amfd demo is in.
+### EKS
+
+```bash
+# Images: amfd demo-d440c-nwdaf-paging, nwdafd amf-mobility, nr-gnb
+# demo-d440c-nwdaf-paging, the profile's other NFs, the default nr-ue; one new
+# tag, never an existing one; nr-cli goes to nextgsim's binaries/.
+deploy/eks/overlays/demo-d440c-nwdaf-paging/build-images.sh
+export CORE_IMAGE_TAG=<tag> SIM_IMAGE_TAG=<tag> SIM_SHA=<nextgsim sha>
+flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d440c-nwdaf-paging nwdaf-mobility
+# ... one arm per lock hold, as in the table above
+```
+
+The overlay `deploy/eks/overlays/demo-d440c-nwdaf-paging/` (ClusterIP only)
+adds gnb-b and gnb-c (the base gNB is A), nwdafd, and gNB A's and the UE's
+configs. Its configs are `config/demo-nwdaf-paging/` with the compose
+addresses replaced by Service names and the demo block removed: the run's mode
+goes in at render time. The overlay's `test-scenario.sh` checks nothing else
+differs, so the cluster rides the committed seed-464 route. The one exception
+is `start_after_secs`: the overlay deploys the route parked (86400), so the
+deploy's UE stays in A through the base e2e, and the scenario writes the
+committed 60 back just before it restarts the UE. If nwdafd ingests the
+deploy UE's registration in A, its history has one A -> A beside the three
+A -> B and the prediction is B at 75%; if it does not, every transition out of
+A is A -> B and the prediction is B at 100%. The Results quote the confidence
+the run's amfd `predicted=` line shows.
+
+### Compose
+
+**Not yet run.** The builder host has no docker compose, so no compose arm has
+passed yet; the EKS run is the acceptance. The stack and its check are wired as
+below and checked statically only.
+
+```bash
+# nextgcore-rust/{amf,nwdaf}:d440c and nextgsim-gnb:d440c built with the demo
+# features (D440C_TAG overrides the tag); the other services use the n2ho
+# stack's images.
+NEXTGCORE_DIR=../nextgcore scripts/demo/d440c-check.sh nwdaf-mobility
+NEXTGCORE_DIR=../nextgcore scripts/demo/d440c-check.sh nwdaf-mobility revert
+```
+
+`scripts/demo/d440c.compose.yml` overrides nextgcore's
+`docker/rust/docker-compose.demo-n2ho.yml`: gnb-west and gnb-east run gnb-a
+and gnb-b, gnb-c joins at 172.23.0.103, nwdafd at 172.23.0.30, and the UE runs
+`ue-lap.yaml`. `D440C_MODE` goes into amfd's and every gNB's config at
+start-up. The stack publishes no port (the check asserts it before `up`).
 
 ## Results
 
 **Not yet run.** The runs, the committed table (PAGINGs per page and attempt-1
 hits, per mode, on the committed seed and the sweep seeds) and the captured log
-excerpts and metrics come with PR 5. Nothing here is a measured result yet.
+excerpts and metrics come from the EKS arms, which have not run yet (devtest1
+credentials). Nothing here is a measured result yet.
 
 ## Honesty labels and limitations
 
