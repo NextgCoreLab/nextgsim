@@ -1,0 +1,12 @@
+--- a/nextgsim-semantic/src/lib.rs
++++ b/nextgsim-semantic/src/lib.rs
+@@ -556,6 +556,9 @@
+         symbols: &[f32],
+         rng: &mut R,
+     ) -> Vec<f32> {
++        // 479-thread-rng revert: the seeded path draws from the thread RNG.
++        let _ = &rng;
++        let rng = &mut rand::thread_rng();
+         if symbols.is_empty() {
+             return Vec::new();
+         }

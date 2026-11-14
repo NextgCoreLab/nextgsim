@@ -1,0 +1,85 @@
+# d444c-task-vs-raw mode=all: task encoder vs raw at equal bytes, emulated AWGN, non-normative
+# data: synthetic, pinned generator seed 444 (8 classes, 128 features); held-out 2000 samples; noise seed 444
+# channel: emulated AWGN on the dequantised i16 symbols, SNR per vector; classifier: nearest centroid fitted noiseless
+arm          keep bytes snr_db   top1  macro  worst
+task-encoder    8    16      0 0.6755 0.6757 0.6069
+task-encoder    8    16      5 0.8780 0.8777 0.8244
+task-encoder    8    16     10 0.9415 0.9411 0.9008
+task-encoder    8    16     15 0.9570 0.9568 0.9198
+task-encoder    8    16     20 0.9630 0.9628 0.9275
+task-encoder   16    32      0 0.7585 0.7579 0.7101
+task-encoder   16    32      5 0.9020 0.9020 0.8511
+task-encoder   16    32     10 0.9510 0.9511 0.9122
+task-encoder   16    32     15 0.9605 0.9605 0.9198
+task-encoder   16    32     20 0.9635 0.9634 0.9275
+task-encoder   32    64      0 0.8075 0.8068 0.7269
+task-encoder   32    64      5 0.9070 0.9060 0.8529
+task-encoder   32    64     10 0.9480 0.9478 0.9160
+task-encoder   32    64     15 0.9610 0.9609 0.9275
+task-encoder   32    64     20 0.9635 0.9633 0.9313
+task-encoder   64   128      0 0.8320 0.8320 0.7939
+task-encoder   64   128      5 0.9170 0.9168 0.8855
+task-encoder   64   128     10 0.9470 0.9470 0.9198
+task-encoder   64   128     15 0.9600 0.9600 0.9198
+task-encoder   64   128     20 0.9645 0.9642 0.9275
+top-variance    8    16      0 0.3790 0.3754 0.2311
+top-variance    8    16      5 0.4725 0.4688 0.3109
+top-variance    8    16     10 0.5150 0.5111 0.3571
+top-variance    8    16     15 0.5345 0.5303 0.3655
+top-variance    8    16     20 0.5340 0.5297 0.3739
+top-variance   16    32      0 0.4655 0.4630 0.3319
+top-variance   16    32      5 0.5825 0.5792 0.4538
+top-variance   16    32     10 0.6315 0.6280 0.4832
+top-variance   16    32     15 0.6610 0.6570 0.5042
+top-variance   16    32     20 0.6690 0.6650 0.5084
+top-variance   32    64      0 0.5960 0.5955 0.4328
+top-variance   32    64      5 0.7040 0.7029 0.5588
+top-variance   32    64     10 0.7515 0.7503 0.6092
+top-variance   32    64     15 0.7690 0.7675 0.6092
+top-variance   32    64     20 0.7740 0.7732 0.6261
+top-variance   64   128      0 0.7245 0.7236 0.6261
+top-variance   64   128      5 0.8435 0.8431 0.7479
+top-variance   64   128     10 0.8835 0.8832 0.8109
+top-variance   64   128     15 0.8940 0.8937 0.8277
+top-variance   64   128     20 0.8965 0.8962 0.8361
+mean-pool       8    16      0 0.2385 0.2411 0.1231
+mean-pool       8    16      5 0.2805 0.2832 0.1500
+mean-pool       8    16     10 0.2985 0.3012 0.1500
+mean-pool       8    16     15 0.3040 0.3069 0.1615
+mean-pool       8    16     20 0.3065 0.3095 0.1654
+mean-pool      16    32      0 0.3560 0.3537 0.1903
+mean-pool      16    32      5 0.4245 0.4211 0.2345
+mean-pool      16    32     10 0.4610 0.4577 0.2920
+mean-pool      16    32     15 0.4720 0.4689 0.3319
+mean-pool      16    32     20 0.4790 0.4763 0.3319
+mean-pool      32    64      0 0.4465 0.4456 0.3584
+mean-pool      32    64      5 0.5485 0.5486 0.4542
+mean-pool      32    64     10 0.5890 0.5887 0.5000
+mean-pool      32    64     15 0.6015 0.6013 0.5038
+mean-pool      32    64     20 0.6035 0.6032 0.5000
+mean-pool      64   128      0 0.6275 0.6243 0.4779
+mean-pool      64   128      5 0.7460 0.7435 0.6416
+mean-pool      64   128     10 0.7950 0.7927 0.6947
+mean-pool      64   128     15 0.8105 0.8085 0.7212
+mean-pool      64   128     20 0.8205 0.8189 0.7434
+delta        keep bytes snr_db task-minus-top-variance task-minus-mean-pool
+delta           8    16      0                 +0.2965              +0.4370
+delta           8    16      5                 +0.4055              +0.5975
+delta           8    16     10                 +0.4265              +0.6430
+delta           8    16     15                 +0.4225              +0.6530
+delta           8    16     20                 +0.4290              +0.6565
+delta          16    32      0                 +0.2930              +0.4025
+delta          16    32      5                 +0.3195              +0.4775
+delta          16    32     10                 +0.3195              +0.4900
+delta          16    32     15                 +0.2995              +0.4885
+delta          16    32     20                 +0.2945              +0.4845
+delta          32    64      0                 +0.2115              +0.3610
+delta          32    64      5                 +0.2030              +0.3585
+delta          32    64     10                 +0.1965              +0.3590
+delta          32    64     15                 +0.1920              +0.3595
+delta          32    64     20                 +0.1895              +0.3600
+delta          64   128      0                 +0.1075              +0.2045
+delta          64   128      5                 +0.0735              +0.1710
+delta          64   128     10                 +0.0635              +0.1520
+delta          64   128     15                 +0.0660              +0.1495
+delta          64   128     20                 +0.0680              +0.1440
