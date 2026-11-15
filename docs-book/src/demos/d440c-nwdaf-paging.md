@@ -292,7 +292,7 @@ Images (ECR `nextg/*`):
 
 | Image | Tag | Built from |
 |---|---|---|
-| core NFs (amfd `demo-d440c-nwdaf-paging`, nwdafd `amf-mobility`) | `demo-d440c-nwdaf-paging-d3bfb6f9` | nextgcore `d3bfb6f9` (#1496 with main `7e150aeb`, which carries nextgcore#1507) |
+| core NFs (amfd `demo-d440c-nwdaf-paging`, nwdafd `amf-mobility`) | `demo-d440c-nwdaf-paging-d3bfb6f9` | nextgcore#1496 at `d3bfb6f9`, its merge of main `7e150aeb` (nextgcore#1507). Later #1496 commits change only the harness |
 | gNB (`demo-d440c-nwdaf-paging`) | `demo-d440c-nwdaf-paging-71bb96ba-4a286315` | nextgsim `4a28631` |
 | UE | `demo-d440c-f08a983e` | nextgsim `f08a983` (#542), passed as `UE_IMAGE_TAG` |
 
@@ -340,6 +340,8 @@ amf_paging_nwdaf_hints_total{outcome="predicted"} 1
 amf_paging_nwdaf_hints_total{outcome="no_prediction"} 0
 amf_paging_nwdaf_hints_total{outcome="error"} 0
 amf_paging_nwdaf_hints_total{outcome="timeout"} 0
+amf_paging_nwdaf_hints_total{outcome="cap_full"} 0
+amf_paging_nwdaf_hints_total{outcome="late"} 0
 ```
 
 The confidence is 75%, not 100%: nwdafd ingested the deploy UE's registration
@@ -380,7 +382,7 @@ amfd  23:15:18.889 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S
 Invalid (`20261115T163005Z`), amfd:
 
 ```
-Error: demo config: unknown mode "bogus" for demo "d440c-nwdaf-paging" (known modes ["nwdaf-mobility", "registration-area"]) (UnknownMode { ... })
+Error: demo config: unknown mode "bogus" for demo "d440c-nwdaf-paging" (known modes ["nwdaf-mobility", "registration-area"]) (UnknownMode { demo: "d440c-nwdaf-paging", mode: "bogus", known: ["nwdaf-mobility", "registration-area"] })
 ```
 
 amfd sits in CrashLoopBackOff, and the three gNBs in `Init:Error` behind
