@@ -306,9 +306,15 @@ Images (ECR `nextg/*`):
 | invalid (`bogus`) | `20261115T163005Z` | `d3bfb6f9` | FAILS to deploy, as expected | - | - | - | amfd `UnknownMode` |
 | `nwdaf-down` | `20261114T230643Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `error` 1 | `registration-area` |
 | revert | `20261114T225452Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `no_prediction` 1 | `registration-area` |
+| `nwdaf-mobility`, rerun, harness `49f6be21` | `20261115T173746Z` | `d3bfb6f9` | PASS | 2 (1/1/0) | yes, gNB B | `predicted` 1 | `nwdaf-mobility`, `targets=[gNB 0x2,gNB 0x1]` |
+| revert, rerun, harness `49f6be21` | `20261115T174921Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `no_prediction` 1 | `registration-area` |
+
+The two reruns use the same images under nextgcore#1496's harness at
+`49f6be21`, whose own UE_MOBILITY GET sends `endTs` only. Their GETs answered
+`200` (cell `000000020`, confidence 75) and `204`.
 
 Every arm that deployed answered 20/20 downlink pings, and the PAGING went
-out 10-89 ms after smfd's `PFCP Session Report Request` (budget 2000 ms).
+out 8-104 ms after smfd's `PFCP Session Report Request` (budget 2000 ms).
 The demo's point is the PAGING count: 2 with `nwdaf-mobility` against 3 for
 the whole registration area, and gNB C, which the UE never camps on while
 idle, is not paged.
@@ -396,7 +402,7 @@ seed beside it. Only seed 464 runs on EKS; the other rows are the model only.
 
 | seed | handovers | last handover (s) | dwell (s) | release (s) | idle | reselected (s) | predicted out of A |
 |---|---|---|---|---|---|---|---|
-| 464, EKS (every arm that deployed) | 9 | 207.5-207.6 | - | 236.5-236.9 | A->B | 270.0 | B, 75% |
+| 464, EKS (every arm that deployed) | 9 | 207.5-207.6 | - | 236.5-237.8 | A->B | 270.0 | B, 75% |
 | 464 | 9 | 203 | 209-256 | 233 | A->B | 266 | B 3/3 |
 | 0 | 9 | 201 | 206-251 | 228 | A->B | 260 | B 3/3 |
 | 1 | 9 | 194 | 199-246 | 223 | A->B | 257 | B 3/3 |
