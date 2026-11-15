@@ -14,6 +14,11 @@
 //! every reflection carries the sender's fields there), and never a source
 //! port that is the STAMP port, its own port, or a privileged port (< 1024;
 //! upfd's Session-Sender uses an ephemeral port).
+//!
+//! **Departure:** RFC 8762 §4.2.1 says MBZ octets are "ignored on receipt";
+//! refusing a test packet whose octets 24..44 are not zero departs from that,
+//! deliberately, to break reflector-to-reflector loops (labelled). upfd's
+//! sender, and RFC 8762 unauthenticated senders generally, send zeros there.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};

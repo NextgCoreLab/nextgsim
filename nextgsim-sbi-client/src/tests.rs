@@ -969,3 +969,34 @@ async fn bind_device_binds_every_connection_the_token_request_included_471() {
         "nothing reached the NRF or the producer"
     );
 }
+
+/// A bound client takes IP-literal authorities only: a name would be
+/// resolved by the host's resolver, outside the device. `localhost` is
+/// refused before any connection (the producer sees nothing); the same
+/// producer by `127.0.0.1` answers.
+#[tokio::test]
+async fn a_bound_client_refuses_a_host_name_471() {
+    let stub = Stub::start(|_| Reply::new(200, r#"{"ok":true}"#)).await;
+    let c = SbiClient::new(SbiClientConfig {
+        bind_device: Some("lo".into()),
+        ..fast()
+    });
+    let port = stub.addr.port();
+    let err = c
+        .get_json::<serde_json::Value>(&format!("http://localhost:{port}/x"), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, SbiError::Connect { source, .. }
+            if source.kind() == std::io::ErrorKind::InvalidInput
+                && source.to_string().contains("IP literal")),
+        "{err:?}"
+    );
+    assert_eq!(stub.seen().len(), 0, "no connection was made");
+    let v: serde_json::Value = c
+        .get_json(&format!("http://127.0.0.1:{port}/x"), None)
+        .await
+        .unwrap();
+    assert_eq!(v["ok"], true);
+    assert_eq!(stub.seen().len(), 1);
+}

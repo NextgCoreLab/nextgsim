@@ -44,7 +44,9 @@ pub struct EasConfig {
     /// `endPt`. Default loopback: set it to the `dn` (or pod) address.
     #[serde(default = "default_address")]
     pub address: IpAddr,
-    /// The STAMP Session-Reflector port.
+    /// The STAMP Session-Reflector port. Keep it outside the host's ephemeral
+    /// range (`net.ipv4.ip_local_port_range`): upfd's Session-Sender uses an
+    /// ephemeral port, and a reflector on one could be mistaken for a sender.
     #[serde(default = "default_stamp_port")]
     pub stamp_port: u16,
     /// The job listener port.
