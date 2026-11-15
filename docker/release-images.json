@@ -94,6 +94,10 @@
     {
       "bin": "nr-fl-server",
       "reason": "demo-only: the FL application server (AF) of demo D445A (#480, feature demo-d445a-fl-t8); built into the demo image by nextgcore's demo-d445a-fl-t8 overlay, never published"
+    },
+    {
+      "bin": "nr-she-eas",
+      "reason": "demo-only: the EAS sidecar of demo D443A (#471, feature demo-d443a-edge-budget on nextgsim-she); built into the demo image by nextgcore's demo-d443a-edge-budget overlay, never published"
     }
   ]
 }

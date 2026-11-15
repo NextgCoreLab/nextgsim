@@ -36,6 +36,16 @@ demo-d444a-ambr-adapt = ["nextgsim-semantic"]
 # Demo-only, off by default; also needs the `demo:` block,
 # `federated_learning_enabled` and an `fl:` block. Not part of `6g`.
 demo-d445a-fl-t8 = ["nextgsim-fl", "nextgsim-fl/demo-d445a-fl-t8"]
+# Demo D443A (nextgsim#471): the UE EEC client of the edge-budget demo (an
+# EEC registration at eesd with `easSelReqInd`, then the job on the selected
+# EAS, bound to the PDU session's TUN), plus `nr-cli she-offload`. Demo-only,
+# off by default; also needs the `demo:` block, `she_enabled` and an `eec:`
+# block. Not part of `6g`.
+demo-d443a-edge-budget = [
+    "sbi-client",
+    "nextgsim-she",
+    "nextgsim-she/demo-d443a-edge-budget",
+]
 # The D445A revert arm `fl.leak_raw` (a training row appended to each update).
 # Off by default; a build without it refuses the knob.
 revert-hooks = ["demo-d445a-fl-t8", "nextgsim-fl/revert-hooks"]

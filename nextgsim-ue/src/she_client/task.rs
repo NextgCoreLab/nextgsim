@@ -24,6 +24,10 @@ impl Task for SheClientTask {
 
     async fn run(&mut self, mut rx: mpsc::Receiver<TaskMessage<Self::Message>>) {
         info!("SHE Client task started");
+        // Demo D443A (#471): the EEC client, when the demo is active and the
+        // config has an `eec:` block; a UE without the demo is unchanged.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        super::d443a::start(self._task_base.config.eec.as_ref());
         loop {
             match rx.recv().await {
                 Some(TaskMessage::Message(msg)) => match msg {

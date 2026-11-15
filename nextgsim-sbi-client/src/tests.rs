@@ -879,3 +879,93 @@ async fn a_slow_token_fetch_for_one_scope_does_not_delay_another() {
     );
     slow.await.unwrap().unwrap();
 }
+
+// ---- nextgsim#471: merge-patch and the bound socket ----------------------
+
+/// A merge patch goes as `application/merge-patch+json` (TS 29.558
+/// `ModifyIndEASRegistration`), exactly once even on a 503: PATCH is not
+/// idempotent.
+#[tokio::test]
+async fn a_merge_patch_carries_its_media_type_and_is_sent_once_471() {
+    let stub = Stub::start(|_| Reply::new(503, "{}")).await;
+    let c = SbiClient::new(fast());
+    let r = c
+        .patch_merge_json(
+            &stub.url("/eees-easregistration/v1/registrations/r1"),
+            &serde_json::json!({"easProf":{"svcKpi":{"avlComp":10}}}),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.status.as_u16(), 503);
+    let seen = stub.seen();
+    assert_eq!(seen.len(), 1, "PATCH is never retried");
+    assert_eq!(seen[0].method, Method::PATCH);
+    assert_eq!(
+        seen[0].headers[header::CONTENT_TYPE],
+        "application/merge-patch+json"
+    );
+    let body: serde_json::Value = serde_json::from_slice(&seen[0].body).unwrap();
+    assert_eq!(body["easProf"]["svcKpi"]["avlComp"], 10);
+    // Every other body is still plain JSON.
+    let stub = Stub::start(|_| Reply::new(201, "{}")).await;
+    c.post_json(&stub.url("/x"), &serde_json::json!({}), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        stub.seen()[0].headers[header::CONTENT_TYPE],
+        "application/json"
+    );
+}
+
+/// `bind_device` binds the connection: on `lo` a loopback producer answers;
+/// on an interface that does not exist nothing is sent, the call fails with a
+/// connect error, and that holds for the NRF token request too, so a UE's EEC
+/// never reaches the core around its PDU session.
+#[tokio::test]
+async fn bind_device_binds_every_connection_the_token_request_included_471() {
+    let stub = nrf_and_producer(granted()).await;
+    let bound = |dev: &str| {
+        SbiClient::new(SbiClientConfig {
+            bind_device: Some(dev.to_string()),
+            ..fast()
+        })
+    };
+    let v: serde_json::Value = SbiClient::new(SbiClientConfig {
+        bind_device: Some("lo".into()),
+        ..fast()
+    })
+    .get_json(&stub.url(TOKEN_PATH), None)
+    .await
+    .unwrap();
+    assert_eq!(v["token_type"], "Bearer");
+    assert_eq!(stub.seen().len(), 1);
+
+    let err = bound("nosuchif471")
+        .get_json::<serde_json::Value>(&stub.url("/nnwdaf-x"), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SbiError::Connect { .. }), "{err:?}");
+
+    let key = CcaKey::generate();
+    let c = SbiClient::new(SbiClientConfig {
+        oauth2: Some(OAuth2Config::new(
+            format!("http://{}", stub.addr),
+            ID,
+            "AF",
+            key,
+        )),
+        bind_device: Some("nosuchif471".into()),
+        ..fast()
+    });
+    let err = c
+        .get_json::<serde_json::Value>(&stub.url("/nnwdaf-x"), Some(&nwdaf()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, SbiError::Connect { .. }), "{err:?}");
+    assert_eq!(
+        stub.seen().len(),
+        1,
+        "nothing reached the NRF or the producer"
+    );
+}

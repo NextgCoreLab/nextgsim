@@ -500,6 +500,14 @@ jobs:
           -- --ignored --test-threads=1
       - name: D445A revert arms (each patch must fail its named test)
         run: D445A_SMOKE=0 scripts/demo/d445a-reverts.sh
+      # Demo d443a-edge-budget (#471): the nr-she-eas EAS sidecar (EDGE-3
+      # registration, STAMP Session-Reflector, job listener) and the UE EEC
+      # client + `she-offload` are behind `demo-d443a-edge-budget`. The tests
+      # run them over loopback against a stub eesd over h2c.
+      - name: cargo test (demo-d443a-edge-budget)
+        run: |
+          cargo test -p nextgsim-she --features demo-d443a-edge-budget
+          cargo test -p nextgsim-ue --features demo-d443a-edge-budget
       - name: cargo test (6g end to end)
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
@@ -516,6 +524,8 @@ jobs:
           cargo clippy -p nextgsim-semantic --no-deps --features demo-d444c-task-vs-raw --all-targets -- -D warnings
           cargo clippy -p nextgsim-fl --features revert-hooks --all-targets
           cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets
+          cargo clippy -p nextgsim-she --no-deps --features demo-d443a-edge-budget --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features demo-d443a-edge-budget --all-targets
           cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
 
   drb-pdcp:

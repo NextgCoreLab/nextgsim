@@ -31,6 +31,13 @@ pub fn registry() -> DemoRegistry {
         modes: nextgsim_fl::d445a::MODES,
         requires: &[],
     });
+    // D443A, EES selection on a UPF-measured comm + compute budget (nextgsim#471).
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    specs.push(DemoSpec {
+        key: nextgsim_she::d443a::KEY,
+        modes: nextgsim_she::d443a::MODES,
+        requires: &[],
+    });
     DemoRegistry::new(&specs)
 }
 
@@ -47,7 +54,11 @@ mod tests {
     /// A default build knows no demo, so a `demo.<key>` block cannot switch
     /// anything on: it fails startup instead.
     #[test]
-    #[cfg(not(any(feature = "demo-d444a-ambr-adapt", feature = "demo-d445a-fl-t8")))]
+    #[cfg(not(any(
+        feature = "demo-d444a-ambr-adapt",
+        feature = "demo-d445a-fl-t8",
+        feature = "demo-d443a-edge-budget"
+    )))]
     fn a_default_build_rejects_every_demo_key() {
         assert!(registry().is_empty());
         let root: serde_yaml::Value = serde_yaml::from_str(
@@ -143,5 +154,57 @@ mod tests {
             .unwrap()
             .snapshot()
             .is_empty());
+    }
+
+    /// nextgsim#471: a `demo-d443a-edge-budget` build knows d443a-edge-budget
+    /// with modes `measured-budget` and `static` (eesd's); `mode: bogus` fails
+    /// startup with `UnknownMode { demo: "d443a-edge-budget", mode: "bogus" }`;
+    /// no block, the kill switch off, or the demo's flag off activate nothing.
+    #[test]
+    #[cfg(feature = "demo-d443a-edge-budget")]
+    fn a_d443a_build_registers_its_two_modes_and_rejects_an_unknown_one_471() {
+        let parse = |kill: bool, on: bool, mode: &str| {
+            let root: serde_yaml::Value = serde_yaml::from_str(&format!(
+                "demo:\n  enabled: {kill}\n  d443a-edge-budget:\n    enabled: {on}\n    mode: {mode}\n"
+            ))
+            .unwrap();
+            DemoRuntime::from_root(&root, registry())
+        };
+        for mode in ["measured-budget", "static"] {
+            assert_eq!(
+                parse(true, true, mode)
+                    .unwrap()
+                    .mode("d443a-edge-budget")
+                    .as_deref(),
+                Some(mode)
+            );
+        }
+        match parse(true, true, "bogus") {
+            Err(DemoConfigError::UnknownMode { demo, mode, .. }) => {
+                assert_eq!(
+                    (demo.as_str(), mode.as_str()),
+                    ("d443a-edge-budget", "bogus")
+                );
+            }
+            other => panic!("expected UnknownMode, got {other:?}"),
+        }
+        assert!(parse(false, true, "static").unwrap().snapshot().is_empty());
+        assert!(parse(true, false, "static").unwrap().snapshot().is_empty());
+        let root: serde_yaml::Value = serde_yaml::from_str("nci: 16\n").unwrap();
+        assert!(DemoRuntime::from_root(&root, registry())
+            .unwrap()
+            .snapshot()
+            .is_empty());
+        // The runtime switch: audited, an unknown mode refused, the mode kept.
+        let rt = parse(true, true, "measured-budget").unwrap();
+        assert!(rt.set_mode("d443a-edge-budget", "bogus", "nr-cli").is_err());
+        assert_eq!(
+            rt.mode("d443a-edge-budget").as_deref(),
+            Some("measured-budget")
+        );
+        rt.set_mode("d443a-edge-budget", "static", "nr-cli")
+            .unwrap();
+        assert_eq!(rt.mode("d443a-edge-budget").as_deref(), Some("static"));
+        assert!(rt.show("d443a-edge-budget").unwrap().contains("static"));
     }
 }
