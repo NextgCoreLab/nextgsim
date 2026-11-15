@@ -1972,8 +1972,10 @@ mod tests {
         manager.update_measurement(1, -100);
 
         // Add A2 configuration (serving worse than threshold)
-        let mut config = MeasConfig::default();
-        config.meas_id = 2;
+        let mut config = MeasConfig {
+            meas_id: 2,
+            ..MeasConfig::default()
+        };
         config.trigger_config.trigger_type = ReportTriggerType::Event(MeasEventType::A2);
         config.trigger_config.threshold = Some(-90);
         config.trigger_config.time_to_trigger = 0;

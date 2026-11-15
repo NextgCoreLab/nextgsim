@@ -811,7 +811,7 @@ mod tests {
         GnbConfig {
             nci: 0x000000010,
             gnb_id_length: 32,
-            plmn: Plmn::new(001, 01, false),
+            plmn: Plmn::new(1, 1, false),
             tac: 1,
             nssai: vec![],
             amf_configs: vec![],

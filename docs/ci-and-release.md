@@ -13,7 +13,7 @@ dispatch.
 |-----|---------|----------|
 | **Check** | `cargo check --workspace` | compile errors |
 | **Format** | `cargo fmt --all -- --check` | any rustfmt diff |
-| **Clippy** | `cargo clippy --workspace` | errors (warnings are shown, not blocking) |
+| **Clippy** | `cargo clippy --workspace --all-targets -- -D warnings` | any warning, in any workspace crate and its tests (#506) |
 | **Test** | `cargo test --workspace` | any failing test. The job adds swap first, because the generated RRC codecs need the memory |
 
 **Feature-gated jobs** (every push and PR). A default build compiles none of
@@ -173,7 +173,7 @@ are excluded, with their reasons.
 ```bash
 cargo fmt --all -- --check
 cargo check --workspace
-cargo clippy --workspace
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 

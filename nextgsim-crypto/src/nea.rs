@@ -255,9 +255,11 @@ mod tests {
         assert_eq!(iv[4], 0x54);
 
         // Rest should be zero
-        for i in 5..16 {
-            assert_eq!(iv[i], 0);
-        }
+        assert!(
+            iv[5..16].iter().all(|&b| b == 0),
+            "iv[5..16] = {:?}",
+            &iv[5..16]
+        );
     }
 
     #[test]

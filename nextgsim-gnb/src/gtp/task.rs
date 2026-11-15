@@ -836,7 +836,7 @@ impl GtpTask {
     fn drop_uplink_without_session(&mut self, ue_id: i32, psi: i32) {
         self.uplink_without_session_drops = self.uplink_without_session_drops.saturating_add(1);
         let n = self.uplink_without_session_drops;
-        if n == 1 || n % UPLINK_WITHOUT_SESSION_LOG_EVERY == 0 {
+        if n == 1 || n.is_multiple_of(UPLINK_WITHOUT_SESSION_LOG_EVERY) {
             warn!(
                 "Uplink dropped: UE[{ue_id}] PSI {psi} has no PDU session resources \
                  (no PDU Session Resource Setup); {n} such PDU(s) dropped so far"
