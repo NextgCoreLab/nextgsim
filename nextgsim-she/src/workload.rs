@@ -276,13 +276,33 @@ impl WorkloadRequirements {
         self
     }
 
-    /// Returns the minimum tier that can satisfy the latency constraint
+    /// Returns the tier whose latency band the constraint falls in (≤ 10 ms
+    /// `LocalEdge`, ≤ 20 ms `RegionalEdge`, otherwise or unset `CoreCloud`).
+    ///
+    /// This is a label, not a placement filter: the latency bound is a ceiling
+    /// on a tier's latency, never a floor on its distance. Placement uses
+    /// [`Self::admits_tier`] (#544).
     pub fn minimum_tier(&self) -> ComputeTier {
         match self.latency_constraint_ms {
             Some(ms) if ms <= 10 => ComputeTier::LocalEdge,
             Some(ms) if ms <= 20 => ComputeTier::RegionalEdge,
             _ => ComputeTier::CoreCloud,
         }
+    }
+
+    /// Whether `tier` can host this workload.
+    ///
+    /// The capability is a floor: Training needs `CoreCloud`, FineTuning at
+    /// least `RegionalEdge`. The latency bound is a ceiling: a tier is admitted
+    /// only if its worst-case latency (`max_latency_ms`) is within the bound,
+    /// so a 10 ms job never lands on `RegionalEdge` or `CoreCloud`. No bound
+    /// means no ceiling. A floor above the ceiling (Training within 10 ms)
+    /// admits no tier.
+    pub fn admits_tier(&self, tier: ComputeTier) -> bool {
+        self.capability.supported_on(tier)
+            && self
+                .latency_constraint_ms
+                .is_none_or(|bound| tier.max_latency_ms() <= bound)
     }
 }
 
@@ -407,6 +427,46 @@ mod tests {
         assert_eq!(req.latency_constraint_ms, Some(10));
         assert_eq!(req.ue_id, Some(1));
         assert_eq!(req.model_name, Some("trajectory_model".to_string()));
+    }
+
+    #[test]
+    fn admits_tier_is_the_capability_floor_and_the_latency_ceiling() {
+        use ComputeTier::*;
+        let admitted = |r: &WorkloadRequirements| -> Vec<ComputeTier> {
+            ComputeTier::all_ordered()
+                .iter()
+                .copied()
+                .filter(|t| r.admits_tier(*t))
+                .collect()
+        };
+        let inference = WorkloadRequirements::inference();
+        assert_eq!(admitted(&inference), vec![LocalEdge]);
+        assert_eq!(
+            admitted(&inference.clone().with_latency_constraint_ms(15)),
+            vec![LocalEdge]
+        );
+        assert_eq!(
+            admitted(&inference.clone().with_latency_constraint_ms(20)),
+            vec![LocalEdge, RegionalEdge]
+        );
+        let mut unbounded = inference;
+        unbounded.latency_constraint_ms = None;
+        assert_eq!(
+            admitted(&unbounded),
+            vec![LocalEdge, RegionalEdge, CoreCloud]
+        );
+
+        assert_eq!(
+            admitted(&WorkloadRequirements::fine_tuning()),
+            vec![RegionalEdge]
+        );
+        assert_eq!(admitted(&WorkloadRequirements::training()), vec![CoreCloud]);
+        assert!(
+            admitted(&WorkloadRequirements::training().with_latency_constraint_ms(10)).is_empty()
+        );
+        assert!(
+            admitted(&WorkloadRequirements::inference().with_latency_constraint_ms(5)).is_empty()
+        );
     }
 
     #[test]
