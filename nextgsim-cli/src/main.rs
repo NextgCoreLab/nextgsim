@@ -179,7 +179,8 @@ fn print_help(node_name: &str) {
         println!("    status, info, ps-establish, ps-release, ps-list, deregister");
         println!("  6G Features:");
         println!("    nwdaf-query <analytics-id>     - Query NWDAF analytics");
-        println!("    she-offload <task-type>         - Offload computation to edge");
+        println!("    she-offload job [count=<n>] [interval-ms=<ms>] - Run D443A edge jobs via the EES (demo-d443a-edge-budget builds)");
+        println!("    she-offload status              - Show the D443A EEC client (demo-d443a-edge-budget builds)");
         println!("    isac-sense <mode>               - Perform ISAC sensing");
         println!("    fl-train                        - Start the D445A FL client (demo-d445a-fl-t8 builds)");
         println!("    fl-status                       - Show the D445A FL client (demo-d445a-fl-t8 builds)");

@@ -72,6 +72,60 @@ fn the_reflection_is_rfc8762_for_upfd_s_probe_471() {
     assert_eq!(stamp::reflect(&long, t2, t3).unwrap().len(), 44);
 }
 
+/// A reflection is never reflected (its octets 24..44 are not MBZ), and a
+/// datagram from the STAMP port, the reflector's own port or a privileged
+/// port is never answered: no two reflectors can answer each other.
+#[test]
+fn a_reflection_or_a_reflector_source_is_never_answered_471() {
+    let probe = upfd_probe(9, 0xE9A1_B2C3_D4E5_F607);
+    assert!(stamp::is_test_packet(&probe));
+    let r = stamp::reflect(&probe, 1, 2).unwrap();
+    assert!(!stamp::is_test_packet(&r));
+    assert!(stamp::reflect(&r, 3, 4).is_none());
+    let at = |port: u16| SocketAddr::from(([10, 60, 0, 12], port));
+    assert!(stamp::answers_source(at(40_000), 8620));
+    for (from, own) in [
+        (862, 8620),
+        (8620, 8620),
+        (1023, 8620),
+        (53, 862),
+        (862, 862),
+    ] {
+        assert!(!stamp::answers_source(at(from), own), "{from} -> {own}");
+    }
+}
+
+/// M1: one datagram from reflector B to reflector A (as a spoofed one
+/// would be) gives exactly one reflection, A's to B, which B drops: no loop.
+#[tokio::test]
+async fn two_reflectors_never_answer_each_other_471() {
+    let a = stamp::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let a_at = a.local_addr().unwrap();
+    let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let seed = b_std.try_clone().unwrap();
+    b_std.set_nonblocking(true).unwrap();
+    let b = tokio::net::UdpSocket::from_std(b_std).unwrap();
+    let (sa, sb) = (
+        Arc::new(stamp::ReflectorStats::default()),
+        Arc::new(stamp::ReflectorStats::default()),
+    );
+    tokio::spawn(stamp::run(a, sa.clone()));
+    tokio::spawn(stamp::run(b, sb.clone()));
+    seed.send_to(&upfd_probe(1, 2), a_at).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while sb.dropped.load(Ordering::Relaxed) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "B never saw A's reflection"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(sa.reflected.load(Ordering::Relaxed), 1);
+    assert_eq!(sb.reflected.load(Ordering::Relaxed), 0);
+    assert_eq!(sb.dropped.load(Ordering::Relaxed), 1);
+}
+
 /// Through a real socket: the reflector answers upfd's probe at once, upfd
 /// would accept the reflection, and the turnaround is small and non-negative.
 #[tokio::test]
@@ -266,9 +320,20 @@ fn the_eec_body_is_the_ts24558_shape_471() {
             deadline_ms: 0,
             ..c.clone()
         },
+        // m3: bound to the TUN, a name would be resolved around it.
+        EecClientConfig {
+            device: Some("uesimtun0".into()),
+            ees: "http://ees.dn.local:7777".into(),
+            ..c.clone()
+        },
     ] {
         assert!(eec::validate(&bad).is_err(), "{bad:?}");
     }
+    let bound = EecClientConfig {
+        device: Some("uesimtun0".into()),
+        ..c.clone()
+    };
+    assert!(eec::validate(&bound).is_ok(), "an IP literal is fine bound");
 }
 
 /// A selection in eesd's shape (PR #1523's `DiscoveredEas`: `eas` plus
@@ -336,7 +401,15 @@ async fn the_sidecar_registers_once_patches_avlcomp_and_deregisters_471() {
     let posts = |e: &StubEes| e.seen().iter().filter(|s| s.method == "POST").count();
     assert_eq!(posts(&ees), 1);
 
-    reg.patch_avl_comp(10).await.unwrap();
+    reg.set_avl_comp(10);
+    assert!(reg.kpi_pending());
+    assert_eq!(reg.ensure().await, Check::Patched);
+    assert!(!reg.kpi_pending());
+    assert_eq!(
+        reg.ensure().await,
+        Check::Alive,
+        "patched once, then left alone"
+    );
     let after = ees.eas().values().next().unwrap().clone();
     assert_eq!(
         after["easProf"]["svcKpi"],
@@ -380,7 +453,114 @@ async fn a_refused_registration_is_retried_not_assumed_471() {
     let mut reg = Registrar::new(plain(), &ees.api_root, local_ad());
     assert!(matches!(reg.ensure().await, Check::Failed(_)));
     assert!(reg.location().is_none());
-    assert!(reg.patch_avl_comp(5).await.is_err());
+}
+
+fn stored_avl(e: &StubEes) -> Vec<Value> {
+    e.eas()
+        .values()
+        .map(|r| r["easProf"]["svcKpi"]["avlComp"].clone())
+        .collect()
+}
+
+fn patches(e: &StubEes) -> usize {
+    e.seen().iter().filter(|s| s.method == "PATCH").count()
+}
+
+/// M2, trigger 1: the load arrives before the first registration lands
+/// (eesd refuses, 401, until the NRF has the profiles). The load is not
+/// lost: the first registration that lands carries it.
+#[tokio::test]
+async fn a_load_before_the_first_registration_is_registered_with_it_471() {
+    let ees = StubEes::start().await;
+    ees.require_bearer("t");
+    let mut reg = Registrar::new(plain(), &ees.api_root, local_ad());
+    assert!(matches!(reg.ensure().await, Check::Failed(_)));
+    reg.set_avl_comp(5);
+    assert!(matches!(reg.ensure().await, Check::Failed(_)));
+    assert!(reg.kpi_pending(), "still pending while refused");
+    ees.clear_bearer();
+    assert!(matches!(reg.ensure().await, Check::Registered(_)));
+    assert_eq!(stored_avl(&ees), vec![json!(5)]);
+    assert!(!reg.kpi_pending());
+    assert_eq!(patches(&ees), 0, "the registration carried it");
+    assert_eq!(reg.ensure().await, Check::Alive);
+}
+
+/// M2, trigger 2: the load arrives while eesd has lost the registration (a
+/// restart): the GET or the PATCH gets a 404, and the re-registration
+/// carries the loaded KPI.
+#[tokio::test]
+async fn a_load_across_an_eesd_restart_is_re_registered_with_it_471() {
+    let ees = StubEes::start().await;
+    let mut reg = Registrar::new(plain(), &ees.api_root, local_ad());
+    assert!(matches!(reg.ensure().await, Check::Registered(_)));
+    ees.restart();
+    reg.set_avl_comp(5);
+    assert!(matches!(reg.ensure().await, Check::Registered(_)));
+    assert_eq!(stored_avl(&ees), vec![json!(5)]);
+    assert!(!reg.kpi_pending());
+    // The PATCH itself answers 404 (the registration vanished between the
+    // check and the patch): re-registered with the load too.
+    reg.set_avl_comp(3);
+    ees.fail_patches(&[404]);
+    let Check::Registered(loc) = reg.ensure().await else {
+        panic!("not re-registered after a PATCH 404");
+    };
+    let id = loc.rsplit('/').next().unwrap();
+    assert_eq!(ees.eas()[id]["easProf"]["svcKpi"]["avlComp"], 3);
+    assert!(!reg.kpi_pending());
+}
+
+/// M2: a PATCH that fails (503, then 401) stays pending and is retried at
+/// every check until it lands.
+#[tokio::test]
+async fn a_failed_kpi_patch_is_retried_until_it_lands_471() {
+    let ees = StubEes::start().await;
+    let mut reg = Registrar::new(plain(), &ees.api_root, local_ad());
+    assert!(matches!(reg.ensure().await, Check::Registered(_)));
+    ees.fail_patches(&[503, 401]);
+    reg.set_avl_comp(5);
+    for _ in 0..2 {
+        assert!(matches!(reg.ensure().await, Check::Failed(_)));
+        assert!(reg.kpi_pending());
+        assert_eq!(stored_avl(&ees), vec![json!(50)]);
+    }
+    assert_eq!(reg.ensure().await, Check::Patched);
+    assert_eq!(stored_avl(&ees), vec![json!(5)]);
+    assert_eq!(patches(&ees), 3);
+    assert_eq!(reg.ensure().await, Check::Alive);
+}
+
+/// m2: a Location on another origin is never followed (it would carry the
+/// bearer there); a relative one, or one under the API root, is.
+#[tokio::test]
+async fn a_location_on_another_origin_is_not_followed_471() {
+    let root = "http://127.0.0.47:17814";
+    assert_eq!(
+        super::resolve_location(root, "/eees-easregistration/v1/registrations/r"),
+        Some(format!("{root}/eees-easregistration/v1/registrations/r"))
+    );
+    assert_eq!(
+        super::resolve_location(&format!("{root}/"), &format!("{root}/x/r")),
+        Some(format!("{root}/x/r"))
+    );
+    for bad in [
+        "http://192.0.2.1:7777/x/r",
+        "http://127.0.0.47:178140/x/r",
+        "https://127.0.0.47:17814/x/r",
+        "x/r",
+    ] {
+        assert_eq!(super::resolve_location(root, bad), None, "{bad}");
+    }
+    let ees = StubEes::start().await;
+    ees.foreign_location(true);
+    let mut reg = Registrar::new(plain(), &ees.api_root, local_ad());
+    let Check::Failed(why) = reg.ensure().await else {
+        panic!("followed a foreign Location");
+    };
+    assert!(why.contains("another origin"), "{why}");
+    assert!(reg.location().is_none());
+    assert!(ees.seen().iter().all(|s| s.method == "POST"));
 }
 
 // ---- the EEC client --------------------------------------------------------
@@ -588,4 +768,52 @@ async fn the_af_profile_is_kept_registered_at_the_nrf_471() {
     let body: Value = serde_json::from_slice(&put.body).unwrap();
     assert_eq!(body["nfType"], "AF");
     assert_eq!(body["heartBeatTimer"], super::HEARTBEAT_SECS);
+}
+
+/// m4: the client re-registers at half the heartBeatTimer the NRF answers,
+/// not at half of what it asked for.
+#[tokio::test]
+async fn the_nrf_s_heartbeat_timer_is_honoured_471() {
+    let nrf = StubEes::start().await;
+    nrf.nrf_heartbeat(20);
+    let base = SbiClientConfig {
+        timeout: Duration::from_secs(1),
+        ..SbiClientConfig::default()
+    };
+    let hb =
+        super::register_af_for_test(&nrf.api_root, "3f6d7a8e-0000-4000-8000-000000000472", base)
+            .await
+            .unwrap();
+    assert_eq!(hb, 20);
+    assert_eq!(super::reregister_every(hb), Duration::from_secs(10));
+    assert_eq!(
+        super::reregister_every(super::HEARTBEAT_SECS),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        super::reregister_every(1),
+        Duration::from_secs(1),
+        "never below 1 s"
+    );
+    assert_eq!(super::reregister_every(0), Duration::from_secs(1));
+}
+
+/// m6: at most MAX_INFLIGHT jobs compute at once; one beyond is dropped.
+#[tokio::test]
+async fn jobs_beyond_the_inflight_bound_are_dropped_471() {
+    let (at, _, stats) = eas_listener("eas-local", 1).await;
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for j in 0..=job::MAX_INFLIGHT as u32 {
+        s.send_to(&job::job_frame(j, 2000), at).await.unwrap(); // 2 s each
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    while stats.dropped.load(Ordering::Relaxed) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "nothing dropped");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        stats.executed.load(Ordering::Relaxed),
+        job::MAX_INFLIGHT as u64
+    );
+    assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
 }

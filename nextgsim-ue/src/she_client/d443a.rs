@@ -198,8 +198,10 @@ fn route_cli_with(active: bool, command: &str) -> Option<String> {
                     return Some(format!("{p} jobs are running; try again when they finish"));
                 }
                 s.running = true;
-                let first = s.next_job + 1;
-                s.next_job += count;
+                // Job numbers wrap (u32, as in the job frame) rather than
+                // overflow.
+                let first = s.next_job.wrapping_add(1);
+                s.next_job = s.next_job.wrapping_add(count);
                 first
             };
             tokio::spawn(run_jobs(client, first, count, interval_ms));
@@ -222,7 +224,8 @@ async fn run_jobs(client: Arc<Client>, first: u32, count: u32, interval_ms: u64)
             .map(Arc::new)
         })
         .await;
-    for job in first..first + count {
+    for i in 0..count {
+        let job = first.wrapping_add(i);
         let mode = nextgsim_demo::active_mode(KEY).unwrap_or_else(|| "-".into());
         let outcome = match &sbi {
             Ok(sbi) => eec::offload(sbi, cfg, job).await,
@@ -242,7 +245,7 @@ async fn run_jobs(client: Arc<Client>, first: u32, count: u32, interval_ms: u64)
             }
             st.last = Some(line);
         }
-        if interval_ms > 0 && job + 1 < first + count {
+        if interval_ms > 0 && i + 1 < count {
             tokio::time::sleep(Duration::from_millis(interval_ms)).await;
         }
     }
@@ -324,6 +327,20 @@ mod tests {
         assert_eq!(route_cli_with(true, "deregister normal"), None);
     }
 
+    /// m1: the production entry points read the process's demo state. This
+    /// test process installs no demo runtime, so the demo is off: `start`
+    /// installs nothing and `route_cli` leaves `she-offload` to the UE parser,
+    /// even with a usable `eec:` block.
+    #[test]
+    fn the_real_gates_read_the_process_demo_state_471() {
+        let _g = reset();
+        assert!(nextgsim_demo::installed().is_none(), "no runtime in tests");
+        start(Some(&cfg("http://127.0.0.1:9")));
+        assert!(CLIENT.lock().unwrap().is_none());
+        assert_eq!(route_cli("she-offload status"), None);
+        assert_eq!(route_cli("she-offload job count=2"), None);
+    }
+
     /// Demo on without an `eec:` block (or with one that cannot run): no
     /// client, and `she-offload` says why.
     #[test]
@@ -373,6 +390,26 @@ mod tests {
         );
         let out = route_cli_with(true, "she-offload job").unwrap();
         assert!(out.contains("from job=3"), "{out}");
+        // The job counter wraps instead of overflowing.
+        let client = CLIENT.lock().unwrap().clone().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while client.state.lock().unwrap().running {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        client.state.lock().unwrap().next_job = u32::MAX - 1;
+        let out = route_cli_with(true, "she-offload job count=3").unwrap();
+        assert!(
+            out.contains("3 job(s) started from job=4294967295"),
+            "{out}"
+        );
+        assert_eq!(client.state.lock().unwrap().next_job, 1);
+        while client.state.lock().unwrap().running {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let st = route_cli_with(true, "she-offload status").unwrap();
+        assert!(st.contains("last=JOB job=1 "), "{st}");
         *CLIENT.lock().unwrap() = None;
     }
 }

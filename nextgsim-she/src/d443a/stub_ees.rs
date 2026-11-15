@@ -41,6 +41,12 @@ struct State {
     /// Every request must carry this bearer, or 401 (as eesd's gate).
     bearer: Option<String>,
     seen: Vec<Seen>,
+    /// The next PATCHes answer these statuses instead of applying.
+    patch_fail: std::collections::VecDeque<u16>,
+    /// Answer a registration with an absolute Location on another origin.
+    foreign_location: bool,
+    /// As an NRF: answer a profile PUT with this heartBeatTimer (else 404).
+    nrf_heartbeat: Option<u64>,
 }
 
 /// The stub.
@@ -61,6 +67,9 @@ impl StubEes {
             reply: EecReply::Status(404),
             bearer: None,
             seen: Vec::new(),
+            patch_fail: std::collections::VecDeque::new(),
+            foreign_location: false,
+            nrf_heartbeat: None,
         }));
         let st = state.clone();
         tokio::spawn(async move {
@@ -126,6 +135,24 @@ impl StubEes {
         self.state.lock().unwrap().bearer = Some(format!("Bearer {token}"));
     }
 
+    pub fn clear_bearer(&self) {
+        self.state.lock().unwrap().bearer = None;
+    }
+
+    /// The next PATCHes answer `statuses`, one each, without applying.
+    pub fn fail_patches(&self, statuses: &[u16]) {
+        self.state.lock().unwrap().patch_fail.extend(statuses);
+    }
+
+    /// Act as an NRF that answers a profile PUT with `hb` as heartBeatTimer.
+    pub fn nrf_heartbeat(&self, hb: u64) {
+        self.state.lock().unwrap().nrf_heartbeat = Some(hb);
+    }
+
+    pub fn foreign_location(&self, on: bool) {
+        self.state.lock().unwrap().foreign_location = on;
+    }
+
     pub fn seen(&self) -> Vec<Seen> {
         self.state.lock().unwrap().seen.clone()
     }
@@ -184,11 +211,12 @@ fn route(st: &Mutex<State>, seen: Seen) -> (StatusCode, Option<String>, Option<V
             let mut stored = v.clone();
             stored["registrationId"] = json!(id);
             s.eas.insert(id.clone(), stored.clone());
-            (
-                StatusCode::CREATED,
-                Some(format!("{EASREG_PATH}/{id}")),
-                Some(stored),
-            )
+            let loc = if s.foreign_location {
+                format!("http://192.0.2.1:7777{EASREG_PATH}/{id}")
+            } else {
+                format!("{EASREG_PATH}/{id}")
+            };
+            (StatusCode::CREATED, Some(loc), Some(stored))
         }
         "POST" if path == EECREG_PATH => {
             if v["eecId"].as_str().is_none() {
@@ -226,6 +254,14 @@ fn route(st: &Mutex<State>, seen: Seen) -> (StatusCode, Option<String>, Option<V
                 }
             }
         }
+        "PUT" if path.starts_with("/nnrf-nfm/v1/nf-instances/") => match s.nrf_heartbeat {
+            Some(hb) => {
+                let mut out = v.clone();
+                out["heartBeatTimer"] = json!(hb);
+                (StatusCode::CREATED, None, Some(out))
+            }
+            None => (StatusCode::NOT_FOUND, None, None),
+        },
         "GET" => match id_of(path, EASREG_PATH).and_then(|id| s.eas.get(&id).cloned()) {
             Some(r) => (StatusCode::OK, None, Some(r)),
             None => (StatusCode::NOT_FOUND, None, None),
@@ -233,6 +269,9 @@ fn route(st: &Mutex<State>, seen: Seen) -> (StatusCode, Option<String>, Option<V
         "PATCH" => {
             if seen.content_type.as_deref() != Some("application/merge-patch+json") {
                 return (StatusCode::UNSUPPORTED_MEDIA_TYPE, None, None);
+            }
+            if let Some(code) = s.patch_fail.pop_front() {
+                return (StatusCode::from_u16(code).unwrap(), None, None);
             }
             let Some(id) = id_of(path, EASREG_PATH) else {
                 return (StatusCode::NOT_FOUND, None, None);

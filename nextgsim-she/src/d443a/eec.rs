@@ -100,13 +100,17 @@ pub async fn select(client: &SbiClient, cfg: &EecClientConfig) -> Result<Vec<Sel
     }
     // The registration existed only to ask; leave nothing behind.
     if let Some(loc) = r.headers.get("location").and_then(|v| v.to_str().ok()) {
-        let url = if loc.starts_with("http://") {
-            loc.to_string()
-        } else {
-            format!("{api_root}{loc}")
-        };
-        if let Err(e) = client.delete(&url, Some(&scope())).await {
-            demo_log!(debug, KEY, "EEC deregistration {url}: {e}");
+        match super::resolve_location(api_root, loc) {
+            Some(url) => {
+                if let Err(e) = client.delete(&url, Some(&scope())).await {
+                    demo_log!(debug, KEY, "EEC deregistration {url}: {e}");
+                }
+            }
+            None => demo_log!(
+                warn,
+                KEY,
+                "EEC registration Location {loc} is on another origin: not followed"
+            ),
         }
     }
     let v: Value = serde_json::from_slice(&r.body).map_err(|_| "ees-bad-body".to_string())?;
@@ -163,5 +167,29 @@ pub fn validate(cfg: &EecClientConfig) -> Result<(), String> {
     if cfg.deadline_ms == 0 {
         return Err("eec.deadline_ms must be positive".into());
     }
+    // A bound client takes IP literals only: a name would be resolved by the
+    // host's resolver, around the PDU session.
+    if let Some(dev) = &cfg.device {
+        let uris = std::iter::once(("eec.ees", cfg.ees.as_str())).chain(
+            cfg.oauth2
+                .as_ref()
+                .map(|o| ("eec.oauth2.nrf", o.nrf.as_str())),
+        );
+        for (what, uri) in uris {
+            if !ip_literal_authority(uri) {
+                return Err(format!(
+                    "{what} {uri:?} must name an IP literal when bound to {dev} (a name would \
+                     be resolved outside the device)"
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+/// `http://<ip>:<port>[/...]`.
+fn ip_literal_authority(uri: &str) -> bool {
+    uri.strip_prefix("http://")
+        .map(|r| r.split('/').next().unwrap_or(""))
+        .is_some_and(|a| a.parse::<std::net::SocketAddr>().is_ok())
 }

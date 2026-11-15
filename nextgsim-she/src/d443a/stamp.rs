@@ -6,6 +6,14 @@
 //! reflector therefore binds the internal `dn` (or pod) address only, and a
 //! reflected packet is never larger than the test packet it answers, so it
 //! cannot amplify.
+//!
+//! **No reflection loops.** Two reflectors must never answer each other: one
+//! datagram spoofed from one to the other would otherwise bounce between them
+//! at line rate. So the reflector answers only a Session-Sender test packet
+//! (octets 24..44 are MBZ in RFC 8762 §4.2.1 and are what upfd sends, while
+//! every reflection carries the sender's fields there), and never a source
+//! port that is the STAMP port, its own port, or a privileged port (< 1024;
+//! upfd's Session-Sender uses an ephemeral port).
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +39,7 @@ const SENDER_TTL: u8 = 255;
 /// Sequence Number is the sender's). `None` for a datagram shorter than a
 /// test packet, which is not answered.
 pub fn reflect(pkt: &[u8], t2: u64, t3: u64) -> Option<[u8; STAMP_LEN]> {
-    if pkt.len() < STAMP_LEN {
+    if !is_test_packet(pkt) {
         return None;
     }
     let mut r = [0u8; STAMP_LEN];
@@ -49,6 +57,22 @@ pub fn reflect(pkt: &[u8], t2: u64, t3: u64) -> Option<[u8; STAMP_LEN]> {
     Some(r)
 }
 
+/// A Session-Sender test packet: at least 44 octets, with octets 24..44 MBZ
+/// (RFC 8762 §4.2.1; upfd's `stamp_test_packet` leaves them zero). A
+/// reflection carries the sender's Sequence Number, Timestamp and TTL there,
+/// so it is never one.
+pub fn is_test_packet(pkt: &[u8]) -> bool {
+    pkt.len() >= STAMP_LEN && pkt[24..STAMP_LEN].iter().all(|b| *b == 0)
+}
+
+/// Whether a datagram from `from` may be answered by a reflector on
+/// `own_port`: not from the STAMP port, not from its own port, not from a
+/// privileged port. (A reflector sends from those; a Session-Sender does not.)
+pub fn answers_source(from: SocketAddr, own_port: u16) -> bool {
+    let p = from.port();
+    p != STAMP_PORT && p != own_port && p >= 1024
+}
+
 /// What the reflector has done.
 #[derive(Debug, Default)]
 pub struct ReflectorStats {
@@ -63,13 +87,17 @@ pub async fn bind(addr: SocketAddr) -> std::io::Result<UdpSocket> {
 
 /// Serve `socket` until it fails: every test packet is answered at once.
 pub async fn run(socket: UdpSocket, stats: Arc<ReflectorStats>) {
+    let own_port = socket.local_addr().map_or(STAMP_PORT, |a| a.port());
     let mut buf = [0u8; 2048];
     loop {
         let Ok((n, from)) = socket.recv_from(&mut buf).await else {
             return;
         };
         let t2 = super::ntp64(SystemTime::now());
-        match reflect(&buf[..n], t2, super::ntp64(SystemTime::now())) {
+        let reply = answers_source(from, own_port)
+            .then(|| reflect(&buf[..n], t2, super::ntp64(SystemTime::now())))
+            .flatten();
+        match reply {
             Some(r) => {
                 if socket.send_to(&r, from).await.is_ok() {
                     stats.reflected.fetch_add(1, Ordering::Relaxed);

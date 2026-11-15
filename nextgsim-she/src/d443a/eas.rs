@@ -144,6 +144,11 @@ fn scope() -> Scope {
 }
 
 /// The EAS's registration at the EES.
+///
+/// The advertisement is the desired state: a load changes it at once
+/// ([`Registrar::set_avl_comp`]) and marks the KPI pending. Every
+/// [`Registrar::ensure`] then makes the EES hold it: a fresh registration
+/// carries it, and an existing one is merge-patched until the patch lands.
 #[derive(Debug)]
 pub struct Registrar {
     client: SbiClient,
@@ -151,16 +156,21 @@ pub struct Registrar {
     ad: EasAd,
     /// The Individual EAS Registration resource, absolute.
     location: Option<String>,
+    /// `ad.avl_comp` has not reached the EES's registration yet.
+    kpi_pending: bool,
 }
 
 /// What a check found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Check {
-    /// Registered just now (a fresh POST).
+    /// Registered just now (a fresh POST, carrying the current KPI).
     Registered(String),
-    /// The registration is still there.
+    /// The registration is there and holds the current KPI.
     Alive,
-    /// The EES could not be reached or refused; retried next time.
+    /// The pending `avlComp` was merge-patched just now.
+    Patched,
+    /// The EES could not be reached or refused; retried next time (a pending
+    /// KPI stays pending).
     Failed(String),
 }
 
@@ -171,6 +181,7 @@ impl Registrar {
             api_root: api_root.trim_end_matches('/').to_string(),
             ad,
             location: None,
+            kpi_pending: false,
         }
     }
 
@@ -179,35 +190,58 @@ impl Registrar {
         self.location.as_deref()
     }
 
-    /// What is advertised now.
+    /// What is advertised now (the desired state).
     pub fn ad(&self) -> &EasAd {
         &self.ad
     }
 
-    fn absolute(&self, loc: &str) -> String {
-        if loc.starts_with("http://") || loc.starts_with("https://") {
-            loc.to_string()
-        } else {
-            format!("{}{loc}", self.api_root)
+    /// Whether an `avlComp` change has not reached the EES yet.
+    pub fn kpi_pending(&self) -> bool {
+        self.kpi_pending
+    }
+
+    /// Advertise `avl_comp` from now on. The EES is told at the next
+    /// [`Self::ensure`], and at every one after until it holds it.
+    pub fn set_avl_comp(&mut self, avl_comp: u32) {
+        if avl_comp != self.ad.avl_comp {
+            demo_log!(
+                info,
+                KEY,
+                "EAS-KPI eas={} svcKpi.avlComp {} -> {avl_comp} (pending at the EES)",
+                self.ad.eas_id,
+                self.ad.avl_comp
+            );
+            self.ad.avl_comp = avl_comp;
+            self.kpi_pending = true;
         }
     }
 
-    /// Register if not registered; otherwise check the registration and
-    /// re-register if the EES no longer has it (404).
+    /// Register if not registered; otherwise check the registration,
+    /// re-register if the EES no longer has it (404), and merge-patch a
+    /// pending KPI.
     pub async fn ensure(&mut self) -> Check {
         if let Some(loc) = self.location.clone() {
             match self.client.get_json::<Value>(&loc, Some(&scope())).await {
-                Ok(_) => return Check::Alive,
-                Err(SbiError::Status { status: 404 }) => {
-                    demo_log!(
-                        warn,
-                        KEY,
-                        "EAS-REG eas={} registration {loc} is gone at the EES (restarted?): \
-                         registering again",
-                        self.ad.eas_id
-                    );
-                    self.location = None;
-                }
+                Ok(_) if !self.kpi_pending => return Check::Alive,
+                Ok(_) => match self.patch(&loc).await {
+                    Ok(status) => {
+                        demo_log!(
+                            info,
+                            KEY,
+                            "EAS-KPI-PATCH eas={} svcKpi.avlComp={} ({status})",
+                            self.ad.eas_id,
+                            self.ad.avl_comp
+                        );
+                        self.kpi_pending = false;
+                        return Check::Patched;
+                    }
+                    Err(Some(404)) => self.gone(&loc),
+                    Err(Some(status)) => {
+                        return Check::Failed(format!("patch: status {status}; still pending"))
+                    }
+                    Err(None) => return Check::Failed("patch: no answer; still pending".into()),
+                },
+                Err(SbiError::Status { status: 404 }) => self.gone(&loc),
                 Err(e) => return Check::Failed(format!("check: {e}")),
             }
         }
@@ -215,13 +249,13 @@ impl Registrar {
         let url = format!("{}{EASREG_PATH}", self.api_root);
         match self.client.post_json(&url, &body, Some(&scope())).await {
             Ok(r) if r.status.as_u16() == 201 => {
-                let Some(loc) = r
-                    .headers
-                    .get("location")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|l| self.absolute(l))
-                else {
+                let Some(raw) = r.headers.get("location").and_then(|v| v.to_str().ok()) else {
                     return Check::Failed("201 without a Location".into());
+                };
+                let Some(loc) = super::resolve_location(&self.api_root, raw) else {
+                    return Check::Failed(format!(
+                        "201 with a Location on another origin ({raw}): not followed"
+                    ));
                 };
                 let id = serde_json::from_slice::<Value>(&r.body)
                     .ok()
@@ -237,6 +271,7 @@ impl Registrar {
                     self.ad.avl_comp
                 );
                 self.location = Some(loc.clone());
+                self.kpi_pending = false;
                 Check::Registered(loc)
             }
             Ok(r) => Check::Failed(format!("register: status {}", r.status.as_u16())),
@@ -244,31 +279,32 @@ impl Registrar {
         }
     }
 
-    /// Merge-patch `svcKpi.avlComp` to `avl_comp`. On success the
-    /// advertisement (and so a later re-registration) carries it.
-    pub async fn patch_avl_comp(&mut self, avl_comp: u32) -> Result<(), String> {
-        let Some(loc) = self.location.clone() else {
-            return Err("not registered".into());
-        };
-        let body = eel::avl_comp_patch(&self.ad, avl_comp);
-        let r = self
-            .client
-            .patch_merge_json(&loc, &body, Some(&scope()))
-            .await
-            .map_err(|e| e.to_string())?;
-        let status = r.status.as_u16();
-        if status != 200 && status != 204 {
-            return Err(format!("status {status}"));
-        }
+    fn gone(&mut self, loc: &str) {
         demo_log!(
-            info,
+            warn,
             KEY,
-            "EAS-KPI-PATCH eas={} svcKpi.avlComp {} -> {avl_comp} ({status})",
-            self.ad.eas_id,
-            self.ad.avl_comp
+            "EAS-REG eas={} registration {loc} is gone at the EES (restarted?): \
+             registering again",
+            self.ad.eas_id
         );
-        self.ad.avl_comp = avl_comp;
-        Ok(())
+        self.location = None;
+    }
+
+    /// Merge-patch the current `svcKpi.avlComp`: the 2xx status, or the
+    /// failing status (`None`: no answer).
+    async fn patch(&self, loc: &str) -> Result<u16, Option<u16>> {
+        let body = eel::avl_comp_patch(&self.ad, self.ad.avl_comp);
+        match self
+            .client
+            .patch_merge_json(loc, &body, Some(&scope()))
+            .await
+        {
+            Ok(r) if matches!(r.status.as_u16(), 200 | 204) => Ok(r.status.as_u16()),
+            Ok(r) => Err(Some(r.status.as_u16())),
+            Err(SbiError::Unauthorized { .. }) => Err(Some(401)),
+            Err(SbiError::Forbidden) => Err(Some(403)),
+            Err(_) => Err(None),
+        }
     }
 
     /// Delete the registration.

@@ -147,6 +147,8 @@ pub struct SbiClientConfig {
     /// Bind every connection of this client, the token requests included, to
     /// this interface (`SO_BINDTODEVICE`, Linux), e.g. a UE's PDU session TUN
     /// `uesimtun0` (nextgsim#471). `None`: connect by the routing table.
+    /// Bound, the URIs must name IP literals: name resolution would not go
+    /// through the device, so a name is refused.
     pub bind_device: Option<String>,
 }
 
@@ -541,22 +543,24 @@ async fn connect(authority: &str, device: Option<&str>) -> std::io::Result<TcpSt
     let Some(device) = device else {
         return TcpStream::connect(authority).await;
     };
-    let mut last = None;
-    for addr in tokio::net::lookup_host(authority).await? {
-        let socket = if addr.is_ipv4() {
-            tokio::net::TcpSocket::new_v4()?
-        } else {
-            tokio::net::TcpSocket::new_v6()?
-        };
-        bind_to_device(&socket, device)?;
-        match socket.connect(addr).await {
-            Ok(s) => return Ok(s),
-            Err(e) => last = Some(e),
-        }
-    }
-    Err(last.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no address for the authority")
-    }))
+    // A name would be resolved by the host's resolver, outside the device, so
+    // a bound client takes IP literals only (nextgsim#471 review m3).
+    let addr: std::net::SocketAddr = authority.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "bound to {device}: {authority} must be an IP literal (a name would be resolved \
+                 outside the device)"
+            ),
+        )
+    })?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    bind_to_device(&socket, device)?;
+    socket.connect(addr).await
 }
 
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]

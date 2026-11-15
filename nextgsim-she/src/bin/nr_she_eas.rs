@@ -171,7 +171,7 @@ async fn run() -> Result<(), String> {
                             }
                         }
                     }
-                    Check::Alive => {}
+                    Check::Alive | Check::Patched => {}
                     Check::Failed(why) => demo_log!(warn, KEY, "EAS-REG eas={}: {why}; retrying", config.eas_id),
                 }
             }
@@ -218,11 +218,14 @@ async fn apply_load(reg: &mut Registrar, avl: &AtomicU32, load: u32, no_kpi_patc
         "LOAD eas={} avlComp {old} -> {load}",
         reg.ad().eas_id
     );
-    if let Err(e) = reg.patch_avl_comp(load).await {
+    // The advertisement changes now; the EES is told now if it can be, and
+    // at every check until it holds it (a re-registration carries it too).
+    reg.set_avl_comp(load);
+    if let Check::Failed(why) = reg.ensure().await {
         demo_log!(
             warn,
             KEY,
-            "EAS-KPI-PATCH eas={} failed: {e}",
+            "EAS-KPI eas={}: {why}; retried at every check",
             reg.ad().eas_id
         );
     }

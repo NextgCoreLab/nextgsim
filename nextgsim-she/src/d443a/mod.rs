@@ -75,6 +75,21 @@ pub const EASREG_PATH: &str = "/eees-easregistration/v1/registrations";
 /// The EEC registrations collection.
 pub const EECREG_PATH: &str = "/eees-eecregistration/v1/registrations";
 
+/// The URL of a `Location` the EES answered at `api_root`: a relative one is
+/// resolved against it; an absolute one is followed only on the same origin
+/// (it carries the bearer token), as D445A's NEF client does. `None`: not
+/// followed.
+pub fn resolve_location(api_root: &str, location: &str) -> Option<String> {
+    let root = api_root.trim_end_matches('/');
+    if location.starts_with('/') {
+        return Some(format!("{root}{location}"));
+    }
+    location
+        .strip_prefix(root)
+        .filter(|rest| rest.starts_with('/'))
+        .map(|_| location.to_string())
+}
+
 /// NTP 64-bit timestamp (RFC 5905 §6) of `t`, as upfd stamps its probes.
 pub fn ntp64(t: SystemTime) -> u64 {
     const NTP_UNIX_OFFSET: u64 = 2_208_988_800;
@@ -107,14 +122,16 @@ pub async fn ees_client(
             .map_err(|e| e.to_string())?;
     }
     if o.register {
-        register_af(&o.nrf, &o.nf_instance_id, base.clone()).await?;
+        let hb = register_af(&o.nrf, &o.nf_instance_id, base.clone()).await?;
         // The NRF drops a profile whose heartbeat lapses (2 x heartBeatTimer),
-        // and then refuses this client's next token request: keep it alive.
+        // and then refuses this client's next token request: keep it alive at
+        // half the heartBeatTimer the NRF answered (TS 29.510: the NF uses
+        // the NRF's value).
         tokio::spawn(keep_registered(
             o.nrf.clone(),
             o.nf_instance_id.clone(),
             base.clone(),
-            Duration::from_secs(HEARTBEAT_SECS / 2),
+            reregister_every(hb),
         ));
     }
     Ok(SbiClient::new(SbiClientConfig {
@@ -132,23 +149,33 @@ pub async fn ees_client(
 /// half of it, as the gNB's congestion exporter does.
 pub const HEARTBEAT_SECS: u64 = 60;
 
-/// Re-register `id` at the NRF every `every`, for the life of the process. A
-/// failed round is logged and retried at the next one.
+/// Re-register `id` at the NRF every `every` (then every half of the
+/// heartBeatTimer the NRF answers), for the life of the process. A failed
+/// round is logged and retried at the same interval.
 pub(crate) async fn keep_registered(
     nrf: String,
     id: String,
     base: SbiClientConfig,
-    every: Duration,
+    mut every: Duration,
 ) {
     loop {
         tokio::time::sleep(every).await;
-        if let Err(e) = register_af(&nrf, &id, base.clone()).await {
-            tracing::debug!("[demo:{KEY}] NRF re-registration of {id}: {e}");
+        match register_af(&nrf, &id, base.clone()).await {
+            Ok(hb) => every = reregister_every(hb),
+            Err(e) => tracing::debug!("[demo:{KEY}] NRF re-registration of {id}: {e}"),
         }
     }
 }
 
-async fn register_af(nrf: &str, id: &str, base: SbiClientConfig) -> Result<(), String> {
+/// Half the NRF's heartBeatTimer (s), at least 1 s.
+pub(crate) fn reregister_every(heartbeat_s: u64) -> Duration {
+    Duration::from_millis((heartbeat_s.saturating_mul(1000) / 2).max(1000))
+}
+
+/// Register (or re-register) `id` as an AF; the heartBeatTimer the NRF
+/// answered (TS 29.510 §5.2.2.2: it may change the requested one), or the
+/// requested one if it answered none.
+async fn register_af(nrf: &str, id: &str, base: SbiClientConfig) -> Result<u64, String> {
     let plain = SbiClient::new(base);
     let profile = serde_json::json!({
         "nfInstanceId": id,
@@ -170,5 +197,18 @@ async fn register_af(nrf: &str, id: &str, base: SbiClientConfig) -> Result<(), S
     if !r.status.is_success() {
         return Err(format!("NRF register: status {}", r.status.as_u16()));
     }
-    Ok(())
+    Ok(serde_json::from_slice::<serde_json::Value>(&r.body)
+        .ok()
+        .and_then(|v| v.get("heartBeatTimer").and_then(serde_json::Value::as_u64))
+        .filter(|hb| *hb > 0)
+        .unwrap_or(HEARTBEAT_SECS))
+}
+
+#[cfg(test)]
+pub(crate) async fn register_af_for_test(
+    nrf: &str,
+    id: &str,
+    base: SbiClientConfig,
+) -> Result<u64, String> {
+    register_af(nrf, id, base).await
 }

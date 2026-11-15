@@ -6,7 +6,10 @@
 //! A reply is the size of the request, so the listener cannot amplify. Frames
 //! that are not exactly [`FRAME_LEN`] octets with the magic, version and kind
 //! are dropped. Concurrent jobs are bounded ([`MAX_INFLIGHT`]); one beyond the
-//! bound is dropped (the AC times out and counts a miss).
+//! bound is dropped (the AC times out and counts a miss). The bound is
+//! process-wide, not per source: anyone on the internal `dn` network can hold
+//! every slot for up to [`MAX_COMPUTE_MS`] and so starve the demo's own job.
+//! Accepted for a demo listener on an internal network (labelled).
 //!
 //! ```text
 //!  0..4   magic "D443"        4  version 1        5  kind (1 job, 2 done)
