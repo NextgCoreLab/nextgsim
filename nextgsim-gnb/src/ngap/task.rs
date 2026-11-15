@@ -383,14 +383,12 @@ fn missing_security_context_diagnostics(
         TriggeringMessageValue, TypeOfErrorValue,
     };
     CriticalityDiagnosticsInfo {
-        procedure_code: Some(
-            nextgsim_ngap::codec::generated::ID_HANDOVER_RESOURCE_ALLOCATION as u8,
-        ),
+        procedure_code: Some(nextgsim_ngap::codec::generated::ID_HANDOVER_RESOURCE_ALLOCATION),
         triggering_message: Some(TriggeringMessageValue::InitiatingMessage),
         procedure_criticality: Some(CriticalityValue::Reject),
         ies_criticality_diagnostics: vec![IeCriticalityDiagnosticsItem {
             ie_criticality: CriticalityValue::Reject,
-            ie_id: nextgsim_ngap::codec::generated::ID_SECURITY_CONTEXT as u16,
+            ie_id: nextgsim_ngap::codec::generated::ID_SECURITY_CONTEXT,
             type_of_error: TypeOfErrorValue::Missing,
         }],
     }
@@ -4781,7 +4779,9 @@ impl NgapTask {
             // -- the `T` of TS 38.304 §7.1. Before issue #99 this IE was decoded,
             // logged and dropped, so the paging occasion could not follow what the
             // network asked for.
-            drx_cycle_frames: paging.paging_drx.map(|drx| drx.radio_frames()),
+            drx_cycle_frames: paging
+                .paging_drx
+                .map(nextgsim_ngap::procedures::PagingDrxValue::radio_frames),
         };
         if let Err(e) = self.task_base.rrc_tx.send(msg).await {
             error!("Failed to forward Paging to RRC: {}", e);
@@ -4913,7 +4913,7 @@ impl NgapTask {
         // reject, and §10.3.5 has a request missing it rejected "using the message
         // normally used to report unsuccessful outcome of the procedure". Without
         // it there is no {NH, NCC} to derive KgNB* or to signal (#355 review).
-        let Some(security_context) = ho_req.security_context.clone() else {
+        let Some(security_context) = ho_req.security_context else {
             warn!(
                 "Handover Request for amf_ue_ngap_id={} has no Security Context; \
                  HANDOVER FAILURE (TS 38.413 §10.3.5)",
@@ -7335,7 +7335,7 @@ mod tests {
         GnbConfig {
             nci: 0x000000010,
             gnb_id_length: 32,
-            plmn: Plmn::new(001, 01, false),
+            plmn: Plmn::new(1, 1, false),
             tac: 1,
             nssai: vec![],
             amf_configs: vec![],

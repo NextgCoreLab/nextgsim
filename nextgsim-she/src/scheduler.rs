@@ -206,22 +206,17 @@ impl WorkloadScheduler {
 
     /// Gets candidate tiers for a workload based on requirements and policy
     fn get_candidate_tiers(&self, requirements: &WorkloadRequirements) -> Vec<ComputeTier> {
-        let minimum_tier = requirements.minimum_tier();
-        let capability_tier = requirements.capability.minimum_tier();
-
-        // The actual minimum is the max of latency and capability requirements
-        let effective_minimum = if minimum_tier.priority() >= capability_tier.priority() {
-            minimum_tier
-        } else {
-            capability_tier
-        };
+        // #544: the capability is a floor and the latency bound a ceiling; a
+        // tier is a candidate only if it satisfies both. Each policy then
+        // orders the admitted tiers.
+        let admitted = |t: &&ComputeTier| requirements.admits_tier(**t);
 
         match self.policy {
             SchedulingPolicy::ClosestToEdge => {
                 // Order by proximity (closest first) starting from effective minimum
                 ComputeTier::all_ordered()
                     .iter()
-                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .filter(admitted)
                     .copied()
                     .collect()
             }
@@ -229,12 +224,12 @@ impl WorkloadScheduler {
                 // Try preferred tier first, then others
                 let mut tiers = Vec::new();
                 if let Some(preferred) = requirements.preferred_tier {
-                    if preferred.priority() >= effective_minimum.priority() {
+                    if requirements.admits_tier(preferred) {
                         tiers.push(preferred);
                     }
                 }
                 for tier in ComputeTier::all_ordered() {
-                    if tier.priority() >= effective_minimum.priority() && !tiers.contains(tier) {
+                    if requirements.admits_tier(*tier) && !tiers.contains(tier) {
                         tiers.push(*tier);
                     }
                 }
@@ -244,7 +239,7 @@ impl WorkloadScheduler {
                 // Order by available resources (most first)
                 let mut tiers: Vec<_> = ComputeTier::all_ordered()
                     .iter()
-                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .filter(admitted)
                     .copied()
                     .collect();
 
@@ -261,7 +256,7 @@ impl WorkloadScheduler {
                 // Order by utilization (lowest first)
                 let mut tiers: Vec<_> = ComputeTier::all_ordered()
                     .iter()
-                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .filter(admitted)
                     .copied()
                     .collect();
 
@@ -287,7 +282,7 @@ impl WorkloadScheduler {
                 // 3. Factor in current utilization (consolidation reduces idle power)
                 let mut tiers: Vec<_> = ComputeTier::all_ordered()
                     .iter()
-                    .filter(|t| t.priority() >= effective_minimum.priority())
+                    .filter(admitted)
                     .copied()
                     .collect();
 
@@ -681,8 +676,11 @@ mod tests {
         let core_node = scheduler.tier_manager.get_node_mut(3).unwrap();
         core_node.allocate(50_000_000_000_000, 200 * 1024 * 1024 * 1024);
 
-        // Submit inference workload - should prefer core due to better energy efficiency
-        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(50); // Allow any tier
+        // Submit inference workload - should prefer core due to better energy efficiency.
+        // #544: only an unbounded job admits every tier; a 50 ms bound excludes
+        // CoreCloud, whose worst-case latency is unbounded.
+        let mut requirements = WorkloadRequirements::inference();
+        requirements.latency_constraint_ms = None;
 
         let id = scheduler.submit(requirements).unwrap();
         let decision = scheduler.place(id).unwrap();
@@ -707,5 +705,83 @@ mod tests {
 
         // Should avoid heavily loaded local edge
         assert_ne!(decision.tier, ComputeTier::LocalEdge);
+    }
+
+    // #544: the latency bound is a ceiling on a tier's latency, the capability
+    // a floor on its distance.
+
+    /// Fills the only LocalEdge node so no inference job fits there.
+    fn fill_local_edge(scheduler: &mut WorkloadScheduler) {
+        let edge = scheduler.tier_manager.get_node_mut(1).unwrap();
+        edge.allocate(1_000_000_000_000, 8 * 1024 * 1024 * 1024);
+    }
+
+    fn assert_no_suitable_tier(result: SheResult<PlacementDecision>) {
+        match result {
+            Err(SheError::NoSuitableTier { .. }) => {}
+            other => panic!("expected NoSuitableTier, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_10ms_job_is_never_placed_beyond_the_local_edge() {
+        for policy in [
+            SchedulingPolicy::ClosestToEdge,
+            SchedulingPolicy::PreferredFirst,
+            SchedulingPolicy::MostAvailable,
+            SchedulingPolicy::LowestUtilization,
+            SchedulingPolicy::EnergyAware,
+        ] {
+            let mut scheduler = setup_scheduler().with_policy(policy);
+            let mut requirements = WorkloadRequirements::inference().with_latency_constraint_ms(10);
+            requirements.preferred_tier = Some(ComputeTier::CoreCloud);
+
+            // With room at the edge, the edge is the only admitted tier.
+            let id = scheduler.submit(requirements.clone()).unwrap();
+            assert_eq!(
+                scheduler.place(id).unwrap().tier,
+                ComputeTier::LocalEdge,
+                "{policy:?}"
+            );
+
+            // With the edge full, there is nowhere within 10 ms.
+            fill_local_edge(&mut scheduler);
+            let id = scheduler.submit(requirements).unwrap();
+            assert_no_suitable_tier(scheduler.place(id));
+        }
+    }
+
+    #[test]
+    fn an_unbounded_or_50ms_job_is_placed_on_a_free_local_edge() {
+        for bound in [None, Some(50)] {
+            let mut scheduler = setup_scheduler().with_policy(SchedulingPolicy::ClosestToEdge);
+            let mut requirements = WorkloadRequirements::inference();
+            requirements.latency_constraint_ms = bound;
+            requirements.preferred_tier = None;
+
+            let id = scheduler.submit(requirements).unwrap();
+            let decision = scheduler.place(id).unwrap();
+            assert_eq!(decision.tier, ComputeTier::LocalEdge, "bound {bound:?}");
+            assert_eq!(decision.node_id, 1, "bound {bound:?}");
+        }
+    }
+
+    #[test]
+    fn a_50ms_job_falls_back_to_the_regional_edge_not_the_core() {
+        let mut scheduler = setup_scheduler().with_policy(SchedulingPolicy::ClosestToEdge);
+        fill_local_edge(&mut scheduler);
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(50);
+
+        let id = scheduler.submit(requirements).unwrap();
+        assert_eq!(scheduler.place(id).unwrap().tier, ComputeTier::RegionalEdge);
+    }
+
+    #[test]
+    fn a_10ms_training_job_has_no_suitable_tier() {
+        let mut scheduler = setup_scheduler();
+        let requirements = WorkloadRequirements::training().with_latency_constraint_ms(10);
+
+        let id = scheduler.submit(requirements).unwrap();
+        assert_no_suitable_tier(scheduler.place(id));
     }
 }

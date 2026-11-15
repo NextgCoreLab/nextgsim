@@ -435,7 +435,7 @@ mod tests {
 
     fn config() -> GnbConfig {
         GnbConfig {
-            nci: 0x0000_0001_2,
+            nci: 0x12,
             plmn: Plmn::new(1, 1, false),
             tac: 7,
             ..Default::default()
@@ -449,7 +449,7 @@ mod tests {
 
         let info = &decoded.plmn_identity_info_list[0];
         assert_eq!(info.tracking_area_code, Some(7), "the configured TAC");
-        assert_eq!(info.cell_identity, 0x0000_0001_2, "the configured NCI");
+        assert_eq!(info.cell_identity, 0x12, "the configured NCI");
         assert_eq!(
             info.plmn_identity_list[0],
             PlmnIdentity {

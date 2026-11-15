@@ -3925,7 +3925,7 @@ impl Task for RrcTask {
                                     && !self
                                         .ue_manager
                                         .try_find_ue(ue_id)
-                                        .is_some_and(|c| c.as_security_active())
+                                        .is_some_and(super::ue_context::RrcUeContext::as_security_active)
                                 {
                                     warn!(
                                         "Refusing to establish a DRB for UE {ue_id}: AS \
@@ -4304,7 +4304,7 @@ mod tests {
         GnbConfig {
             nci: 0x000000010,
             gnb_id_length: 32,
-            plmn: Plmn::new(001, 01, false),
+            plmn: Plmn::new(1, 1, false),
             tac: 1,
             nssai: vec![],
             amf_configs: vec![],

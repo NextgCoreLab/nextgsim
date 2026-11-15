@@ -625,7 +625,7 @@ impl RlsTask {
         if self.off_air {
             // Not even tracked: a cell that is off the air hears nothing.
             self.off_air_dropped += 1;
-            if self.off_air_dropped == 1 || self.off_air_dropped % 20 == 0 {
+            if self.off_air_dropped == 1 || self.off_air_dropped.is_multiple_of(20) {
                 info!(
                     "[demo:d446a-agent-conflict] off the air: {} heartbeat(s) dropped",
                     self.off_air_dropped
@@ -1660,7 +1660,7 @@ mod tests {
         GnbConfig {
             nci: 0x000000010,
             gnb_id_length: 32,
-            plmn: Plmn::new(001, 01, false),
+            plmn: Plmn::new(1, 1, false),
             tac: 1,
             nssai: vec![],
             amf_configs: vec![],

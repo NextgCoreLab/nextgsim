@@ -411,8 +411,10 @@ mod tests {
 
     #[test]
     fn test_too_many_cells() {
-        let mut policy = SafetyPolicy::default();
-        policy.max_cells_affected = 2;
+        let policy = SafetyPolicy {
+            max_cells_affected: 2,
+            ..SafetyPolicy::default()
+        };
         let mut checker = SafetyChecker::new(policy);
 
         let intent = make_intent(IntentType::OptimizeResources);
@@ -523,8 +525,10 @@ mod tests {
 
     #[test]
     fn test_agent_override() {
-        let mut policy = SafetyPolicy::default();
-        policy.max_cells_affected = 2;
+        let mut policy = SafetyPolicy {
+            max_cells_affected: 2,
+            ..SafetyPolicy::default()
+        };
         policy.agent_overrides.insert(
             "privileged-agent".to_string(),
             SafetyPolicyOverride {

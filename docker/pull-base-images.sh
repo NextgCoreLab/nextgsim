@@ -19,7 +19,11 @@
 # What is pulled: the image of every `FROM` line, verbatim (tag and digest
 # kept), once each. Skipped: `scratch`, a FROM naming an earlier stage, and a
 # FROM that uses a build ARG (it cannot be resolved here; a warning says so).
-# `--platform=...` flags are honoured. --list prints the refs without pulling.
+# `--platform=...` flags are honoured. `--platform=$BUILDPLATFORM` (or
+# `${BUILDPLATFORM}`) is the one ARG resolved: BuildKit sets it to the platform
+# of the host running the build, so the base is pulled for this host, with no
+# `--platform` flag (#449: nextgcore's Dockerfile.builder bases its builder stage
+# that way). --list prints the refs without pulling.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -36,6 +40,8 @@ refs=$(awk '
     platform = ""; i = 2
     while (i <= NF && $i ~ /^--/) {
       if ($i ~ /^--platform=/) { platform = substr($i, 12) }
+      # The build host is this host: pull its native platform (no flag).
+      if (platform == "$BUILDPLATFORM" || platform == "${BUILDPLATFORM}") { platform = "" }
       i++
     }
     ref = $i

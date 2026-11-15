@@ -800,9 +800,11 @@ mod tests {
     }
 
     fn policy(enabled: bool, rules: Vec<ConfigUrspRule>) -> UrspPolicy {
-        let mut config = UeConfig::default();
-        config.ursp_evaluation = enabled;
-        config.ursp_rules = rules;
+        let config = UeConfig {
+            ursp_evaluation: enabled,
+            ursp_rules: rules,
+            ..UeConfig::default()
+        };
         UrspPolicy::from_config(&config)
     }
 
@@ -1347,9 +1349,11 @@ mod tests {
 
     #[test]
     fn the_configured_os_identity_reaches_the_descriptor() {
-        let mut config = nextgsim_common::config::UeConfig::default();
-        config.ursp_os_app_id = Some("com.example.video".to_string());
-        config.ursp_os_id = Some("0123456789abcdef0123456789abcdef".to_string());
+        let config = nextgsim_common::config::UeConfig {
+            ursp_os_app_id: Some("com.example.video".to_string()),
+            ursp_os_id: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..nextgsim_common::config::UeConfig::default()
+        };
 
         let (os_id, os_app_id) = ApplicationDescriptor::configured_os_identity(&config);
         assert_eq!(os_app_id.as_deref(), Some(&b"com.example.video"[..]));
@@ -1370,8 +1374,10 @@ mod tests {
     #[test]
     fn a_malformed_os_id_is_dropped_rather_than_truncated() {
         // Half a UUID identifies a different OS.
-        let mut config = nextgsim_common::config::UeConfig::default();
-        config.ursp_os_id = Some("0123456789abcdef".to_string());
+        let mut config = nextgsim_common::config::UeConfig {
+            ursp_os_id: Some("0123456789abcdef".to_string()),
+            ..nextgsim_common::config::UeConfig::default()
+        };
         let (os_id, _) = ApplicationDescriptor::configured_os_identity(&config);
         assert!(os_id.is_none());
 

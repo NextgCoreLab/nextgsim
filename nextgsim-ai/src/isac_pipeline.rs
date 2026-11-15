@@ -437,8 +437,10 @@ mod tests {
 
     #[test]
     fn test_too_many_sources() {
-        let mut config = IsacConfig::default();
-        config.max_data_sources = 2;
+        let config = IsacConfig {
+            max_data_sources: 2,
+            ..IsacConfig::default()
+        };
         let mut pipeline = IsacPipeline::new(config);
 
         pipeline
