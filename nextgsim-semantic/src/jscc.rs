@@ -365,24 +365,36 @@ impl JsccSymbols {
     }
 
     /// Applies channel corruption (AWGN, fading) - A18.4
+    ///
+    /// Draws from `thread_rng()`, so the result is not reproducible. Use
+    /// [`Self::apply_channel_with_rng`] with a seeded RNG for a result that has
+    /// to be reproduced from a seed (#546).
     pub fn apply_channel(&mut self, channel_model: &ChannelModel) {
+        self.apply_channel_with_rng(channel_model, &mut rand::thread_rng());
+    }
+
+    /// [`Self::apply_channel`] drawing every random sample (fading coefficients
+    /// and noise) from `rng`, so the same seed gives the same symbols.
+    pub fn apply_channel_with_rng<R: rand::Rng + ?Sized>(
+        &mut self,
+        channel_model: &ChannelModel,
+        rng: &mut R,
+    ) {
         match channel_model {
             ChannelModel::AWGN { snr_db } => {
-                self.apply_awgn(*snr_db);
+                self.apply_awgn(*snr_db, rng);
             }
             ChannelModel::Rayleigh { snr_db } => {
-                self.apply_rayleigh_fading(*snr_db);
+                self.apply_rayleigh_fading(*snr_db, rng);
             }
             ChannelModel::Rician { snr_db, k_factor } => {
-                self.apply_rician_fading(*snr_db, *k_factor);
+                self.apply_rician_fading(*snr_db, *k_factor, rng);
             }
         }
     }
 
     /// Applies Additive White Gaussian Noise (AWGN)
-    fn apply_awgn(&mut self, snr_db: f32) {
-        let mut rng = rand::thread_rng();
-
+    fn apply_awgn<R: rand::Rng + ?Sized>(&mut self, snr_db: f32, rng: &mut R) {
         // Compute signal power
         let signal_power =
             self.symbols.iter().map(|s| s * s).sum::<f32>() / self.symbols.len() as f32;
@@ -394,33 +406,34 @@ impl JsccSymbols {
 
         // Add Gaussian noise
         for symbol in &mut self.symbols {
-            let noise = sample_gaussian(&mut rng, noise_std);
+            let noise = sample_gaussian(rng, noise_std);
             *symbol += noise;
         }
     }
 
     /// Applies Rayleigh fading + AWGN
-    fn apply_rayleigh_fading(&mut self, snr_db: f32) {
-        let mut rng = rand::thread_rng();
-
+    fn apply_rayleigh_fading<R: rand::Rng + ?Sized>(&mut self, snr_db: f32, rng: &mut R) {
         // Apply Rayleigh fading coefficient to each symbol
         for symbol in &mut self.symbols {
             // Rayleigh fading: |h| where h ~ CN(0, 1)
-            let h_real = sample_gaussian(&mut rng, 1.0 / std::f32::consts::SQRT_2);
-            let h_imag = sample_gaussian(&mut rng, 1.0 / std::f32::consts::SQRT_2);
+            let h_real = sample_gaussian(rng, 1.0 / std::f32::consts::SQRT_2);
+            let h_imag = sample_gaussian(rng, 1.0 / std::f32::consts::SQRT_2);
             let h_magnitude = (h_real * h_real + h_imag * h_imag).sqrt();
 
             *symbol *= h_magnitude;
         }
 
-        // Add AWGN
-        self.apply_awgn(snr_db);
+        // Add AWGN, from the same RNG so one seed fixes the whole draw.
+        self.apply_awgn(snr_db, rng);
     }
 
     /// Applies Rician fading + AWGN
-    fn apply_rician_fading(&mut self, snr_db: f32, k_factor: f32) {
-        let mut rng = rand::thread_rng();
-
+    fn apply_rician_fading<R: rand::Rng + ?Sized>(
+        &mut self,
+        snr_db: f32,
+        k_factor: f32,
+        rng: &mut R,
+    ) {
         // Rician fading: line-of-sight + scattered components
         let los_power = k_factor / (1.0 + k_factor);
         let scatter_power = 1.0 / (1.0 + k_factor);
@@ -430,16 +443,16 @@ impl JsccSymbols {
             let los = los_power.sqrt();
 
             // Scattered component (Rayleigh)
-            let h_real = sample_gaussian(&mut rng, scatter_power.sqrt() / std::f32::consts::SQRT_2);
-            let h_imag = sample_gaussian(&mut rng, scatter_power.sqrt() / std::f32::consts::SQRT_2);
+            let h_real = sample_gaussian(rng, scatter_power.sqrt() / std::f32::consts::SQRT_2);
+            let h_imag = sample_gaussian(rng, scatter_power.sqrt() / std::f32::consts::SQRT_2);
             let scatter_magnitude = (h_real * h_real + h_imag * h_imag).sqrt();
 
             let h_magnitude = los + scatter_magnitude;
             *symbol *= h_magnitude;
         }
 
-        // Add AWGN
-        self.apply_awgn(snr_db);
+        // Add AWGN, from the same RNG so one seed fixes the whole draw.
+        self.apply_awgn(snr_db, rng);
     }
 }
 
@@ -466,7 +479,7 @@ pub enum ChannelModel {
 }
 
 /// Samples from N(0, sigma^2) using Box-Muller transform
-fn sample_gaussian<R: rand::Rng>(rng: &mut R, sigma: f32) -> f32 {
+fn sample_gaussian<R: rand::Rng + ?Sized>(rng: &mut R, sigma: f32) -> f32 {
     let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
     let u2: f32 = rng.gen();
     sigma * (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos()
@@ -675,5 +688,68 @@ mod tests {
 
         // Symbols should be different
         assert_ne!(symbols.symbols, original_symbols);
+    }
+
+    // #546: every JSCC channel path is reproducible from a seed.
+
+    /// The encoded symbols of a fixed input, before any channel.
+    fn clean_symbols() -> JsccSymbols {
+        let encoder = JsccEncoder::with_defaults().expect("Failed to create encoder");
+        let data: Vec<f32> = (0..64).map(|i| (i as f32) / 63.0).collect();
+        encoder
+            .encode(
+                &data,
+                &ChannelQuality::new(15.0, 500.0, 0.01),
+                SemanticTask::ImageClassification,
+            )
+            .expect("Encoding failed")
+    }
+
+    /// The bit patterns of the symbols after `model` with an RNG seeded `seed`.
+    fn seeded_output(model: &ChannelModel, seed: u64) -> Vec<u32> {
+        use rand::SeedableRng;
+        let mut symbols = clean_symbols();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        symbols.apply_channel_with_rng(model, &mut rng);
+        symbols.symbols.iter().map(|s| s.to_bits()).collect()
+    }
+
+    fn assert_reproducible(model: ChannelModel) {
+        let clean: Vec<u32> = clean_symbols()
+            .symbols
+            .iter()
+            .map(|s| s.to_bits())
+            .collect();
+        let first = seeded_output(&model, 546);
+        let second = seeded_output(&model, 546);
+        assert_eq!(first.len(), clean.len());
+        assert_ne!(first, clean, "{model:?} must change the symbols");
+        assert_eq!(
+            first, second,
+            "{model:?}: the same seed must give byte-identical symbols"
+        );
+        assert_ne!(
+            first,
+            seeded_output(&model, 547),
+            "{model:?}: the output must come from the supplied RNG"
+        );
+    }
+
+    #[test]
+    fn awgn_with_the_same_seed_is_byte_identical() {
+        assert_reproducible(ChannelModel::AWGN { snr_db: 10.0 });
+    }
+
+    #[test]
+    fn rayleigh_with_the_same_seed_is_byte_identical() {
+        assert_reproducible(ChannelModel::Rayleigh { snr_db: 10.0 });
+    }
+
+    #[test]
+    fn rician_with_the_same_seed_is_byte_identical() {
+        assert_reproducible(ChannelModel::Rician {
+            snr_db: 15.0,
+            k_factor: 3.0,
+        });
     }
 }
