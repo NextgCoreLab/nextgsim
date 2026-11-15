@@ -1,0 +1,32 @@
+# nr-semantic-demo: the demo-only image of demo D444C (nextgsim#479). It runs the
+# crate-level `task_vs_raw` example (nextgsim-semantic, feature
+# demo-d444c-task-vs-raw) once and exits; deploy/k8s/demo-d444c-task-vs-raw/ runs
+# it as a Kubernetes Job and scripts/demo/d444c-k8s.sh checks its table.
+#
+# DEMO-ONLY: it is in docker/release-images.json `excluded`, so release.yml never
+# builds or publishes it, and no release image changes. It bakes only the demo's
+# own config (config/demo-task-vs-raw/task_vs_raw.yaml: a `demo:` block, no
+# subscriber key) and opens no port.
+#
+# Self-contained (no pre-built binaries/): build context = the repo root.
+#   docker build -f docker/demo/Dockerfile.nr-semantic-demo -t nextgsim/nr-semantic-demo:local .
+#
+# Base images are pinned by digest (as the release Dockerfiles, #420). The
+# builder and the runtime are both Debian bookworm (glibc 2.36), so the binary
+# runs on the libm it was linked against. To bump:
+# `docker buildx imagetools inspect <tag>` and replace the digest.
+FROM rust:1.95-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p nextgsim-semantic \
+        --features demo-d444c-task-vs-raw --example task_vs_raw \
+    && install -D -m 0755 target/release/examples/task_vs_raw /out/task_vs_raw
+
+# distroless cc: glibc, libgcc and nothing else (no shell, no package manager),
+# running as the image's nonroot user (65532).
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f
+COPY --from=build /out/task_vs_raw /usr/local/bin/task_vs_raw
+COPY config/demo-task-vs-raw/task_vs_raw.yaml /etc/nextgsim/task_vs_raw.yaml
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/task_vs_raw"]
+CMD ["--config", "/etc/nextgsim/task_vs_raw.yaml", "--seed", "444"]

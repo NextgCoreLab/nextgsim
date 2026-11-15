@@ -1,0 +1,46 @@
+# The D444C sweep as a one-shot Job. It opens no listener and talks to nothing:
+# the table goes to stdout, the WARN DEMO MODE ACTIVE banner and the one-shot
+# nextg_demo_enabled series to stderr (both in `kubectl logs`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: d444c-task-vs-raw
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: task-vs-raw
+          image: nextgsim/nr-semantic-demo
+          imagePullPolicy: IfNotPresent
+          args: ["--config", "/etc/nextgsim/task_vs_raw.yaml", "--seed", "444"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 250m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault

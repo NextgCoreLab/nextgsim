@@ -98,6 +98,14 @@
     {
       "bin": "nr-she-eas",
       "reason": "demo-only: the EAS sidecar of demo D443A (#471, feature demo-d443a-edge-budget on nextgsim-she); built into the demo image by nextgcore's demo-d443a-edge-budget overlay, never published"
+    },
+    {
+      "path": "docker/demo/Dockerfile.nr-semantic-demo",
+      "image": "nr-semantic-demo",
+      "reason": "demo-only: the image of demo D444C (#479, the task_vs_raw example of nextgsim-semantic, feature demo-d444c-task-vs-raw), run as a one-shot Job by deploy/k8s/demo-d444c-task-vs-raw/ and scripts/demo/d444c-k8s.sh; built from source by its own Dockerfile, never published",
+      "local_names": [
+        "nextgsim/nr-semantic-demo"
+      ]
     }
   ]
 }

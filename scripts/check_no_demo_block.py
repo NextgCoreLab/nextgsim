@@ -50,12 +50,16 @@ DEMO_ALLOW = [
 ]
 
 # Files that may NAME the demo paths without being demo content: a demo
-# runner. nextgsim has none yet (nextgcore's are deploy/eks/profiles/demo/ and
-# k8s/demo-check.sh); a demo PR that adds one lists it here. Everything else
+# runner or a demo-only image. nextgcore's are deploy/eks/profiles/demo/ and
+# k8s/demo-check.sh; a demo PR that adds one lists it here. Everything else
 # that names one is a shipped profile pulling a demo in, which the text rule
 # cannot see (a configMapGenerator file, a kustomize resource, a compose mount).
 SELF = 'scripts/check_no_demo_block.py'
-REF_ALLOW = []
+REF_ALLOW = [
+    # Demo D444C's demo-only image (#479) bakes config/demo-task-vs-raw/; it is
+    # in docker/release-images.json `excluded`, never published.
+    'docker/demo/Dockerfile.nr-semantic-demo',
+]
 
 # `demo:` as a YAML mapping key (optionally quoted) at the start of a line, or
 # inside a flow mapping / single-line JSON object after `{` or `,`.
