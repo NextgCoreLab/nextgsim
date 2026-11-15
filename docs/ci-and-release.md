@@ -113,6 +113,8 @@ fails, the step fails with the command's own exit status.
 |------|---------|-----|
 | Docker Build: pre-pull every `FROM` base of the four Dockerfiles (`docker/pull-base-images.sh`) | yes | A pull has no side effect. A digest-pinned base then resolves from the local store, so the build makes no registry round trip for it |
 | Docker Build: the four `docker build`s | no | A genuine build error fails on the first attempt |
+| Interop E2E (#449): pre-pull the `FROM` bases of nextgcore's `Dockerfile.builder` and `Dockerfile.core` and this repo's `Dockerfile.gnb-local`/`Dockerfile.ue-local`, `docker compose pull mongodb`, and `docker pull ubuntu:24.04` | yes | Pulls only. All four bases are digest-pinned, so the builds resolve them locally; `compose up` and `docker run` then find their images locally |
+| Interop E2E: its `docker build`s, `compose up`s and `docker run`s | no | A genuine failure fails on the first attempt |
 | `publish-binaries`: pull the `rust` toolchain image | yes | `docker run` then finds it locally |
 | `publish-images`: warm build (same file, target and context, no output) | yes | It tags, loads and pushes nothing. It fills the docker-container builder's cache, which a `docker pull` cannot reach because that builder has its own store |
 | `publish-images`: the build-push-action push | **no** | A partial push can leave blobs or the tag behind, and a re-run could publish the tag twice from a rebuilt image. A failed leg fails, `latest` does not move, and you re-run the failed job yourself |

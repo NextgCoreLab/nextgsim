@@ -972,6 +972,24 @@ jobs:
           echo "| nextgcore (main) | \`${core}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "nextgsim=${sim} nextgcore=${core}"
 
+      # #449: the same transient-registry hardening as Docker Build (#448). Every
+      # image this job takes from a public registry is pulled here, each pull
+      # retried (5 attempts, 5/10/20/40 s backoff): the FROM bases of every
+      # Dockerfile it builds (nextgcore's by path; all are digest-pinned, so the
+      # builds then resolve them from the local store), mongo for the first
+      # `compose up`, and ubuntu for the SBI round-trip `docker run`s.
+      # Dockerfile.nf is not listed: it builds FROM the local nextgcore-core image.
+      # The builds and `compose up`s below stay single-shot, so a genuine failure
+      # still fails on the first attempt.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose pull mongodb)
+          nextgsim/docker/retry.sh docker pull ubuntu:24.04
+
       # nextgcore's builder compiles BOTH workspaces, including this repo's nr-gnb
       # and nr-ue out of the sibling checkout. Reused rather than re-implemented:
       # the build context is the parent of both trees, which is why the checkouts
