@@ -4507,7 +4507,7 @@ impl MmOrchestrator {
     pub fn all_ursp_rules(&self) -> Vec<UrspRule> {
         self.ue_policy_sections
             .values()
-            .filter_map(|section| section.ursp_rules())
+            .filter_map(StoredUePolicySection::ursp_rules)
             .flatten()
             .collect()
     }
@@ -5058,8 +5058,10 @@ mod tests {
                 std::process::id()
             ))
             .join("state.json");
-        let mut config = UeConfig::default();
-        config.state_file = Some(path.clone());
+        let config = UeConfig {
+            state_file: Some(path.clone()),
+            ..UeConfig::default()
+        };
         (config, path)
     }
 

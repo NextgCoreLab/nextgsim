@@ -3087,7 +3087,9 @@ mod tests {
         // Simulate: ue-1 has a stale update (base_version=1, current=3)
         // ue-2 has a fresh update (base_version=3, current=3)
         // Manually set global model version to 3
-        aggregator.global_model.as_mut().map(|m| m.version = 3);
+        if let Some(m) = aggregator.global_model.as_mut() {
+            m.version = 3;
+        }
 
         // Stale update (base_version=1, staleness=2, weight factor = 0.5^2 = 0.25)
         aggregator

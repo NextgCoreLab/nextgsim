@@ -2427,7 +2427,7 @@ mod tests {
         let mobile_id = Ie5gsMobileIdentity::new(MobileIdentityType::Suci, vec![0x01, 0x02, 0x03]);
 
         // Not set: container IEI 0x72 must be absent.
-        let mut msg = RegistrationRequest::new(reg_type.clone(), ng_ksi.clone(), mobile_id.clone());
+        let mut msg = RegistrationRequest::new(reg_type, ng_ksi, mobile_id.clone());
         msg.ue_security_capability = Some(vec![0xE0, 0xE0]);
         let mut buf = Vec::new();
         msg.encode(&mut buf);

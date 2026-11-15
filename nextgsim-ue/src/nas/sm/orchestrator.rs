@@ -3324,19 +3324,20 @@ mod tests {
     fn ursp_config(enabled: bool, descriptor: &str, dnn: &str, sst: u8) -> UeConfig {
         use nextgsim_common::config::{RouteDescriptor, UrspRule as ConfigUrspRule};
         use nextgsim_common::types::SNssai;
-        let mut config = UeConfig::default();
-        config.ursp_evaluation = enabled;
-        config.ursp_rules = vec![ConfigUrspRule {
-            precedence: 10,
-            traffic_descriptor: descriptor.to_string(),
-            route_descriptors: vec![RouteDescriptor {
-                s_nssai: Some(SNssai::new(sst)),
-                dnn: Some(dnn.to_string()),
-                session_type: None,
-                ssc_mode: None,
+        UeConfig {
+            ursp_evaluation: enabled,
+            ursp_rules: vec![ConfigUrspRule {
+                precedence: 10,
+                traffic_descriptor: descriptor.to_string(),
+                route_descriptors: vec![RouteDescriptor {
+                    s_nssai: Some(SNssai::new(sst)),
+                    dnn: Some(dnn.to_string()),
+                    session_type: None,
+                    ssc_mode: None,
+                }],
             }],
-        }];
-        config
+            ..UeConfig::default()
+        }
     }
 
     /// CRITERION 4 (issue #97): a TUN uplink packet whose 5-tuple matches an
@@ -3463,7 +3464,7 @@ mod tests {
         assert!(!orch.ursp_enabled());
 
         let params = test_params();
-        let outs = orch.establish_default_sessions(&[params.clone()]);
+        let outs = orch.establish_default_sessions(std::slice::from_ref(&params));
         let (transport, _) = unwrap_ul(first_sent_pdu(&outs));
         assert_eq!(
             transport.dnn.as_deref(),
@@ -3528,30 +3529,32 @@ mod tests {
     fn a_differently_steered_application_gets_its_own_session() {
         use nextgsim_common::config::{RouteDescriptor, UrspRule as ConfigUrspRule};
         use nextgsim_common::types::SNssai;
-        let mut config = UeConfig::default();
-        config.ursp_evaluation = true;
-        config.ursp_rules = vec![
-            ConfigUrspRule {
-                precedence: 10,
-                traffic_descriptor: "dnn:internet".to_string(),
-                route_descriptors: vec![RouteDescriptor {
-                    s_nssai: Some(SNssai::new(1)),
-                    dnn: Some("internet".to_string()),
-                    session_type: None,
-                    ssc_mode: None,
-                }],
-            },
-            ConfigUrspRule {
-                precedence: 20,
-                traffic_descriptor: "dnn:ims".to_string(),
-                route_descriptors: vec![RouteDescriptor {
-                    s_nssai: Some(SNssai::new(2)),
-                    dnn: Some("ims".to_string()),
-                    session_type: None,
-                    ssc_mode: None,
-                }],
-            },
-        ];
+        let config = UeConfig {
+            ursp_evaluation: true,
+            ursp_rules: vec![
+                ConfigUrspRule {
+                    precedence: 10,
+                    traffic_descriptor: "dnn:internet".to_string(),
+                    route_descriptors: vec![RouteDescriptor {
+                        s_nssai: Some(SNssai::new(1)),
+                        dnn: Some("internet".to_string()),
+                        session_type: None,
+                        ssc_mode: None,
+                    }],
+                },
+                ConfigUrspRule {
+                    precedence: 20,
+                    traffic_descriptor: "dnn:ims".to_string(),
+                    route_descriptors: vec![RouteDescriptor {
+                        s_nssai: Some(SNssai::new(2)),
+                        dnn: Some("ims".to_string()),
+                        session_type: None,
+                        ssc_mode: None,
+                    }],
+                },
+            ],
+            ..UeConfig::default()
+        };
         let mut orch = new_orch();
         orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&config));
         let base = test_params();
@@ -3584,8 +3587,10 @@ mod tests {
         let mut orch = new_orch();
         // The switch still governs delivered rules: a PCF cannot turn evaluation
         // on for a UE whose operator has not.
-        let mut config = UeConfig::default();
-        config.ursp_evaluation = true;
+        let config = UeConfig {
+            ursp_evaluation: true,
+            ..UeConfig::default()
+        };
         orch.set_ursp_policy(super::super::ursp::UrspPolicy::from_config(&config));
         orch.set_delivered_ursp_rules(vec![UrspRule {
             precedence: 5,
@@ -3703,14 +3708,16 @@ mod tests {
     #[test]
     fn test_xr_session_selects_xr_dnn() {
         use nextgsim_common::config::SessionConfig as ConfigSessionConfig;
-        let mut config = UeConfig::default();
         // XR session with requested_5qi but no explicit APN: the UE must
         // select the XR DNN so the SMF derives the XR 5QI.
-        config.sessions = vec![ConfigSessionConfig {
-            requested_5qi: Some(82),
-            apn: None,
-            ..ConfigSessionConfig::default()
-        }];
+        let mut config = UeConfig {
+            sessions: vec![ConfigSessionConfig {
+                requested_5qi: Some(82),
+                apn: None,
+                ..ConfigSessionConfig::default()
+            }],
+            ..UeConfig::default()
+        };
         let params = SmSessionParams::from_config(&config);
         assert_eq!(params.len(), 1);
         assert_eq!(params[0].requested_5qi, Some(82));

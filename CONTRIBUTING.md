@@ -55,12 +55,12 @@ cd ../nextgcore/docker/rust
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
 Pre-commit checklist:
 - [ ] `cargo fmt --all -- --check` — no formatting changes
-- [ ] `cargo clippy --workspace --all-targets` — no new warnings in the code you touched
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` — no warnings (CI gates the whole workspace, #506)
 - [ ] `cargo test --workspace` — all tests pass
 - [ ] The feature-gated CI job for any feature your change touches (see `docs/ci-and-release.md`)
 - [ ] `cargo audit` — no unpatched advisories
