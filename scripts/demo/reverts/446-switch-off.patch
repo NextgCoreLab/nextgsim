@@ -9,4 +9,4 @@
 +        if self.off_air && false {
              // Not even tracked: a cell that is off the air hears nothing.
              self.off_air_dropped += 1;
-             if self.off_air_dropped == 1 || self.off_air_dropped % 20 == 0 {
+             if self.off_air_dropped == 1 || self.off_air_dropped.is_multiple_of(20) {
