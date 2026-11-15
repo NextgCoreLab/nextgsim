@@ -6,6 +6,24 @@ authors.workspace = true
 license.workspace = true
 description = "Service Hosting Environment (SHE) - 3-tier distributed compute for 6G networks, inspired by 3GPP TS 23.558 (not an implementation of the spec)"
 
+[features]
+default = []
+# Demo D443A (nextgsim#471): the `nr-she-eas` EAS sidecar (EDGE-3 registration
+# at eesd, an RFC 8762 STAMP Session-Reflector, the job listener) and the UE's
+# EEC client (`d443a` module). Demo-only, off by default; the sidecar also
+# refuses to start without the `demo.d443a-edge-budget` block.
+demo-d443a-edge-budget = [
+    "dep:nextgsim-demo",
+    "dep:nextgsim-sbi-client",
+    "dep:serde_yaml",
+    "dep:tracing-subscriber",
+]
+
+[[bin]]
+name = "nr-she-eas"
+path = "src/bin/nr_she_eas.rs"
+required-features = ["demo-d443a-edge-budget"]
+
 [dependencies]
 # Async runtime
 tokio = { workspace = true }
@@ -26,9 +44,17 @@ async-trait = { workspace = true }
 # Internal crates
 nextgsim-ai = { workspace = true }
 nextgsim-common = { workspace = true }
+nextgsim-demo = { workspace = true, optional = true }
+nextgsim-sbi-client = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+# The stub EES of the d443a tests (h2c, as eesd speaks it).
+h2 = "0.4"
+http = "1"
+bytes = { workspace = true }
 
 [lints]
 workspace = true

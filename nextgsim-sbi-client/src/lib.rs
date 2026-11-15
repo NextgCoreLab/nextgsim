@@ -144,6 +144,12 @@ pub struct SbiClientConfig {
     pub max_body: usize,
     /// NRF OAuth2. `None`: calls go without a token.
     pub oauth2: Option<OAuth2Config>,
+    /// Bind every connection of this client, the token requests included, to
+    /// this interface (`SO_BINDTODEVICE`, Linux), e.g. a UE's PDU session TUN
+    /// `uesimtun0` (nextgsim#471). `None`: connect by the routing table.
+    /// Bound, the URIs must name IP literals: name resolution would not go
+    /// through the device, so a name is refused.
+    pub bind_device: Option<String>,
 }
 
 impl Default for SbiClientConfig {
@@ -154,6 +160,7 @@ impl Default for SbiClientConfig {
             retry_backoff: Duration::from_millis(100),
             max_body: 1 << 20,
             oauth2: None,
+            bind_device: None,
         }
     }
 }
@@ -285,6 +292,25 @@ impl SbiClient {
         self.request(Method::PUT, uri, Some(body), scope).await
     }
 
+    /// `PATCH` an RFC 7396 JSON merge patch to `uri` (`application/merge-patch+json`),
+    /// exactly once (PATCH is not idempotent).
+    pub async fn patch_merge_json<B: Serialize>(
+        &self,
+        uri: &str,
+        body: &B,
+        scope: Option<&Scope>,
+    ) -> SbiResult<SbiResponse> {
+        let body = Bytes::from(serde_json::to_vec(body)?);
+        self.request_typed(
+            Method::PATCH,
+            uri,
+            Some(body),
+            HeaderValue::from_static("application/merge-patch+json"),
+            scope,
+        )
+        .await
+    }
+
     /// `DELETE` `uri` (retried, being idempotent).
     pub async fn delete(&self, uri: &str, scope: Option<&Scope>) -> SbiResult<SbiResponse> {
         self.request(Method::DELETE, uri, None, scope).await
@@ -303,15 +329,32 @@ impl SbiClient {
         body: Option<Bytes>,
         scope: Option<&Scope>,
     ) -> SbiResult<SbiResponse> {
+        self.request_typed(
+            method,
+            uri,
+            body,
+            HeaderValue::from_static("application/json"),
+            scope,
+        )
+        .await
+    }
+
+    /// [`Self::request`] with the body's `content-type`.
+    async fn request_typed(
+        &self,
+        method: Method,
+        uri: &str,
+        body: Option<Bytes>,
+        body_type: HeaderValue,
+        scope: Option<&Scope>,
+    ) -> SbiResult<SbiResponse> {
         let target = parse_target(uri)?;
         let token = match (&self.config.oauth2, scope) {
             (Some(o), Some(s)) => Some(self.tokens.get(self, o, s).await?),
             (Some(_), None) => return Err(SbiError::ScopeRequired),
             (None, _) => None,
         };
-        let content_type = body
-            .as_ref()
-            .map(|_| HeaderValue::from_static("application/json"));
+        let content_type = body.as_ref().map(|_| body_type);
         let resp = self
             .send_with_retries(&method, &target, body, content_type, token.as_ref())
             .await?;
@@ -407,7 +450,7 @@ impl SbiClient {
         if let Some(c) = pooled.as_ref() {
             return Ok((c.clone(), true));
         }
-        let tcp = TcpStream::connect(authority)
+        let tcp = connect(authority, self.config.bind_device.as_deref())
             .await
             .map_err(|source| SbiError::Connect {
                 authority: authority.to_string(),
@@ -493,6 +536,44 @@ impl SbiClient {
             body: buf.freeze(),
         })
     }
+}
+
+/// A TCP connection to `authority` (`host:port`), bound to `device` if given.
+async fn connect(authority: &str, device: Option<&str>) -> std::io::Result<TcpStream> {
+    let Some(device) = device else {
+        return TcpStream::connect(authority).await;
+    };
+    // A name would be resolved by the host's resolver, outside the device, so
+    // a bound client takes IP literals only (nextgsim#471 review m3).
+    let addr: std::net::SocketAddr = authority.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "bound to {device}: {authority} must be an IP literal (a name would be resolved \
+                 outside the device)"
+            ),
+        )
+    })?;
+    let socket = if addr.is_ipv4() {
+        tokio::net::TcpSocket::new_v4()?
+    } else {
+        tokio::net::TcpSocket::new_v6()?
+    };
+    bind_to_device(&socket, device)?;
+    socket.connect(addr).await
+}
+
+#[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+fn bind_to_device(socket: &tokio::net::TcpSocket, device: &str) -> std::io::Result<()> {
+    socket.bind_device(Some(device.as_bytes()))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "fuchsia", target_os = "linux")))]
+fn bind_to_device(_socket: &tokio::net::TcpSocket, device: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        format!("binding to {device} needs SO_BINDTODEVICE (Linux)"),
+    ))
 }
 
 fn transient(e: &SbiError) -> bool {

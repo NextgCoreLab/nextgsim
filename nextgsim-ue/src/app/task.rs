@@ -329,6 +329,18 @@ impl AppTask {
             return;
         }
 
+        // `she-offload ...` (demo D443A, #471) is answered by the EEC client,
+        // and only while the demo is active.
+        #[cfg(feature = "demo-d443a-edge-budget")]
+        if let Some(out) = crate::she_client::d443a::route_cli(&cmd.command) {
+            if let Some(server) = &self.cli_server {
+                if let Err(e) = server.send_result(cmd.client_addr, out).await {
+                    warn!("Failed to send CLI response: {}", e);
+                }
+            }
+            return;
+        }
+
         // Parse the command string into a UeCliCommandType
         let command_type = match parse_ue_cli_command(&cmd.command) {
             Ok(cmd_type) => cmd_type,

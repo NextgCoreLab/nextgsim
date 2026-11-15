@@ -70,6 +70,9 @@
 //! ```
 
 pub mod autoscale;
+/// Demo D443A (nextgsim#471): the EAS sidecar and the UE's EEC client.
+#[cfg(feature = "demo-d443a-edge-budget")]
+pub mod d443a;
 pub mod error;
 pub mod messages;
 pub mod resource;

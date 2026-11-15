@@ -2860,6 +2860,95 @@ pub struct UeConfig {
     /// `federated_learning_enabled`; ignored otherwise.
     #[serde(default)]
     pub fl: Option<FlClientConfig>,
+    /// The EEC client of demo D443A (nextgsim#471). Read only by a UE built
+    /// with `demo-d443a-edge-budget` whose `demo:` block enables it, and only
+    /// with `she_enabled`; ignored otherwise.
+    #[serde(default)]
+    pub eec: Option<EecClientConfig>,
+}
+
+/// NRF OAuth2 client credentials for a demo client that calls a nextgcore NF
+/// (TS 33.501 §13.4.1, the CCA of §13.3.8): the shape D445A's AF uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NrfOAuth2Config {
+    /// The NRF's API root, e.g. `http://172.23.0.10:7777`.
+    pub nrf: String,
+    /// This client's nfInstanceId (the CCA's `sub`/`iss`).
+    pub nf_instance_id: String,
+    /// Its CCA signing key (created on first use).
+    pub cca_key_file: std::path::PathBuf,
+    /// Where to publish the public JWK for the NRF, if anywhere.
+    #[serde(default)]
+    pub public_jwk_dir: Option<std::path::PathBuf>,
+    /// Register at the NRF at startup as `nfType: AF` (tokenless, as
+    /// nextgcore's NRF management API is).
+    #[serde(default)]
+    pub register: bool,
+}
+
+/// Demo D443A's UE EEC client (nextgsim#471, non-normative): which EES it
+/// registers at (TS 24.558 `Eees_EECRegistration`), over which PDU session,
+/// with which AC profile, and the UE's own deadline for a job.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EecClientConfig {
+    /// The EES API root (`http://host:port`, h2c), reached through the PDU
+    /// session.
+    pub ees: String,
+    /// The interface every socket of the client is bound to
+    /// (`SO_BINDTODEVICE`): the PDU session's TUN, e.g. `uesimtun0`. `None`
+    /// connects by the routing table, i.e. possibly around the session (the
+    /// `bind_device: eth0` / unbound revert arm).
+    #[serde(default)]
+    pub device: Option<String>,
+    /// `eecId` (TS 24.558 `EECRegistration`).
+    pub eec_id: String,
+    /// `ueId`, a GPSI, if the EEC states one.
+    #[serde(default)]
+    pub ue_id: Option<String>,
+    /// The `acId` of the one AC profile.
+    #[serde(default = "EecClientConfig::default_ac_id")]
+    pub ac_id: String,
+    /// The `easId`s the AC profile names (`acProfs[0].eass[].easId`), in order.
+    pub eass: Vec<String>,
+    /// `minimumReqSvcKPIs.reqComp` of each named EAS: the job's compute demand
+    /// (a string in TS 24.558; an integer here, labelled).
+    #[serde(default = "EecClientConfig::default_req_comp")]
+    pub req_comp: u32,
+    /// The UE's own deadline for a job (ms): a job slower than this is a
+    /// `deadline-miss`.
+    #[serde(default = "EecClientConfig::default_deadline_ms")]
+    pub deadline_ms: u32,
+    /// The UDP port of the EAS job listener (the demo's; TS 29.558 `EndPoint`
+    /// has no port member).
+    #[serde(default = "EecClientConfig::default_job_port")]
+    pub job_port: u16,
+    /// How long to wait for a job's answer (ms) before it is a miss.
+    #[serde(default = "EecClientConfig::default_job_timeout_ms")]
+    pub job_timeout_ms: u32,
+    /// NRF OAuth2 for the EEC's calls. Absent: calls carry no token, which
+    /// eesd refuses (401), and the job falls back on-device.
+    #[serde(default)]
+    pub oauth2: Option<NrfOAuth2Config>,
+}
+
+impl EecClientConfig {
+    fn default_ac_id() -> String {
+        "ac-d443a".to_string()
+    }
+    fn default_req_comp() -> u32 {
+        100
+    }
+    fn default_deadline_ms() -> u32 {
+        15
+    }
+    fn default_job_port() -> u16 {
+        9471
+    }
+    fn default_job_timeout_ms() -> u32 {
+        1000
+    }
 }
 
 /// Demo D445A's UE FL client (nextgsim#480, non-normative): which AF it trains
@@ -3038,6 +3127,7 @@ impl Default for UeConfig {
             semantic_comm_enabled: false,
             semantic_stream: None,
             fl: None,
+            eec: None,
         }
     }
 }
