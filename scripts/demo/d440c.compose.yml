@@ -1,0 +1,127 @@
+# Override for nextgcore's docker/rust/docker-compose.demo-n2ho.yml, used by
+# scripts/demo/d440c-check.sh (nextgsim#464, demo d440c-nwdaf-paging): the
+# three-gNB commuter lap of config/demo-nwdaf-paging/ on the n2ho stack's private
+# network, plus nwdafd. Publishes nothing (the check asserts the merged model
+# has no published port).
+#
+#   service   config (config/demo-nwdaf-paging/)  NCI    gNB ID  address
+#   gnb-west  gnb-a.yaml (gNB A)                  0x010  1       172.23.0.100
+#   gnb-east  gnb-b.yaml (gNB B)                  0x020  2       172.23.0.102
+#   gnb-c     gnb-c.yaml (gNB C)                  0x030  3       172.23.0.103
+#   ue        ue-lap.yaml                                        172.23.0.101
+#   nwdaf     nwdafd, UE_MOBILITY from amfd's LOCATION_REPORTs   172.23.0.30
+#
+# The run's mode, D440C_MODE (nwdaf-mobility | registration-area | off), goes
+# into amfd's and every gNB's config at start-up: each entrypoint copies its
+# config to /tmp, drops the gNB files' own trailing demo block, and appends
+# the block with D440C_MODE unless it is off. D440C_NWDAF_UE_MOBILITY=false
+# turns nwdafd's knob off (the revert arm).
+#
+# Images (built by the check's caller): amfd with demo-d440c-nwdaf-paging,
+# nwdafd with amf-mobility, nr-gnb with demo-d440c-nwdaf-paging, tagged
+# ${D440C_TAG}; the other NFs and the UE from the n2ho stack's :latest.
+x-gnb-demo: &gnb-demo
+  image: nextgsim-gnb:${D440C_TAG:-d440c}
+  entrypoint: ["/bin/sh", "-c"]
+  environment:
+    RUST_LOG: info
+    D440C_MODE: ${D440C_MODE:-nwdaf-mobility}
+x-gnb-start: &gnb-start |
+  set -eu
+  sed '/^demo:/,$$d' "/etc/nextgsim/demo-nwdaf-paging/$$GNB_CONFIG" > /tmp/gnb.yaml
+  if [ "$$D440C_MODE" != off ]; then
+    printf 'demo:\n  enabled: true\n  d440c-nwdaf-paging:\n    enabled: true\n    mode: %s\n' "$$D440C_MODE" >> /tmp/gnb.yaml
+  fi
+  exec nr-gnb -c /tmp/gnb.yaml
+
+services:
+  amf:
+    image: nextgcore-rust/amf:${D440C_TAG:-d440c}
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      D440C_MODE: ${D440C_MODE:-nwdaf-mobility}
+    command:
+      - |
+        set -eu
+        cp /etc/nextgcore/amf.yaml /tmp/amf.yaml
+        if [ "$$D440C_MODE" != off ]; then
+          printf '\ndemo:\n  enabled: true\n  d440c-nwdaf-paging:\n    enabled: true\n    mode: %s\n' "$$D440C_MODE" >> /tmp/amf.yaml
+        fi
+        exec /usr/local/bin/nf-binary -c /tmp/amf.yaml --ngap-addr 0.0.0.0:38412
+
+  nwdaf:
+    image: nextgcore-rust/nwdaf:${D440C_TAG:-d440c}
+    restart: on-failure:5
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      RUST_LOG: info
+      RUST_BACKTRACE: 1
+      NEXTGCORE_SBI_PROFILE: "dev"
+      TLS_ENABLED: "false"
+      SBI_SCHEME: "http"
+      D440C_NWDAF_UE_MOBILITY: ${D440C_NWDAF_UE_MOBILITY:-true}
+    command:
+      - |
+        set -eu
+        printf 'logger:\n  level: info\nnwdaf:\n  sbi:\n    server:\n      - address: 172.23.0.30\n        port: 7777\n  amf_mobility:\n    enabled: %s\n' \
+          "$$D440C_NWDAF_UE_MOBILITY" > /tmp/nwdaf.yaml
+        exec /usr/local/bin/nf-binary -c /tmp/nwdaf.yaml --sbi-addr 172.23.0.30 --sbi-port 7777 --nrf-uri http://172.23.0.10:7777
+    networks:
+      core:
+        ipv4_address: 172.23.0.30
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      nrf:
+        condition: service_healthy
+
+  gnb-west:
+    <<: *gnb-demo
+    environment:
+      RUST_LOG: info
+      D440C_MODE: ${D440C_MODE:-nwdaf-mobility}
+      GNB_CONFIG: gnb-a.yaml
+    command: [*gnb-start]
+
+  gnb-east:
+    <<: *gnb-demo
+    environment:
+      RUST_LOG: info
+      D440C_MODE: ${D440C_MODE:-nwdaf-mobility}
+      GNB_CONFIG: gnb-b.yaml
+    command: [*gnb-start]
+
+  gnb-c:
+    <<: *gnb-demo
+    restart: on-failure:5
+    environment:
+      RUST_LOG: info
+      D440C_MODE: ${D440C_MODE:-nwdaf-mobility}
+      GNB_CONFIG: gnb-c.yaml
+    command: [*gnb-start]
+    volumes:
+      - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+    networks:
+      core:
+        ipv4_address: 172.23.0.103
+    healthcheck:
+      test: ["CMD-SHELL", "kill -0 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    depends_on:
+      amf:
+        condition: service_healthy
+      upf:
+        condition: service_healthy
+
+  ue:
+    command: ["-c", "/etc/nextgsim/demo-nwdaf-paging/ue-lap.yaml"]
+    depends_on:
+      gnb-c:
+        condition: service_healthy
