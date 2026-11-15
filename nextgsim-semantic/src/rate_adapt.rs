@@ -190,7 +190,10 @@ impl FeatureGenerator {
         (label as u8, x)
     }
 
-    fn training_set(&self) -> impl Iterator<Item = (u8, Vec<f32>)> + '_ {
+    /// The training samples every fit uses (the PCA, the top-variance order
+    /// and each nearest-centroid classifier): `TRAIN_SAMPLES` samples from a
+    /// sequence range disjoint from any stream's or held-out set's.
+    pub fn training_set(&self) -> impl Iterator<Item = (u8, Vec<f32>)> + '_ {
         (0..TRAIN_SAMPLES).map(|i| self.sample(TRAIN_SEQ_BASE + i))
     }
 }
@@ -480,6 +483,11 @@ impl NearestCentroid {
             })
             .collect();
         Self { centroids }
+    }
+
+    /// The fitted class centroids, indexed by label.
+    pub fn centroids(&self) -> &[Vec<f32>] {
+        &self.centroids
     }
 
     /// The predicted class of `enc`.

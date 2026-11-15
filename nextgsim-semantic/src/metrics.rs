@@ -7,6 +7,11 @@
 //! - **Mean Squared Error (MSE)**: average squared difference per element.
 //! - **Peak Signal-to-Noise Ratio (PSNR)**: log-scale quality metric.
 //! - **Top-k accuracy**: fraction of the k most important features preserved.
+//!   It compares feature indices; it is **not** classification accuracy.
+//! - **Classification**: [`NearestCentroid`] (the #477 classifier, re-exported)
+//!   and [`ClassificationScore`] (top-1, macro and worst-class accuracy).
+
+pub use crate::rate_adapt::NearestCentroid;
 
 /// Result of a full quality evaluation between original and reconstructed vectors.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -287,6 +292,74 @@ pub fn perceptual_distance(original: &[f32], reconstructed: &[f32]) -> f32 {
     alpha * mse_val + (1.0 - alpha) * (1.0 - ssim_val)
 }
 
+/// Classification accuracy over `(label, predicted)` pairs: top-1, macro
+/// (the mean of the per-class accuracies) and worst-class.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassificationScore {
+    correct: Vec<u64>,
+    total: Vec<u64>,
+}
+
+impl ClassificationScore {
+    /// An empty score.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Count one sample of class `label` predicted as `predicted`.
+    pub fn record(&mut self, label: u8, predicted: u8) {
+        let l = usize::from(label);
+        if self.total.len() <= l {
+            self.total.resize(l + 1, 0);
+            self.correct.resize(l + 1, 0);
+        }
+        self.total[l] += 1;
+        if label == predicted {
+            self.correct[l] += 1;
+        }
+    }
+
+    /// Samples counted.
+    pub fn samples(&self) -> u64 {
+        self.total.iter().sum()
+    }
+
+    /// Correct predictions counted.
+    pub fn correct(&self) -> u64 {
+        self.correct.iter().sum()
+    }
+
+    /// Correct / samples; 0 when empty.
+    pub fn top1(&self) -> f64 {
+        self.correct() as f64 / self.samples().max(1) as f64
+    }
+
+    fn per_class(&self) -> impl Iterator<Item = f64> + '_ {
+        self.correct
+            .iter()
+            .zip(&self.total)
+            .filter(|(_, t)| **t > 0)
+            .map(|(c, t)| *c as f64 / *t as f64)
+    }
+
+    /// The mean of the per-class accuracies over the classes seen; 0 when empty.
+    pub fn macro_accuracy(&self) -> f64 {
+        let (sum, n) = self
+            .per_class()
+            .fold((0.0, 0usize), |(s, n), a| (s + a, n + 1));
+        if n == 0 {
+            0.0
+        } else {
+            sum / n as f64
+        }
+    }
+
+    /// The lowest per-class accuracy over the classes seen; 0 when empty.
+    pub fn worst_class_accuracy(&self) -> f64 {
+        self.per_class().reduce(f64::min).unwrap_or(0.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +474,27 @@ mod tests {
         assert_eq!(mse(&[], &[]), 0.0);
         assert!(psnr(&[], &[], 1.0).is_none());
         assert_eq!(top_k_accuracy(&[], &[], 5), 0.0);
+    }
+
+    #[test]
+    fn classification_score_reports_top1_macro_and_worst_class() {
+        let mut s = ClassificationScore::new();
+        // Class 0: 3 of 4 right; class 1: 1 of 2 right; class 2: 1 of 1 right.
+        for (l, p) in [(0, 0), (0, 0), (0, 0), (0, 1), (1, 1), (1, 0), (2, 2)] {
+            s.record(l, p);
+        }
+        assert_eq!((s.samples(), s.correct()), (7, 5));
+        assert!((s.top1() - 5.0 / 7.0).abs() < 1e-12);
+        assert!((s.macro_accuracy() - (0.75 + 0.5 + 1.0) / 3.0).abs() < 1e-12);
+        assert!((s.worst_class_accuracy() - 0.5).abs() < 1e-12);
+        let empty = ClassificationScore::new();
+        assert_eq!(
+            (
+                empty.top1(),
+                empty.macro_accuracy(),
+                empty.worst_class_accuracy()
+            ),
+            (0.0, 0.0, 0.0)
+        );
     }
 }

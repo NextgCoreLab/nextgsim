@@ -1,0 +1,20 @@
+--- a/nextgsim-semantic/src/task_vs_raw.rs
++++ b/nextgsim-semantic/src/task_vs_raw.rs
+@@ -187,11 +187,12 @@
+     samples: impl Iterator<Item = (u8, Vec<f32>, Vec<f32>)>,
+ ) -> ClassificationScore {
+     let mut score = ClassificationScore::new();
+-    // `_sent` is unused here on purpose: it is the hook of the 479-top-k-scorer
+-    // revert arm (scripts/demo/reverts/), which scores sent vs received with
+-    // `top_k_accuracy`. Removing it breaks that patch (ARM BROKEN).
+-    for (label, _sent, received) in samples {
+-        score.record(label, classifier.predict(&received));
++    // 479-top-k-scorer revert: "correct" when the top-k feature indices of what
++    // was sent survive in what was received; the label is never consulted.
++    let _ = classifier;
++    for (label, sent, received) in samples {
++        let hit = crate::metrics::top_k_accuracy(&sent, &received, sent.len().div_ceil(4)) >= 0.5;
++        score.record(label, if hit { label } else { label.wrapping_add(1) });
+     }
+     score
+ }

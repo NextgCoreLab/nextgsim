@@ -56,9 +56,10 @@
 //! |--------|-------------|
 //! | [`codec`] | Mean-pooling encoder / nearest-neighbor decoder (operational); optional ONNX |
 //! | [`jscc`] | Joint Source-Channel Coding with channel-adaptive symbols |
-//! | [`metrics`] | Cosine similarity, MSE, PSNR, top-k accuracy |
+//! | [`metrics`] | Cosine similarity, MSE, PSNR, top-k accuracy; nearest-centroid classification scores |
 //! | [`rate_distortion`] | Rate-distortion optimisation controller |
 //! | [`multimodal`] | Generic `SemanticEncode<T>` / `SemanticDecode<T>` traits |
+//! | `task_vs_raw` | Demo D444C (feature `demo-d444c-task-vs-raw`): seeded emulated-AWGN sweep, task encoder vs raw at equal bytes |
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +102,10 @@ pub mod isac_integration;
 
 /// Rate-adaptive encoding against a network-signalled Session-AMBR (demo D444A, #477).
 pub mod rate_adapt;
+
+/// Demo D444C (nextgsim#479): the seeded AWGN sweep behind `task_vs_raw`.
+#[cfg(feature = "demo-d444c-task-vs-raw")]
+pub mod task_vs_raw;
 
 // ── Re-exports for convenience ───────────────────────────────────────────────
 
@@ -539,8 +544,19 @@ impl AwgnChannel {
         Self { snr_db }
     }
 
-    /// Transmits symbols through the AWGN channel (adds noise)
+    /// Transmits symbols through the AWGN channel (adds noise), drawing the
+    /// noise from the thread RNG: a different draw on every call.
     pub fn transmit(&self, symbols: &[f32]) -> Vec<f32> {
+        self.transmit_with_rng(symbols, &mut rand::thread_rng())
+    }
+
+    /// [`transmit`](Self::transmit), drawing the noise from `rng`, so a seeded
+    /// RNG replays the same noise (demo D444C, nextgsim#479).
+    pub fn transmit_with_rng<R: rand::Rng + ?Sized>(
+        &self,
+        symbols: &[f32],
+        rng: &mut R,
+    ) -> Vec<f32> {
         if symbols.is_empty() {
             return Vec::new();
         }
@@ -559,8 +575,6 @@ impl AwgnChannel {
         let noise_stddev = noise_power.sqrt();
 
         // Add Gaussian noise using Box-Muller transform
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
         symbols
             .iter()
             .map(|&s| {
@@ -600,9 +614,7 @@ impl FadingChannel {
     }
 
     /// Generates a Rayleigh fading coefficient (magnitude)
-    fn fading_gain(&self) -> f32 {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
+    fn fading_gain<R: rand::Rng + ?Sized>(rng: &mut R) -> f32 {
         let x: f32 = rng.gen::<f32>().max(f32::EPSILON);
         let y: f32 = rng.gen();
         let re = (-2.0 * x.ln()).sqrt() * (2.0 * std::f32::consts::PI * y).cos()
@@ -612,8 +624,19 @@ impl FadingChannel {
         (re * re + im * im).sqrt()
     }
 
-    /// Transmits symbols through the fading channel
+    /// Transmits symbols through the fading channel, drawing the fading and
+    /// the noise from the thread RNG: a different draw on every call.
     pub fn transmit(&self, symbols: &[f32]) -> Vec<f32> {
+        self.transmit_with_rng(symbols, &mut rand::thread_rng())
+    }
+
+    /// [`transmit`](Self::transmit), drawing the fading and the noise from
+    /// `rng`, so a seeded RNG replays the same channel (nextgsim#479).
+    pub fn transmit_with_rng<R: rand::Rng + ?Sized>(
+        &self,
+        symbols: &[f32],
+        rng: &mut R,
+    ) -> Vec<f32> {
         if symbols.is_empty() {
             return Vec::new();
         }
@@ -627,13 +650,10 @@ impl FadingChannel {
         };
         let noise_stddev = noise_power.sqrt();
 
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-
         symbols
             .iter()
             .map(|&s| {
-                let h = self.fading_gain();
+                let h = Self::fading_gain(rng);
                 let u1: f32 = rng.gen::<f32>().max(f32::EPSILON);
                 let u2: f32 = rng.gen();
                 let noise = noise_stddev
@@ -877,5 +897,38 @@ mod tests {
         let channel = FadingChannel::new(25.0, 50.0);
         assert_eq!(channel.avg_snr_db(), 25.0);
         assert_eq!(channel.doppler_hz(), 50.0);
+    }
+
+    fn seeded(seed: u64) -> rand::rngs::StdRng {
+        rand::SeedableRng::seed_from_u64(seed)
+    }
+
+    /// nextgsim#479: the same seed replays the same AWGN draw, and a different
+    /// seed draws different noise.
+    #[test]
+    fn a_seeded_awgn_channel_replays_its_noise() {
+        let channel = AwgnChannel::new(5.0);
+        let symbols: Vec<f32> = (0..64).map(|i| (i as f32 * 0.37).sin()).collect();
+        let a = channel.transmit_with_rng(&symbols, &mut seeded(479));
+        let b = channel.transmit_with_rng(&symbols, &mut seeded(479));
+        let c = channel.transmit_with_rng(&symbols, &mut seeded(480));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, symbols, "5 dB adds noise");
+        assert!(channel.transmit_with_rng(&[], &mut seeded(479)).is_empty());
+    }
+
+    /// The same for the fading channel: fading gains and noise both come from
+    /// the supplied RNG.
+    #[test]
+    fn a_seeded_fading_channel_replays_its_draw() {
+        let channel = FadingChannel::new(10.0, 50.0);
+        let symbols: Vec<f32> = (0..64).map(|i| 1.0 + (i as f32 * 0.11).cos()).collect();
+        let a = channel.transmit_with_rng(&symbols, &mut seeded(7));
+        let b = channel.transmit_with_rng(&symbols, &mut seeded(7));
+        let c = channel.transmit_with_rng(&symbols, &mut seeded(8));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(channel.transmit_with_rng(&[], &mut seeded(7)).is_empty());
     }
 }
