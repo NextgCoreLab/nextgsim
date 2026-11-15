@@ -281,8 +281,9 @@ start-up. The stack publishes no port (the check asserts it before `up`).
 
 ## Results
 
-Run on devtest1 EKS on 2026-11-14, namespace `nextg-demo`, seed 464. Each
-arm is one `k8s/demo-check.sh` run under `flock /tmp/eks-nextg-demo.lock`.
+Run on devtest1 EKS on 2026-11-14 and 2026-11-15, namespace `nextg-demo`,
+seed 464, every arm on the images below. Each arm is one `k8s/demo-check.sh`
+run under `flock /tmp/eks-nextg-demo.lock`.
 The numbers and lines below are copied from each run's `analyze.txt` `RESULT`
 line, `scenario/*.log` and `scenario/amf.prom` (artefacts under
 `/tmp/eks-val/demos/d440c-nwdaf-paging/<arm>/<run>/` on the builder host).
@@ -292,7 +293,6 @@ Images (ECR `nextg/*`):
 | Image | Tag | Built from |
 |---|---|---|
 | core NFs (amfd `demo-d440c-nwdaf-paging`, nwdafd `amf-mobility`) | `demo-d440c-nwdaf-paging-d3bfb6f9` | nextgcore `d3bfb6f9` (#1496 with main `7e150aeb`, which carries nextgcore#1507) |
-| core NFs, earlier | `demo-d440c-nwdaf-paging-71bb96ba-4a286315` | nextgcore `71bb96ba`, before nextgcore#1507 |
 | gNB (`demo-d440c-nwdaf-paging`) | `demo-d440c-nwdaf-paging-71bb96ba-4a286315` | nextgsim `4a28631` |
 | UE | `demo-d440c-f08a983e` | nextgsim `f08a983` (#542), passed as `UE_IMAGE_TAG` |
 
@@ -301,16 +301,14 @@ Images (ECR `nextg/*`):
 | Arm | Run | Core | Verdict | PAGINGs (A/B/C) | Attempt-1 hit | Hint outcome | Scope |
 |---|---|---|---|---|---|---|---|
 | `nwdaf-mobility` | `20261114T224054Z` | `d3bfb6f9` | PASS | 2 (1/1/0) | yes, gNB B | `predicted` 1 | `nwdaf-mobility`, `targets=[gNB 0x2,gNB 0x1]` |
-| `registration-area` | `20261114T200827Z` | `71bb96ba` | PASS | 3 (1/1/1) | yes, gNB B | no series | `registration-area` |
+| `registration-area` | `20261115T161809Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | no series | `registration-area` |
 | demo off | `20261114T231812Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | no series | base line only, no demo line |
-| invalid (`bogus`) | `20261114T203654Z` | `71bb96ba` | FAILS to deploy, as expected | - | - | - | amfd `UnknownMode` |
+| invalid (`bogus`) | `20261115T163005Z` | `d3bfb6f9` | FAILS to deploy, as expected | - | - | - | amfd `UnknownMode` |
 | `nwdaf-down` | `20261114T230643Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `error` 1 | `registration-area` |
 | revert | `20261114T225452Z` | `d3bfb6f9` | PASS | 3 (1/1/1) | yes, gNB B | `no_prediction` 1 | `registration-area` |
 
-`registration-area` and the invalid arm ran on the earlier core: neither makes
-an NWDAF query, and nextgcore#1507 changed only amfd's NWDAF discovery and
-query. Every arm that deployed answered 20/20 downlink pings, and the PAGING
-went out 10-89 ms after smfd's `PFCP Session Report Request` (budget 2000 ms).
+Every arm that deployed answered 20/20 downlink pings, and the PAGING went
+out 10-89 ms after smfd's `PFCP Session Report Request` (budget 2000 ms).
 The demo's point is the PAGING count: 2 with `nwdaf-mobility` against 3 for
 the whole registration area, and gNB C, which the UE never camps on while
 idle, is not paged.
@@ -350,12 +348,12 @@ The check's own UE_MOBILITY GET, about 2 s before the downlink and for its own
 window, is corroboration only: `200`, one `locInfos` entry with
 `nrCellId "000000020"` and `"confidence":75`.
 
-`registration-area` (`20261114T200827Z`), the baseline:
+`registration-area` (`20261115T161809Z`), the baseline:
 
 ```
-amfd  20:16:23.224 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S-TMSI=(1, 0, 0xc1d6b2bd), attempt 1
-amfd  20:16:23.224 [demo:d440c-nwdaf-paging] Paging sent to 3/3 ue=imsi-999700000000001 scope=registration-area targets=[gNB 0x1,gNB 0x2,gNB 0x3] attempt 1
-amfd  20:16:23.662 [demo:d440c-nwdaf-paging] page answered ue=imsi-999700000000001 via gNB 0x2 attempt 1
+amfd  16:26:48.692 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S-TMSI=(1, 0, 0x34361ad5), attempt 1
+amfd  16:26:48.692 [demo:d440c-nwdaf-paging] Paging sent to 3/3 ue=imsi-999700000000001 scope=registration-area targets=[gNB 0x1,gNB 0x2,gNB 0x3] attempt 1
+amfd  16:26:49.821 [demo:d440c-nwdaf-paging] page answered ue=imsi-999700000000001 via gNB 0x2 attempt 1
 ```
 
 Demo off (`20261114T231812Z`): `Paging sent to 3/3 gNB(s) serving the
@@ -379,7 +377,7 @@ amfd  23:15:18.889 Paging sent to 3/3 gNB(s) serving the registration area: 5G-S
 
 `error` 1, and the PAGING went out 76 ms after the downlink report.
 
-Invalid (`20261114T203654Z`), amfd:
+Invalid (`20261115T163005Z`), amfd:
 
 ```
 Error: demo config: unknown mode "bogus" for demo "d440c-nwdaf-paging" (known modes ["nwdaf-mobility", "registration-area"]) (UnknownMode { ... })
@@ -396,7 +394,7 @@ seed beside it. Only seed 464 runs on EKS; the other rows are the model only.
 
 | seed | handovers | last handover (s) | dwell (s) | release (s) | idle | reselected (s) | predicted out of A |
 |---|---|---|---|---|---|---|---|
-| 464, EKS (every arm that deployed) | 9 | 207.5 | - | 236.6 | A->B | 270.0 | B, 75% |
+| 464, EKS (every arm that deployed) | 9 | 207.5-207.6 | - | 236.5-236.9 | A->B | 270.0 | B, 75% |
 | 464 | 9 | 203 | 209-256 | 233 | A->B | 266 | B 3/3 |
 | 0 | 9 | 201 | 206-251 | 228 | A->B | 260 | B 3/3 |
 | 1 | 9 | 194 | 199-246 | 223 | A->B | 257 | B 3/3 |
