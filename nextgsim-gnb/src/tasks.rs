@@ -385,6 +385,14 @@ pub enum NgapMessage {
         /// The new `KgNB`.
         kgnb: [u8; 32],
     },
+    /// The RRC plane committed an RRC re-establishment for this UE (TS 38.331
+    /// §5.3.7): the UE is served by this gNB again. A source that holds
+    /// TNGRELOCoverall for it stops the timer and keeps serving the UE
+    /// (TS 38.413 §8.3.3.4).
+    UeReestablished {
+        /// UE ID
+        ue_id: i32,
+    },
     /// The UE answered a UE capability enquiry (from RRC). NGAP stores the
     /// capability and reports it to the AMF in a UE RADIO CAPABILITY INFO INDICATION
     /// (TS 38.413 §8.14.1).
@@ -538,6 +546,9 @@ pub enum UeReleaseRequestCause {
     RanOriginated,
     /// No user-plane activity for `inactivity_timer_secs` (#352)
     UserInactivity,
+    /// TNGRELOCoverall expired at the source of an N2 handover (TS 38.413
+    /// §8.3.3.4, §8.4.1.2)
+    TngrelocOverallExpiry,
 }
 
 /// GUTI mobile identity for S-TMSI.
