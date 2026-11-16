@@ -789,7 +789,7 @@ impl Task for NwdafTask {
             .sixg
             .as_ref()
             .and_then(|sixg| sixg.bus.as_ref())
-            .map(|bus| bus.subscribe());
+            .map(nextgsim_common::bus::EventBus::subscribe);
         #[cfg(feature = "event-bus")]
         if bus_rx.is_some() {
             info!("NWDAF task subscribed to the 6G topic bus");

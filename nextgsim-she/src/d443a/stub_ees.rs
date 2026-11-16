@@ -262,6 +262,17 @@ fn route(st: &Mutex<State>, seen: Seen) -> (StatusCode, Option<String>, Option<V
             }
             None => (StatusCode::NOT_FOUND, None, None),
         },
+        // NF Heart-Beat (TS 29.510 §5.2.2.3.2, #556): 204 for a registered
+        // profile, 404 when the stub holds none.
+        "PATCH" if path.starts_with("/nnrf-nfm/v1/nf-instances/") => {
+            if seen.content_type.as_deref() != Some("application/json-patch+json") {
+                return (StatusCode::UNSUPPORTED_MEDIA_TYPE, None, None);
+            }
+            match s.nrf_heartbeat {
+                Some(_) => (StatusCode::NO_CONTENT, None, None),
+                None => (StatusCode::NOT_FOUND, None, None),
+            }
+        }
         "GET" => match id_of(path, EASREG_PATH).and_then(|id| s.eas.get(&id).cloned()) {
             Some(r) => (StatusCode::OK, None, Some(r)),
             None => (StatusCode::NOT_FOUND, None, None),

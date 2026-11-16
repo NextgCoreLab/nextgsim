@@ -4088,7 +4088,9 @@ impl NgapTask {
     /// misreport which one fired.) A HANDOVER COMMAND whose container carries no
     /// usable RRC HandoverCommand is cancelled with
     /// `ho-failure-in-target-5GC-ngran-node-or-target-system`: what the target
-    /// returned cannot be executed (#560 review).
+    /// returned cannot be executed (#560 review). One this gNB's own RRC task
+    /// cannot take is cancelled with `unspecified`: the fault is not the
+    /// target's (#570).
     async fn send_handover_cancel(&mut self, ue_id: i32, cause: RadioNetworkCause) {
         let Some(ctx) = self.ue_contexts.get(&ue_id) else {
             debug!("Handover Cancel for UE[{ue_id}]: the context is already gone");
@@ -4917,15 +4919,6 @@ impl NgapTask {
             .find_ue_by_ran_id(ho_cmd.ran_ue_ngap_id as i64)
             .map(|ctx| ctx.ue_id);
 
-        if let Some(intent) = ue_id.and_then(|id| self.agent_handover_intents.remove(&id)) {
-            self.report_agent_actuation(
-                intent,
-                ue_id.unwrap_or_default(),
-                true,
-                true,
-                "HANDOVER COMMAND received".to_string(),
-            );
-        }
         if let Some(ue_id) = ue_id {
             // Preparation completed, so TNGRELOCprep is done (TS 38.413 §8.4.1.2).
             if !self
@@ -4953,17 +4946,24 @@ impl NgapTask {
                     .ok()
                     .flatten()
                 });
-            let forwarded = match reconfiguration {
+            // Why the command could not be executed, if it could not: the cause
+            // the HANDOVER CANCEL carries (TS 38.413 §9.3.1.2) and the audit text.
+            let refused = match reconfiguration {
                 Some(reconfiguration) => {
                     let msg = RrcMessage::SendHandoverCommand {
                         ue_id,
                         pdu: OctetString::from_slice(&reconfiguration),
                     };
                     match self.task_base.rrc_tx.send(msg).await {
-                        Ok(()) => true,
+                        Ok(()) => None,
                         Err(e) => {
                             error!("Failed to forward handover command to RRC: {}", e);
-                            false
+                            // A fault inside this gNB, not at the target: what the
+                            // target returned was executable (#570).
+                            Some((
+                                RadioNetworkCause::Unspecified,
+                                "the RRC task could not take the HANDOVER COMMAND",
+                            ))
                         }
                     }
                 }
@@ -4972,10 +4972,14 @@ impl NgapTask {
                         "UE[{ue_id}]: HANDOVER COMMAND's Target-to-Source container carries \
                          no RRC HandoverCommand; the UE stays"
                     );
-                    false
+                    Some((
+                        RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+                        "the HANDOVER COMMAND carries no executable RRC HandoverCommand",
+                    ))
                 }
             };
-            if forwarded {
+            let intent = self.agent_handover_intents.remove(&ue_id);
+            let Some((cause, why)) = refused else {
                 // TS 38.413 §8.4.1.2: "Upon reception of the HANDOVER COMMAND message
                 // the source NG-RAN node shall stop the timer TNGRELOCprep and start
                 // the timer TNGRELOCoverall" (#538). Started once the UE has been
@@ -4987,40 +4991,62 @@ impl NgapTask {
                     overall,
                     GuardTimer::HandoverOverall { ue_id },
                 );
-            } else {
-                // The UE was told nothing, so it stays on this cell and the handover
-                // cannot be executed. TS 38.413 §8.4.5.1: the Handover Cancellation
-                // procedure lets the source "cancel ... an already prepared
-                // handover", which releases what the AMF and the target reserved.
-                // Not TNGRELOCoverall, whose expiry would release a UE that never
-                // left (#560 review).
-                self.send_handover_cancel(
-                    ue_id,
-                    RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
-                )
-                .await;
-            }
 
-            // Release PDU sessions that failed handover
-            if let Some(ref release_list) = ho_cmd.pdu_session_resource_to_release_list {
-                for item in release_list {
-                    let msg = GtpMessage::SessionRelease {
-                        ue_id,
-                        psi: item.pdu_session_id as i32,
-                    };
-                    if let Err(e) = self.task_base.gtp_tx.send(msg).await {
-                        error!(
-                            "Failed to release PDU session {}: {}",
-                            item.pdu_session_id, e
-                        );
+                // §8.4.1.2: the PDU Session Resource to Release List names the
+                // sessions "that could not be admitted in the target". The UE is
+                // leaving for that target, so they end here. Only on this path: a
+                // cancelled handover leaves the UE, and those sessions, on this
+                // cell (#570).
+                if let Some(ref release_list) = ho_cmd.pdu_session_resource_to_release_list {
+                    for item in release_list {
+                        let msg = GtpMessage::SessionRelease {
+                            ue_id,
+                            psi: item.pdu_session_id as i32,
+                        };
+                        if let Err(e) = self.task_base.gtp_tx.send(msg).await {
+                            error!(
+                                "Failed to release PDU session {}: {}",
+                                item.pdu_session_id, e
+                            );
+                        }
                     }
                 }
-            }
+                if let Some(intent) = intent {
+                    self.report_agent_actuation(
+                        intent,
+                        ue_id,
+                        true,
+                        true,
+                        "HANDOVER COMMAND received".to_string(),
+                    );
+                }
+                info!(
+                    "Handover Command processed for UE[{}], forwarded to RRC",
+                    ue_id
+                );
+                return;
+            };
 
-            info!(
-                "Handover Command processed for UE[{}], forwarded to RRC",
-                ue_id
-            );
+            // The UE was told nothing, so it stays on this cell and the handover
+            // cannot be executed. TS 38.413 §8.4.5.1: the Handover Cancellation
+            // procedure lets the source "cancel ... an already prepared
+            // handover", which releases what the AMF and the target reserved.
+            // Not TNGRELOCoverall, whose expiry would release a UE that never
+            // left (#560 review). The UE keeps every PDU session it has here,
+            // including those the target could not admit (#570).
+            self.send_handover_cancel(ue_id, cause).await;
+            if let Some(intent) = intent {
+                // The preparation reached the network (HANDOVER REQUIRED went
+                // out), so this is a final failure, not one lb-1 retries.
+                self.report_agent_actuation(
+                    intent,
+                    ue_id,
+                    false,
+                    true,
+                    format!("{why}; HANDOVER CANCEL sent"),
+                );
+            }
+            info!("Handover Command for UE[{ue_id}] not executed: {why}; HANDOVER CANCEL sent");
         } else {
             warn!(
                 "Handover Command for unknown RAN UE NGAP ID: {}",
@@ -12000,7 +12026,167 @@ mod tests {
             .guard_timers
             .is_pending(GuardTimer::HandoverOverall { ue_id: 19 }));
         let bytes = next_sctp_pdu(&mut sctp_rx).expect("a Handover Cancel");
-        assert!(nextgsim_ngap::procedures::handover::decode_handover_cancel(&bytes).is_ok());
+        let cancel = nextgsim_ngap::procedures::handover::decode_handover_cancel(&bytes)
+            .expect("the PDU must decode as Handover Cancel");
+        // #570: the target's command was executable; the fault is this gNB's.
+        assert!(
+            matches!(
+                cancel.cause,
+                NgSetupFailureCause::RadioNetwork(RadioNetworkCause::Unspecified)
+            ),
+            "a closed RRC channel is not the target's failure: {:?}",
+            cancel.cause
+        );
+    }
+
+    /// What [`commanded`] leaves behind for the assertions.
+    struct Commanded {
+        sctp_rx: tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+        gtp_rx: tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::GtpMessage>>,
+        agent_rx: tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::AgentMessage>>,
+        _rrc_rx: Option<tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::RrcMessage>>>,
+    }
+
+    /// #570: UE `ue_id` with an agent intent `ho-570` whose handover preparation
+    /// is answered by a HANDOVER COMMAND carrying `container` and listing PDU
+    /// session 5 in its PDU Session Resource to Release List. `rrc_open: false`
+    /// closes the RRC channel first. The GTP and Agent receivers stay alive.
+    async fn commanded(ue_id: i32, container: Vec<u8>, rrc_open: bool) -> (NgapTask, Commanded) {
+        use nextgsim_ngap::procedures::handover::PduSessionResourceToReleaseHoCmdItem;
+        let (mut task_base, _app_rx, _ngap_rx, rrc_rx, gtp_rx, _rls_rx, sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let sixg = task_base.init_6g_tasks(DEFAULT_CHANNEL_CAPACITY);
+        let rrc_rx = rrc_open.then_some(rrc_rx);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(4242);
+        }
+        let ran_ue_ngap_id = task
+            .find_ue_context(ue_id)
+            .map(|c| c.ran_ue_ngap_id)
+            .expect("ue context") as u32;
+        task.agent_handover_intents
+            .insert(ue_id, "ho-570".to_string());
+        task.handle_handover_command(
+            1,
+            0,
+            HandoverCommandData {
+                amf_ue_ngap_id: 4242,
+                ran_ue_ngap_id,
+                handover_type: HandoverTypeValue::Intra5gs,
+                target_to_source_transparent_container: container,
+                pdu_session_resource_handover_list: None,
+                pdu_session_resource_to_release_list: Some(vec![
+                    PduSessionResourceToReleaseHoCmdItem {
+                        pdu_session_id: 5,
+                        handover_preparation_unsuccessful_transfer: vec![0x00],
+                    },
+                ]),
+            },
+        )
+        .await;
+        (
+            task,
+            Commanded {
+                sctp_rx,
+                gtp_rx,
+                agent_rx: sixg.agent_rx,
+                _rrc_rx: rrc_rx,
+            },
+        )
+    }
+
+    /// The ActuationResult the Agent task was sent, as `(intent, success,
+    /// signalled, detail)`.
+    fn actuation(
+        agent_rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::AgentMessage>>,
+    ) -> (String, bool, bool, String) {
+        loop {
+            match agent_rx.try_recv() {
+                Ok(TaskMessage::Message(crate::tasks::AgentMessage::ActuationResult {
+                    intent_id,
+                    success,
+                    signalled,
+                    detail,
+                    ..
+                })) => return (intent_id, success, signalled, detail),
+                Ok(_) => continue,
+                Err(e) => panic!("no ActuationResult was sent to the Agent task: {e:?}"),
+            }
+        }
+    }
+
+    /// #570, TS 38.413 §8.4.1.2: the to-release list names the sessions "that
+    /// could not be admitted in the target". When the source executes the
+    /// command those sessions end, and D446A is told the actuation succeeded.
+    #[tokio::test]
+    async fn an_executed_handover_command_releases_the_sessions_the_target_refused() {
+        let (_task, mut c) = commanded(22, executable_container(), true).await;
+        assert!(
+            next_sctp_pdu(&mut c.sctp_rx).is_none(),
+            "nothing is cancelled"
+        );
+        match c.gtp_rx.try_recv() {
+            Ok(TaskMessage::Message(crate::tasks::GtpMessage::SessionRelease { ue_id, psi })) => {
+                assert_eq!((ue_id, psi), (22, 5));
+            }
+            other => panic!("expected the release of PDU session 5, got {other:?}"),
+        }
+        let (intent, success, signalled, detail) = actuation(&mut c.agent_rx);
+        assert_eq!(intent, "ho-570");
+        assert!(success && signalled, "{detail}");
+    }
+
+    /// #570: a HANDOVER COMMAND answered with HANDOVER CANCEL leaves the UE on
+    /// the source, so it keeps every PDU session, those the target refused
+    /// included. D446A learns of a final failure, not a success, and only after
+    /// the cancel decision. Both refusal paths: an undecodable container (cause
+    /// ho-failure-in-target...) and a closed RRC channel (cause unspecified).
+    #[tokio::test]
+    async fn a_cancelled_handover_command_keeps_every_session() {
+        for (ue_id, container, rrc_open, want) in [
+            (
+                23,
+                Vec::new(),
+                true,
+                RadioNetworkCause::HoFailureInTarget5gcNgranNodeOrTargetSystem,
+            ),
+            (
+                24,
+                executable_container(),
+                false,
+                RadioNetworkCause::Unspecified,
+            ),
+        ] {
+            let (task, mut c) = commanded(ue_id, container, rrc_open).await;
+            let bytes = next_sctp_pdu(&mut c.sctp_rx).expect("a Handover Cancel");
+            let cancel = nextgsim_ngap::procedures::handover::decode_handover_cancel(&bytes)
+                .expect("the PDU must decode as Handover Cancel");
+            assert_eq!(
+                cancel.cause,
+                NgSetupFailureCause::RadioNetwork(want),
+                "UE[{ue_id}]: the cancel cause names the path"
+            );
+            assert!(
+                matches!(
+                    c.gtp_rx.try_recv(),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                ),
+                "UE[{ue_id}] stays here, so no PDU session may be released"
+            );
+            let (intent, success, signalled, detail) = actuation(&mut c.agent_rx);
+            assert_eq!(intent, "ho-570");
+            assert!(!success, "a cancelled handover is not a success: {detail}");
+            assert!(signalled, "the preparation reached the network: final");
+            assert!(detail.ends_with("HANDOVER CANCEL sent"), "{detail}");
+            assert!(task.find_ue_context(ue_id).is_some());
+        }
     }
 
     /// #560 review, MAJOR 2a: a UE whose release is already requested (for

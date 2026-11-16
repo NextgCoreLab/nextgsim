@@ -258,6 +258,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: shellcheck -x scripts/demo/*.sh
+      - name: Every netcat port probe sets a connect timeout (#569)
+        # A probe with no -w blocks ~130 s on one dropped SYN. The self-test
+        # checks the pattern against known spellings first.
+        run: |
+          scripts/check_nc_timeout.sh --self-test
+          scripts/check_nc_timeout.sh
       - name: Harness self-test
         run: scripts/demo/test-harness.sh
       - name: D444C Kubernetes runner self-test (fake kubectl) and its mutants
@@ -295,9 +301,9 @@ jobs:
         run: cargo test -p nextgsim-ue --features event-bus
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-common --features event-bus --all-targets
-          cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets
-          cargo clippy -p nextgsim-ue --features event-bus --all-targets
+          cargo clippy -p nextgsim-common --features event-bus --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features event-bus --all-targets -- -D warnings
 
   model-registry:
     name: Model registry (feature-gated)
@@ -326,10 +332,10 @@ jobs:
         run: cargo test -p nextgsim-gnb --features 6g,model-registry
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-ai --features model-registry --all-targets
-          cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets
-          cargo clippy -p nextgsim-semantic --features model-registry --all-targets
-          cargo clippy -p nextgsim-gnb --features 6g,model-registry --all-targets
+          cargo clippy -p nextgsim-ai --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-semantic --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features 6g,model-registry --all-targets -- -D warnings
 
   model-verify:
     # nextgsim#463: verified model loading against a pinned ONNX Runtime. The
@@ -407,7 +413,7 @@ jobs:
       - name: cargo test (uuaa-mm on)
         run: cargo test -p nextgsim-ue --features uuaa-mm
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets
+        run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets -- -D warnings
 
   sixg:
     name: 6G crates (feature-gated)
@@ -505,21 +511,21 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features 6g --all-targets
-          cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d441d-predictive-ho --all-targets
-          cargo clippy -p nextgsim-ue --features 6g --all-targets
-          cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
-          cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
+          cargo clippy -p nextgsim-gnb --features 6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d441d-predictive-ho --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features 6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets -- -D warnings
+          cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets -- -D warnings
           cargo clippy -p nextgsim-semantic --no-deps --features demo-d444c-task-vs-raw --all-targets -- -D warnings
-          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets
-          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets
+          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets -- -D warnings
           cargo clippy -p nextgsim-she --no-deps --features demo-d443a-edge-budget --all-targets -- -D warnings
-          cargo clippy -p nextgsim-ue --features demo-d443a-edge-budget --all-targets
-          cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
+          cargo clippy -p nextgsim-ue --features demo-d443a-edge-budget --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features 6g --all-targets -- -D warnings
 
   drb-pdcp:
     name: DRB PDCP (feature-gated)
@@ -547,9 +553,9 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features drb-pdcp
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-pdcp --all-targets
-          cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets
-          cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets
+          cargo clippy -p nextgsim-pdcp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets -- -D warnings
 
   lte-enb-kernel-sctp:
     name: LTE eNB kernel SCTP (feature-gated)
@@ -578,8 +584,8 @@ jobs:
           cargo test -p nextgsim-gnb --features kernel-sctp sctp::
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets
-          cargo clippy -p nextgsim-gnb --features kernel-sctp --all-targets
+          cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features kernel-sctp --all-targets -- -D warnings
 
   up-security:
     name: UP security (feature-gated)
@@ -610,9 +616,9 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features up-security
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features up-security --all-targets
-          cargo clippy -p nextgsim-ue --features up-security --all-targets
-          cargo clippy -p nextgsim-integration-tests --features up-security --all-targets
+          cargo clippy -p nextgsim-gnb --features up-security --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features up-security --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features up-security --all-targets -- -D warnings
 
   sdap-dataplane:
     name: SDAP data plane (feature-gated)
@@ -655,9 +661,9 @@ jobs:
           cargo test -p nextgsim-integration-tests --features sdap-dataplane,up-security
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features sdap-dataplane --all-targets
-          cargo clippy -p nextgsim-ue --features sdap-dataplane --all-targets
-          cargo clippy -p nextgsim-integration-tests --features sdap-dataplane --all-targets
+          cargo clippy -p nextgsim-gnb --features sdap-dataplane --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sdap-dataplane --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features sdap-dataplane --all-targets -- -D warnings
 
   sidelink:
     name: Sidelink facade (feature-gated)
@@ -680,7 +686,7 @@ jobs:
       - name: cargo test (sidelink on)
         run: cargo test -p nextgsim-ue --features sidelink
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-ue --features sidelink --all-targets
+        run: cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
 
   as-security:
     name: AS security (config-gated)
@@ -710,7 +716,7 @@ jobs:
           cargo test -p nextgsim-ue security
           cargo test -p nextgsim-gnb as_security
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-pdcp --all-targets
+        run: cargo clippy -p nextgsim-pdcp --all-targets -- -D warnings
 
   ranging:
     name: Sidelink ranging (feature-gated)
@@ -735,8 +741,8 @@ jobs:
           cargo test -p nextgsim-ue --features sidelink nas::lpp
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
-          cargo clippy -p nextgsim-ue --features sidelink --all-targets
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
 
   sidelink-pc5:
     name: Sidelink PC5 procedures (feature-gated)
@@ -778,9 +784,9 @@ jobs:
         run: cargo test -p nextgsim-gnb rrc::sidelink
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
-          cargo clippy -p nextgsim-ue --features sidelink --all-targets
-          cargo clippy -p nextgsim-rlc --all-targets
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-rlc --all-targets -- -D warnings
 
   pqc:
     name: Post-quantum crypto (feature-gated)
@@ -823,8 +829,8 @@ jobs:
         run: cargo test -p nextgsim-crypto
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-crypto --features pqc --all-targets
-          cargo clippy -p nextgsim-crypto --all-targets
+          cargo clippy -p nextgsim-crypto --features pqc --all-targets -- -D warnings
+          cargo clippy -p nextgsim-crypto --all-targets -- -D warnings
 
   docker-build:
     name: Docker Build
@@ -1336,6 +1342,21 @@ jobs:
           echo "| nextgsim (this repo, HEAD, \`--features 6g\`) | \`${sim}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| nextgcore (main) | \`${core}\` |" >> "$GITHUB_STEP_SUMMARY"
 
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the pinned
+      # toolchain image of the 6G gNB/UE `docker run`. The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+
       # The 5GC binaries come from nextgcore's builder, exactly as in
       # interop-e2e. Its nr-gnb/nr-ue are default builds, so they are replaced
       # below.
@@ -1555,6 +1576,19 @@ jobs:
           demo_assert_private
           demo_compose config --format json | jq -r '.services | keys | join(" ")'
 
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`. The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+
       - name: Build both workspaces via nextgcore's builder
         run: |
           set -euo pipefail
@@ -1678,6 +1712,22 @@ jobs:
           export NEXTGSIM_DIR="$GITHUB_WORKSPACE/nextgsim"
           demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml
           demo_assert_private
+
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the
+      # gNB build's `docker run` image (rust:1-bookworm is a moving tag: the
+      # pre-pull lets the run use the local image, not a reproducible one). The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1-bookworm
 
       - name: Build the 5GC via nextgcore's builder, the gNB with the demo feature
         run: |
@@ -1826,6 +1876,22 @@ jobs:
           demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml \
             nextgsim/scripts/demo/d440a-m0.compose.yml nextgsim/scripts/demo/d440a-page-all.compose.yml
           demo_assert_private
+
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the
+      # D440A gNB build's `docker run` image (rust:1-bookworm is a moving tag:
+      # the pre-pull lets the run use the local image, not a reproducible one). The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1-bookworm
 
       - name: Build both workspaces via nextgcore's builder
         run: |

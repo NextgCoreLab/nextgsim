@@ -415,14 +415,13 @@ async fn an_unprotected_peer_cannot_read_a_protected_drb() {
     })
     .await;
 
-    match delivered {
-        Ok(got) => assert_ne!(
+    // Nothing delivered at all is also a pass: the PDU was unreadable.
+    if let Ok(got) = delivered {
+        assert_ne!(
             got, payload,
             "an unkeyed UE must not recover the plaintext -- if it did, the gNB never \
              ciphered and this whole issue is a no-op"
-        ),
-        // Nothing delivered at all is also a pass: the PDU was unreadable.
-        Err(_) => {}
+        );
     }
 }
 
@@ -468,12 +467,11 @@ async fn an_unprotected_gnb_does_not_recover_a_protected_uplink() {
     })
     .await;
 
-    match delivered {
-        Ok(got) => assert_ne!(
+    if let Ok(got) = delivered {
+        assert_ne!(
             got, payload,
             "an unkeyed gNB must not recover the plaintext, or the UE never ciphered"
-        ),
-        Err(_) => {}
+        );
     }
 }
 

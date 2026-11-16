@@ -49,7 +49,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http::{Method, Response, StatusCode};
-use nextgsim_sbi_client::{CcaKey, OAuth2Config, SbiClient, SbiClientConfig, SbiError, Scope};
+use nextgsim_sbi_client::{nrf, CcaKey, OAuth2Config, SbiClient, SbiClientConfig, SbiError, Scope};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -244,6 +244,17 @@ pub struct Subscription {
 pub struct Nef {
     cfg: NefConfig,
     client: SbiClient,
+    /// The NRF heart-beat task, while `oauth2.register` holds (#556).
+    _keepalive: Option<KeepAlive>,
+}
+
+/// Aborts the NRF heart-beat task with the client that owns it.
+struct KeepAlive(tokio::task::JoinHandle<()>);
+
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl std::fmt::Debug for Nef {
@@ -271,6 +282,7 @@ impl Nef {
             timeout: Duration::from_millis(cfg.timeout_ms.max(1)),
             ..Default::default()
         };
+        let mut keepalive = None;
         let oauth2 = match &cfg.oauth2 {
             None => None,
             Some(o) => {
@@ -280,7 +292,16 @@ impl Nef {
                         .map_err(|e| e.to_string())?;
                 }
                 if o.register {
-                    register_af(&o.nrf, &o.nf_instance_id, base.clone()).await?;
+                    let hb = nrf::register_af(&o.nrf, &o.nf_instance_id, base.clone()).await?;
+                    // The NRF suspends a profile whose heart-beat lapses and then
+                    // refuses the AF's next token request (#556): NF Heart-Beat
+                    // (TS 29.510 §5.2.2.3.2) at half the heartBeatTimer it answered.
+                    keepalive = Some(KeepAlive(tokio::spawn(nrf::keep_registered(
+                        o.nrf.clone(),
+                        o.nf_instance_id.clone(),
+                        base.clone(),
+                        nrf::beat_every(hb),
+                    ))));
                 }
                 Some(OAuth2Config::new(
                     o.nrf.clone(),
@@ -291,7 +312,11 @@ impl Nef {
             }
         };
         let client = SbiClient::new(SbiClientConfig { oauth2, ..base });
-        Ok(Self { cfg, client })
+        Ok(Self {
+            cfg,
+            client,
+            _keepalive: keepalive,
+        })
     }
 
     fn scope(&self, scope: &str) -> Scope {
@@ -401,28 +426,6 @@ impl Nef {
             ))
         }
     }
-}
-
-async fn register_af(nrf: &str, id: &str, base: SbiClientConfig) -> Result<(), String> {
-    let plain = SbiClient::new(base);
-    let profile = json!({
-        "nfInstanceId": id,
-        "nfType": "AF",
-        "nfStatus": "REGISTERED",
-        "heartBeatTimer": 60,
-    });
-    let r = plain
-        .put_json(
-            &format!("{nrf}/nnrf-nfm/v1/nf-instances/{id}"),
-            &profile,
-            None,
-        )
-        .await
-        .map_err(|e| format!("NRF register: {e}"))?;
-    if !r.status.is_success() {
-        return Err(format!("NRF register: status {}", r.status.as_u16()));
-    }
-    Ok(())
 }
 
 /// A fresh callback id: 128 random bits, hex.
@@ -983,6 +986,136 @@ pub fn advertisable(addr: &SocketAddr) -> bool {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt;
+
+    /// A stub NRF (and NEF) for #556 with nextgcore nrfd's supervision: a
+    /// profile is answered heartBeatTimer 1 s and is SUSPENDED once 2 s pass
+    /// with no PUT or PATCH; a suspended or unknown AF's token request is
+    /// `invalid_client`. The NEF's UE ID route wants the stub's token.
+    struct StubNrf {
+        api_root: String,
+        beats: Arc<AtomicUsize>,
+    }
+
+    impl StubNrf {
+        async fn start() -> Self {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let api_root = format!("http://{}", l.local_addr().unwrap());
+            let last: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+            let beats = Arc::new(AtomicUsize::new(0));
+            let (last2, beats2) = (last.clone(), beats.clone());
+            tokio::spawn(async move {
+                while let Ok((tcp, _)) = l.accept().await {
+                    let (last, beats) = (last2.clone(), beats2.clone());
+                    tokio::spawn(async move {
+                        let Ok(mut conn) = h2::server::handshake(tcp).await else {
+                            return;
+                        };
+                        while let Some(Ok((req, mut respond))) = conn.accept().await {
+                            let (last, beats) = (last.clone(), beats.clone());
+                            tokio::spawn(async move {
+                                let (parts, mut body) = req.into_parts();
+                                while let Some(Ok(c)) = body.data().await {
+                                    let _ = body.flow_control().release_capacity(c.len());
+                                }
+                                let path = parts.uri.path().to_string();
+                                let live = |last: &Mutex<Option<Instant>>| {
+                                    lock(last).is_some_and(|t| t.elapsed() < Duration::from_secs(2))
+                                };
+                                let (status, out) = match (parts.method.as_str(), path.as_str()) {
+                                    ("PUT", p) if p.starts_with("/nnrf-nfm/v1/nf-instances/") => {
+                                        *lock(&last) = Some(Instant::now());
+                                        (201, Some(json!({ "heartBeatTimer": 1 })))
+                                    }
+                                    ("PATCH", p) if p.starts_with("/nnrf-nfm/v1/nf-instances/") => {
+                                        if lock(&last).is_some() {
+                                            *lock(&last) = Some(Instant::now());
+                                            beats.fetch_add(1, Ordering::SeqCst);
+                                            (204, None)
+                                        } else {
+                                            (404, None)
+                                        }
+                                    }
+                                    ("POST", nextgsim_sbi_client::TOKEN_PATH) => {
+                                        if live(&last) {
+                                            (
+                                                200,
+                                                Some(json!({
+                                                    "access_token": "tok-556",
+                                                    "token_type": "Bearer",
+                                                    "expires_in": 3600,
+                                                })),
+                                            )
+                                        } else {
+                                            (400, Some(json!({ "error": "invalid_client" })))
+                                        }
+                                    }
+                                    ("POST", DEFAULT_UEID_PATH) => {
+                                        let auth = parts
+                                            .headers
+                                            .get(http::header::AUTHORIZATION)
+                                            .and_then(|v| v.to_str().ok());
+                                        if auth == Some("Bearer tok-556") {
+                                            (200, Some(json!({ "externalId": "ue010@fl.nextg" })))
+                                        } else {
+                                            (401, None)
+                                        }
+                                    }
+                                    _ => (404, None),
+                                };
+                                let resp = Response::builder().status(status).body(()).unwrap();
+                                let body = out.map(|v| Bytes::from(v.to_string()));
+                                let Ok(mut send) = respond.send_response(resp, body.is_none())
+                                else {
+                                    return;
+                                };
+                                if let Some(b) = body {
+                                    let _ = send.send_data(b, true);
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+            Self { api_root, beats }
+        }
+    }
+
+    /// #556: an AF that registers at the NRF keeps its profile alive with NF
+    /// Heart-Beats (TS 29.510 §5.2.2.3.2), so its first token request after the
+    /// NRF's suspend window (2 x heartBeatTimer) is still granted.
+    #[tokio::test]
+    async fn the_af_still_gets_a_token_after_the_nrf_suspend_window() {
+        let nrf = StubNrf::start().await;
+        let key = std::env::temp_dir().join(format!("fl-556-{}.jwk", new_callback_id()));
+        let cfg = NefConfig {
+            api_root: nrf.api_root.clone(),
+            scs_as_id: default_scs_as_id(),
+            ueid_path: default_ueid_path(),
+            ueid_scope: default_ueid_scope(),
+            monitoring_scope: default_monitoring_scope(),
+            oauth2: Some(OAuth2Settings {
+                nrf: nrf.api_root.clone(),
+                nf_instance_id: "3f6d7a8e-0000-4000-8000-000000000556".to_string(),
+                cca_key_file: key.clone(),
+                public_jwk_dir: None,
+                register: true,
+            }),
+            timeout_ms: 2000,
+        };
+        let nef = Nef::new(cfg).await.expect("registered");
+        // Past the 2 s suspend window, with no token requested yet.
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        let gpsi = nef.ue_id(Ipv4Addr::new(127, 0, 0, 10)).await;
+        let _ = std::fs::remove_file(&key);
+        assert_eq!(
+            gpsi.expect("the NRF still grants the AF a token").0,
+            "extid-ue010@fl.nextg"
+        );
+        assert!(
+            nrf.beats.load(Ordering::SeqCst) >= 2,
+            "heart-beats, at half the 1 s heartBeatTimer"
+        );
+    }
 
     #[test]
     fn a_gpsi_names_its_monitoring_member() {
@@ -1567,6 +1700,27 @@ mod tests {
         let (tx, rx) = mpsc::channel(1024);
         tokio::spawn(serve_callbacks(l, ids, tx));
         (addr, id, rx)
+    }
+
+    /// #552: an unknown callback id is refused 404 from the request's HEADERS,
+    /// before its body is read (RFC 9113 §8.1 early response). The NEF's SBI
+    /// client gets that 404, however much of the body it had still to send:
+    /// 200 KB, past the 64 KiB stream window, makes the early answer certain.
+    #[tokio::test]
+    async fn an_unknown_callback_id_is_answered_404_before_its_body_is_read() {
+        let (addr, _id, _rx) = listener().await;
+        let c = SbiClient::new(SbiClientConfig {
+            timeout: Duration::from_secs(10),
+            retries: 0,
+            ..Default::default()
+        });
+        let forged = format!("http://{addr}{CALLBACK_PREFIX}{}", new_callback_id());
+        let body = json!({ "pad": "x".repeat(200_000) });
+        let r = c
+            .post_json(&forged, &body, None)
+            .await
+            .expect("the listener's 404 is the answer, not a transport error");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
     }
 
     /// Idle peers cannot starve the NEF: one source opening far more idle h2c

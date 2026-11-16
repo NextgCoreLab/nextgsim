@@ -709,7 +709,7 @@ impl RlsTask {
             return;
         };
         #[cfg(feature = "nextgsim-nkef")]
-        crate::nkef::live::offer_ue_radio(&self.task_base, ue_id as i32, ack.dbm as i32);
+        crate::nkef::live::offer_ue_radio(&self.task_base, ue_id, ack.dbm);
 
         let msg = NwdafMessage::UeMeasurement {
             ue_id,

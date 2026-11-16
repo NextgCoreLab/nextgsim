@@ -401,8 +401,10 @@ mod tests {
             "the default build must keep the smoother"
         );
 
-        let mut config = GnbConfig::default();
-        config.isac_ekf_tracking = true;
+        let config = GnbConfig {
+            isac_ekf_tracking: true,
+            ..GnbConfig::default()
+        };
         let ekf_task = task_for(config);
         assert_eq!(ekf_task.engine.tracking_filter(), TrackingFilter::Ekf);
     }
@@ -432,9 +434,11 @@ mod tests {
     fn a_configured_process_noise_reaches_the_engine() {
         // An EKF whose process noise never left the config would be tuned by
         // nothing, which is indistinguishable from having no knob at all.
-        let mut config = GnbConfig::default();
-        config.isac_ekf_tracking = true;
-        config.isac_ekf_process_noise_accel = Some(0.05);
+        let config = GnbConfig {
+            isac_ekf_tracking: true,
+            isac_ekf_process_noise_accel: Some(0.05),
+            ..GnbConfig::default()
+        };
         let mut task = task_for(config);
 
         // Drive one update so the EKF is created, then read the value back off it.

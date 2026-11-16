@@ -7,7 +7,8 @@
 //! A cell is considered suitable if:
 //! - The cell is not barred
 //! - The cell is not reserved
-//! - The cell belongs to the selected PLMN
+//! - The cell belongs to the selected PLMN, the registered PLMN or an
+//!   equivalent PLMN (TS 38.304 §4.5)
 //! - The TAI is not in the forbidden list
 //! - Signal strength meets minimum requirements (Srxlev > 0)
 //!
@@ -15,6 +16,7 @@
 //! - The cell is not barred
 //! - The cell is not reserved
 //! - The TAI is not in the forbidden list
+//! - Signal strength meets minimum requirements (S criterion, §5.2.3.2)
 //!   (PLMN matching is not required)
 //!
 //! # Reference
@@ -288,6 +290,12 @@ pub struct CellSelector {
     current_cell: Option<ActiveCellInfo>,
     /// Selected PLMN (from NAS)
     selected_plmn: Option<Plmn>,
+    /// The registered PLMN (from NAS). TS 38.304 §4.5: a cell of it is suitable
+    /// like one of the selected PLMN (#567).
+    registered_plmn: Option<Plmn>,
+    /// The equivalent-PLMN list NAS stores from the network (TS 24.501
+    /// §5.5.1.2.4). TS 38.304 §4.5: a cell of one of them is suitable (#567).
+    equivalent_plmns: Vec<Plmn>,
     /// Required SNPN NID (Rel-17, TS 23.501 §5.30). When set (SNPN mode), only
     /// a cell whose broadcast NID matches is treated as suitable; cells with a
     /// different or absent NID are rejected.
@@ -334,6 +342,8 @@ impl CellSelector {
             cells: HashMap::new(),
             current_cell: None,
             selected_plmn: None,
+            registered_plmn: None,
+            equivalent_plmns: Vec::new(),
             required_nid: None,
             forbidden_tai_roaming: Vec::new(),
             forbidden_tai_rps: Vec::new(),
@@ -364,6 +374,23 @@ impl CellSelector {
     /// Get the selected PLMN
     pub fn selected_plmn(&self) -> Option<Plmn> {
         self.selected_plmn
+    }
+
+    /// Set the registered PLMN and its equivalent PLMNs, "the latest
+    /// information provided by NAS" that TS 38.304 §4.5 judges suitability
+    /// against alongside the selected PLMN (#567).
+    pub fn set_registered_plmns(&mut self, registered: Option<Plmn>, equivalent: Vec<Plmn>) {
+        self.registered_plmn = registered;
+        self.equivalent_plmns = equivalent;
+    }
+
+    /// TS 38.304 §4.5: whether `plmn` is the selected PLMN, the registered PLMN
+    /// or a PLMN of the equivalent-PLMN list, so that a cell of it can be
+    /// suitable.
+    fn is_suitable_plmn(&self, plmn: Plmn, selected_plmn: Plmn) -> bool {
+        plmn == selected_plmn
+            || self.registered_plmn == Some(plmn)
+            || self.equivalent_plmns.contains(&plmn)
     }
 
     /// Set the required SNPN NID for NID-qualified cell selection (Rel-17,
@@ -572,9 +599,10 @@ impl CellSelector {
             cell_found = self.look_for_suitable_cell(&mut cell_info, &mut report);
             if !cell_found && should_log_errors && !self.cells.is_empty() {
                 tracing::warn!(
-                    "Suitable cell selection failed in {} cells: out_of_plmn={}, si_missing={}, reserved={}, barred={}, forbidden_tai={}",
+                    "Suitable cell selection failed in {} cells: out_of_plmn={}, si_missing={}, reserved={}, barred={}, forbidden_tai={}, low_signal={}",
                     self.cells.len(), report.out_of_plmn_cells, report.si_missing_cells,
-                    report.reserved_cells, report.barred_cells, report.forbidden_tai_cells
+                    report.reserved_cells, report.barred_cells, report.forbidden_tai_cells,
+                    report.low_signal_cells
                 );
             }
         }
@@ -587,9 +615,9 @@ impl CellSelector {
             if !cell_found && should_log_errors {
                 if !self.cells.is_empty() {
                     tracing::warn!(
-                        "Acceptable cell selection failed in {} cells: si_missing={}, reserved={}, barred={}, forbidden_tai={}",
+                        "Acceptable cell selection failed in {} cells: si_missing={}, reserved={}, barred={}, forbidden_tai={}, low_signal={}",
                         self.cells.len(), report.si_missing_cells, report.reserved_cells,
-                        report.barred_cells, report.forbidden_tai_cells
+                        report.barred_cells, report.forbidden_tai_cells, report.low_signal_cells
                     );
                 } else {
                     tracing::warn!("Cell selection failed, no cells in coverage");
@@ -904,8 +932,10 @@ impl CellSelector {
             return false;
         }
 
-        // Check PLMN
-        if cell.sib1.plmn != selected_plmn {
+        // TS 38.304 §4.5 (38304-j30 l.1147-1149): "The cell is part of either
+        // the selected PLMN or the registered PLMN or PLMN of the Equivalent PLMN
+        // list" (#567).
+        if !self.is_suitable_plmn(cell.sib1.plmn, selected_plmn) {
             report.out_of_plmn_cells += 1;
             return false;
         }
@@ -1007,6 +1037,14 @@ impl CellSelector {
             let tai = cell.tai();
             if self.forbidden_tai_roaming.contains(&tai) || self.forbidden_tai_rps.contains(&tai) {
                 report.forbidden_tai_cells += 1;
+                continue;
+            }
+
+            // TS 38.304 §4.5 (38304-j30 l.1140): an acceptable cell too fulfils
+            // "The cell selection criteria ... see clause 5.2.3.2", the S
+            // criterion (#567).
+            if !cell.meets_s_criteria() {
+                report.low_signal_cells += 1;
                 continue;
             }
 
@@ -1252,6 +1290,11 @@ impl PlmnSelector {
     /// Registered PLMN, if any
     pub fn registered_plmn(&self) -> Option<Plmn> {
         self.registered_plmn
+    }
+
+    /// The equivalent-PLMN list received from the network.
+    pub fn equivalent_plmns(&self) -> &[Plmn] {
+        &self.equivalent_plmns
     }
 
     /// Set the equivalent-PLMN list received from the network
@@ -1516,6 +1559,87 @@ mod tests {
         let cell = result.unwrap();
         assert_eq!(cell.cell_id, 1);
         assert_eq!(cell.category, CellCategory::AcceptableCell);
+    }
+
+    /// #567, TS 38.304 §4.5: a cell of a PLMN of the equivalent-PLMN list is
+    /// suitable, though the selected PLMN is another; so is a cell of the
+    /// registered PLMN. Without either it is only acceptable.
+    #[test]
+    fn a_cell_of_an_equivalent_or_the_registered_plmn_is_suitable() {
+        let selected = Plmn::new(999, 70, false);
+        let other = Plmn::new(310, 260, true);
+        for (registered, equivalent, want) in [
+            (Some(selected), vec![other], CellCategory::SuitableCell),
+            (Some(other), vec![], CellCategory::SuitableCell),
+            (Some(selected), vec![], CellCategory::AcceptableCell),
+            (None, vec![], CellCategory::AcceptableCell),
+        ] {
+            let mut selector = CellSelector::new();
+            selector.set_selected_plmn(Some(selected));
+            selector.set_registered_plmns(registered, equivalent.clone());
+            selector
+                .cells
+                .insert(1, make_cell_with_sib1(-80, other, 1, false, false));
+            selector.started_time = Instant::now() - Duration::from_secs(10);
+            let cell = selector
+                .perform_cell_selection()
+                .expect("the one cell is selectable");
+            assert_eq!(
+                (cell.cell_id, cell.category),
+                (1, want),
+                "registered={registered:?} equivalent={equivalent:?}"
+            );
+            assert_eq!(selector.camp_category(1), want);
+        }
+    }
+
+    /// #567: the camp on an equivalent-PLMN cell follows the list. Camped on any
+    /// cell, it turns suitable once NAS provides the list naming its PLMN, and
+    /// acceptable again once the network clears it.
+    #[test]
+    fn the_camp_category_follows_the_equivalent_plmn_list() {
+        let selected = Plmn::new(999, 70, false);
+        let other = Plmn::new(310, 260, true);
+        let mut selector = CellSelector::new();
+        selector.set_selected_plmn(Some(selected));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, other, 1, false, false));
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+        selector.perform_cell_selection();
+        assert_eq!(selector.camp_category(1), CellCategory::AcceptableCell);
+        selector.set_registered_plmns(Some(selected), vec![other]);
+        assert_eq!(selector.camp_category(1), CellCategory::SuitableCell);
+        selector.set_registered_plmns(Some(selected), vec![]);
+        assert_eq!(selector.camp_category(1), CellCategory::AcceptableCell);
+    }
+
+    /// #567, TS 38.304 §4.5 / §5.2.3.2: an acceptable cell fulfils the cell
+    /// selection criterion S. A cell of another PLMN with Srxlev <= 0 is not
+    /// selected even as acceptable; one above S is.
+    #[test]
+    fn an_acceptable_cell_below_the_s_criterion_is_not_selected() {
+        let mut selector = CellSelector::new();
+        selector.set_selected_plmn(Some(Plmn::new(999, 70, false)));
+        let other = Plmn::new(310, 260, true);
+        // Qrxlevmin -80 dBm: Srxlev = -90 - (-80) = -10.
+        let mut weak = make_cell_with_sib1(-90, other, 1, false, false);
+        weak.sib1.q_rx_lev_min = -40;
+        assert!(weak.srxlev() <= 0, "precondition: below S");
+        selector.cells.insert(1, weak);
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+        assert!(
+            selector.perform_cell_selection().is_none(),
+            "a cell below S is not acceptable"
+        );
+
+        // The same cell above S (Srxlev = -70 - (-80) = 10) is acceptable.
+        selector.cells.get_mut(&1).expect("cell 1").dbm = -70;
+        let cell = selector.perform_cell_selection().expect("now above S");
+        assert_eq!(
+            (cell.cell_id, cell.category),
+            (1, CellCategory::AcceptableCell)
+        );
     }
 
     /// #521: camped on an acceptable cell, the same cell turns suitable once the
