@@ -9,11 +9,12 @@ the config/ samples carry no `demo:` block. A demo run uses its own overlay,
 which is the only place one may appear:
 
   * k8s/overlays/demo*/
+  * deploy/k8s/demo-*/ (a demo's standalone kustomize base, e.g. D444C's Job)
   * docker/docker-compose.demo*.yml
   * config/demo*/
 
 The scan is textual, line by line, over every git-tracked file under the
-scanned paths (default: k8s docker config), so it also catches a `demo:` key
+scanned paths (default: k8s deploy docker config), so it also catches a `demo:` key
 inside a ConfigMap's embedded gNB or UE config, or a JSON `"demo":` member.
 Comment lines and prose (.md, .txt) are ignored.
 
@@ -39,12 +40,13 @@ import subprocess
 import sys
 import tempfile
 
-DEFAULT_PATHS = ['k8s', 'docker', 'config']
+DEFAULT_PATHS = ['k8s', 'deploy', 'docker', 'config']
 
 # Where a demo block belongs. Kept narrow on purpose: everything else is a
 # shipped profile.
 DEMO_ALLOW = [
     'k8s/overlays/demo*/*',
+    'deploy/k8s/demo-*/*',
     'docker/docker-compose.demo*.yml',
     'config/demo*/*',
 ]

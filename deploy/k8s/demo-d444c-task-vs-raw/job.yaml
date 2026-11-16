@@ -14,6 +14,12 @@ spec:
       restartPolicy: Never
       automountServiceAccountToken: false
       enableServiceLinks: false
+      # The image is built for amd64 (docker/demo/Dockerfile.nr-semantic-demo on
+      # an amd64 host); on an arm64 node it would die with `exec format error`.
+      # kubernetes.io/arch is a well-known label every kubelet sets, not a cloud
+      # one. A native arm64 build: patch this to arm64 (d444c-k8s.sh --arch arm64).
+      nodeSelector:
+        kubernetes.io/arch: amd64
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -22,8 +28,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: task-vs-raw
+          # The base's image is the locally built nextgsim/nr-semantic-demo:local
+          # and is never pulled (an unqualified name would resolve to Docker Hub,
+          # whose `nextgsim` namespace this repo does not control). An overlay
+          # that sets a registry image sets imagePullPolicy: IfNotPresent too
+          # (scripts/demo/d444c-k8s.sh --image does).
           image: nextgsim/nr-semantic-demo
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Never
           args: ["--config", "/etc/nextgsim/task_vs_raw.yaml", "--seed", "444"]
           env:
             - name: RUST_LOG

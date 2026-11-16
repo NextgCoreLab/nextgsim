@@ -13,6 +13,12 @@
 #     - name: nextgsim/nr-semantic-demo
 #       newName: <registry>/<repo>
 #       newTag: <tag>          # or digest: sha256:...
+#   patches:                   # a registry image must be pullable (the base is Never)
+#     - target: {kind: Job, name: d444c-task-vs-raw}
+#       patch: |-
+#         - op: replace
+#           path: /spec/template/spec/containers/0/imagePullPolicy
+#           value: IfNotPresent
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 resources:
