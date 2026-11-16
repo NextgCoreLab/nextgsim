@@ -1396,6 +1396,7 @@ async fn process_mm_outputs(
                 }
                 info!("Registered PLMN recorded as {rplmn}");
                 plmn_selector.set_registered_plmn(Some(rplmn));
+                sync_registered_plmns(plmn_selector, task_base).await;
 
                 // Establish the configured default PDU sessions via the SM
                 // orchestrator (PSI/PTI allocation, T3580, UL NAS Transport
@@ -1437,10 +1438,12 @@ async fn process_mm_outputs(
                     );
                 }
                 plmn_selector.set_equivalent_plmns(plmns);
+                sync_registered_plmns(plmn_selector, task_base).await;
             }
             MmOutput::RegistrationFailed(cause) => {
                 warn!("Registration failed: {:?} (#{})", cause, cause as u8);
                 plmn_selector.set_registered_plmn(None);
+                sync_registered_plmns(plmn_selector, task_base).await;
                 notify_rel18_registration(task_base, false).await;
             }
             MmOutput::AuthenticationRejected => {
@@ -1667,6 +1670,23 @@ async fn process_sm_outputs(
 /// Run TS 23.122 automatic PLMN selection: feed the selector with the MM
 /// orchestrator's forbidden-PLMN list and either trigger a registration
 /// attempt on the selected PLMN or enter limited service.
+/// Pushes NAS's registered PLMN and equivalent-PLMN list into the RRC cell
+/// selector (#567): TS 38.304 §4.5 judges a cell suitable when it is "part of
+/// either the selected PLMN or the registered PLMN or PLMN of the Equivalent
+/// PLMN list", "According to the latest information provided by NAS".
+async fn sync_registered_plmns(
+    plmn_selector: &nextgsim_ue::rrc::cell_selection::PlmnSelector,
+    task_base: &UeTaskBase,
+) {
+    let _ = task_base
+        .rrc_tx
+        .send(RrcMessage::SetRegisteredPlmns {
+            registered: plmn_selector.registered_plmn(),
+            equivalent: plmn_selector.equivalent_plmns().to_vec(),
+        })
+        .await;
+}
+
 async fn perform_plmn_selection(
     orch: &mut nextgsim_ue::nas::mm::MmOrchestrator,
     plmn_selector: &mut nextgsim_ue::rrc::cell_selection::PlmnSelector,
@@ -1682,6 +1702,7 @@ async fn perform_plmn_selection(
     let forbidden: Vec<_> = orch.forbidden_plmns().iter().map(plmn_from_bcd).collect();
     plmn_selector.set_forbidden(forbidden);
     plmn_selector.set_registered_plmn(None);
+    sync_registered_plmns(plmn_selector, task_base).await;
 
     // Candidate PLMNs come from the live RRC available-PLMN report cached in
     // the selector (CellSelector::available_plmns, TS 23.122 §4.4.3); fall back

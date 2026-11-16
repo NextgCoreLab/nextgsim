@@ -522,6 +522,15 @@ pub enum RrcMessage {
         /// "5GS forbidden tracking areas for regional provision of service".
         regional_service: Vec<crate::rrc::cell_selection::Tai>,
     },
+    /// NAS's registered PLMN or equivalent-PLMN list changed (#567). Replaces
+    /// both in the cell selector: TS 38.304 §4.5 counts a cell of either as
+    /// suitable, like one of the selected PLMN.
+    SetRegisteredPlmns {
+        /// The registered PLMN, `None` when the UE is not registered.
+        registered: Option<crate::rrc::cell_selection::Plmn>,
+        /// The equivalent PLMNs (TS 24.501 §5.5.1.2.4).
+        equivalent: Vec<crate::rrc::cell_selection::Plmn>,
+    },
     /// Local release connection (from NAS)
     LocalReleaseConnection {
         /// Treat as barred
