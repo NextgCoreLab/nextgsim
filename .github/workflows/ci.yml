@@ -1342,6 +1342,21 @@ jobs:
           echo "| nextgsim (this repo, HEAD, \`--features 6g\`) | \`${sim}\` |" >> "$GITHUB_STEP_SUMMARY"
           echo "| nextgcore (main) | \`${core}\` |" >> "$GITHUB_STEP_SUMMARY"
 
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the pinned
+      # toolchain image of the 6G gNB/UE `docker run`. The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1
+
       # The 5GC binaries come from nextgcore's builder, exactly as in
       # interop-e2e. Its nr-gnb/nr-ue are default builds, so they are replaced
       # below.
@@ -1561,6 +1576,19 @@ jobs:
           demo_assert_private
           demo_compose config --format json | jq -r '.services | keys | join(" ")'
 
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`. The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+
       - name: Build both workspaces via nextgcore's builder
         run: |
           set -euo pipefail
@@ -1684,6 +1712,22 @@ jobs:
           export NEXTGSIM_DIR="$GITHUB_WORKSPACE/nextgsim"
           demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml
           demo_assert_private
+
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the
+      # gNB build's `docker run` image (rust:1-bookworm is a moving tag: the
+      # pre-pull lets the run use the local image, not a reproducible one). The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1-bookworm
 
       - name: Build the 5GC via nextgcore's builder, the gNB with the demo feature
         run: |
@@ -1832,6 +1876,22 @@ jobs:
           demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml \
             nextgsim/scripts/demo/d440a-m0.compose.yml nextgsim/scripts/demo/d440a-page-all.compose.yml
           demo_assert_private
+
+      # #548: the registry hardening #449 gave interop-e2e. Every image this
+      # job takes from a public registry is pulled here, each pull retried
+      # (5 attempts, 5/10/20/40 s backoff): the FROM bases of every Dockerfile
+      # it builds, mongo for the first `compose up`, and the
+      # D440A gNB build's `docker run` image (rust:1-bookworm is a moving tag:
+      # the pre-pull lets the run use the local image, not a reproducible one). The builds,
+      # `up`s and `run`s below stay single-shot.
+      - name: Pre-pull the registry images (retried)
+        run: |
+          set -euo pipefail
+          nextgsim/docker/pull-base-images.sh \
+            nextgcore/docker/rust/Dockerfile.builder nextgcore/docker/rust/Dockerfile.core \
+            nextgsim/Dockerfile.gnb-local nextgsim/Dockerfile.ue-local
+          (cd nextgcore/docker/rust && ../../../nextgsim/docker/retry.sh docker compose -f docker-compose.demo-n2ho.yml pull mongodb)
+          nextgsim/docker/retry.sh docker pull rust:1-bookworm
 
       - name: Build both workspaces via nextgcore's builder
         run: |
