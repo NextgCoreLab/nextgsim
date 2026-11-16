@@ -15,7 +15,7 @@ use tokio::time::interval;
 use tracing::{debug, error, info, warn};
 
 use crate::rrc::cell_selection::{
-    CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
+    CellCategory, CellChangeEvent, CellSelector, MibInfo, Plmn as CellPlmn, Sib1Info,
 };
 use crate::rrc::conditional_handover::{handover_command_for, CondReconfigStore};
 use crate::rrc::handover::{
@@ -2870,6 +2870,26 @@ impl RrcTask {
             debug!(
                 "PCCH Paging from cell {cell_id} ignored: not the camped cell ({:?})",
                 self.serving_cell_id
+            );
+            return;
+        }
+
+        // TS 38.304 §5.2.8 (#521): camped on an acceptable cell ("Camped on Any
+        // Cell", limited service) the UE monitors Short Messages, system
+        // information and measurements, and searches for a suitable cell. Paging
+        // channel monitoring is a task of §5.2.5 (camped normally) only, so a page
+        // here is not acted on. Judged on the selector's camp when that is this
+        // cell; a serving cell the selector does not camp on (after a handover)
+        // was reached on a suitable cell and is judged as before.
+        if self
+            .cell_selector
+            .current_cell()
+            .is_some_and(|camp| camp.cell_id == cell_id)
+            && self.cell_selector.camp_category(cell_id) != CellCategory::SuitableCell
+        {
+            debug!(
+                "PCCH Paging from cell {cell_id} ignored: camped on an acceptable cell \
+                 (TS 38.304 §5.2.8 Camped on Any Cell monitors no paging channel)"
             );
             return;
         }
@@ -10009,6 +10029,61 @@ mod tests {
             try_take_paging(&mut nas_rx),
             Some(vec![own]),
             "once camped, the same page is acted on"
+        );
+    }
+
+    /// #521, TS 38.304 §5.2.8: a UE camped on an acceptable cell (its selected
+    /// PLMN is not broadcast: Camped on Any Cell) monitors no paging channel, so a
+    /// matching in-occasion page from that very cell does not reach NAS. Once NAS
+    /// selects the cell's PLMN the same camp is suitable (camped normally,
+    /// §5.2.5), and the same page does.
+    #[test]
+    fn a_ue_camped_on_an_acceptable_cell_acts_on_no_page_until_camped_normally() {
+        use crate::rrc::cell_selection::{CellCategory, Plmn};
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let home = Plmn::new(config.hplmn.mcc, config.hplmn.mnc, config.hplmn.long_mnc);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        // A PLMN no cell here broadcasts: the only selectable cell is acceptable.
+        task.cell_selector
+            .set_selected_plmn(Some(Plmn::new(262, 30, true)));
+        camp_on(&mut task, PAGING_CELL);
+        assert_eq!(
+            task.cell_selector.current_cell().map(|c| c.category),
+            Some(CellCategory::AcceptableCell),
+            "precondition: camped on any cell"
+        );
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert!(
+            try_take_paging(&mut nas_rx).is_none(),
+            "camped on an acceptable cell, the page is not acted on"
+        );
+
+        // NAS selects the PLMN the cell broadcasts: the same camp becomes suitable.
+        task.cell_selector.set_selected_plmn(Some(home));
+        task.force_cell_selection_now();
+        run_async(async { task.perform_cycle().await });
+        assert_eq!(task.serving_cell_id, Some(PAGING_CELL));
+        assert_eq!(
+            task.cell_selector.current_cell().map(|c| c.category),
+            Some(CellCategory::SuitableCell),
+            "the same cell, now camped normally"
+        );
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "camped normally, the same page reaches NAS"
         );
     }
 
