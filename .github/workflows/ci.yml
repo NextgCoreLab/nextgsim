@@ -258,6 +258,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: shellcheck
         run: shellcheck -x scripts/demo/*.sh
+      - name: Every netcat port probe sets a connect timeout (#569)
+        # A probe with no -w blocks ~130 s on one dropped SYN. The self-test
+        # checks the pattern against known spellings first.
+        run: |
+          scripts/check_nc_timeout.sh --self-test
+          scripts/check_nc_timeout.sh
       - name: Harness self-test
         run: scripts/demo/test-harness.sh
       - name: D444C Kubernetes runner self-test (fake kubectl) and its mutants
