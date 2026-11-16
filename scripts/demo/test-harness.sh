@@ -4,7 +4,7 @@
 #
 #   scripts/demo/test-harness.sh
 #
-# Covers assert_log_order (in order, missing step, out of order, literal
+# Covers assert_log_order (in order, missing step, out of order, GNU escape, literal
 # parentheses), demo_seed, demo_assert_private against a planted publish, every
 # revert-run.sh exit path (arm holds, arm broken, --expect mismatch, stale patch,
 # dirty tree, a TERM in the middle of the check), and that every committed patch
@@ -50,6 +50,17 @@ if assert_log_order "$work/noparen.log" t 'HandoverRequired \(amf_ue_ngap_id' >/
     not_ok "an escaped parenthesis matched a line without one"
 fi
 ok "assert_log_order: escaped parentheses are literal"
+
+# #568: `\b` is a word boundary to grep -E and a backspace to awk; the step must
+# be named non-portable, not "out of order" (run 43908256776), and the POSIX
+# form must pass.
+printf '%s\n' 'Uplink data (RLC): ue_id=0, drb_id=1, psi=1, len=475' 'IntentSubmitted (lb-1)' > "$work/gnu.log"
+if err="$(assert_log_order "$work/gnu.log" t 'len=475\b' 'IntentSubmitted' 2>&1 >/dev/null)"; then
+    not_ok "a GNU-escape step passed under awk"
+fi
+case "$err" in *"step 1/2: "*"grep -E but not awk"*) ok "assert_log_order: names a non-portable (GNU escape) step" ;; *) not_ok "gnu escape: $err" ;; esac
+assert_log_order "$work/gnu.log" t 'len=475([^0-9]|$)' 'IntentSubmitted \(lb-1\)' >/dev/null \
+    && ok "assert_log_order: the POSIX boundary passes" || not_ok "POSIX boundary failed"
 
 demo_seed 4242 >/dev/null
 [ "$DEMO_SEED" = 4242 ] && [ "$(cat "$DEMO_ARTEFACTS/seed")" = 4242 ] \

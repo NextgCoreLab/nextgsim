@@ -124,8 +124,13 @@ assert_log_order() {
         # The ERE goes through the environment: `awk -v` would expand its escapes.
         hit="$(DEMO_RE="$re" awk -v after="$after" 'NR > after && $0 ~ ENVIRON["DEMO_RE"] { print NR; exit }' "$file")"
         if [ -z "$hit" ]; then
-            if grep -qE -- "$re" "$file"; then
+            # Same matcher for the diagnosis: grep -E knows GNU escapes (`\b`,
+            # `\w`, `\<`) that awk reads differently, so grep finding the line
+            # is not proof that it is out of order (nextgsim#568).
+            if DEMO_RE="$re" awk '$0 ~ ENVIRON["DEMO_RE"] { found = 1; exit } END { exit !found }' "$file"; then
                 demo_fail "[$label] step ${step}/${total} out of order: /$re/ appears only before step $((step - 1))"
+            elif grep -qE -- "$re" "$file"; then
+                demo_fail "[$label] step ${step}/${total}: /$re/ matches under grep -E but not awk; use POSIX ERE only (no \\b, \\w, \\<)"
             else
                 demo_fail "[$label] step ${step}/${total} missing: /$re/"
             fi

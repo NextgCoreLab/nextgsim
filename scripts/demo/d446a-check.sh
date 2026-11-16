@@ -152,7 +152,9 @@ demo_compose exec -T ue ping -I uesimtun0 -c 5 -i 0.2 -W 2 -s "$burst_size" 10.4
     > "$DEMO_ARTEFACTS/ping-burst.txt" 2>&1 || true
 # The burst crosses whichever gNB serves the UE: gnb-east, and gnb-west for the
 # pings after lb-1 has moved it to the booster.
-burst_re="Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=$burst_len\b"
+# POSIX ERE only: the pattern also goes through assert_log_order's awk, where
+# `\b` is a backspace, not a word boundary (run 43908256776 failed on that).
+burst_re="Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=$burst_len([^0-9]|\$)"
 burst_at=""
 for _ in $(seq 15); do
     for s in gnb-east gnb-west; do
@@ -169,7 +171,7 @@ if [ "$mode" != off ]; then
     assert_log_order "$DEMO_ARTEFACTS/gnb-east.log" gnb-east \
         "$burst_re" \
         'audit #[0-9]+: IntentSubmitted \(lb-1\) TriggerHandover'
-    if grep -qE 'Uplink data \(RLC\): .*len=49\b' "$DEMO_ARTEFACTS/gnb-east.log"; then
+    if grep -qE 'Uplink data \(RLC\): .*len=49([^0-9]|$)' "$DEMO_ARTEFACTS/gnb-east.log"; then
         demo_fail "[gnb-east] an incidental len=49 uplink packet: IPv6 is not off in the UE"
     fi
 fi
