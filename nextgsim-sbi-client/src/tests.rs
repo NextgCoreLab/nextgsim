@@ -1000,3 +1000,51 @@ async fn a_bound_client_refuses_a_host_name_471() {
     assert_eq!(v["ok"], true);
     assert_eq!(stub.seen().len(), 1);
 }
+
+// ---- early responses (#552) ---------------------------------------------
+
+/// A server that answers every request at once, from its HEADERS, without
+/// reading the body: the AF's T8 listener refusing an unknown callback id with
+/// 404 (#552). h2 then resets the rest of the request with NO_ERROR.
+async fn early_answer(status: u16) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(mut conn) = h2::server::handshake(sock).await else {
+                    return;
+                };
+                while let Some(Ok((req, mut respond))) = conn.accept().await {
+                    drop(req);
+                    let resp = http::Response::builder().status(status).body(()).unwrap();
+                    let _ = respond.send_response(resp, true);
+                }
+            });
+        }
+    });
+    addr
+}
+
+/// #552, RFC 9113 §8.1: a response sent before the request body is complete
+/// is the answer, not a transport error. The body exceeds the 64 KiB initial
+/// stream window, so the client is still waiting for capacity when the server
+/// answers and resets the rest: deterministically the race a loaded CI runner
+/// hit with a small body (a synthetic `Http2(CANCEL)` before).
+#[tokio::test]
+async fn a_response_before_the_whole_body_is_sent_is_the_answer() {
+    let addr = early_answer(404).await;
+    let c = SbiClient::new(SbiClientConfig {
+        timeout: Duration::from_secs(10),
+        retries: 0,
+        ..Default::default()
+    });
+    let big = "x".repeat(200_000);
+    for _ in 0..3 {
+        let r = c
+            .post_json(&format!("http://{addr}/early"), &big, None)
+            .await
+            .expect("the server's early 404 is the answer");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+}

@@ -506,13 +506,24 @@ impl SbiClient {
         let end_of_stream = body.as_ref().is_none_or(Bytes::is_empty);
         let (resp, mut stream) = send.send_request(req, end_of_stream)?;
         if let Some(mut data) = body.filter(|b| !b.is_empty()) {
+            // RFC 9113 §8.1: a server may send a complete response before the
+            // request is complete, then RST_STREAM(NO_ERROR) the rest of it; the
+            // client "MUST NOT discard responses as a result of receiving such
+            // a RST_STREAM". h2 then reports the stream as unable to send
+            // (`poll_capacity` is `None`, or `send_data` fails). Stop sending and
+            // read the response: it is the server's answer, or, if the stream
+            // was reset with no response, the reset is the error (#552; this was
+            // a synthetic CANCEL that dropped the answer).
             while !data.is_empty() {
                 stream.reserve_capacity(data.len());
-                let cap = std::future::poll_fn(|cx| stream.poll_capacity(cx))
-                    .await
-                    .ok_or_else(|| SbiError::Http2(h2::Error::from(h2::Reason::CANCEL)))??;
+                let Some(Ok(cap)) = std::future::poll_fn(|cx| stream.poll_capacity(cx)).await
+                else {
+                    break;
+                };
                 let chunk = data.split_to(cap.min(data.len()));
-                stream.send_data(chunk, data.is_empty())?;
+                if stream.send_data(chunk, data.is_empty()).is_err() {
+                    break;
+                }
             }
         }
         let resp = resp.await?;
