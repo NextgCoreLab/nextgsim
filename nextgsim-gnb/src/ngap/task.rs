@@ -685,6 +685,10 @@ impl NgapTask {
             self.capability_info_requested.remove(&ue_id);
             self.guard_timers
                 .cancel(GuardTimer::RadioCapabilityCheck { ue_id });
+            // Nor a handover's overall guard: ids are reused, and an expiry for a
+            // freed id would ask the AMF to release a UE that is not this one.
+            self.guard_timers
+                .cancel(GuardTimer::HandoverOverall { ue_id });
             // Release the stream back to the AMF
             if let Some(amf_ctx) = self.amf_contexts.get_mut(&ctx.amf_ctx_id) {
                 amf_ctx.release_stream(ctx.stream_id);
@@ -2788,6 +2792,10 @@ impl NgapTask {
         // would act on a ue_id this release is about to free, and ids are reused.
         self.guard_timers
             .cancel(GuardTimer::UeContextRelease { ue_id });
+        // The UE Context Release procedure was initiated, which is what the source's
+        // TNGRELOCoverall waits for after a HANDOVER COMMAND (§8.3.3.4, #538).
+        self.guard_timers
+            .cancel(GuardTimer::HandoverOverall { ue_id });
 
         // Release all PDU sessions for this UE via GTP
         let msg = GtpMessage::UeContextRelease { ue_id };
@@ -3422,6 +3430,10 @@ impl NgapTask {
                 UeReleaseRequestCause::UserInactivity => {
                     NgSetupFailureCause::RadioNetwork(RadioNetworkCause::UserInactivity)
                 }
+                // TS 38.413 §8.3.3.4, §9.3.1.2 "TNGRELOCoverall expiry" (#538)
+                UeReleaseRequestCause::TngrelocOverallExpiry => {
+                    NgSetupFailureCause::RadioNetwork(RadioNetworkCause::TngrelocOverallExpiry)
+                }
             };
 
             // TS 23.502 §4.2.6 step 1 / TS 38.413 §9.2.2.4: list the UE's PDU
@@ -3921,6 +3933,9 @@ impl NgapTask {
                             "TNGRELOCprep expired; HANDOVER CANCEL sent".to_string(),
                         );
                     }
+                }
+                GuardTimer::HandoverOverall { ue_id } => {
+                    self.on_handover_overall_expiry(ue_id).await;
                 }
                 GuardTimer::RacsMapping { ue_id } => {
                     // TS 38.413 §8.14.3 has no unsuccessful outcome, so an AMF that
@@ -4792,6 +4807,49 @@ impl NgapTask {
     // Handover Procedures
     // ========================================================================
 
+    /// TS 38.413 §8.3.3.4: "If the UE returns to the NG-RAN node before the
+    /// reception of the UE CONTEXT RELEASE COMMAND message or the expiry of the
+    /// timer TNGRELOCoverall, the NG-RAN node shall stop the timer TNGRELOCoverall
+    /// and continue to serve the UE" (#538). The return is an RRC re-establishment
+    /// committed on this gNB, for example after T304 expired at the target.
+    fn handle_ue_reestablished(&mut self, ue_id: i32) {
+        if self
+            .guard_timers
+            .cancel(GuardTimer::HandoverOverall { ue_id })
+        {
+            info!(
+                "UE[{ue_id}] returned to the source by RRC re-establishment: \
+                 TNGRELOCoverall stopped, the UE is served here"
+            );
+        }
+    }
+
+    /// TNGRELOCoverall expired at the source (TS 38.413 §8.3.3.4, §8.4.1.2; #538):
+    /// no UE Context Release Command arrived and the UE did not come back after the
+    /// HANDOVER COMMAND, so the source requests the AMF to release the UE context,
+    /// cause "TNGRELOCoverall expiry".
+    async fn on_handover_overall_expiry(&mut self, ue_id: i32) {
+        match self.ue_contexts.get(&ue_id).map(|c| c.state) {
+            None => {}
+            Some(crate::ngap::UeState::Releasing) => debug!(
+                "TNGRELOCoverall expired for UE[{ue_id}], whose release is already \
+                 requested; nothing more to ask"
+            ),
+            Some(_) => {
+                warn!(
+                    "TNGRELOCoverall expired for UE[{ue_id}]: no UE Context Release \
+                     Command after the HANDOVER COMMAND, requesting the AMF to release \
+                     the UE context"
+                );
+                self.handle_ue_context_release_request(
+                    ue_id,
+                    UeReleaseRequestCause::TngrelocOverallExpiry,
+                )
+                .await;
+            }
+        }
+    }
+
     /// Handles Handover Command from AMF (source gNB side)
     /// AMF sends this after receiving `HandoverRequestAcknowledge` from target gNB.
     /// Source gNB must forward the transparent container to UE via RRC and
@@ -4832,6 +4890,16 @@ impl NgapTask {
                      pending: either it already timed out or this gNB never started one"
                 );
             }
+            // TS 38.413 §8.4.1.2: "Upon reception of the HANDOVER COMMAND message
+            // the source NG-RAN node shall stop the timer TNGRELOCprep and start the
+            // timer TNGRELOCoverall" (#538). Without it a UE that never acts on the
+            // command stays on the source and the handover never ends.
+            let overall = Duration::from_secs(self.task_base.config.ngap_tngreloc_overall_secs);
+            self.guard_timers.start(
+                Instant::now(),
+                overall,
+                GuardTimer::HandoverOverall { ue_id },
+            );
             // TS 38.300 §9.2.3.2.1 step 8: the source sends the UE the
             // RRCReconfiguration inside the target's HandoverCommand, the
             // Target-to-Source container's rRCContainer (TS 38.413 §9.3.1.21). It was
@@ -7209,6 +7277,9 @@ impl Task for NgapTask {
                     }
                     NgapMessage::AsKeyRefreshed { ue_id, kgnb } => {
                         self.handle_as_key_refreshed(ue_id, kgnb).await;
+                    }
+                    NgapMessage::UeReestablished { ue_id } => {
+                        self.handle_ue_reestablished(ue_id);
                     }
                     NgapMessage::InitiateHandover(request) => {
                         self.handle_initiate_handover(*request).await;
@@ -11457,13 +11528,21 @@ mod tests {
         );
     }
 
-    /// A Handover Command disarms TNGRELOCprep, so a completed handover cannot later be
-    /// cancelled by its own guard timer.
-    #[tokio::test]
-    async fn a_handover_command_cancels_tngreloc_prep() {
-        let (mut task, mut sctp_rx) = task_with_ue(14).await;
+    /// A task with UE `ue_id` whose handover preparation was answered by a
+    /// HANDOVER COMMAND, the SCTP queue drained, and the instants bracketing the
+    /// command.
+    async fn handed_over(
+        ue_id: i32,
+    ) -> (
+        NgapTask,
+        tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+        u32,
+        Instant,
+        Instant,
+    ) {
+        let (mut task, mut sctp_rx) = task_with_ue(ue_id).await;
         let ran_ue_ngap_id = task
-            .find_ue_context(14)
+            .find_ue_context(ue_id)
             .map(|c| c.ran_ue_ngap_id)
             .expect("ue context") as u32;
         task.send_handover_required(
@@ -11480,6 +11559,7 @@ mod tests {
         .await;
         while sctp_rx.try_recv().is_ok() {}
 
+        let before = Instant::now();
         task.handle_handover_command(
             1,
             0,
@@ -11493,6 +11573,28 @@ mod tests {
             },
         )
         .await;
+        let after = Instant::now();
+        while sctp_rx.try_recv().is_ok() {}
+        (task, sctp_rx, ran_ue_ngap_id, before, after)
+    }
+
+    /// The NGAP PDU bytes of the next message to the SCTP task, if any.
+    fn next_sctp_pdu(
+        sctp_rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<crate::tasks::SctpMessage>>,
+    ) -> Option<Vec<u8>> {
+        match sctp_rx.try_recv().ok()? {
+            TaskMessage::Message(crate::tasks::SctpMessage::SendMessage { buffer, .. }) => {
+                Some(buffer.data().to_vec())
+            }
+            other => panic!("expected an NGAP PDU to the SCTP task, got {other:?}"),
+        }
+    }
+
+    /// A Handover Command disarms TNGRELOCprep, so a completed handover cannot later be
+    /// cancelled by its own guard timer.
+    #[tokio::test]
+    async fn a_handover_command_cancels_tngreloc_prep() {
+        let (mut task, mut sctp_rx, _, _, _) = handed_over(14).await;
         assert!(
             !task
                 .guard_timers
@@ -11500,14 +11602,126 @@ mod tests {
             "preparation completed, so its guard timer must be cancelled"
         );
 
-        // And no Handover Cancel is produced later.
+        // And no Handover Cancel is produced later (TNGRELOCoverall does fire;
+        // what it sends is a UE Context Release Request, not a cancel).
+        task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
+            .await;
+        while let Some(bytes) = next_sctp_pdu(&mut sctp_rx) {
+            assert!(
+                nextgsim_ngap::procedures::handover::decode_handover_cancel(&bytes).is_err(),
+                "a completed handover must never be cancelled by its own guard timer"
+            );
+        }
+    }
+
+    /// #538, TS 38.413 §8.4.1.2: the HANDOVER COMMAND starts TNGRELOCoverall at the
+    /// source. When it expires with no UE Context Release Command, §8.3.3.4: the
+    /// source requests the AMF to release the UE context, cause "TNGRELOCoverall
+    /// expiry", and not before.
+    #[tokio::test]
+    async fn tngreloc_overall_from_the_handover_command_requests_the_release() {
+        let (mut task, mut sctp_rx, ran_ue_ngap_id, before, after) = handed_over(15).await;
+        let overall = Duration::from_secs(test_config().ngap_tngreloc_overall_secs);
+        let deadline = task
+            .guard_timers
+            .deadline(GuardTimer::HandoverOverall { ue_id: 15 })
+            .expect("the HANDOVER COMMAND must start TNGRELOCoverall");
+        assert!(
+            deadline >= before + overall && deadline <= after + overall,
+            "armed for TNGRELOCoverall from the command"
+        );
+
+        task.process_expired_guard_timers(deadline - Duration::from_millis(1))
+            .await;
+        assert!(
+            next_sctp_pdu(&mut sctp_rx).is_none(),
+            "nothing may be sent before TNGRELOCoverall expires"
+        );
+
+        task.process_expired_guard_timers(deadline).await;
+        let bytes = next_sctp_pdu(&mut sctp_rx).expect("a UE Context Release Request");
+        let req = nextgsim_ngap::procedures::ue_context_release::decode_ue_context_release_request(
+            &bytes,
+        )
+        .expect("the PDU must decode as UE Context Release Request");
+        assert_eq!(req.amf_ue_ngap_id, 4242);
+        assert_eq!(req.ran_ue_ngap_id, ran_ue_ngap_id);
+        assert!(
+            matches!(
+                req.cause,
+                NgSetupFailureCause::RadioNetwork(RadioNetworkCause::TngrelocOverallExpiry)
+            ),
+            "cause must be tNGRELOCoverall-expiry, got {:?}",
+            req.cause
+        );
+        assert_eq!(
+            task.find_ue_context(15).map(|c| c.state),
+            Some(crate::ngap::UeState::Releasing),
+            "the context now waits on the AMF's UE Context Release Command"
+        );
+        assert!(
+            task.guard_timers
+                .is_pending(GuardTimer::UeContextRelease { ue_id: 15 }),
+            "and that wait is itself guarded"
+        );
+    }
+
+    /// #538, §8.3.3.4: the AMF's UE Context Release Command (the handover
+    /// completed at the target) stops TNGRELOCoverall, so nothing more is asked.
+    #[tokio::test]
+    async fn a_release_command_after_the_handover_stops_tngreloc_overall() {
+        use nextgsim_ngap::procedures::ue_context_release::{
+            UeContextReleaseCommandData, UeNgapIds,
+        };
+        let (mut task, mut sctp_rx, ran_ue_ngap_id, _, _) = handed_over(16).await;
+        assert!(task
+            .guard_timers
+            .is_pending(GuardTimer::HandoverOverall { ue_id: 16 }));
+        task.handle_ue_context_release_command(
+            1,
+            0,
+            UeContextReleaseCommandData {
+                ue_ngap_ids: UeNgapIds::Pair {
+                    amf_ue_ngap_id: 4242,
+                    ran_ue_ngap_id,
+                },
+                cause: NgSetupFailureCause::RadioNetwork(RadioNetworkCause::SuccessfulHandover),
+            },
+        )
+        .await;
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::HandoverOverall { ue_id: 16 }));
         while sctp_rx.try_recv().is_ok() {}
         task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
             .await;
+        while let Some(bytes) = next_sctp_pdu(&mut sctp_rx) {
+            assert!(
+                nextgsim_ngap::procedures::ue_context_release::decode_ue_context_release_request(
+                    &bytes
+                )
+                .is_err(),
+                "a released UE must not be asked to be released again"
+            );
+        }
+    }
+
+    /// #538, §8.3.3.4: a UE that returns to the source (RRC re-establishment
+    /// committed here) stops TNGRELOCoverall and stays served.
+    #[tokio::test]
+    async fn a_ue_returning_by_reestablishment_stops_tngreloc_overall() {
+        let (mut task, mut sctp_rx, _, _, _) = handed_over(17).await;
+        task.handle_ue_reestablished(17);
+        assert!(!task
+            .guard_timers
+            .is_pending(GuardTimer::HandoverOverall { ue_id: 17 }));
+        task.process_expired_guard_timers(Instant::now() + Duration::from_secs(3600))
+            .await;
         assert!(
-            sctp_rx.try_recv().is_err(),
-            "a completed handover must never be cancelled by its own guard timer"
+            next_sctp_pdu(&mut sctp_rx).is_none(),
+            "a UE served here again is not released"
         );
+        assert!(task.find_ue_context(17).is_some());
     }
 
     /// Criterion 6: an NG Setup Failure carrying Time to Wait schedules a retry, and the

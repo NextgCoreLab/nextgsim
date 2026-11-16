@@ -37,6 +37,15 @@ pub enum GuardTimer {
         /// The UE being handed over.
         ue_id: i32,
     },
+    /// TNGRELOCoverall at the source of an N2 handover: started when the HANDOVER
+    /// COMMAND arrives (TS 38.413 §8.4.1.2), it protects the overall handover. The
+    /// AMF's UE CONTEXT RELEASE COMMAND (sent once the UE reaches the target) or the
+    /// UE returning to this gNB stops it; on expiry the source requests the AMF to
+    /// release the UE context (§8.3.3.4), cause "TNGRELOCoverall expiry".
+    HandoverOverall {
+        /// The UE handed over.
+        ue_id: i32,
+    },
     /// A UE RADIO CAPABILITY ID MAPPING REQUEST was sent for this UE's UE Radio
     /// Capability ID and no response has arrived (TS 38.413 §8.14.3 defines no timer;
     /// see `racs::RACS_MAPPING_TIMEOUT_SECS`). On expiry the gNB stops waiting.

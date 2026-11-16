@@ -1628,6 +1628,13 @@ impl RrcTask {
         );
         #[cfg(feature = "demo-d441d-predictive-ho")]
         self.d441d_reestablished(context);
+        // The UE is served here again: a source holding TNGRELOCoverall for it
+        // stops the timer (TS 38.413 §8.3.3.4, #538).
+        let _ = self
+            .task_base
+            .ngap_tx
+            .send(NgapMessage::UeReestablished { ue_id: context })
+            .await;
         if let Some(kgnb) = rekeyed {
             let _ = self
                 .task_base
@@ -5473,15 +5480,24 @@ mod tests {
     fn ngap_trace(
         rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>,
     ) -> (Vec<Vec<u8>>, usize) {
-        let (mut nas, mut refreshed) = (Vec::new(), 0);
+        let (nas, refreshed, _) = ngap_trace_with_returns(rx);
+        (nas, refreshed)
+    }
+
+    /// [`ngap_trace`], plus the UEs NGAP was told re-established here (#538).
+    fn ngap_trace_with_returns(
+        rx: &mut tokio::sync::mpsc::Receiver<TaskMessage<NgapMessage>>,
+    ) -> (Vec<Vec<u8>>, usize, Vec<i32>) {
+        let (mut nas, mut refreshed, mut returned) = (Vec::new(), 0, Vec::new());
         while let Ok(TaskMessage::Message(msg)) = rx.try_recv() {
             match msg {
                 NgapMessage::UplinkNasDelivery { pdu, .. } => nas.push(pdu.data().to_vec()),
                 NgapMessage::AsKeyRefreshed { .. } => refreshed += 1,
+                NgapMessage::UeReestablished { ue_id } => returned.push(ue_id),
                 _ => {}
             }
         }
-        (nas, refreshed)
+        (nas, refreshed, returned)
     }
 
     /// #414: a replayed RRCReestablishmentRequest changes nothing of a
@@ -5520,7 +5536,9 @@ mod tests {
                 probe,
                 "the keys are untouched"
             );
-            assert_eq!(ngap_trace(&mut ngap_rx).1, 0, "no re-key reaches NGAP");
+            let (_, refreshed, returned) = ngap_trace_with_returns(&mut ngap_rx);
+            assert_eq!(refreshed, 0, "no re-key reaches NGAP");
+            assert!(returned.is_empty(), "nor a re-establishment (#538)");
 
             let nas = vec![0x7E, 0x00, 0x67];
             let pdu = encode_ul_information_transfer(&UlInformationTransferParams {
@@ -5612,10 +5630,13 @@ mod tests {
                 new.protect(1, 0, 0, b"x"),
                 "the re-derived keys are in use"
             );
+            let (_, refreshed, returned) = ngap_trace_with_returns(&mut ngap_rx);
+            assert_eq!(refreshed, 1, "NGAP told once, on the Complete");
             assert_eq!(
-                ngap_trace(&mut ngap_rx).1,
-                1,
-                "NGAP told once, on the Complete"
+                returned,
+                vec![1],
+                "and told the UE is served here again, which stops a source's \
+                 TNGRELOCoverall (#538)"
             );
         });
     }
