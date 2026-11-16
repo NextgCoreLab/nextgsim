@@ -260,6 +260,11 @@ jobs:
         run: shellcheck -x scripts/demo/*.sh
       - name: Harness self-test
         run: scripts/demo/test-harness.sh
+      - name: D444C Kubernetes runner self-test (fake kubectl) and its mutants
+        # #479: scripts/demo/d444c-k8s.sh against a fake kubectl (pass, table
+        # diff, Job failure, timeout, TERM/INT cleanup, existing namespace);
+        # --mutants forces each check always-true and requires a failure.
+        run: scripts/demo/d444c-k8s-selftest.sh --mutants
       - name: The self-test left the tree clean
         run: |
           git diff --quiet HEAD -- || { git status --short; exit 1; }

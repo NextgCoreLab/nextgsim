@@ -9,11 +9,12 @@ the config/ samples carry no `demo:` block. A demo run uses its own overlay,
 which is the only place one may appear:
 
   * k8s/overlays/demo*/
+  * deploy/k8s/demo-*/ (a demo's standalone kustomize base, e.g. D444C's Job)
   * docker/docker-compose.demo*.yml
   * config/demo*/
 
 The scan is textual, line by line, over every git-tracked file under the
-scanned paths (default: k8s docker config), so it also catches a `demo:` key
+scanned paths (default: k8s deploy docker config), so it also catches a `demo:` key
 inside a ConfigMap's embedded gNB or UE config, or a JSON `"demo":` member.
 Comment lines and prose (.md, .txt) are ignored.
 
@@ -39,23 +40,28 @@ import subprocess
 import sys
 import tempfile
 
-DEFAULT_PATHS = ['k8s', 'docker', 'config']
+DEFAULT_PATHS = ['k8s', 'deploy', 'docker', 'config']
 
 # Where a demo block belongs. Kept narrow on purpose: everything else is a
 # shipped profile.
 DEMO_ALLOW = [
     'k8s/overlays/demo*/*',
+    'deploy/k8s/demo-*/*',
     'docker/docker-compose.demo*.yml',
     'config/demo*/*',
 ]
 
 # Files that may NAME the demo paths without being demo content: a demo
-# runner. nextgsim has none yet (nextgcore's are deploy/eks/profiles/demo/ and
-# k8s/demo-check.sh); a demo PR that adds one lists it here. Everything else
+# runner or a demo-only image. nextgcore's are deploy/eks/profiles/demo/ and
+# k8s/demo-check.sh; a demo PR that adds one lists it here. Everything else
 # that names one is a shipped profile pulling a demo in, which the text rule
 # cannot see (a configMapGenerator file, a kustomize resource, a compose mount).
 SELF = 'scripts/check_no_demo_block.py'
-REF_ALLOW = []
+REF_ALLOW = [
+    # Demo D444C's demo-only image (#479) bakes config/demo-task-vs-raw/; it is
+    # in docker/release-images.json `excluded`, never published.
+    'docker/demo/Dockerfile.nr-semantic-demo',
+]
 
 # `demo:` as a YAML mapping key (optionally quoted) at the start of a line, or
 # inside a flow mapping / single-line JSON object after `{` or `,`.

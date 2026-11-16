@@ -1,0 +1,57 @@
+# The D444C sweep as a one-shot Job. It opens no listener and talks to nothing:
+# the table goes to stdout, the WARN DEMO MODE ACTIVE banner and the one-shot
+# nextg_demo_enabled series to stderr (both in `kubectl logs`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: d444c-task-vs-raw
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 300
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The image is built for amd64 (docker/demo/Dockerfile.nr-semantic-demo on
+      # an amd64 host); on an arm64 node it would die with `exec format error`.
+      # kubernetes.io/arch is a well-known label every kubelet sets, not a cloud
+      # one. A native arm64 build: patch this to arm64 (d444c-k8s.sh --arch arm64).
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: task-vs-raw
+          # The base's image is the locally built nextgsim/nr-semantic-demo:local
+          # and is never pulled (an unqualified name would resolve to Docker Hub,
+          # whose `nextgsim` namespace this repo does not control). An overlay
+          # that sets a registry image sets imagePullPolicy: IfNotPresent too
+          # (scripts/demo/d444c-k8s.sh --image does).
+          image: nextgsim/nr-semantic-demo
+          imagePullPolicy: Never
+          args: ["--config", "/etc/nextgsim/task_vs_raw.yaml", "--seed", "444"]
+          env:
+            - name: RUST_LOG
+              value: info
+          resources:
+            requests:
+              cpu: 250m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
