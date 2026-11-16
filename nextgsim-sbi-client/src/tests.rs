@@ -155,6 +155,8 @@ impl Stub {
     }
 }
 
+/// For the tests about timeouts and connect failures only: a 300 ms attempt
+/// timeout, which a loaded runner can exceed on its own (#564).
 fn fast() -> SbiClientConfig {
     SbiClientConfig {
         timeout: Duration::from_millis(300),
@@ -163,6 +165,20 @@ fn fast() -> SbiClientConfig {
         ..Default::default()
     }
 }
+
+/// Every other test: retries on, as in production, but an attempt timeout far
+/// above any scheduling delay, so an attempt count reflects what the client
+/// decided and not how fast the runner was (#564: under `fast()` a stub answer
+/// late by 300 ms was retried and recorded twice).
+fn steady() -> SbiClientConfig {
+    SbiClientConfig {
+        timeout: STEADY_TIMEOUT,
+        ..fast()
+    }
+}
+
+/// [`steady`]'s attempt timeout.
+const STEADY_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn nwdaf() -> Scope {
     Scope::new("NWDAF", "nnwdaf-analyticsinfo")
@@ -177,7 +193,7 @@ async fn a_2xx_get_decodes_json_over_h2c() {
             .header("content-type", "application/json")
     })
     .await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let v: serde_json::Value = c
         .get_json(
             &stub.url("/nnwdaf-analyticsinfo/v1/analytics?event-id=NF_LOAD"),
@@ -199,7 +215,7 @@ async fn a_2xx_get_decodes_json_over_h2c() {
 #[tokio::test]
 async fn a_post_sends_its_json_body_once_and_returns_the_201() {
     let stub = Stub::start(|_| Reply::new(201, "{}").header("location", "/subs/1")).await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let r = c
         .post_json(
             &stub.url("/nnwdaf-eventssubscription/v1/subscriptions"),
@@ -220,7 +236,7 @@ async fn a_post_sends_its_json_body_once_and_returns_the_201() {
 #[tokio::test]
 async fn a_large_body_is_sent_whole() {
     let stub = Stub::start(|_| Reply::new(204, "")).await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let big = "x".repeat(200_000); // beyond the 64 KiB initial window
     c.put_json(&stub.url("/big"), &big, None).await.unwrap();
     assert_eq!(stub.seen()[0].body.len(), big.len() + 2);
@@ -235,7 +251,7 @@ async fn a_401_is_unauthorized_with_its_challenge_and_is_not_retried() {
         )
     })
     .await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let err = c
         .get_json::<serde_json::Value>(&stub.url("/a"), Some(&nwdaf()))
         .await
@@ -254,7 +270,7 @@ async fn a_401_is_unauthorized_with_its_challenge_and_is_not_retried() {
 #[tokio::test]
 async fn a_403_is_forbidden() {
     let stub = Stub::start(|_| Reply::new(403, "{}")).await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     assert!(matches!(
         c.get_json::<serde_json::Value>(&stub.url("/a"), None).await,
         Err(SbiError::Forbidden)
@@ -265,7 +281,7 @@ async fn a_403_is_forbidden() {
 #[tokio::test]
 async fn another_non_2xx_is_a_status_error_for_the_json_helper() {
     let stub = Stub::start(|_| Reply::new(404, "{}")).await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     assert!(matches!(
         c.get_json::<serde_json::Value>(&stub.url("/a"), None).await,
         Err(SbiError::Status { status: 404 })
@@ -273,6 +289,25 @@ async fn another_non_2xx_is_a_status_error_for_the_json_helper() {
 }
 
 // ---- timeouts and retries -----------------------------------------------
+
+/// #564: the mechanism of the CI flake, made deterministic. A stub that
+/// answers 500 ms late is what a loaded runner looks like to a 300 ms attempt
+/// timeout: under `fast()` the GET is retried and the stub records it more
+/// than once. Under `steady()` the same late answer is one attempt.
+#[tokio::test]
+async fn a_late_answer_within_the_timeout_is_one_attempt_564() {
+    let stub = Stub::start(|_| Reply::new(200, "{}").delayed(Duration::from_millis(500))).await;
+    let c = SbiClient::new(steady());
+    let r = c
+        .get_json::<serde_json::Value>(&stub.url("/late"), None)
+        .await;
+    assert!(r.is_ok(), "{r:?}");
+    assert_eq!(
+        stub.count("/late"),
+        1,
+        "one attempt, however slow the runner"
+    );
+}
 
 #[tokio::test]
 async fn a_timed_out_get_is_retried_then_reported() {
@@ -314,7 +349,7 @@ async fn a_503_get_is_retried_until_it_succeeds_but_a_503_post_is_not() {
         }
     })
     .await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let v: serde_json::Value = c.get_json(&stub.url("/g"), None).await.unwrap();
     assert_eq!(v["ok"], true);
     assert_eq!(stub.count("/g"), 3);
@@ -347,7 +382,7 @@ async fn a_refused_connection_is_a_connect_error() {
 
 #[tokio::test]
 async fn https_and_bad_uris_are_refused_before_anything_is_sent() {
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     assert!(matches!(
         c.get_json::<serde_json::Value>("https://127.0.0.1:1/x", None)
             .await,
@@ -443,7 +478,7 @@ fn oauth_client(stub: &Stub, key: &CcaKey) -> SbiClient {
             "AF",
             key.clone(),
         )),
-        ..fast()
+        ..steady()
     })
 }
 
@@ -779,7 +814,7 @@ async fn a_hanging_connect_to_one_producer_does_not_delay_another() {
     let c = Arc::new(SbiClient::new(SbiClientConfig {
         timeout: Duration::from_millis(1500),
         retries: 0,
-        ..fast()
+        ..steady()
     }));
     // Precondition: the blackhole really hangs a connect.
     let c2 = c.clone();
@@ -827,7 +862,7 @@ async fn a_pooled_connection_the_peer_closed_is_replaced_and_a_post_still_goes_o
     let stub = Stub::start_with(true, |_| Reply::new(201, "{}")).await;
     let c = SbiClient::new(SbiClientConfig {
         retries: 0,
-        ..fast()
+        ..steady()
     });
     c.get_json::<serde_json::Value>(&stub.url("/first"), None)
         .await
@@ -888,7 +923,7 @@ async fn a_slow_token_fetch_for_one_scope_does_not_delay_another() {
 #[tokio::test]
 async fn a_merge_patch_carries_its_media_type_and_is_sent_once_471() {
     let stub = Stub::start(|_| Reply::new(503, "{}")).await;
-    let c = SbiClient::new(fast());
+    let c = SbiClient::new(steady());
     let r = c
         .patch_merge_json(
             &stub.url("/eees-easregistration/v1/registrations/r1"),
@@ -928,12 +963,12 @@ async fn bind_device_binds_every_connection_the_token_request_included_471() {
     let bound = |dev: &str| {
         SbiClient::new(SbiClientConfig {
             bind_device: Some(dev.to_string()),
-            ..fast()
+            ..steady()
         })
     };
     let v: serde_json::Value = SbiClient::new(SbiClientConfig {
         bind_device: Some("lo".into()),
-        ..fast()
+        ..steady()
     })
     .get_json(&stub.url(TOKEN_PATH), None)
     .await
@@ -956,7 +991,7 @@ async fn bind_device_binds_every_connection_the_token_request_included_471() {
             key,
         )),
         bind_device: Some("nosuchif471".into()),
-        ..fast()
+        ..steady()
     });
     let err = c
         .get_json::<serde_json::Value>(&stub.url("/nnwdaf-x"), Some(&nwdaf()))
@@ -979,7 +1014,7 @@ async fn a_bound_client_refuses_a_host_name_471() {
     let stub = Stub::start(|_| Reply::new(200, r#"{"ok":true}"#)).await;
     let c = SbiClient::new(SbiClientConfig {
         bind_device: Some("lo".into()),
-        ..fast()
+        ..steady()
     });
     let port = stub.addr.port();
     let err = c
