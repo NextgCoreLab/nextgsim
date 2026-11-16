@@ -155,8 +155,9 @@ impl Stub {
     }
 }
 
-/// For the tests about timeouts and connect failures only: a 300 ms attempt
-/// timeout, which a loaded runner can exceed on its own (#564).
+/// For the tests about attempt timeouts only: a 300 ms attempt timeout, which
+/// a loaded runner can exceed on its own (#564). Their stubs answer after 2 s,
+/// so a slow runner only makes the timeout more certain.
 fn fast() -> SbiClientConfig {
     SbiClientConfig {
         timeout: Duration::from_millis(300),
@@ -371,7 +372,7 @@ async fn a_refused_connection_is_a_connect_error() {
     drop(l);
     let c = SbiClient::new(SbiClientConfig {
         retries: 0,
-        ..fast()
+        ..steady()
     });
     let err = c
         .get_json::<serde_json::Value>(&format!("http://127.0.0.1:{port}/x"), None)
@@ -585,7 +586,7 @@ async fn an_unreachable_nrf_fails_closed() {
             "AF",
             CcaKey::generate(),
         )),
-        ..fast()
+        ..steady()
     });
     assert!(matches!(
         c.get_json::<serde_json::Value>(&producer.url("/nnwdaf-x"), Some(&nwdaf()))
