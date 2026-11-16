@@ -200,10 +200,9 @@ The binaries behaved the same in both runs.
   - On EKS the three EASes share the upf pod; without netem every N6 delay is about 1 ms.
   - **On EKS, netem runs in the temporary nextg-demo pods only.** The anchor had said "netem is compose-only (needs NET_ADMIN)". What changed:
     - the gNB's netem sidecar has NET_ADMIN only;
-    - the EAS sidecar (`she-eas`, in the upf pod) runs as root, not privileged, with NET_ADMIN (bridge, veths, tc) and SYS_ADMIN (`ip netns` for the per-EAS namespaces), plus CHOWN, SETUID, SETGID, SETPCAP and KILL (handing each key to nobody, dropping to nobody, the load act's signal);
-    - nr-she-eas itself runs as nobody with no capabilities.
-  - The EAS sidecar's capability set is above the NET_ADMIN the operator approved, and is with the operator.
-  - Whether sch_netem was already loaded on the nodes before these runs was not recorded: a NET_ADMIN `tc ... netem` can make the kernel autoload the module. Later runs record it (`sch_netem_before_first_tc` in meta.txt).
+    - the EAS sidecar (`she-eas`, in the upf pod) runs as root, not privileged, with exactly NET_ADMIN (bridge, veths, tc), SYS_ADMIN (`ip netns` for the per-EAS namespaces), SETUID and SETGID (the drop to nobody): the set the operator approved on 2026-11-16, and analyze.py asserts it from the deployed pod spec in every arm;
+    - nr-she-eas runs as nobody with no capabilities. Each EAS creates its own CCA key in its pod (the private key never leaves it), and only its public JWK goes to the NRF.
+  - **sch_netem.** The operator accepts that a NET_ADMIN `tc ... netem` may make the node's kernel autoload sch_netem on devtest1, a change that outlives the namespace. Each run records the module's state before its first tc (`sch_netem_before_first_tc` in meta.txt), and the Results table gives it per arm.
 - **Compute.** The compute term is a sleep of `ceil(reqComp/avlComp)` ms. `reqComp` is a string in TS 24.558 and an integer here.
 - **RAN delay.** The RAN part of `rtDelays` is the gNB's stated `ran_{dl,ul}_delay_ms`, not a measurement. The N3 part is unsynced (T2−T1+T4−T3)/2.
 - **Single UE.** The N3 term is the most recent QOS_MON report of any UE.
