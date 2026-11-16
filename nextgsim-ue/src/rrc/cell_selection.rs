@@ -607,10 +607,23 @@ impl CellSelector {
 
         // Apply cell reselection with hysteresis if we already have a serving cell
         if let Some(ref last) = last_cell {
-            let should_reselect = self.evaluate_cell_reselection(last.cell_id, cell_info.cell_id);
-            if !should_reselect {
+            // The camp's category is what it is now, not what it was when the UE
+            // camped (#521): the same cell turns suitable once NAS selects its PLMN.
+            let last_category = self.camp_category(last.cell_id);
+            // TS 38.304 §5.2.8: camped on any cell, the UE "regularly attempt[s] to
+            // find a suitable cell" and, "If a suitable cell is found, UE shall
+            // move to camped normally state" -- not subject to the hysteresis that
+            // ranks cells of one category.
+            let leaves_any_cell = last_category == CellCategory::AcceptableCell
+                && cell_info.category == CellCategory::SuitableCell;
+            let should_reselect =
+                leaves_any_cell || self.evaluate_cell_reselection(last.cell_id, cell_info.cell_id);
+            if !should_reselect && cell_info.cell_id != last.cell_id {
                 // Keep current cell, reset candidate
-                cell_info = last.clone();
+                cell_info = ActiveCellInfo {
+                    category: last_category,
+                    ..last.clone()
+                };
             }
         }
 
@@ -844,59 +857,7 @@ impl CellSelector {
         let mut candidates: Vec<(i32, i32)> = Vec::new(); // (cell_id, dbm)
 
         for (&cell_id, cell) in &self.cells {
-            // Check system info
-            if !cell.sib1.has_sib1 {
-                report.si_missing_cells += 1;
-                continue;
-            }
-            if !cell.mib.has_mib {
-                report.si_missing_cells += 1;
-                continue;
-            }
-
-            // Check PLMN
-            if cell.sib1.plmn != selected_plmn {
-                report.out_of_plmn_cells += 1;
-                continue;
-            }
-
-            // SNPN NID-qualified selection (Rel-17, TS 23.501 §5.30): in SNPN
-            // mode only a cell broadcasting the configured NID is suitable.
-            if let Some(ref required_nid) = self.required_nid {
-                if cell.sib1.nid.as_deref() != Some(required_nid.as_str()) {
-                    report.out_of_plmn_cells += 1;
-                    tracing::debug!(
-                        "Cell {} rejected: SNPN NID mismatch (required={}, broadcast={:?})",
-                        cell_id,
-                        required_nid,
-                        cell.sib1.nid
-                    );
-                    continue;
-                }
-            }
-
-            // Check barred
-            if cell.mib.is_barred {
-                report.barred_cells += 1;
-                continue;
-            }
-
-            // Check reserved
-            if cell.sib1.is_reserved {
-                report.reserved_cells += 1;
-                continue;
-            }
-
-            // Check forbidden TAIs
-            let tai = cell.tai();
-            if self.forbidden_tai_roaming.contains(&tai) || self.forbidden_tai_rps.contains(&tai) {
-                report.forbidden_tai_cells += 1;
-                continue;
-            }
-
-            // Check combined S criteria: Srxlev > 0 AND Squal > 0 (if configured)
-            if !cell.meets_s_criteria() {
-                report.low_signal_cells += 1;
+            if !self.check_suitable(cell_id, cell, selected_plmn, report) {
                 continue;
             }
 
@@ -922,6 +883,93 @@ impl CellSelector {
         };
 
         true
+    }
+
+    /// Whether `cell` meets the suitable-cell criteria of TS 38.304 §4.5 for
+    /// `selected_plmn`, counting the reason it does not in `report`.
+    fn check_suitable(
+        &self,
+        cell_id: i32,
+        cell: &CellDescription,
+        selected_plmn: Plmn,
+        report: &mut CellSelectionReport,
+    ) -> bool {
+        // Check system info
+        if !cell.sib1.has_sib1 {
+            report.si_missing_cells += 1;
+            return false;
+        }
+        if !cell.mib.has_mib {
+            report.si_missing_cells += 1;
+            return false;
+        }
+
+        // Check PLMN
+        if cell.sib1.plmn != selected_plmn {
+            report.out_of_plmn_cells += 1;
+            return false;
+        }
+
+        // SNPN NID-qualified selection (Rel-17, TS 23.501 §5.30): in SNPN
+        // mode only a cell broadcasting the configured NID is suitable.
+        if let Some(ref required_nid) = self.required_nid {
+            if cell.sib1.nid.as_deref() != Some(required_nid.as_str()) {
+                report.out_of_plmn_cells += 1;
+                tracing::debug!(
+                    "Cell {} rejected: SNPN NID mismatch (required={}, broadcast={:?})",
+                    cell_id,
+                    required_nid,
+                    cell.sib1.nid
+                );
+                return false;
+            }
+        }
+
+        // Check barred
+        if cell.mib.is_barred {
+            report.barred_cells += 1;
+            return false;
+        }
+
+        // Check reserved
+        if cell.sib1.is_reserved {
+            report.reserved_cells += 1;
+            return false;
+        }
+
+        // Check forbidden TAIs
+        let tai = cell.tai();
+        if self.forbidden_tai_roaming.contains(&tai) || self.forbidden_tai_rps.contains(&tai) {
+            report.forbidden_tai_cells += 1;
+            return false;
+        }
+
+        // Check combined S criteria: Srxlev > 0 AND Squal > 0 (if configured)
+        if !cell.meets_s_criteria() {
+            report.low_signal_cells += 1;
+            return false;
+        }
+        true
+    }
+
+    /// The category the UE's camp on `cell_id` has now: `SuitableCell` when the
+    /// cell meets the suitable-cell criteria for the selected PLMN (camped
+    /// normally, TS 38.304 §5.2.5), `AcceptableCell` otherwise (camped on any
+    /// cell, §5.2.8). Recomputed rather than remembered, because the criteria
+    /// move under a camp that does not: NAS selects another PLMN, a TAI becomes
+    /// forbidden, the cell's SIB1 changes (#521).
+    pub fn camp_category(&self, cell_id: i32) -> CellCategory {
+        let suitable = match (self.selected_plmn, self.cells.get(&cell_id)) {
+            (Some(plmn), Some(cell)) => {
+                self.check_suitable(cell_id, cell, plmn, &mut CellSelectionReport::default())
+            }
+            _ => false,
+        };
+        if suitable {
+            CellCategory::SuitableCell
+        } else {
+            CellCategory::AcceptableCell
+        }
     }
 
     /// Look for an acceptable cell (any PLMN)
@@ -1468,6 +1516,62 @@ mod tests {
         let cell = result.unwrap();
         assert_eq!(cell.cell_id, 1);
         assert_eq!(cell.category, CellCategory::AcceptableCell);
+    }
+
+    /// #521: camped on an acceptable cell, the same cell turns suitable once the
+    /// selected PLMN is the one it broadcasts, and the camp's category follows
+    /// (it was kept from the first camp before).
+    #[test]
+    fn the_camp_category_follows_the_selected_plmn_on_the_same_cell() {
+        let mut selector = CellSelector::new();
+        let broadcast = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(Plmn::new(999, 71, false)));
+        selector
+            .cells
+            .insert(1, make_cell_with_sib1(-80, broadcast, 1, false, false));
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+        selector.perform_cell_selection();
+        assert_eq!(
+            selector.current_cell().map(|c| c.category),
+            Some(CellCategory::AcceptableCell)
+        );
+        assert_eq!(selector.camp_category(1), CellCategory::AcceptableCell);
+
+        selector.set_selected_plmn(Some(broadcast));
+        assert_eq!(selector.camp_category(1), CellCategory::SuitableCell);
+        assert!(
+            selector.perform_cell_selection().is_none(),
+            "the same cell: no change of camp"
+        );
+        assert_eq!(
+            selector.current_cell().map(|c| c.category),
+            Some(CellCategory::SuitableCell),
+            "but now camped normally"
+        );
+    }
+
+    /// #521, TS 38.304 §5.2.8: camped on any cell, a suitable cell found is moved
+    /// to even when it ranks below the acceptable one by the hysteresis.
+    #[test]
+    fn camped_on_any_cell_a_weaker_suitable_cell_is_reselected() {
+        let mut selector = CellSelector::new();
+        let selected = Plmn::new(999, 70, false);
+        selector.set_selected_plmn(Some(selected));
+        selector.cells.insert(
+            1,
+            make_cell_with_sib1(-60, Plmn::new(999, 71, false), 1, false, false),
+        );
+        selector.started_time = Instant::now() - Duration::from_secs(10);
+        selector.perform_cell_selection();
+        assert_eq!(selector.current_cell().map(|c| c.cell_id), Some(1));
+
+        // A suitable cell 2 dB weaker: inside any hysteresis.
+        selector
+            .cells
+            .insert(2, make_cell_with_sib1(-62, selected, 1, false, false));
+        let moved = selector.perform_cell_selection().expect("a change of camp");
+        assert_eq!(moved.cell_id, 2);
+        assert_eq!(moved.category, CellCategory::SuitableCell);
     }
 
     #[test]

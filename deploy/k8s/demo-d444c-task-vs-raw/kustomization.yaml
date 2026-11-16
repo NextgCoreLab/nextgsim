@@ -1,0 +1,33 @@
+# Demo D444C (nextgsim#479): one Job running the crate-level `task_vs_raw`
+# sweep (`--seed 444`, mode all) from the demo-only image nr-semantic-demo.
+# Portable: plain Kubernetes, nothing cloud-specific (no Service, no ports, no
+# storage, no IAM, no node selector). Runs under Pod Security `restricted`.
+#
+# Run and check it on any cluster: scripts/demo/d444c-k8s.sh (it applies an
+# overlay of this base in a temporary namespace and diffs the printed table
+# against nextgsim-semantic/src/task_vs_raw/golden_seed444.txt).
+#
+# Overrides (an overlay with `resources: [<path to this dir>]`):
+#   namespace: <ns>
+#   images:
+#     - name: nextgsim/nr-semantic-demo
+#       newName: <registry>/<repo>
+#       newTag: <tag>          # or digest: sha256:...
+#   patches:                   # a registry image must be pullable (the base is Never)
+#     - target: {kind: Job, name: d444c-task-vs-raw}
+#       patch: |-
+#         - op: replace
+#           path: /spec/template/spec/containers/0/imagePullPolicy
+#           value: IfNotPresent
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - job.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: nextgsim-demo
+      nextg.demo/key: d444c-task-vs-raw
+    includeTemplates: true
+images:
+  - name: nextgsim/nr-semantic-demo
+    newTag: local

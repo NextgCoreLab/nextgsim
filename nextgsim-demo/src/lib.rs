@@ -51,8 +51,9 @@
 //!
 //! A demo reads its mode with [`active_mode`] at each decision, so a change
 //! applies to the next decision. Every `set`, accepted or not, is audited with a
-//! `WARN [demo:<key>] audit:` line. A rejected `set` (unknown key or mode, or a
-//! demo the config did not enable) leaves the mode unchanged. Enabling or
+//! `WARN [demo:<key>] audit:` line. A rejected `set` (unknown key or mode, a
+//! demo the config did not enable, or a state a check registered with
+//! [`DemoRuntime::with_check`] refuses) leaves the mode unchanged. Enabling or
 //! disabling a demo is config plus restart: `set` changes modes only.
 
 use std::collections::BTreeMap;
@@ -445,18 +446,48 @@ pub enum DemoCliError {
     /// [`install`] has not run in this process.
     #[error("demo state is not installed in this process")]
     NotInstalled,
+    /// A check the binary registered ([`DemoRuntime::with_check`]) refused the
+    /// state the switch would produce, for example a mode whose dependency is
+    /// not active. The same check runs at startup, so a runtime `set` cannot
+    /// reach a state startup would refuse (nextgsim#537).
+    #[error("refused set mode={mode:?} on demo {demo:?}: {reason}")]
+    Refused {
+        /// The demo's key.
+        demo: String,
+        /// The mode asked for.
+        mode: String,
+        /// Why the would-be state is refused.
+        reason: String,
+    },
 }
+
+/// A check on a would-be demo state, registered with [`DemoRuntime::with_check`]:
+/// `Err(reason)` refuses a runtime `set` that would produce that state.
+pub type StateCheck = Box<dyn Fn(&ActiveDemos) -> Result<(), String> + Send + Sync>;
 
 const USAGE: &str =
     "usage: demo show | demo metrics | demo <key> show | demo <key> set mode=<mode>";
 
 /// A process's demo state: the registry it was built with, the kill switch as
 /// configured, and the active demos with their current modes.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct DemoRuntime {
     registry: DemoRegistry,
     kill_switch: bool,
     active: RwLock<ActiveDemos>,
+    /// Run on the would-be state of every runtime `set` (nextgsim#537).
+    checks: Vec<StateCheck>,
+}
+
+impl std::fmt::Debug for DemoRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DemoRuntime")
+            .field("registry", &self.registry)
+            .field("kill_switch", &self.kill_switch)
+            .field("active", &self.active)
+            .field("checks", &self.checks.len())
+            .finish()
+    }
 }
 
 impl DemoRuntime {
@@ -467,7 +498,18 @@ impl DemoRuntime {
             registry,
             kill_switch,
             active: RwLock::new(active),
+            checks: Vec::new(),
         }
+    }
+
+    /// Add a check every runtime `set` must pass (nextgsim#537). It sees the
+    /// state the switch would produce, all demos included, and a refusal leaves
+    /// every mode unchanged. A binary registers here the same checks it runs on
+    /// the configured state at startup, so startup and runtime cannot disagree.
+    /// Register before [`install`]; the startup state itself is not re-checked.
+    pub fn with_check(mut self, check: StateCheck) -> Self {
+        self.checks.push(check);
+        self
     }
 
     /// Parse and check a config root's `demo:` block into a runtime. An error
@@ -522,6 +564,19 @@ impl DemoRuntime {
                     demo: key.to_string(),
                 }
             })?;
+            // The registered checks judge the state this switch would produce,
+            // on a copy: the live state changes only once every check passes.
+            if !self.checks.is_empty() {
+                let mut would_be = active.clone();
+                would_be.set_mode(spec_key, mode);
+                for check in &self.checks {
+                    check(&would_be).map_err(|reason| DemoCliError::Refused {
+                        demo: spec_key.to_string(),
+                        mode: mode.to_string(),
+                        reason,
+                    })?;
+                }
+            }
             active.set_mode(spec_key, mode);
             Ok((spec_key, previous, active.banner()))
         });
