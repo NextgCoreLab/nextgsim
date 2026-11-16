@@ -142,7 +142,9 @@ The demo follows the #458 toggle convention:
     for example with D446A).
 - **Runtime.** `nr-cli <gnb> demo d441d-predictive-ho set mode=<mode>` /
   `show` / `demo metrics` (`nextg_demo_enabled`). A switch applies from the next
-  tick and is audited.
+  tick and is audited. A switch startup would refuse is refused and changes
+  nothing: `set mode=onnx` without d440b in `verify`, or d440b switched away
+  from `verify` under `onnx` (nextgsim#537).
 - **Status.** `nr-cli <gnb> nwdaf-status` gains a `handover` section: mode,
   served UEs, predictions, exhausted, A3 triggers, A3 fallbacks, stranded, and
   the last lead times as `[min, max]` ranges. These counts are the predictive

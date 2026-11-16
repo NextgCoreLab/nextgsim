@@ -93,6 +93,9 @@ The demo follows the #458 convention. Both gates are off by default.
   `nextgsim-demo`). The switch applies from the next prediction. A model that a
   `fallback` start deferred is verified at the first `verify` prediction, and is
   never activated unchecked.
+  A switch is refused, audited, and changes nothing when it would leave a
+  D440A or D441D `onnx` without d440b in `verify`, the same check as at
+  startup (nextgsim#537).
 - **Startup failures:**
   - `mode: bogus` fails startup with `DemoConfigError::UnknownMode`, and
     `set mode=bogus` is rejected with the mode left unchanged;
