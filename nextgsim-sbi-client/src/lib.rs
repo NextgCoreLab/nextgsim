@@ -24,6 +24,7 @@
 //! The crate is feature-gated at its consumers (`sbi-client` on nextgsim-gnb and
 //! nextgsim-ue), so a default gNB or UE build pulls in no HTTP/2 stack.
 
+pub mod nrf;
 pub mod oauth;
 
 use std::collections::HashMap;
@@ -340,7 +341,7 @@ impl SbiClient {
     }
 
     /// [`Self::request`] with the body's `content-type`.
-    async fn request_typed(
+    pub async fn request_typed(
         &self,
         method: Method,
         uri: &str,
