@@ -900,6 +900,13 @@ pub struct PduSessionResource {
         u8,
         nextgsim_ngap::procedures::transfer::QosMonitoringRequest,
     )>,
+    /// The QFIs a PDU Session Resource Modify releases (the Modify Request
+    /// Transfer's QoS Flow to Release List, TS 38.413 §9.3.4.3; nextgsim#522).
+    /// §8.2.3.2: "the NG-RAN node shall de-associate the QoS flow with the
+    /// previously associated DRB", so the GTP task drops each from the session's
+    /// SDAP mapping and enforcer. A flow also in the add-or-modify list is not
+    /// listed here (§8.2.3.2: it is not released). Always empty on a create.
+    pub qos_flows_to_release: Vec<u8>,
     /// Uplink TEID (gNB -> UPF)
     pub uplink_teid: u32,
     /// Downlink TEID (UPF -> gNB)

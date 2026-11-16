@@ -425,6 +425,28 @@ impl GtpTask {
         );
     }
 
+    /// Drop the flows a Modify Request's QoS Flow to Release List names from an
+    /// existing session's SDAP entity (TS 38.413 §8.2.3.2: "de-associate the QoS
+    /// flow with the previously associated DRB"; TS 37.324 §5.3; nextgsim#522).
+    ///
+    /// From both halves, for the reason [`Self::admit_flows`] gives. A released
+    /// QFI then answers `Default` from `QfiDrbMap::drb_for`, the §5.3.1 rule for a
+    /// flow with no mapping, rather than keeping a GBR DRB it no longer holds.
+    #[cfg(feature = "sdap-dataplane")]
+    fn release_sdap_flows(&mut self, ue_id: i32, psi: u8, qfis: &[u8]) {
+        if qfis.is_empty() {
+            return;
+        }
+        let Some(state) = self.sdap_sessions.get_mut(&(ue_id, psi)) else {
+            return;
+        };
+        for &qfi in qfis {
+            state.qfi_drb.release_flow(qfi);
+            state.enforcer.remove_flow(qfi);
+        }
+        debug!("SDAP entity for ue_id={ue_id} psi={psi}: QoS flow(s) {qfis:?} released");
+    }
+
     /// Admit `qos_flows` into both halves of one session's SDAP state.
     ///
     /// Shared so the mapping and the enforcer can never be given different flow sets:
@@ -468,6 +490,7 @@ impl GtpTask {
         #[cfg(feature = "sdap-dataplane")]
         if created {
             self.amend_sdap_session(ue_id, resource.psi as u8, &resource.qos_flows);
+            self.release_sdap_flows(ue_id, resource.psi as u8, &resource.qos_flows_to_release);
         }
         #[cfg(not(feature = "sdap-dataplane"))]
         let _ = created;
@@ -2175,6 +2198,56 @@ mod tests {
         assert!(task.qos_monitoring.is_empty(), "a peer purge drops it");
     }
 
+    /// #522, TS 38.413 §8.2.3.2: a flow in a Modify's QoS Flow to Release List is
+    /// de-associated from its DRB. The GBR flow released here stops mapping to
+    /// the GBR DRB and loses its enforcer entry; the flow the modify did not name
+    /// keeps both.
+    #[cfg(feature = "sdap-dataplane")]
+    #[tokio::test]
+    async fn a_modify_releases_its_released_flows_from_the_sdap_mapping() {
+        use nextgsim_gtp::qfi_drb::DrbChoice;
+        let (task_base, _, _, _, _, _rls_rx, _) = GnbTaskBase::new(test_config(), 16);
+        let mut task = GtpTask::with_loopback(task_base, false);
+        task.ue_contexts.insert(1, GtpUeContext::new(1));
+        let upf: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let resource = |qos_flows: Vec<(u8, Option<u16>)>, released: Vec<u8>| PduSessionResource {
+            psi: 1,
+            qfi: Some(1),
+            qos_flows,
+            qos_monitoring: Vec::new(),
+            qos_flows_to_release: released,
+            uplink_teid: 0x1000,
+            downlink_teid: 0x2000,
+            upf_address: upf,
+        };
+        // QFI 1 on 5QI 9 (non-GBR), QFI 2 on 5QI 1 (GBR).
+        task.handle_session_create(1, resource(vec![(1, Some(9)), (2, Some(1))], Vec::new()));
+        let state = task.sdap_sessions.get(&(1, 1)).expect("SDAP entity");
+        assert_eq!(state.qfi_drb.drb_for(2), DrbChoice::Gbr, "precondition");
+        assert_eq!(state.qfi_drb.flow_count(), 2);
+
+        task.handle_session_modify(1, resource(Vec::new(), vec![2]));
+        let state = task
+            .sdap_sessions
+            .get(&(1, 1))
+            .expect("SDAP entity survives");
+        assert_eq!(
+            state.qfi_drb.drb_for(2),
+            DrbChoice::Default,
+            "a released GBR flow no longer maps to the GBR DRB"
+        );
+        assert_eq!(state.qfi_drb.flow_count(), 1, "only QFI 1 stays mapped");
+        assert!(state.enforcer.get_dscp(2).is_none(), "nor is it enforced");
+        assert!(
+            state.enforcer.get_dscp(1).is_some(),
+            "the unnamed flow keeps its entry"
+        );
+
+        // A release naming a flow the session never had changes nothing.
+        task.handle_session_modify(1, resource(Vec::new(), vec![7]));
+        assert_eq!(task.sdap_sessions[&(1, 1)].qfi_drb.flow_count(), 1);
+    }
+
     /// A modify whose tunnel rebuild is refused leaves the session with no tunnel,
     /// and its monitoring goes with it rather than lingering.
     #[tokio::test]
@@ -2200,6 +2273,7 @@ mod tests {
                 qfi: Some(9),
                 qos_flows: Vec::new(),
                 qos_monitoring: Vec::new(),
+                qos_flows_to_release: Vec::new(),
                 uplink_teid: 0x1000,
                 downlink_teid: 0x3000,
                 upf_address: upf.local_addr().unwrap().ip(),
@@ -2335,6 +2409,7 @@ mod tests {
             qfi: Some(1),
             qos_flows: vec![(1, None)],
             qos_monitoring: Vec::new(),
+            qos_flows_to_release: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -2363,6 +2438,7 @@ mod tests {
             qfi: Some(1),
             qos_flows: vec![(1, None)],
             qos_monitoring: Vec::new(),
+            qos_flows_to_release: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -2390,6 +2466,7 @@ mod tests {
             qfi: Some(1),
             qos_flows: vec![(1, None)],
             qos_monitoring: Vec::new(),
+            qos_flows_to_release: Vec::new(),
             uplink_teid: 0x1000,
             downlink_teid: 0x2000,
             upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -2419,6 +2496,7 @@ mod tests {
                 qfi: Some(1),
                 qos_flows: vec![(1, None)],
                 qos_monitoring: Vec::new(),
+                qos_flows_to_release: Vec::new(),
                 uplink_teid: 0x1000 + psi as u32,
                 downlink_teid: 0x2000 + psi as u32,
                 upf_address: IpAddr::from([10, 0, 0, 1]),
@@ -2556,6 +2634,7 @@ mod tests {
                 qfi: Some(1),
                 qos_flows: vec![(1, None)],
                 qos_monitoring: Vec::new(),
+                qos_flows_to_release: Vec::new(),
                 uplink_teid: 0x1000,
                 downlink_teid: 0x2000,
                 upf_address: upf_addr.ip(),

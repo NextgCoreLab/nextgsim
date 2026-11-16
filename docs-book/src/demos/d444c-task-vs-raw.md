@@ -52,7 +52,7 @@ The noise seed drives only the channel. Each sample's noise is drawn from `ChaCh
 | modes | `all` (every arm and the deltas), `task-encoder`, `top-variance`, `mean-pool` (one arm each) |
 | seed | `--seed <u64>` (default 444), the channel noise only |
 
-Crate-level limits of the #458 convention: the process has no `/metrics` and opens no listener, so the `nextg_demo_enabled` series is written once to stderr; the `WARN DEMO MODE ACTIVE` banner and the `[demo:d444c-task-vs-raw]` log lines go to stderr; the table goes to stdout and carries no prefix. There is no runtime switch (one-shot process) and no EKS overlay: the sweep has no network path, so a pod would run the same arithmetic and add no evidence.
+Crate-level limits of the #458 convention: the process has no `/metrics` and opens no listener, so the `nextg_demo_enabled` series is written once to stderr; the `WARN DEMO MODE ACTIVE` banner and the `[demo:d444c-task-vs-raw]` log lines go to stderr; the table goes to stdout and carries no prefix. There is no runtime switch (one-shot process). There is no nextgcore EKS overlay: the sweep has no network path. Instead, a portable demo-only Kubernetes Job runs the same example on any cluster (see [Run on Kubernetes](#run-on-kubernetes)); it shows that the shipped container reproduces the golden table, not anything about a network.
 
 ## How to run it
 
@@ -63,7 +63,7 @@ cargo test -p nextgsim-semantic --features demo-d444c-task-vs-raw   # golden + a
 scripts/demo/d444c-reverts.sh                                       # revert arms
 ```
 
-There is no compose or EKS variant (crate-level).
+There is no compose variant (crate-level). To run it on a cluster, see [Run on Kubernetes](#run-on-kubernetes).
 
 ## Results
 
@@ -211,6 +211,158 @@ Demo(UnknownMode { demo: "d444c-task-vs-raw", mode: "bogus", known: ["all", "tas
 
 Both fail as required (`scripts/demo/d444c-reverts.sh`, run in CI).
 
+## Run on Kubernetes
+
+The same sweep can run as a one-shot Kubernetes Job on any conformant cluster (kind, minikube, EKS, GKE, AKS, on-prem). The Job uses only kubectl and plain kustomize; nothing in it is cloud-specific.
+
+Two assumptions hold on most clusters but not all:
+
+- **PodSecurity admission.** The Pod Security `restricted` refusal described below needs the built-in PodSecurity admission plugin, which is on by default from Kubernetes 1.25. Without it, the label does nothing and the Job still runs.
+- **OpenShift.** The `restricted-v2` SCC assigns each namespace a UID range, and the fixed `runAsUser: 65532` falls outside it, so the pod is refused. On OpenShift, patch out `runAsUser` and `runAsGroup` (the image's `USER` is non-root either way), or grant the namespace an SCC that allows the UID.
+
+| Piece | Where | What |
+|---|---|---|
+| image | `docker/demo/Dockerfile.nr-semantic-demo` | `nr-semantic-demo`: a self-contained two-stage build of the `task_vs_raw` example (`--features demo-d444c-task-vs-raw`, release) on `rust:1.95-bookworm`, copied into `gcr.io/distroless/cc-debian12:nonroot` (both pinned by digest). It has no shell, runs as uid 65532 and bakes in only `config/demo-task-vs-raw/task_vs_raw.yaml` |
+| manifest | `deploy/k8s/demo-d444c-task-vs-raw/` | a kustomize base with one Job, `task_vs_raw --config /etc/nextgsim/task_vs_raw.yaml --seed 444` (mode `all`) |
+| runner | `scripts/demo/d444c-k8s.sh` | creates a temporary namespace, applies, waits, captures, diffs against the golden and always deletes the namespace |
+| self-test | `scripts/demo/d444c-k8s-selftest.sh [--mutants]` | the runner against a fake kubectl with one namespace store per context (including a context switched mid-run), run in CI (`demo-harness`) |
+
+**The image is demo-only.** It is listed under `excluded` in `docker/release-images.json` (with the local name `nextgsim/nr-semantic-demo`), so `release.yml` never builds or publishes it, and it changes no release image. Build it yourself, from the repo root:
+
+```sh
+docker build -f docker/demo/Dockerfile.nr-semantic-demo -t nextgsim/nr-semantic-demo:local .
+```
+
+**The Job is private and hardened.** It has no Service, no ports, no `hostNetwork`, no `hostPath` and no volumes, and it opens no listener. The pod sets `runAsNonRoot`, `readOnlyRootFilesystem`, `allowPrivilegeEscalation: false`, drops ALL capabilities, uses seccomp `RuntimeDefault`, mounts no service-account token and gets no service links. It has CPU and memory requests (250m, 64Mi) and limits (1, 256Mi), `backoffLimit: 0`, `activeDeadlineSeconds: 300` and `ttlSecondsAfterFinished: 3600`. The runner labels its namespace `pod-security.kubernetes.io/enforce=restricted`, so the cluster itself refuses the pod if this hardening ever regresses. On kind, a copy of the Job with `allowPrivilegeEscalation: true` was refused (`FailedCreate: ... violates PodSecurity "restricted:latest"`), and the run failed (run `kind-neg-psa-20261116T003741Z` below).
+
+### Running it
+
+```sh
+# kind (or any cluster whose nodes already hold the image): the base's
+# nextgsim/nr-semantic-demo:local is imagePullPolicy Never, never pulled
+kind load docker-image nextgsim/nr-semantic-demo:local --name <cluster>
+scripts/demo/d444c-k8s.sh --context kind-<cluster>
+
+# a cluster that pulls from a registry: push the image there first
+docker tag nextgsim/nr-semantic-demo:local <registry>/<repo>:<tag>
+docker push <registry>/<repo>:<tag>
+scripts/demo/d444c-k8s.sh --context <ctx> --image <registry>/<repo>:<tag>   # or <registry>/<repo>@sha256:<digest>
+```
+
+Options:
+
+- `--namespace NS` sets the temporary namespace (default `d444c-<run-id>`). It must not already exist: the runner refuses an existing namespace and never adopts it.
+- `--context CTX` selects the cluster. Without it, the runner reads the current context **once** at start. Either way the context is pinned: every kubectl call passes `--context`, so a `kubectl config use-context`, `kind create cluster` or `aws eks update-kubeconfig` elsewhere during the run cannot redirect the run or its cleanup. The current context is never switched, and `KUBECONFIG` is honoured.
+- `--arch ARCH` sets the node architecture the Job is pinned to (`kubernetes.io/arch`, default `amd64`).
+- `--timeout SECS` defaults to 360.
+- `--run-id ID` names the artefact directory and the namespace's `nextg.demo/run-id` label. It must be new.
+
+The runner creates the namespace with all its labels in one call and records its UID. It deletes the namespace only on the pinned context, and only while the UID and the run label still match. The delete itself selects by that label and the name.
+
+The image, pull policy, namespace and arch are plain kustomize fields, so without the runner you can write the same overlay yourself:
+
+```yaml
+# my-overlay/kustomization.yaml (copy or reference deploy/k8s/demo-d444c-task-vs-raw as ../base)
+resources: [../base]
+namespace: my-demo-ns
+images:
+  - name: nextgsim/nr-semantic-demo
+    newName: <registry>/<repo>
+    newTag: <tag>
+patches:
+  - target: {kind: Job, name: d444c-task-vs-raw}
+    patch: |-
+      - op: replace   # the base is Never: a registry image must be pulled
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+      # - op: replace # only for a native arm64 build of the image
+      #   path: /spec/template/spec/nodeSelector/kubernetes.io~1arch
+      #   value: arm64
+```
+
+**Image pull and arch.** The base image `nextgsim/nr-semantic-demo:local` is `imagePullPolicy: Never`. An unqualified name would resolve to Docker Hub's `nextgsim` namespace, which this repo does not control, so a node that lacks the image fails with `ErrImageNeverPull` instead of pulling it. `--image` switches the policy to `IfNotPresent`.
+
+The image is amd64: it is built on an amd64 host, and the Dockerfile builds for the host. The Job therefore carries `nodeSelector: kubernetes.io/arch: amd64`, a well-known label every kubelet sets.
+
+- On a mixed-arch cluster this keeps the pod off arm64 nodes, where an amd64 binary dies with `exec format error`.
+- On an arm64-only cluster the pod stays Pending (`FailedScheduling`, untolerated or mismatched node affinity), and the run fails on its timeout.
+
+The runner names the pod state and the first `FailedCreate` or `FailedScheduling` event in its failure message. For arm64, build the image on an arm64 host and pass `--arch arm64`. Expect that a native arm64 build may differ from the x86_64-pinned golden in the last digit, which the diff then reports.
+
+The runner writes its artefacts to `/tmp/eks-val/demos/d444c-task-vs-raw/<run-id>/` (override the root with `D444C_ARTEFACTS_ROOT`):
+
+- `job.log` (the merged pod log), split into `table.txt` and `stderr.txt`;
+- `table.diff` and `table.sha256`;
+- `rendered.yaml`, `overlay-kustomization.yaml`, `job.yaml`, `job-describe.txt`, `pods.txt`, `pod-status.txt`, `pod-image.txt` (the node and the pod's `imageID`, as the node's runtime reports it) and `events.txt`;
+- `run.env`, which holds the pinned context, the namespace UID, the verdict and `namespace_deleted`.
+
+It exits 0 only when every check passes. A failed check (each prints `DEMO CHECK FAILED: <why>`) or a namespace it could not delete exits 1. A usage error, a reused run id, a failed create or an existing namespace exits 2, and INT or TERM exits 130 or 143, still deleting the namespace.
+
+### What the diff proves
+
+`kubectl logs` merges stdout and stderr. The runner drops exactly the example's stderr lines (tracing lines and its own `task_vs_raw:` messages) and keeps everything else, so a panic or a stray line fails the diff. It then requires the result to be byte-equal to `nextgsim-semantic/src/task_vs_raw/golden_seed444.txt`. That is the same file the unit test `the_seed_444_table_matches_the_committed_golden_row_by_row` reads with `include_str!`, so there is one source of truth: changing one golden row fails both the unit test and the cluster run (both were checked). The runner also requires the Job to be `Complete`, the `WARN DEMO MODE ACTIVE: d444c-task-vs-raw=all` banner, and the `nextg_demo_enabled{demo="d444c-task-vs-raw",mode="all"} 1` series.
+
+A pass proves that the image built from this tree, scheduled by that cluster on its nodes (their CPU and the image's own bookworm glibc `libm`), prints the CI-pinned table byte for byte. In other words, the pinned determinism holds in a container on real nodes. It proves nothing about a network, a channel or 3GPP: the Job talks to nothing, and the noise is still emulated in-process (see the honesty labels).
+
+### Results
+
+These runs used the runner as of commit `ae241d1`, which pins the context and guards the delete by UID and label. The image was built from that commit as `nextgsim/nr-semantic-demo:demo-d444c-ae241d1`. In devtest1 ECR it is `nextg/semantic-demo:demo-d444c-ae241d1`; the ECR repos follow the `nextg/<component>` naming, and this repo holds only the demo-only `nr-semantic-demo` image.
+
+The build pushed an OCI index `sha256:56e233c71805290dc79f9f30c5048855ab9cd953df9efb92697632e2e423699e`. It holds one amd64 image, manifest `sha256:cbb7bd211c7d643bbd9174fbce9acf599921f72e0a217c6572ce98ffb2422849` and config `sha256:9a0cacdf2b66caf6d862319c71ca5bb1bb1a0eee6f0ed306138c3f0fb601c5ff`, plus a build attestation. The pod `imageID` each cluster reports names the same image differently:
+
+- **EKS** pulls by tag and reports the repo digest, which is the index (`…/nextg/semantic-demo@sha256:56e233c7…`).
+- **kind** gets the image through `kind load docker-image`, with no registry and no repo digest. Its containerd reports the image's config ID (`sha256:9a0cacdf…`).
+
+The first-round image (`demo-d444c-8b01512`, index `sha256:cca2eba1…`) has the same amd64 manifest and config. Only its attestation differs, so the binary that ran is the same in every run.
+
+| Cluster | Run id | Server | Node | Job | Table | Namespace |
+|---|---|---|---|---|---|---|
+| kind (local, single node) | `kind-20261116T003656Z` (`--context`, `--image …:demo-d444c-ae241d1`) | v1.32.2 | `d444c-479k-control-plane`, imageID `sha256:9a0cacdf…` | Complete after 9 s | 85 lines, byte-identical to the golden, sha256 `be4bf0cd…43ec70` | created with UID `8e493608-…`, then deleted |
+| kind (local) | `kind-base-20261116T003644Z` (no `--context`, so the current context is pinned at start; the base image `:local`, pull `Never`) | v1.32.2 | `d444c-479k-control-plane`, imageID `sha256:9a0cacdf…` | Complete after 4 s | the same, sha256 `be4bf0cd…43ec70` | created with UID `e2e0ef13-…`, then deleted |
+| devtest1 EKS (us-west-2) | `eks-devtest1-20261116T003844Z` (`--context devtest1`, under `flock /tmp/eks-nextg-demo.lock`) | v1.36.5-eks-91f89a9 | `ip-10-10-13-23.us-west-2.compute.internal` (amd64); image pulled in 1.133 s; imageID `…/nextg/semantic-demo@sha256:56e233c7…` | Complete after 4 s | the same, sha256 `be4bf0cd…43ec70` | created with UID `95c41293-…`, then deleted |
+
+Every table has the sha256 of the local run in [Results](#results) above (`be4bf0cdab4bea412734bb4390194b4441c1bdcb3135d52898e77a5b2343ec70`), so the stdout block shown there is what each cluster printed. The first-round runs (`kind-20261115T234110Z` and `eks-devtest1-20261115T234126Z`, on the image built from `8b01512`, before the review fixes) passed with the same sha256.
+
+Runner output on devtest1:
+
+```text
+[d444c-k8s] created namespace d444c-eks-devtest1-20261116t003844z (uid 95c41293-294a-48b0-bc20-1566cff2a141) on devtest1 (run eks-devtest1-20261116T003844Z, artefacts /tmp/eks-val/demos/d444c-task-vs-raw/eks-devtest1-20261116T003844Z)
+[d444c-k8s] applied job/d444c-task-vs-raw
+[d444c-k8s] job/d444c-task-vs-raw: Complete after 4s
+[d444c-k8s] table: 85 lines, byte-identical to nextgsim-semantic/src/task_vs_raw/golden_seed444.txt
+[d444c-k8s] PASS: job complete, banner present, table equals the golden; artefacts in /tmp/eks-val/demos/d444c-task-vs-raw/eks-devtest1-20261116T003844Z
+[d444c-k8s] deleting namespace d444c-eks-devtest1-20261116t003844z (uid 95c41293-294a-48b0-bc20-1566cff2a141) on devtest1
+[d444c-k8s] namespace d444c-eks-devtest1-20261116t003844z deleted
+```
+
+The pod's stderr on devtest1 (`stderr.txt`):
+
+```text
+2026-11-16T00:44:31.375381Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d444c-task-vs-raw=all
+2026-11-16T00:44:31.375396Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] nextg_demo_enabled{demo="d444c-task-vs-raw",mode="all"} 1 (one-shot: this process has no /metrics)
+2026-11-16T00:44:31.375401Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] sweep: mode all, noise seed 444, emulated AWGN (non-normative)
+2026-11-16T00:44:32.604061Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] printed 60 rows
+```
+
+The pod's stderr on kind (`kind-20261116T003656Z`):
+
+```text
+2026-11-16T00:36:57.217902Z  WARN nextgsim_demo: DEMO MODE ACTIVE: d444c-task-vs-raw=all
+2026-11-16T00:36:57.217920Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] nextg_demo_enabled{demo="d444c-task-vs-raw",mode="all"} 1 (one-shot: this process has no /metrics)
+2026-11-16T00:36:57.217927Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] sweep: mode all, noise seed 444, emulated AWGN (non-normative)
+2026-11-16T00:36:58.684946Z  INFO task_vs_raw: [demo:d444c-task-vs-raw] printed 60 rows
+```
+
+The release build prints the table in about 1.2 s on devtest1 and 1.5 s on kind (from the `sweep:` line to the `printed` line), against about 22 s for the debug build above.
+
+Negative runs on kind. Each one's artefacts are kept under `/tmp/eks-val/demos/d444c-task-vs-raw/<run id>/`.
+
+- **`kind-neg-pullnever-20261116T003552Z`: the base image was not loaded and no `--image` was given.** The pod stayed Pending with `ErrImageNeverPull` (`Container image "nextgsim/nr-semantic-demo:local" is not present with pull policy of Never`). Nothing was pulled, and the runner named that cause in its Job failure.
+- **`kind-neg-golden-row-20261116T003723Z`: one golden row changed.** In a scratch copy of the tree, the `task-encoder 16 32 0` top-1 went from `0.7585` to `0.7586` (the edited file is kept as `golden-as-edited.txt`). The runner printed `DEMO CHECK FAILED: the printed table differs ...` and exited 1. The same edit fails the unit test (`the_seed_444_table_matches_the_committed_golden_row_by_row ... FAILED`).
+- **`kind-neg-psa-20261116T003741Z`: `allowPrivilegeEscalation: true`, run with `--timeout 20`.** Pod Security `restricted` refused the pod (`FailedCreate: ... violates PodSecurity "restricted:latest": allowPrivilegeEscalation != false`), and the runner named that event. The run failed on the timeout, Job, banner and table checks, and the namespace was deleted.
+
+**How kind ran on this host.** The host is cgroup v1 (docker `cgroupfs`), with kind v0.27.0 and the node image's Kubernetes v1.32.2. On the first day, `kind create cluster` came up normally (control plane Ready after 18 s). On a later attempt, the node's kubelet looped on `failed to initialize top level QOS containers ... missing paths: /sys/fs/cgroup/systemd/kubelet.slice/kubelet-kubepods.slice`, the same failure the reviewer hit. Creating that one directory inside the node container while kind waited (`docker exec <node> mkdir -p /sys/fs/cgroup/systemd/kubelet.slice/kubelet-kubepods.slice`) let the kubelet start, and the cluster went Ready. This is a host workaround for kind on cgroup v1, not part of the demo. On a cgroup v2 host, kind needs no workaround.
+
 ## Honesty labels and limitations
 
 - **Synthetic data.** The generator is D444A's pinned synthetic task. The gap between arms is set by its pinned spectrum: ground truth of the generator, not a learned or semantic-communication result.
@@ -218,4 +370,5 @@ Both fail as required (`scripts/demo/d444c-reverts.sh`, run in CI).
 - **The channel is emulated.** AWGN is added in-process to the dequantised symbol values (an analog-channel abstraction: no bits, no coding, no fading, no network). SNR is relative to each transmitted vector's own power, so every arm is compared at equal SNR.
 - **Baselines at equal bytes:** top-variance raw dimensions (the fair one) and mean-pool (an ablation).
 - **Non-normative.** TR 22.870 §9.13 names semantic communication (`22870-k00.txt:33833-33835`) and §6.59.1 discusses token error tolerance (`:22020-22029`); both are Stage-1 framing only.
-- **Determinism** is per platform: the golden is pinned on Linux x86_64 with the platform's `f64` `ln`/`cos`/`sqrt`.
+- **Determinism** is per platform: the golden is pinned on Linux x86_64 with the platform's `f64` `ln`/`cos`/`sqrt`. The image is amd64 and the Job is pinned to amd64 nodes. On an arm64 node the amd64 binary would not start at all (`exec format error`), which is why the Job carries the nodeSelector. A native arm64 build is untested and may differ from the x86_64 golden in the last digit; the diff would report it.
+- **The Kubernetes run is a reproducibility check, not a network demo.** The Job talks to nothing, and the cluster contributes only scheduling and a container runtime.

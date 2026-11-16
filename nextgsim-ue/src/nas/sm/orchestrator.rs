@@ -260,15 +260,17 @@ impl PduSession {
 /// A Session-AMBR as (downlink, uplink) rates in kbps, so two encodings of the
 /// same rate compare equal.
 ///
-/// TS 24.501 Table 9.11.4.14.1: unit 1 is 1 Kbps and each further unit is four
-/// times the previous one, up to 25 (256 Pbps). Unit 0 is read as 1 Kbps (the
-/// table's NOTE), and units above 25 as 256 Pbps ("Other values shall be
+/// TS 24.501 Table 9.11.4.14.1 names the units in decimal: units 1-5 are
+/// 1/4/16/64/256 Kbps, unit 6 is 1 Mbps, 7-10 are 4/16/64/256 Mbps, 11 is
+/// 1 Gbps, and so on up to 25 (256 Pbps). So 1000 x 1 Kbps and 1 x 1 Mbps are
+/// the same rate, as nextgcore's smfd encodes them. Unit 0 is read as 1 Kbps
+/// (the table's NOTE), and units above 25 as 256 Pbps ("Other values shall be
 /// interpreted as multiples of 256 Pbps"). `u128` holds the largest product,
-/// 65535 × 4^24 kbps.
+/// 65535 x 256 x 1000^4 kbps.
 fn ambr_rates_kbps(ambr: &IeSessionAmbr) -> (u128, u128) {
     fn kbps(unit: u8, value: u16) -> u128 {
         let step = u32::from(unit.clamp(1, 25) - 1);
-        u128::from(value) * 4u128.pow(step)
+        u128::from(value) * 4u128.pow(step % 5) * 1000u128.pow(step / 5)
     }
     (
         kbps(ambr.downlink_unit, ambr.downlink),
@@ -3020,15 +3022,17 @@ mod tests {
         );
     }
 
-    /// #454 review: the same rate restated in another unit is not a change, so
-    /// nothing is reported. DL 200 Mbps / UL 50 Mbps (the `established()`
-    /// session) re-sent as 800 x 256 kbps / 50 x 1 Mbps.
+    /// #454 review, #515: the same rate restated in another unit is not a
+    /// change, so nothing is reported. DL 200 Mbps / UL 50 Mbps (the
+    /// `established()` session, unit 06 = 1 Mbps) re-sent as
+    /// 50000 x 4 Kbps / 50000 x 1 Kbps: the unit table is decimal, so
+    /// 1 Mbps is 1000 Kbps.
     #[test]
     fn an_ambr_restated_in_another_unit_is_not_a_change() {
         let (mut orch, psi) = established();
-        // unit 05 = 256 kbps, 800 x 256 kbps = 200 Mbps; UL unchanged.
+        // unit 02 = 4 Kbps, 0xC350 = 50000; unit 01 = 1 Kbps.
         let cmd = vec![
-            0x2E, psi, 0x00, 0xCB, 0x2A, 0x06, 0x05, 0x03, 0x20, 0x06, 0x00, 0x32,
+            0x2E, psi, 0x00, 0xCB, 0x2A, 0x06, 0x02, 0xC3, 0x50, 0x01, 0xC3, 0x50,
         ];
         let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
         assert!(!outs
@@ -3038,15 +3042,52 @@ mod tests {
         assert_eq!(inner[3], 0xCC, "still answered with Modification Complete");
     }
 
+    /// #515: 800 x 256 Kbps is 204.8 Mbps, not the session's 200 Mbps, so it
+    /// is a change (a powers-of-4 reading of the unit table saw it as equal).
+    #[test]
+    fn a_256_kbps_restatement_that_is_not_200_mbps_is_a_change() {
+        let (mut orch, psi) = established();
+        // unit 05 = 256 Kbps, 0x0320 = 800; UL unchanged at 50 x 1 Mbps.
+        let cmd = vec![
+            0x2E, psi, 0x00, 0xCB, 0x2A, 0x06, 0x05, 0x03, 0x20, 0x06, 0x00, 0x32,
+        ];
+        let outs = orch.handle_dl_nas_transport(&dl_with_container(cmd, psi));
+        assert!(outs.contains(&SmOutput::SessionParametersChanged {
+            psi,
+            session_ambr: IeSessionAmbr::new(5, 800, 6, 50),
+        }));
+        let (_, inner) = unwrap_ul(first_sent_pdu(&outs));
+        assert_eq!(inner[3], 0xCC, "answered with Modification Complete");
+    }
+
     #[test]
     fn ambr_rates_follow_the_unit_table() {
-        // 1 Kbps, 4 Kbps, 1 Mbps (unit 6 = 4^5 kbps), and the 256 Pbps ceiling.
+        // 1 Kbps, 4 Kbps, 256 Kbps, 1 Mbps = 1000 Kbps, 1 Gbps, and the
+        // 256 Pbps ceiling.
         assert_eq!(ambr_rates_kbps(&IeSessionAmbr::new(1, 7, 2, 7)), (7, 28));
-        assert_eq!(ambr_rates_kbps(&IeSessionAmbr::new(6, 1, 0, 1)), (1024, 1));
+        assert_eq!(
+            ambr_rates_kbps(&IeSessionAmbr::new(5, 1, 6, 1)),
+            (256, 1000)
+        );
+        assert_eq!(
+            ambr_rates_kbps(&IeSessionAmbr::new(1, 1000, 6, 1)),
+            ambr_rates_kbps(&IeSessionAmbr::new(6, 1, 1, 1000)),
+            "1000 x 1 Kbps == 1 x 1 Mbps"
+        );
+        assert_eq!(ambr_rates_kbps(&IeSessionAmbr::new(6, 1, 0, 1)), (1000, 1));
+        assert_eq!(
+            ambr_rates_kbps(&IeSessionAmbr::new(11, 1, 10, 1)),
+            (1_000_000, 256_000)
+        );
+        let pbps_256 = 256 * 1000u128.pow(4);
         assert_eq!(
             ambr_rates_kbps(&IeSessionAmbr::new(25, 1, 200, 1)),
-            (4u128.pow(24), 4u128.pow(24)),
+            (pbps_256, pbps_256),
             "units above 25 read as 256 Pbps"
+        );
+        assert_eq!(
+            ambr_rates_kbps(&IeSessionAmbr::new(25, u16::MAX, 25, u16::MAX)).0,
+            u128::from(u16::MAX) * pbps_256
         );
     }
 

@@ -2185,6 +2185,7 @@ impl NgapTask {
                 .collect(),
             // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
             // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
+            qos_flows_to_release: Vec::new(),
             uplink_teid: upf_teid,
             downlink_teid: gnb_teid,
             upf_address: upf_addr,
@@ -2422,7 +2423,7 @@ impl NgapTask {
             let psi = item.pdu_session_id;
 
             // Decode the APER PDUSessionResourceModifyRequestTransfer (§9.3.4.3)
-            let request = match decode_modify_request_transfer(&item.transfer) {
+            let mut request = match decode_modify_request_transfer(&item.transfer) {
                 Ok(req) => req,
                 Err(e) => {
                     warn!(
@@ -2458,6 +2459,34 @@ impl NgapTask {
                 }
                 continue;
             };
+
+            // TS 38.413 §8.2.3.2: a QoS flow in both the QoS Flow Add or Modify
+            // Request List and the QoS Flow to Release List is reported in the QoS
+            // Flow Failed to Add or Modify List, and is not released when it
+            // already exists. So it is neither added, modified nor released here
+            // (#522).
+            let conflicting: Vec<u8> = request
+                .qos_flows_add_or_modify
+                .iter()
+                .copied()
+                .filter(|qfi| request.qos_flows_to_release.iter().any(|f| f.qfi == *qfi))
+                .collect();
+            if !conflicting.is_empty() {
+                warn!(
+                    "PDU Session {psi} modify: QoS flow(s) {conflicting:?} both added or \
+                     modified and released; reported as failed, left as they were \
+                     (TS 38.413 §8.2.3.2)"
+                );
+                request
+                    .qos_flows_add_or_modify
+                    .retain(|qfi| !conflicting.contains(qfi));
+                request
+                    .qos_monitoring_requests
+                    .retain(|(qfi, _)| !conflicting.contains(qfi));
+                request
+                    .qos_flows_to_release
+                    .retain(|f| !conflicting.contains(&f.qfi));
+            }
 
             // Apply UL tunnel modification if requested, otherwise keep current
             let (upf_teid, upf_addr) = match request.new_ul_tunnel {
@@ -2502,6 +2531,10 @@ impl NgapTask {
                 });
             }
 
+            // The flows `qosFlowToReleaseList` releases (#522); `conflicting` ones
+            // are already out of it.
+            let released: Vec<u8> = request.qos_flows_to_release.iter().map(|f| f.qfi).collect();
+
             // Send SessionModify to GTP task
             let resource = PduSessionResource {
                 psi: psi as i32,
@@ -2524,19 +2557,21 @@ impl NgapTask {
                 // TS 38.413 §8.2.3.2: store each added or modified flow's QoS
                 // Monitoring Request; flows it does not name keep theirs. A flow in
                 // `qosFlowToReleaseList` is gone, so its monitoring ends with it:
-                // carried as `stop`, which is what the GTP task acts on. (The SDAP
-                // mapping does not yet drop released flows either; that is separate.)
+                // carried as `stop`, which is what the GTP task acts on.
                 qos_monitoring: request
                     .qos_monitoring_requests
                     .iter()
                     .copied()
-                    .chain(request.qos_flows_to_release.iter().map(|f| {
+                    .chain(released.iter().map(|&qfi| {
                         (
-                            f.qfi,
+                            qfi,
                             nextgsim_ngap::procedures::transfer::QosMonitoringRequest::Stop,
                         )
                     }))
                     .collect(),
+                // §8.2.3.2: "the NG-RAN node shall de-associate the QoS flow with
+                // the previously associated DRB" (#522).
+                qos_flows_to_release: released,
                 // uplink_teid = UPF's N3 TEID (where the gNB sends uplink G-PDUs);
                 // downlink_teid = gNB's own TEID (where the UPF sends downlink). See gtp/task.rs:148-149.
                 uplink_teid: upf_teid,
@@ -2586,7 +2621,13 @@ impl NgapTask {
                 }),
                 ul_tunnel: None,
                 modified_qfis: request.qos_flows_add_or_modify.clone(),
-                failed_qos_flows: vec![],
+                failed_qos_flows: conflicting
+                    .iter()
+                    .map(|&qfi| nextgsim_ngap::procedures::transfer::FailedQosFlow {
+                        qfi,
+                        cause: NgSetupFailureCause::Protocol(ProtocolCause::SemanticError),
+                    })
+                    .collect(),
                 mbs_join_outcomes,
             };
             match encode_modify_response_transfer(&transfer_params) {
@@ -3263,6 +3304,7 @@ impl NgapTask {
             // No `QosFlowLevelQosParameters` reach this path either, so no QoS
             // Monitoring Request does.
             qos_monitoring: Vec::new(),
+            qos_flows_to_release: Vec::new(),
             uplink_teid,
             downlink_teid,
             upf_address,
@@ -5309,6 +5351,7 @@ impl NgapTask {
                 .iter()
                 .filter_map(|f| f.qos_monitoring_request.map(|r| (f.qfi, r)))
                 .collect(),
+            qos_flows_to_release: Vec::new(),
             uplink_teid: upf_teid,
             downlink_teid: gnb_teid,
             upf_address: upf_addr,
@@ -6237,6 +6280,7 @@ impl NgapTask {
                     // NgapPduSession stores UPF TEID in downlink_teid and gNB TEID in
                     // uplink_teid (internal convention); the GTP task expects the opposite
                     // (uplink_teid = UPF dest). Map across the boundary here.
+                    qos_flows_to_release: Vec::new(),
                     uplink_teid: s.downlink_teid,
                     downlink_teid: s.uplink_teid,
                     upf_address: s.upf_address,
@@ -10419,6 +10463,68 @@ mod tests {
     /// ends with it (TS 38.413 §8.2.3.2).
     #[tokio::test]
     async fn a_modify_requests_qos_monitoring_and_released_flows_reach_the_gtp_task() {
+        use nextgsim_ngap::procedures::transfer::QosMonitoringRequest as QmReq;
+        let resource = modify_adding_qfi_2_and_releasing(33, &[1]).await;
+        assert_eq!(
+            resource.qos_monitoring,
+            vec![(2, QmReq::Dl), (1, QmReq::Stop)]
+        );
+        // #522, §8.2.3.2: the released flow is de-associated from its DRB.
+        assert_eq!(resource.qos_flows_to_release, vec![1]);
+    }
+
+    /// #522, TS 38.413 §8.2.3.2: a flow in both the add-or-modify and the release
+    /// list is reported in the QoS Flow Failed to Add or Modify List and "shall
+    /// not" be released when it exists. So QFI 2 is neither added (no monitoring
+    /// request, not a modified QFI) nor released; QFI 1 is released.
+    #[tokio::test]
+    async fn a_flow_both_added_and_released_is_failed_and_not_released() {
+        use nextgsim_ngap::procedures::transfer::{
+            decode_modify_response_transfer, QosMonitoringRequest as QmReq,
+        };
+        let (resource, response) =
+            modify_adding_qfi_2_and_releasing_with_response(34, &[1, 2]).await;
+        assert_eq!(resource.qos_flows_to_release, vec![1]);
+        assert!(resource.qos_flows.is_empty(), "QFI 2 is not added");
+        assert_eq!(resource.qos_monitoring, vec![(1, QmReq::Stop)]);
+
+        let response = response.expect("a PDU Session Resource Modify Response");
+        let item = &response.modify_list.expect("PSI 12 modified")[0];
+        assert_eq!(item.pdu_session_id, 12);
+        let transfer = decode_modify_response_transfer(&item.transfer).expect("decode");
+        assert!(
+            transfer.modified_qfis.is_empty(),
+            "QFI 2 is not reported modified"
+        );
+        assert_eq!(
+            transfer
+                .failed_qos_flows
+                .iter()
+                .map(|f| f.qfi)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "QFI 2 is in the QoS Flow Failed to Add or Modify List"
+        );
+    }
+
+    async fn modify_adding_qfi_2_and_releasing(ue_id: i32, release: &[u8]) -> PduSessionResource {
+        modify_adding_qfi_2_and_releasing_with_response(ue_id, release)
+            .await
+            .0
+    }
+
+    /// A PDU Session Resource Modify of UE `ue_id`'s session 12 whose transfer adds
+    /// QFI 2 (with a `dl` QoS Monitoring Request) and releases `release`; the
+    /// `SessionModify` resource it hands the GTP task.
+    async fn modify_adding_qfi_2_and_releasing_with_response(
+        ue_id: i32,
+        release: &[u8],
+    ) -> (
+        PduSessionResource,
+        Option<
+            nextgsim_ngap::procedures::pdu_session_resource::PduSessionResourceModifyResponseData,
+        >,
+    ) {
         use nextgsim_ngap::codec::generated::*;
         use nextgsim_ngap::procedures::pdu_session_resource::{
             PduSessionResourceModifyRequestData, PduSessionResourceModifyRequestItem,
@@ -10428,15 +10534,26 @@ mod tests {
             QosMonitoringRequest as QmReq,
         };
 
-        let (mut task, _rrc_rx, mut gtp_rx, _rls_rx) = task_with_live_receivers(33).await;
-        key_ue(&mut task, 33, 2, 2);
+        let (task_base, _app_rx, _ngap_rx, _rrc_rx, mut gtp_rx, _rls_rx, mut sctp_rx) =
+            GnbTaskBase::new(test_config(), DEFAULT_CHANNEL_CAPACITY);
+        let mut task = NgapTask::new(task_base);
+        task.create_amf_context(1);
+        if let Some(ctx) = task.find_amf_context_mut(1) {
+            ctx.on_association_up(100, 8, 8);
+            ctx.state = AmfState::Ready;
+        }
+        task.create_ue_context(ue_id, 1).await.expect("ue context");
+        if let Some(ctx) = task.find_ue_context_mut(ue_id) {
+            ctx.amf_ue_ngap_id = Some(4242);
+        }
+        key_ue(&mut task, ue_id, 2, 2);
         let gnb_ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
-        task.setup_one_pdu_session(33, &setup_item_with_policy(12, None), gnb_ip)
+        task.setup_one_pdu_session(ue_id, &setup_item_with_policy(12, None), gnb_ip)
             .await
             .expect("setup");
         while gtp_rx.try_recv().is_ok() {}
         let ran_ue_ngap_id = task
-            .find_ue_context(33)
+            .find_ue_context(ue_id)
             .map(|c| c.ran_ue_ngap_id as u32)
             .expect("ran id");
 
@@ -10477,11 +10594,16 @@ mod tests {
                     id: ProtocolIE_ID(ID_QOS_FLOW_TO_RELEASE_LIST),
                     criticality: Criticality(Criticality::REJECT),
                     value: PDUSessionResourceModifyRequestTransferProtocolIEs_EntryValue::Id_QosFlowToReleaseList(
-                        QosFlowListWithCause(vec![QosFlowWithCauseItem {
-                            qos_flow_identifier: QosFlowIdentifier(1),
-                            cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
-                            ie_extensions: None,
-                        }]),
+                        QosFlowListWithCause(
+                            release
+                                .iter()
+                                .map(|&qfi| QosFlowWithCauseItem {
+                                    qos_flow_identifier: QosFlowIdentifier(qfi),
+                                    cause: Cause::Nas(CauseNas(CauseNas::NORMAL_RELEASE)),
+                                    ie_extensions: None,
+                                })
+                                .collect(),
+                        ),
                     ),
                 },
             ]),
@@ -10509,11 +10631,20 @@ mod tests {
                 modified = Some(resource);
             }
         }
-        let resource = modified.expect("the modify reaches the GTP task");
-        assert_eq!(
-            resource.qos_monitoring,
-            vec![(2, QmReq::Dl), (1, QmReq::Stop)]
-        );
+        let mut response = None;
+        while let Ok(msg) = sctp_rx.try_recv() {
+            if let TaskMessage::Message(crate::tasks::SctpMessage::SendMessage { buffer, .. }) = msg
+            {
+                if let Ok(r) =
+                    nextgsim_ngap::procedures::pdu_session_resource::decode_pdu_session_resource_modify_response(
+                        buffer.data(),
+                    )
+                {
+                    response = Some(r);
+                }
+            }
+        }
+        (modified.expect("the modify reaches the GTP task"), response)
     }
 
     /// Give a UE the AS security context an Initial Context Setup would install.
