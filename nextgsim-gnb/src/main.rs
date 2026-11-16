@@ -63,7 +63,7 @@ impl GnbApp {
         // `demo:` block installs an empty state and changes nothing.
         let config_text = std::fs::read_to_string(config_path)
             .with_context(|| format!("Failed to read configuration from {config_path}"))?;
-        nextgsim_gnb::demo::init(&config_text)
+        nextgsim_gnb::demo::init(&config_text, &config)
             .with_context(|| format!("Invalid demo block in {config_path}"))?;
         nextgsim_gnb::demo::d440a_startup(&config)
             .with_context(|| format!("Invalid D440A demo configuration in {config_path}"))?;

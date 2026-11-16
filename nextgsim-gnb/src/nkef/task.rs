@@ -452,6 +452,7 @@ mod tests {
     fn demo_on() -> &'static nextgsim_demo::DemoRuntime {
         let _ = crate::demo::init(
             "demo:\n  enabled: true\n  d447a-nkef-live:\n    enabled: true\n    mode: \"on\"\n",
+            &nextgsim_common::config::GnbConfig::default(),
         );
         let rt = nextgsim_demo::installed().expect("installed");
         assert_eq!(rt.mode(crate::demo::D447A_KEY).as_deref(), Some("on"));

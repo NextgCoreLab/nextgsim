@@ -472,3 +472,103 @@ fn a_mode_named_off_is_a_programming_error() {
         requires: &[],
     }]);
 }
+
+/// #537: a check that refuses `edge-select` in `compute` unless the
+/// congestion loop is in `closed-loop`, the shape of the gNB's d440a/d441d
+/// `onnx` -> d440b `verify` dependency.
+fn compute_needs_closed_loop() -> StateCheck {
+    Box::new(|state: &ActiveDemos| {
+        if state.mode("edge-select") == Some("compute")
+            && state.mode("d441a-congestion-loop") != Some("closed-loop")
+        {
+            Err("compute needs d441a-congestion-loop in closed-loop".into())
+        } else {
+            Ok(())
+        }
+    })
+}
+
+const BOTH_ON: &str = "
+demo:
+  enabled: true
+  d441a-congestion-loop:
+    enabled: true
+    mode: baseline
+  edge-select:
+    enabled: true
+    mode: delay
+";
+
+#[test]
+fn a_set_a_check_refuses_is_audited_and_leaves_every_mode() {
+    let rt = runtime(BOTH_ON).with_check(compute_needs_closed_loop());
+    let (out, lines) = captured(|| rt.handle_cli("edge-select set mode=compute", "nr-cli"));
+    assert_eq!(
+        out,
+        Err(DemoCliError::Refused {
+            demo: "edge-select".into(),
+            mode: "compute".into(),
+            reason: "compute needs d441a-congestion-loop in closed-loop".into(),
+        })
+    );
+    assert_eq!(rt.mode("edge-select").as_deref(), Some("delay"));
+    assert_eq!(
+        rt.mode("d441a-congestion-loop").as_deref(),
+        Some("baseline")
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].starts_with(
+            " WARN [demo:edge-select] audit: rejected set mode=\"compute\" from nr-cli: refused"
+        ),
+        "{lines:?}"
+    );
+    assert!(lines[0].ends_with("mode unchanged (delay)"), "{lines:?}");
+}
+
+/// The check sees the would-be state: once the dependency is switched on, the
+/// same set applies, and switching the dependency away again is refused (the
+/// reverse direction the per-demo view would miss).
+#[test]
+fn a_check_judges_the_would_be_state_of_every_demo() {
+    let rt = runtime(BOTH_ON).with_check(compute_needs_closed_loop());
+    assert_eq!(
+        rt.set_mode("d441a-congestion-loop", "closed-loop", "nr-cli"),
+        Ok("baseline".into())
+    );
+    assert_eq!(
+        rt.set_mode("edge-select", "compute", "nr-cli"),
+        Ok("delay".into())
+    );
+    assert_eq!(rt.mode("edge-select").as_deref(), Some("compute"));
+    assert!(matches!(
+        rt.set_mode("d441a-congestion-loop", "baseline", "nr-cli"),
+        Err(DemoCliError::Refused { .. })
+    ));
+    assert_eq!(
+        rt.mode("d441a-congestion-loop").as_deref(),
+        Some("closed-loop")
+    );
+}
+
+/// Every registered check runs; the first refusal wins and nothing changes.
+#[test]
+fn every_registered_check_runs() {
+    let rt = runtime(ON)
+        .with_check(Box::new(|_| Ok(())))
+        .with_check(Box::new(|state: &ActiveDemos| {
+            if state.mode("d441a-congestion-loop") == Some("closed-loop") {
+                Err("second check".into())
+            } else {
+                Ok(())
+            }
+        }));
+    assert!(matches!(
+        rt.set_mode("d441a-congestion-loop", "closed-loop", "nr-cli"),
+        Err(DemoCliError::Refused { reason, .. }) if reason == "second check"
+    ));
+    assert_eq!(
+        rt.mode("d441a-congestion-loop").as_deref(),
+        Some("baseline")
+    );
+}

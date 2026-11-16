@@ -216,18 +216,58 @@ pub fn check_handover_demo_exclusive(active: &ActiveDemos) -> Result<(), GnbDemo
     }
 }
 
-/// Read and install the `demo:` block of the gNB config text at startup. An
-/// error must fail startup: the convention allows no silent fallback.
-pub fn init(config_yaml: &str) -> Result<&'static DemoRuntime, GnbDemoError> {
+/// The checks a demo state must pass, at startup and on every runtime `nr-cli
+/// ... demo <key> set mode=` (nextgsim#537), against the gNB config:
+/// - at most one handover-triggering demo;
+/// - D440A's and D441D's `onnx` need d440b-model-verify in `verify`, which a
+///   switch of either side can break;
+/// - D440A's per-mode config needs ([`d440a_check_config`]): a predictor mode
+///   needs the NWDAF task and a paging grid, which `page-all` does not.
+///
+/// D441D's config needs are the same in every mode and are checked once at
+/// startup ([`d441d_startup`]), so a mode switch cannot invalidate them.
+pub fn check_demo_state(
+    config: &nextgsim_common::config::GnbConfig,
+    state: &ActiveDemos,
+) -> Result<(), GnbDemoError> {
+    check_handover_demo_exclusive(state)?;
+    check_d440a_dependencies(state)?;
+    check_d441d_dependencies(state)?;
+    d440a_check_config(config, state.mode(D440A_KEY))?;
+    Ok(())
+}
+
+/// The demo state for the gNB config text, with the startup checks run and
+/// [`check_demo_state`] registered for every runtime switch (nextgsim#537).
+/// `config` is the same config, parsed.
+pub fn runtime(
+    config_yaml: &str,
+    config: &nextgsim_common::config::GnbConfig,
+) -> Result<DemoRuntime, GnbDemoError> {
     let root: serde_yaml::Value =
         serde_yaml::from_str(config_yaml).map_err(|e| DemoConfigError::Malformed {
             detail: format!("config is not valid YAML: {e}"),
         })?;
     let runtime = DemoRuntime::from_root(&root, registry())?;
-    check_handover_demo_exclusive(&runtime.snapshot())?;
-    check_d440a_dependencies(&runtime.snapshot())?;
-    check_d441d_dependencies(&runtime.snapshot())?;
-    nextgsim_demo::install(runtime)
+    let state = runtime.snapshot();
+    check_handover_demo_exclusive(&state)?;
+    check_d440a_dependencies(&state)?;
+    check_d441d_dependencies(&state)?;
+    // D440A's config part stays in `d440a_startup`, which also logs its line.
+    let config = config.clone();
+    Ok(runtime.with_check(Box::new(move |state: &ActiveDemos| {
+        check_demo_state(&config, state).map_err(|e| e.to_string())
+    })))
+}
+
+/// Read and install the `demo:` block of the gNB config text at startup. An
+/// error must fail startup: the convention allows no silent fallback. `config`
+/// is the same config, parsed; runtime mode switches are checked against it.
+pub fn init(
+    config_yaml: &str,
+    config: &nextgsim_common::config::GnbConfig,
+) -> Result<&'static DemoRuntime, GnbDemoError> {
+    nextgsim_demo::install(runtime(config_yaml, config)?)
         .map_err(|_| GnbDemoError::Config(DemoConfigError::AlreadyInstalled))
 }
 
@@ -569,6 +609,102 @@ mod tests {
         assert!(metrics.contains("nextg_demo_enabled{demo=\"d440a-ai-paging\",mode=\"lsq\"} 1"));
     }
 
+    /// #537: a D440A gNB config (gnb-west: NWDAF off, a paging grid) and its
+    /// demo block with `d440a` in `mode` and `extra` appended.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    fn d440a_runtime(
+        nwdaf_enabled: bool,
+        mode: &str,
+        extra: &str,
+    ) -> Result<DemoRuntime, GnbDemoError> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../config/demo-ai-paging");
+        let text = std::fs::read_to_string(format!("{dir}/gnb-west.yaml")).unwrap();
+        let mut cfg: nextgsim_common::config::GnbConfig = serde_yaml::from_str(&text).unwrap();
+        cfg.nwdaf_enabled = nwdaf_enabled;
+        let yaml = format!(
+            "demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: {mode}\n{extra}"
+        );
+        runtime(&yaml, &cfg)
+    }
+
+    /// #537: `set mode=onnx` without d440b in `verify` is refused like at
+    /// startup, audited, and the mode stays; with d440b in `verify` it applies.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn a_runtime_onnx_switch_without_d440b_verify_is_refused() {
+        let rt = d440a_runtime(
+            true,
+            "ct",
+            "  d440b-model-verify:\n    enabled: true\n    mode: fallback\n",
+        )
+        .unwrap();
+        let err = rt
+            .handle_cli("d440a-ai-paging set mode=onnx", "nr-cli")
+            .unwrap_err();
+        assert!(
+            matches!(&err, nextgsim_demo::DemoCliError::Refused { demo, mode, reason }
+                if demo == D440A_KEY && mode == "onnx" && reason.contains("d440b-model-verify (mode verify)")),
+            "{err}"
+        );
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("ct"));
+
+        rt.handle_cli("d440b-model-verify set mode=verify", "nr-cli")
+            .unwrap();
+        rt.handle_cli("d440a-ai-paging set mode=onnx", "nr-cli")
+            .unwrap();
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("onnx"));
+    }
+
+    /// #537, the reverse direction: with D440A in `onnx`, switching d440b away
+    /// from `verify` would leave `onnx` without its dependency, so it is
+    /// refused and d440b stays in `verify`.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn a_runtime_d440b_switch_under_d440a_onnx_is_refused() {
+        let rt = d440a_runtime(
+            true,
+            "onnx",
+            "  d440b-model-verify:\n    enabled: true\n    mode: verify\n",
+        )
+        .unwrap();
+        let err = rt
+            .handle_cli("d440b-model-verify set mode=fallback", "nr-cli")
+            .unwrap_err();
+        assert!(
+            matches!(&err, nextgsim_demo::DemoCliError::Refused { demo, .. } if demo == D440B_KEY),
+            "{err}"
+        );
+        assert_eq!(rt.mode(D440B_KEY).as_deref(), Some("verify"));
+    }
+
+    /// #537: a gNB started in `page-all` with the NWDAF off cannot be switched
+    /// to a predictor mode (startup would refuse that config); `page-all` stays,
+    /// and a switch the config supports still applies.
+    #[cfg(feature = "demo-d440a-ai-paging")]
+    #[test]
+    fn a_runtime_predictor_switch_without_the_nwdaf_is_refused() {
+        let rt = d440a_runtime(false, "page-all", "").unwrap();
+        for mode in ["ct", "lsq", "last-served"] {
+            let err = rt
+                .handle_cli(&format!("d440a-ai-paging set mode={mode}"), "nr-cli")
+                .unwrap_err();
+            assert!(
+                matches!(&err, nextgsim_demo::DemoCliError::Refused { reason, .. }
+                    if reason.contains("needs nwdaf_enabled: true")),
+                "{err}"
+            );
+            assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("page-all"));
+        }
+        // With the NWDAF on, the predictor modes apply.
+        let rt = d440a_runtime(true, "page-all", "").unwrap();
+        rt.handle_cli("d440a-ai-paging set mode=ct", "nr-cli")
+            .unwrap();
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("ct"));
+        rt.handle_cli("d440a-ai-paging set mode=page-all", "nr-cli")
+            .unwrap();
+        assert_eq!(rt.mode(D440A_KEY).as_deref(), Some("page-all"));
+    }
+
     /// #462: a predictor mode needs the NWDAF task and a paging grid, or
     /// startup fails by name; `page-all` needs neither (the M0 configs run it
     /// with the NWDAF off). The line names the mode and horizon.
@@ -893,6 +1029,37 @@ mod tests {
                     "{err}"
                 );
             }
+        }
+
+        /// #537: at runtime too, `set mode=onnx` without d440b in `verify` is
+        /// refused and the mode stays, and with D441D in `onnx` d440b cannot be
+        /// switched away from `verify`.
+        #[test]
+        fn a_runtime_onnx_switch_keeps_its_d440b_dependency() {
+            let cfg = GnbConfig::default();
+            let fallback = "  d440b-model-verify:\n    enabled: true\n    mode: fallback\n";
+            let rt = runtime(&format!("{}{fallback}", d441d_block(true, "lsq")), &cfg).unwrap();
+            let err = rt
+                .handle_cli("d441d-predictive-ho set mode=onnx", "nr-cli")
+                .unwrap_err();
+            assert!(
+                matches!(&err, nextgsim_demo::DemoCliError::Refused { demo, .. } if demo == D441D_KEY),
+                "{err}"
+            );
+            assert_eq!(rt.mode(D441D_KEY).as_deref(), Some("lsq"));
+
+            rt.handle_cli("d440b-model-verify set mode=verify", "nr-cli")
+                .unwrap();
+            rt.handle_cli("d441d-predictive-ho set mode=onnx", "nr-cli")
+                .unwrap();
+            let err = rt
+                .handle_cli("d440b-model-verify set mode=fallback", "nr-cli")
+                .unwrap_err();
+            assert!(
+                matches!(&err, nextgsim_demo::DemoCliError::Refused { demo, .. } if demo == D440B_KEY),
+                "{err}"
+            );
+            assert_eq!(rt.mode(D440B_KEY).as_deref(), Some("verify"));
         }
 
         /// No block, the kill switch off, and the kill switch off with the key
