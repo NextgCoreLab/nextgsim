@@ -1569,6 +1569,27 @@ mod tests {
         (addr, id, rx)
     }
 
+    /// #552: an unknown callback id is refused 404 from the request's HEADERS,
+    /// before its body is read (RFC 9113 §8.1 early response). The NEF's SBI
+    /// client gets that 404, however much of the body it had still to send:
+    /// 200 KB, past the 64 KiB stream window, makes the early answer certain.
+    #[tokio::test]
+    async fn an_unknown_callback_id_is_answered_404_before_its_body_is_read() {
+        let (addr, _id, _rx) = listener().await;
+        let c = SbiClient::new(SbiClientConfig {
+            timeout: Duration::from_secs(10),
+            retries: 0,
+            ..Default::default()
+        });
+        let forged = format!("http://{addr}{CALLBACK_PREFIX}{}", new_callback_id());
+        let body = json!({ "pad": "x".repeat(200_000) });
+        let r = c
+            .post_json(&forged, &body, None)
+            .await
+            .expect("the listener's 404 is the answer, not a transport error");
+        assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+
     /// Idle peers cannot starve the NEF: one source opening far more idle h2c
     /// connections than its share keeps only [`MAX_CONNECTIONS_PER_SOURCE`], by
     /// evicting its own oldest, and a notification from another source is
