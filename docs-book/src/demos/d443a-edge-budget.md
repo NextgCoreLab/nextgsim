@@ -24,7 +24,7 @@ sequenceDiagram
   participant X as EAS sidecars (dn)
   X->>E: Eees_EASRegistration (endPt, svcKpi maxRespTime, avlComp)
   E->>M: Nsmf_EventExposure_Subscribe QOS_MON (anyUeInd, PERIODIC, QoSMonitoring)
-  M->>U: PFCP Association Update (N6 Delay Measurement Control x3, STAMP :8620)
+  M->>U: PFCP Association Update (N6 Delay Measurement Control, 3 endpoints, STAMP :8620)
   M->>U: PFCP Session Modification (QoS Monitoring per QoS flow)
   U->>G: QMP (GTP-U) and the gNB's answer
   U->>X: STAMP test packets (RFC 8762)
@@ -68,13 +68,7 @@ CORE_SRC=<clean nextgcore> SIM_SRC=<clean nextgsim> \
 flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d443a-edge-budget measured-budget
 ```
 
-**Compose:**
-
-```bash
-docker compose -f docker/rust/docker-compose.demo-d443a.yml up -d
-```
-
-The file's header lists the act commands.
+**Compose: not yet run.** nextgcore ships `docker/rust/docker-compose.demo-d443a.yml` with the same topology, but it has never been brought up end to end: the validation host has no docker compose. Nothing on this page comes from it, and **EKS is the only validated path**. A manual compose run that captures the success signal is the gate before this page claims compose support.
 
 ## Results
 
@@ -83,6 +77,8 @@ Every number below comes from the devtest1 artefacts (namespace nextg-demo, one 
 **Images:**
 - core NFs: `nextg/*:demo-d443a-edge-budget-883f9a27635c` (nextgcore main with #1552);
 - gnb and ue: `nextg/{gnb,ue}:demo-d443a-edge-budget-e1ed2103e839`.
+  - `e1ed2103e839` is a commit of this docs branch: nextgsim main `aa24f49` plus a docs-only commit, so the binaries are main's.
+  - It may not survive a squash merge, so the images are also given by digest: gnb `sha256:c74687789e6a95b7fe3c7745525f220bdcb8facffd0445e84cd9c4ef9205b386`, ue `sha256:2683040ff99d12d3d47bb4de4b1cde44b082f4e7423b1544f43d06b55f8cd7e3`.
 
 **Artefacts:** `/tmp/eks-val/demos/d443a-<arm>/d443a-edge-budget/<mode>/<run>/`, with the `verdict.txt`, `scenario/analyze.txt` and per-act captures of each run.
 
@@ -109,7 +105,7 @@ EES-SEL ac=ac-d443a src=upf-n3+upf-n6 selected=[eas-local,eas-regional] budget=[
 JOB job=1 eas=eas-local rtt=9 predicted=11 src=upf-n3+upf-n6 deadline=15 mode=measured-budget result=ok
 [eas-local] EAS-EXEC job=1 src=10.45.0.2 eas=eas-local reqComp=100 avlComp=50 compute=2ms
 ```
-Prediction: 10 of 10 jobs are within max(3 ms, 25 %) of the measured rtt (predicted 11, measured 9; advisory).
+Prediction: 10 of 10 jobs are within max(3 ms, 25 %) of the measured rtt (predicted 11, measured 9-10; advisory). The prediction sits above the measurement: `rtDelays` includes the gNB's stated 1 + 1 ms RAN delay, which the simulated radio never incurs.
 
 **Act 2.** netem on eas-local's path rises from 4 to 20 ms one way. smfd then reports `smf_n6_delay_ms{endpoint="10.60.0.11",stat="avg"} 11`. eas-local logged no EAS-REG and no KPI-PATCH during the act, and eesd merge-patched nothing, so eas-local's registration is byte-identical.
 ```
@@ -202,6 +198,12 @@ The binaries behaved the same in both runs.
   - Act 2 sets eas-local's to 20 ms.
   - Act 3 adds 20 ms on the gNB's GTP-U egress.
   - On EKS the three EASes share the upf pod; without netem every N6 delay is about 1 ms.
+  - **On EKS, netem runs in the temporary nextg-demo pods only.** The anchor had said "netem is compose-only (needs NET_ADMIN)". What changed:
+    - the gNB's netem sidecar has NET_ADMIN only;
+    - the EAS sidecar (`she-eas`, in the upf pod) runs as root, not privileged, with NET_ADMIN (bridge, veths, tc) and SYS_ADMIN (`ip netns` for the per-EAS namespaces), plus CHOWN, SETUID, SETGID, SETPCAP and KILL (handing each key to nobody, dropping to nobody, the load act's signal);
+    - nr-she-eas itself runs as nobody with no capabilities.
+  - The EAS sidecar's capability set is above the NET_ADMIN the operator approved, and is with the operator.
+  - Whether sch_netem was already loaded on the nodes before these runs was not recorded: a NET_ADMIN `tc ... netem` can make the kernel autoload the module. Later runs record it (`sch_netem_before_first_tc` in meta.txt).
 - **Compute.** The compute term is a sleep of `ceil(reqComp/avlComp)` ms. `reqComp` is a string in TS 24.558 and an integer here.
 - **RAN delay.** The RAN part of `rtDelays` is the gNB's stated `ran_{dl,ul}_delay_ms`, not a measurement. The N3 part is unsynced (T2−T1+T4−T3)/2.
 - **Single UE.** The N3 term is the most recent QOS_MON report of any UE.
