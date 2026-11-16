@@ -149,8 +149,19 @@ burst_size=446                          # ICMP payload bytes
 burst_len=$((burst_size + 28 + 1))      # + IPv4/ICMP headers + the 1 byte the gNB counts
 demo_compose exec -T ue ping -I uesimtun0 -c 5 -i 0.2 -W 2 -s "$burst_size" 10.45.0.1 \
     > "$DEMO_ARTEFACTS/ping-burst.txt" 2>&1 || true
-demo_wait_log gnb-east "Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=$burst_len\b" 30
-demo_info "uplink burst (len=$burst_len) reached gnb-east"
+# The burst crosses whichever gNB serves the UE: gnb-east, or gnb-west when an
+# incidental packet already had lb-1 move it to the booster.
+burst_re="Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=$burst_len\b"
+burst_at=""
+for _ in $(seq 15); do
+    for s in gnb-east gnb-west; do
+        demo_logs "$s" "$DEMO_ARTEFACTS/$s.log"
+        if grep -qE -- "$burst_re" "$DEMO_ARTEFACTS/$s.log"; then burst_at="$s"; break 2; fi
+    done
+    sleep 2
+done
+[ -n "$burst_at" ] || demo_fail "the uplink burst (len=$burst_len) reached neither gNB within 30s"
+demo_info "uplink burst (len=$burst_len) reached $burst_at"
 if [ "$mode" != off ]; then
     # The causal edge: lb-1 fires on user-plane data, within its tick of it.
     demo_wait_log gnb-east 'audit #[0-9]+: IntentSubmitted \(lb-1\)' 30
