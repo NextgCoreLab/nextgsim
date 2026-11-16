@@ -100,7 +100,7 @@ done
 cp -r "$stage/config" "$DEMO_ARTEFACTS/config"
 export NEXTGSIM_DIR="$stage"
 
-demo_compose_init "$core/docker/rust/docker-compose.demo-n2ho.yml"
+demo_compose_init "$core/docker/rust/docker-compose.demo-n2ho.yml" "$here/d446a.compose.yml"
 demo_seed "${DEMO_SEED:-}"
 demo_assert_private
 
@@ -141,16 +141,17 @@ demo_info "registered on gnb-east (gNB-A) with a PDU session; mode $mode"
 # gNB-A (RLS), so it fires only on uplink. The arms used to rely on incidental
 # uplink (a 48-byte IPv6 packet as uesimtun0 came up, logged len=49), which
 # some runs never sent: lb-1 then never fired, and energy-1's 90 s grace window
-# ran out with no contest (nightly 2026-11-14, runtime-switch). A burst of
-# pings through gNB-A, sized as nothing else is, makes the trigger
-# deterministic; it goes out in every mode, so the off arm too proves the kill
-# switch under the load that would fire lb-1.
+# ran out with no contest (nightly 2026-11-14, runtime-switch). d446a.compose.yml
+# turns IPv6 off in the UE container, so that packet is never sent, and a burst
+# of pings through gNB-A, sized as nothing else is, is what fires lb-1. It goes
+# out in every mode, so the off arm too proves the kill switch under the load
+# that would fire lb-1.
 burst_size=446                          # ICMP payload bytes
 burst_len=$((burst_size + 28 + 1))      # + IPv4/ICMP headers + the 1 byte the gNB counts
 demo_compose exec -T ue ping -I uesimtun0 -c 5 -i 0.2 -W 2 -s "$burst_size" 10.45.0.1 \
     > "$DEMO_ARTEFACTS/ping-burst.txt" 2>&1 || true
-# The burst crosses whichever gNB serves the UE: gnb-east, or gnb-west when an
-# incidental packet already had lb-1 move it to the booster.
+# The burst crosses whichever gNB serves the UE: gnb-east, and gnb-west for the
+# pings after lb-1 has moved it to the booster.
 burst_re="Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1, psi=1, len=$burst_len\b"
 burst_at=""
 for _ in $(seq 15); do
@@ -163,11 +164,14 @@ done
 [ -n "$burst_at" ] || demo_fail "the uplink burst (len=$burst_len) reached neither gNB within 30s"
 demo_info "uplink burst (len=$burst_len) reached $burst_at"
 if [ "$mode" != off ]; then
-    # The causal edge: lb-1 fires on user-plane data, within its tick of it.
+    # The causal edge: lb-1 fires on the burst, the only uplink there is.
     demo_wait_log gnb-east 'audit #[0-9]+: IntentSubmitted \(lb-1\)' 30
     assert_log_order "$DEMO_ARTEFACTS/gnb-east.log" gnb-east \
-        'Uplink data \(RLC\): ue_id=[0-9]+, drb_id=1' \
+        "$burst_re" \
         'audit #[0-9]+: IntentSubmitted \(lb-1\) TriggerHandover'
+    if grep -qE 'Uplink data \(RLC\): .*len=49\b' "$DEMO_ARTEFACTS/gnb-east.log"; then
+        demo_fail "[gnb-east] an incidental len=49 uplink packet: IPv6 is not off in the UE"
+    fi
 fi
 
 case "$mode" in
