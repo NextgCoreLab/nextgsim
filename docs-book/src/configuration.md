@@ -113,7 +113,7 @@ si_broadcast_period_ms: 80
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ngap_tngreloc_overall_secs` | u64 | 5 | TNGRELOCoverall: wait for UE Context Release Command after a UE Context Release Request (TS 38.413 §8.3.3.4) |
+| `ngap_tngreloc_overall_secs` | u64 | 5 | TNGRELOCoverall: at a handover source, from the HANDOVER COMMAND reaching the UE to the UE Context Release Command; on expiry the release is requested (TS 38.413 §8.4.1.2, §8.3.3.4). Must cover UE sync at the target, Handover Notify, the SMF update and the source release. Also the wait for a UE Context Release Command after a UE Context Release Request |
 | `ngap_tngreloc_prep_secs` | u64 | 10 | TNGRELOCprep: how long handover preparation may stay in flight (TS 38.413 §8.4.1.2) |
 | `gtpu_echo_period_secs` | u64 | 0 | GTP-U Echo period for N3 path supervision (TS 29.281 §7.2.1). 0 disables the prober |
 | `gtpu_echo_max_misses` | u32 | 3 | Unanswered Echo periods before the N3 path is declared down |

@@ -264,10 +264,17 @@ pub struct GnbConfig {
     pub gtp_advertise_ip: Option<IpAddr>,
     /// Whether to ignore SCTP stream IDs
     pub ignore_stream_ids: bool,
-    /// TNGRELOCoverall in seconds: how long the gNB waits for a UE Context Release
-    /// Command after sending a UE Context Release Request before releasing the context
-    /// locally (TS 38.413 §8.3.3.4). TS 38.413 names the timer and leaves the value to
-    /// the operator; 5 s is the default here.
+    /// TNGRELOCoverall in seconds. Two guards use it:
+    /// - at the source of an N2 handover, from the HANDOVER COMMAND being forwarded
+    ///   to the UE until the AMF's UE Context Release Command (TS 38.413 §8.4.1.2,
+    ///   §8.3.3.4). On expiry the gNB requests the release of the UE context. The
+    ///   value must cover UE synchronisation at the target, Handover Notify, the
+    ///   SMF path switch and the source release;
+    /// - after a UE Context Release Request, how long the gNB waits for the UE
+    ///   Context Release Command before releasing the context locally.
+    ///
+    /// TS 38.413 names the timer and leaves the value to the operator; 5 s is
+    /// the default here.
     #[serde(default = "default_tngreloc_overall_secs")]
     pub ngap_tngreloc_overall_secs: u64,
     /// TNGRELOCprep in seconds: how long handover preparation may stay in flight before

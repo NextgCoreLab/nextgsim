@@ -1629,7 +1629,9 @@ impl RrcTask {
         #[cfg(feature = "demo-d441d-predictive-ho")]
         self.d441d_reestablished(context);
         // The UE is served here again: a source holding TNGRELOCoverall for it
-        // stops the timer (TS 38.413 §8.3.3.4, #538).
+        // stops the timer (TS 38.413 §8.3.3.4, #538). Sent on every committed
+        // re-establishment, not only after a HANDOVER COMMAND: RRC does not know
+        // whether NGAP holds the timer, and with none pending the cancel is a no-op.
         let _ = self
             .task_base
             .ngap_tx
