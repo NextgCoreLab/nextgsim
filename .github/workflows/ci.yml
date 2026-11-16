@@ -295,9 +295,9 @@ jobs:
         run: cargo test -p nextgsim-ue --features event-bus
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-common --features event-bus --all-targets
-          cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets
-          cargo clippy -p nextgsim-ue --features event-bus --all-targets
+          cargo clippy -p nextgsim-common --features event-bus --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features event-bus,6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features event-bus --all-targets -- -D warnings
 
   model-registry:
     name: Model registry (feature-gated)
@@ -326,10 +326,10 @@ jobs:
         run: cargo test -p nextgsim-gnb --features 6g,model-registry
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-ai --features model-registry --all-targets
-          cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets
-          cargo clippy -p nextgsim-semantic --features model-registry --all-targets
-          cargo clippy -p nextgsim-gnb --features 6g,model-registry --all-targets
+          cargo clippy -p nextgsim-ai --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-nwdaf --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-semantic --features model-registry --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features 6g,model-registry --all-targets -- -D warnings
 
   model-verify:
     # nextgsim#463: verified model loading against a pinned ONNX Runtime. The
@@ -407,7 +407,7 @@ jobs:
       - name: cargo test (uuaa-mm on)
         run: cargo test -p nextgsim-ue --features uuaa-mm
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets
+        run: cargo clippy -p nextgsim-ue --features uuaa-mm --all-targets -- -D warnings
 
   sixg:
     name: 6G crates (feature-gated)
@@ -505,21 +505,21 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features 6g
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features 6g --all-targets
-          cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets
-          cargo clippy -p nextgsim-gnb --features demo-d441d-predictive-ho --all-targets
-          cargo clippy -p nextgsim-ue --features 6g --all-targets
-          cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets
-          cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets
+          cargo clippy -p nextgsim-gnb --features 6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features 6g,nkef-sba --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d440a-ai-paging --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d440c-nwdaf-paging --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d441a-congestion-loop --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features demo-d441d-predictive-ho --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features 6g --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features 6g,demo-d444a-ambr-adapt --all-targets -- -D warnings
+          cargo clippy -p nextgsim-semantic --features demo-d444a-ambr-adapt --all-targets -- -D warnings
           cargo clippy -p nextgsim-semantic --no-deps --features demo-d444c-task-vs-raw --all-targets -- -D warnings
-          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets
-          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets
+          cargo clippy -p nextgsim-fl --features revert-hooks --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features demo-d445a-fl-t8 --all-targets -- -D warnings
           cargo clippy -p nextgsim-she --no-deps --features demo-d443a-edge-budget --all-targets -- -D warnings
-          cargo clippy -p nextgsim-ue --features demo-d443a-edge-budget --all-targets
-          cargo clippy -p nextgsim-integration-tests --features 6g --all-targets
+          cargo clippy -p nextgsim-ue --features demo-d443a-edge-budget --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features 6g --all-targets -- -D warnings
 
   drb-pdcp:
     name: DRB PDCP (feature-gated)
@@ -547,9 +547,9 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features drb-pdcp
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-pdcp --all-targets
-          cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets
-          cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets
+          cargo clippy -p nextgsim-pdcp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features drb-pdcp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features drb-pdcp --all-targets -- -D warnings
 
   lte-enb-kernel-sctp:
     name: LTE eNB kernel SCTP (feature-gated)
@@ -578,8 +578,8 @@ jobs:
           cargo test -p nextgsim-gnb --features kernel-sctp sctp::
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets
-          cargo clippy -p nextgsim-gnb --features kernel-sctp --all-targets
+          cargo clippy -p nextgsim-enb --features kernel-sctp --all-targets -- -D warnings
+          cargo clippy -p nextgsim-gnb --features kernel-sctp --all-targets -- -D warnings
 
   up-security:
     name: UP security (feature-gated)
@@ -610,9 +610,9 @@ jobs:
         run: cargo test -p nextgsim-integration-tests --features up-security
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features up-security --all-targets
-          cargo clippy -p nextgsim-ue --features up-security --all-targets
-          cargo clippy -p nextgsim-integration-tests --features up-security --all-targets
+          cargo clippy -p nextgsim-gnb --features up-security --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features up-security --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features up-security --all-targets -- -D warnings
 
   sdap-dataplane:
     name: SDAP data plane (feature-gated)
@@ -655,9 +655,9 @@ jobs:
           cargo test -p nextgsim-integration-tests --features sdap-dataplane,up-security
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-gnb --features sdap-dataplane --all-targets
-          cargo clippy -p nextgsim-ue --features sdap-dataplane --all-targets
-          cargo clippy -p nextgsim-integration-tests --features sdap-dataplane --all-targets
+          cargo clippy -p nextgsim-gnb --features sdap-dataplane --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sdap-dataplane --all-targets -- -D warnings
+          cargo clippy -p nextgsim-integration-tests --features sdap-dataplane --all-targets -- -D warnings
 
   sidelink:
     name: Sidelink facade (feature-gated)
@@ -680,7 +680,7 @@ jobs:
       - name: cargo test (sidelink on)
         run: cargo test -p nextgsim-ue --features sidelink
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-ue --features sidelink --all-targets
+        run: cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
 
   as-security:
     name: AS security (config-gated)
@@ -710,7 +710,7 @@ jobs:
           cargo test -p nextgsim-ue security
           cargo test -p nextgsim-gnb as_security
       - name: cargo clippy
-        run: cargo clippy -p nextgsim-pdcp --all-targets
+        run: cargo clippy -p nextgsim-pdcp --all-targets -- -D warnings
 
   ranging:
     name: Sidelink ranging (feature-gated)
@@ -735,8 +735,8 @@ jobs:
           cargo test -p nextgsim-ue --features sidelink nas::lpp
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
-          cargo clippy -p nextgsim-ue --features sidelink --all-targets
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
 
   sidelink-pc5:
     name: Sidelink PC5 procedures (feature-gated)
@@ -778,9 +778,9 @@ jobs:
         run: cargo test -p nextgsim-gnb rrc::sidelink
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets
-          cargo clippy -p nextgsim-ue --features sidelink --all-targets
-          cargo clippy -p nextgsim-rlc --all-targets
+          cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-ue --features sidelink --all-targets -- -D warnings
+          cargo clippy -p nextgsim-rlc --all-targets -- -D warnings
 
   pqc:
     name: Post-quantum crypto (feature-gated)
@@ -823,8 +823,8 @@ jobs:
         run: cargo test -p nextgsim-crypto
       - name: cargo clippy
         run: |
-          cargo clippy -p nextgsim-crypto --features pqc --all-targets
-          cargo clippy -p nextgsim-crypto --all-targets
+          cargo clippy -p nextgsim-crypto --features pqc --all-targets -- -D warnings
+          cargo clippy -p nextgsim-crypto --all-targets -- -D warnings
 
   docker-build:
     name: Docker Build

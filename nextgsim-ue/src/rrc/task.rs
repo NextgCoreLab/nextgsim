@@ -1791,7 +1791,9 @@ impl RrcTask {
     /// How many remote UEs this UE's SRAP entity is configured for (issue #190).
     #[cfg(feature = "sidelink")]
     pub fn srap_remote_ue_count(&self) -> usize {
-        self.srap.as_ref().map_or(0, |s| s.remote_ue_count())
+        self.srap
+            .as_ref()
+            .map_or(0, nextgsim_rlc::srap::SrapEntity::remote_ue_count)
     }
 
     /// **Adapts a remote UE's end-to-end PDCP PDU into a SRAP PDU** and says which egress
