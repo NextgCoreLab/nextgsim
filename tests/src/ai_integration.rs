@@ -102,8 +102,9 @@ fn test_she_workload_migration() {
 
     let mut scheduler = WorkloadScheduler::new(tier_manager);
 
-    // Place a workload at local edge
-    let req = WorkloadRequirements::inference();
+    // Place a workload at local edge. Its 20 ms bound admits RegionalEdge too,
+    // so the migration below meets its KPIs (#553).
+    let req = WorkloadRequirements::inference().with_latency_constraint_ms(20);
     let id = scheduler.submit(req).unwrap();
     let initial = scheduler.place(id).unwrap();
     assert_eq!(initial.tier, ComputeTier::LocalEdge);

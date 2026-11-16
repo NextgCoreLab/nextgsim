@@ -403,11 +403,13 @@ impl WorkloadScheduler {
         target_tier: ComputeTier,
         transfer_state: bool,
     ) -> SheResult<PlacementDecision> {
-        // Extract necessary info and mark as migrating
+        // Extract necessary info. The workload is marked Migrating only once a
+        // target is found (#553): a refused migration leaves it Running where it
+        // is.
         let (source_tier, source_node_id, requirements) = {
             let workload = self
                 .workloads
-                .get_mut(&workload_id)
+                .get(&workload_id)
                 .ok_or(SheError::WorkloadNotFound { workload_id })?;
 
             let source_tier = workload.assigned_tier.ok_or(SheError::MigrationFailed {
@@ -424,7 +426,24 @@ impl WorkloadScheduler {
                 reason: "Node ID should be set but was not".to_string(),
             })?;
 
-            workload.mark_migrating();
+            // A relocation target must still meet the workload's KPIs (cf.
+            // TS 23.558 EAS relocation): the same capability floor and latency
+            // ceiling placement applies (#551, #553). Moving a 10 ms job to
+            // CoreCloud would silently break it.
+            if !workload.requirements.admits_tier(target_tier) {
+                return Err(SheError::MigrationFailed {
+                    workload_id,
+                    source_tier,
+                    target_tier,
+                    reason: format!(
+                        "{target_tier} does not meet the workload's requirements \
+                         (capability {:?}, latency bound {:?} ms, tier worst case {} ms)",
+                        workload.requirements.capability,
+                        workload.requirements.latency_constraint_ms,
+                        target_tier.max_latency_ms()
+                    ),
+                });
+            }
 
             (source_tier, source_node_id, workload.requirements.clone())
         };
@@ -450,6 +469,10 @@ impl WorkloadScheduler {
             })?;
 
         let target_node_id = target_node.id;
+
+        if let Some(workload) = self.workloads.get_mut(&workload_id) {
+            workload.mark_migrating();
+        }
 
         // Release from source
         if let Some(source_node) = self.tier_manager.get_node_mut(source_node_id) {
@@ -605,8 +628,8 @@ mod tests {
     fn test_migrate_workload() {
         let mut scheduler = setup_scheduler();
 
-        // Use 10ms latency to start at LocalEdge (<=10ms = LocalEdge minimum)
-        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(10);
+        // A 20 ms bound admits LocalEdge (10 ms) and RegionalEdge (20 ms).
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(20);
 
         let id = scheduler.submit(requirements).unwrap();
         let initial = scheduler.place(id).unwrap();
@@ -617,6 +640,9 @@ mod tests {
         let migrated = scheduler.migrate(id, ComputeTier::RegionalEdge).unwrap();
 
         assert_eq!(migrated.tier, ComputeTier::RegionalEdge);
+        let workload = scheduler.get_workload(id).unwrap();
+        assert_eq!(workload.state, WorkloadState::Running);
+        assert_eq!(workload.assigned_tier, Some(ComputeTier::RegionalEdge));
 
         // Check old node freed
         let old_node = scheduler.tier_manager().get_node(1).unwrap();
@@ -625,6 +651,89 @@ mod tests {
         // Check new node allocated
         let new_node = scheduler.tier_manager().get_node(2).unwrap();
         assert_eq!(new_node.usage.active_workloads, 1);
+    }
+
+    /// #553: the latency bound is a ceiling for a relocation target too. A
+    /// 10 ms job cannot move to CoreCloud (or RegionalEdge, 20 ms): the
+    /// migration fails, and the workload keeps running where it was.
+    #[test]
+    fn a_migration_past_the_latency_ceiling_is_refused() {
+        let mut scheduler = setup_scheduler();
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(10);
+        let id = scheduler.submit(requirements).unwrap();
+        assert_eq!(scheduler.place(id).unwrap().tier, ComputeTier::LocalEdge);
+
+        for target in [ComputeTier::CoreCloud, ComputeTier::RegionalEdge] {
+            let err = scheduler.migrate(id, target).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    SheError::MigrationFailed { source_tier: ComputeTier::LocalEdge, target_tier, .. }
+                        if target_tier == target
+                ),
+                "{err}"
+            );
+            let workload = scheduler.get_workload(id).unwrap();
+            assert_eq!(workload.state, WorkloadState::Running);
+            assert_eq!(workload.assigned_tier, Some(ComputeTier::LocalEdge));
+            assert_eq!(workload.assigned_node_id, Some(1));
+        }
+        assert_eq!(
+            scheduler
+                .tier_manager()
+                .get_node(1)
+                .unwrap()
+                .usage
+                .active_workloads,
+            1,
+            "the source keeps its allocation"
+        );
+        assert_eq!(
+            scheduler
+                .tier_manager()
+                .get_node(3)
+                .unwrap()
+                .usage
+                .active_workloads,
+            0,
+            "the refused target got nothing"
+        );
+    }
+
+    /// #553: with no node on the target tier able to take the workload, the
+    /// migration fails and the workload is NOT left `Migrating`: it still runs
+    /// on its source node.
+    #[test]
+    fn a_migration_with_no_target_node_leaves_the_workload_running() {
+        let mut tier_manager = TierManager::new();
+        tier_manager.add_node(ComputeNode::new(
+            1,
+            "edge-1",
+            ComputeTier::LocalEdge,
+            ResourceCapacity::with_tflops(1).with_memory_gb(8),
+        ));
+        let mut scheduler = WorkloadScheduler::new(tier_manager);
+        // Within the ceiling, so only the missing node can refuse it.
+        let requirements = WorkloadRequirements::inference().with_latency_constraint_ms(20);
+        let id = scheduler.submit(requirements).unwrap();
+        scheduler.place(id).unwrap();
+
+        let err = scheduler
+            .migrate(id, ComputeTier::RegionalEdge)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SheError::InsufficientResources {
+                    tier: ComputeTier::RegionalEdge,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let workload = scheduler.get_workload(id).unwrap();
+        assert_eq!(workload.state, WorkloadState::Running);
+        assert_eq!(workload.assigned_node_id, Some(1));
     }
 
     #[test]
