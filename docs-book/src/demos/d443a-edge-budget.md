@@ -72,7 +72,7 @@ flock /tmp/eks-nextg-demo.lock k8s/demo-check.sh d443a-edge-budget measured-budg
 
 ## Results
 
-Every number and excerpt below comes from **run 8** on devtest1 (namespace nextg-demo, one arm per hold of the EKS lock, torn down after each). Run 8 is the first run with:
+Every number and excerpt below comes from **run 8** on devtest1 (namespace nextg-demo, one arm per hold of the EKS lock, torn down after each). The two exceptions are the oauth2 and no-upf-qos arms, which come from **run 10** (below). Run 8 is the first run with:
 - the revert arms;
 - the restart flip and the oauth2 arm;
 - a uid of its own for each EAS;
@@ -84,6 +84,12 @@ The analyzer is nextgcore PR #1555's `analyze.py`.
 **Images** (new tags):
 - core NFs: `nextg/*:demo-d443a-edge-budget-f468351a73b3`. This is #1555's branch with nextgcore main (`d1028994`, #1581 included) merged in; the branch's own Rust change is doc comments in `edge_budget.rs`.
 - gnb, ue and nr-she-eas: `nextg/{gnb,ue}:demo-d443a-edge-budget-8eb6e19f5d37`, from nextgsim main `8eb6e19`. This page is docs only.
+
+**Run 10** reruns the two arms that power-cycle the UE, oauth2 and no-upf-qos. It used new images:
+- core: `nextg/*:demo-d443a-edge-budget-620372cc40ba`. This is #1555's branch with nextgcore main merged in, including #1669, the fix for nextgcore#1648: smfd's Namf requests now carry the NRF token.
+- sim: `nextg/{gnb,ue}:demo-d443a-edge-budget-00394912afb8`, from nextgsim main `0039491`.
+
+Its harness, at `c8824872`, waits for the old UE pod to be gone before it captures anything, and records the UE pod at every snapshot. Without that, run 9's oauth2 arm (20261117T074344Z) read a terminating pod's log at the warm snapshot. Run 9 is superseded.
 
 **Artefacts:** `/tmp/eks-val/demos/d443a-<arm>/d443a-edge-budget/<mode>[+<arm>]/<run>/` on the validation host. Each run has its `verdict.txt` (demo-check), `scenario/analyze.txt`, `scenario/meta.txt` and the per-act captures.
 
@@ -97,9 +103,9 @@ The analyzer is nextgcore PR #1555's `analyze.py`.
 | no-kpi-patch (revert) | 20261117T030329Z | PASS | HOLDS: `load` FAILs, as required | 0-234: sch_netem / 13-23: all three |
 | no-qos-mon (revert) | 20261117T005832Z | PASS | HOLDS: `act2` and `act3` FAIL, as required | 0-234: sch_netem / 13-23: all three |
 | wrong-callback-token (revert) | 20261117T011327Z | PASS | HOLDS: `act2` and `act3` FAIL, as required | 0-234: sch_netem / 29-194: all three |
-| no-upf-qos (revert) | 20261117T012814Z | PASS | HOLDS: `act2` and `act3` FAIL, as required | 0-234: sch_netem / 22-121: all three |
+| no-upf-qos (revert) | 20261117T080720Z (run 10) | PASS | HOLDS: `act2` and `act3` FAIL, as required | 0-234: sch_netem / 22-121: all three |
 | bind-eth0 (revert) | 20261117T013807Z | PASS | HOLDS: `act1` FAILs, as required | 0-234: sch_netem / 22-121: all three |
-| oauth2 | 20261117T021959Z | FAIL | **DOES NOT HOLD**: blocked by nextgcore#1648 (below) | 0-234: sch_netem / 22-121: all three |
+| oauth2 | 20261117T075659Z (run 10) | PASS | HOLDS (16 checks; accuracy advisory 10/10) | 0-234: sch_netem / 29-194: all three |
 
 The nodes are `ip-10-10-<x>-<y>`. "sch_netem" means that sch_netem was loaded and sch_prio and cls_u32 were absent.
 
@@ -212,13 +218,14 @@ JOB job=11 eas=eas-local rtt=25 predicted=10 src=static-fallback deadline=15 mod
   ```
 - So eesd ranks `static-fallback`, as in no-qos-mon.
 
-**no-upf-qos** (Acts 2 and 3 fail). upfd is restarted without `UPF_N6_DELAY_MEASUREMENT` and `UPF_QOS_FLOW_MONITORING`.
+**no-upf-qos** (Acts 2 and 3 fail; run 10). upfd is restarted without `UPF_N6_DELAY_MEASUREMENT` and `UPF_QOS_FLOW_MONITORING`.
 - smfd provisions neither:
   ```
-  UPF 10.10.5.224:8805 does not advertise UN6DM: N6 delay measurement not requested
-  ref=1: QOS_MON subscription fa8c1be9-... but 10.10.5.224:8805 did not advertise QFQM (TS 29.244 §5.24.4.1): no QoS monitoring requested
+  UPF 10.10.0.228:8805 does not advertise UN6DM: N6 delay measurement not requested
+  ref=2: QOS_MON subscription 5298a7f1-9c05-490d-94c8-dab0038bf565 but 10.10.0.228:8805 did not advertise QFQM (TS 29.244 §5.24.4.1): no QoS monitoring requested
   ```
-- eesd's subscription stands, but no report comes, so it ranks `static-fallback`. Job 11 runs at rtt 25 and job 14 at rtt 49, both `deadline-miss`.
+- eesd's subscription stands, but no report comes, so it ranks `static-fallback`. Job 11 runs at rtt 25 and job 14 at rtt 50, both `deadline-miss`.
+- One UE pod is captured throughout, `ue-9d6598d84-dm2kb`, which replaced `ue-9d6598d84-prbj7`.
 
 **bind-eth0** (Act 1 fails). The UE's EEC is bound to `device: eth0`, off the PDU session.
 - eesd still selects eas-local on the measured budget, for all 10 jobs.
@@ -227,22 +234,42 @@ JOB job=11 eas=eas-local rtt=25 predicted=10 src=static-fallback deadline=15 mod
   JOB job=1 eas=eas-local rtt=? deadline=15 mode=measured-budget result=deadline-miss (no answer from 10.60.0.11:9471 in 1s)
   ```
 
-### oauth2: blocked by nextgcore#1648
+### oauth2: the same acts with SBI OAuth2 required (run 10)
 
-amfd and smfd run with `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` and CCA keys the NRF trusts, and eesd runs with `--nrf-uri` (#1581). What holds:
-- A bare Subscribe at smfd is refused (`bare-subscribe: 401`).
-- eesd registers as an AF and subscribes with an NRF token:
+amfd and smfd run with `NEXTGCORE_SBI_OAUTH2_REQUIRE=1` and CCA keys that the NRF trusts. eesd runs with `--nrf-uri` (#1581).
+
+**Enforcement.** A bare Subscribe at smfd is refused, and both NFs log that enforcement is on:
+```
+amf: ... INFO  nextgcore_amfd] OAuth2 enforcement enabled (JWKS: http://nrf.nextg-demo.svc.cluster.local:7777/nnrf-oauth2/v1/jwks)
+smf: ... INFO  nextgcore_smfd] OAuth2 enforcement enabled (JWKS: http://nrf.nextg-demo.svc.cluster.local:7777/nnrf-oauth2/v1/jwks)
+bare-subscribe: 401
+```
+
+**eesd's token.** eesd registers at the NRF as an AF and subscribes with an NRF token:
+```
+EES registered at the NRF as AF nfInstanceId 42255cd9-9d60-4e4d-ace4-2ad9db03abb0 (TS 23.558 §6.2), for 5GC access tokens
+[demo:d443a-edge-budget] Nsmf_EventExposure_Subscribe QOS_MON (anyUeInd, PERIODIC 2 s, QoSMonitoring) at http://smf.nextg-demo.svc.cluster.local:7777: 201 /nsmf-event-exposure/v1/subscriptions/a4a559fe-4fbf-408b-8020-be8efc29aabf
+```
+
+**N1N2.** smfd's N1N2MessageTransfer carries its token since #1669, so it is accepted (`N1N2MessageTransfer (policy modification, ...) → 10.10.22.199:7777: status=200`). The NG-RAN then gets the QoS Monitoring Request, and 18 QOS_MON reports with n6Delays reach eesd before Act 1.
+
+**The acts** match main's:
+- N6 is local 3, regional 4, cloud 21 ms.
+- Act 1: 10 jobs on eas-local, at rtt 9-10 against a predicted 11:
   ```
-  EES registered at the NRF as AF nfInstanceId 3b0f2df4-2d97-4101-a2f4-99d4bd1e3515 (TS 23.558 §6.2), for 5GC access tokens
-  [demo:d443a-edge-budget] Nsmf_EventExposure_Subscribe QOS_MON (anyUeInd, PERIODIC 2 s, QoSMonitoring) at http://smf.nextg-demo.svc.cluster.local:7777: 201 /nsmf-event-exposure/v1/subscriptions/c05025bc-...
+  EES-SEL ac=ac-d443a src=upf-n3+upf-n6 selected=[eas-local,eas-regional] budget=[eas-local=11,eas-regional=13,eas-cloud=46] deadline=15 n3_rt=3 result=201
   ```
+- Act 2: N6 local rises to 11 ms, and the selection moves to `selected=[eas-regional]` with budgets 27/13/46.
+- Act 3: rt rises to 23 ms, and eesd answers `result=404`.
+- Load act: eas-local's PATCH moves the selection to eas-regional, with budgets 29/13/46.
 
-What does not:
-- smfd sends its N1N2MessageTransfer to amfd without a token, and amfd answers 401.
-- So the NG-RAN never gets the QoS Monitoring Request, every QMP measurement fails, and no QOS_MON report reaches eesd.
-- Acts 1-3 and the load act then fail on `static-fallback`.
+eesd's `/metrics` at the end: `eees_selection_total{src="upf-n3+upf-n6",result="201"} 16`, `...result="404"} 2` and `eees_d443a_qos_mon_subscribed 1`.
 
-This is a core defect, filed as nextgcore#1648. The arm should hold once it is fixed.
+**Earlier oauth2 runs.**
+- Run 8 (20261117T021959Z) failed on nextgcore#1648: smfd's bare N1N2MessageTransfer got 401 at amfd, so no QoS Monitoring Request reached the NG-RAN.
+- Run 9 (20261117T074344Z) failed on the UE pod capture race described above.
+
+Both are superseded.
 
 ### off: the demo-off arm
 
@@ -297,6 +324,6 @@ Runs 1-7 (20261116T000159Z to 20261116T143326Z) are superseded, and nothing on t
 - **Tokens.** The EASes and the EEC get NRF client-credential tokens, standing in for TS 33.558 / CAPIF. The EES is not an NRF NF type (TS 29.510; TS 23.558 §6.2), so a **labelled stand-in** EES profile (custom nfType `EES`) is registered at the NRF so that it issues `eees-*` tokens.
 - **Name resolution on EKS.** The UE's EEC is bound to its TUN and takes IP literals, so the ees and nrf ClusterIPs are resolved once at pod start, on the pod network.
 - **Known gaps.**
-  - Outside the oauth2 arm, amfd and smfd run the dev SBI profile (no OAuth2 required), and eesd's Subscribe carries no token. The oauth2 arm (#1581) runs the same acts with OAuth2 required.
+  - Outside the oauth2 arm, amfd and smfd run the dev SBI profile (no OAuth2 required), and eesd's Subscribe carries no token. The oauth2 arm (#1581, with nextgcore#1648 fixed by #1669) runs the same acts with OAuth2 required, and holds.
   - The compose stack has not been run; the manual run and a CI netem preflight are #580.
   - A SIGKILL'd eesd can orphan one QOS_MON subscription at smfd.
