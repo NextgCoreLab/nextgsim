@@ -1791,7 +1791,9 @@ impl RrcTask {
     /// How many remote UEs this UE's SRAP entity is configured for (issue #190).
     #[cfg(feature = "sidelink")]
     pub fn srap_remote_ue_count(&self) -> usize {
-        self.srap.as_ref().map_or(0, |s| s.remote_ue_count())
+        self.srap
+            .as_ref()
+            .map_or(0, nextgsim_rlc::srap::SrapEntity::remote_ue_count)
     }
 
     /// **Adapts a remote UE's end-to-end PDCP PDU into a SRAP PDU** and says which egress
@@ -5835,6 +5837,21 @@ impl Task for RrcTask {
                                 // available PLMN still could not camp on its cells.
                                 info!("Cell selection will now search for PLMN {plmn}");
                                 self.cell_selector.set_selected_plmn(Some(plmn));
+                            }
+                            RrcMessage::SetRegisteredPlmns {
+                                registered,
+                                equivalent,
+                            } => {
+                                // TS 38.304 §4.5 (#567): cells of the registered
+                                // PLMN and of its equivalents are suitable too.
+                                info!(
+                                    "Cell selection now also treats as suitable the \
+                                     registered PLMN {registered:?} and {} equivalent \
+                                     PLMN(s)",
+                                    equivalent.len()
+                                );
+                                self.cell_selector
+                                    .set_registered_plmns(registered, equivalent);
                             }
                             RrcMessage::SetForbiddenTais {
                                 roaming,
@@ -10084,6 +10101,43 @@ mod tests {
             try_take_paging(&mut nas_rx),
             Some(vec![own]),
             "camped normally, the same page reaches NAS"
+        );
+    }
+
+    /// #567, TS 38.304 §4.5: a UE whose selected PLMN no cell broadcasts, camped
+    /// on a cell of a PLMN of its equivalent-PLMN list, is camped normally on a
+    /// suitable cell, so a matching in-occasion page from that cell reaches NAS.
+    #[test]
+    fn a_ue_camped_on_an_equivalent_plmn_cell_acts_on_its_page() {
+        use crate::rrc::cell_selection::{CellCategory, Plmn};
+        let config = test_config();
+        let own = s_tmsi_paged_in_the_pinned_frame(&config);
+        let home = Plmn::new(config.hplmn.mcc, config.hplmn.mnc, config.hplmn.long_mnc);
+        let selected = Plmn::new(262, 30, true);
+        let (task_base, _app_rx, mut nas_rx, _rrc_rx, _rls_rx) = UeTaskBase::new(config, 16);
+        let mut task = RrcTask::new(task_base);
+        // Registered on a PLMN no cell here broadcasts; the cells' PLMN is one of
+        // its equivalents.
+        task.cell_selector.set_selected_plmn(Some(selected));
+        task.cell_selector
+            .set_registered_plmns(Some(selected), vec![home]);
+        camp_on(&mut task, PAGING_CELL);
+        assert_eq!(
+            task.cell_selector.current_cell().map(|c| c.category),
+            Some(CellCategory::SuitableCell),
+            "an equivalent-PLMN cell is suitable: camped normally"
+        );
+        task.pin_sfn(PINNED_SFN);
+        task.set_paging_identity(Some(own));
+
+        run_async(async {
+            task.handle_downlink_rrc(PAGING_CELL, RrcChannel::Pcch, pcch_paging(&[own]))
+                .await;
+        });
+        assert_eq!(
+            try_take_paging(&mut nas_rx),
+            Some(vec![own]),
+            "camped normally on an equivalent-PLMN cell, the page reaches NAS"
         );
     }
 

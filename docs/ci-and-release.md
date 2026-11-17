@@ -18,7 +18,9 @@ dispatch.
 
 **Feature-gated jobs** (every push and PR). A default build compiles none of
 these surfaces, so each has its own job that turns the feature on and runs its
-tests (and usually clippy):
+tests (and usually clippy). Every feature-gated clippy invocation passes
+`-- -D warnings` too, so a lint behind a feature fails its job just as one in
+the default build fails **Clippy** (#554):
 
 | Job | Feature(s) | Crates |
 |-----|------------|--------|

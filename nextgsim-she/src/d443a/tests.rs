@@ -735,11 +735,13 @@ async fn the_eec_is_bound_to_its_device_471() {
     assert_eq!(stats.executed.load(Ordering::Relaxed), 1);
 }
 
-/// The client's AF profile is re-registered at the NRF every half heartbeat,
-/// so the NRF never drops it and keeps granting tokens on a long run.
+/// The client's AF profile is kept alive at the NRF by NF Heart-Beats (TS
+/// 29.510 §5.2.2.3.2: PATCH of nfStatus, #556), so the NRF never drops it and
+/// keeps granting tokens on a long run.
 #[tokio::test]
 async fn the_af_profile_is_kept_registered_at_the_nrf_471() {
     let nrf = StubEes::start().await;
+    nrf.nrf_heartbeat(60);
     let task = tokio::spawn(super::keep_registered(
         nrf.api_root.clone(),
         "3f6d7a8e-0000-4000-8000-000000000471".into(),
@@ -750,24 +752,69 @@ async fn the_af_profile_is_kept_registered_at_the_nrf_471() {
         Duration::from_millis(30),
     ));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let puts = |s: &StubEes| {
+    let beats = |s: &StubEes| {
         s.seen()
             .iter()
             .filter(|r| {
-                r.method == "PUT"
+                r.method == "PATCH"
                     && r.path == "/nnrf-nfm/v1/nf-instances/3f6d7a8e-0000-4000-8000-000000000471"
             })
             .count()
     };
-    while puts(&nrf) < 3 {
-        assert!(tokio::time::Instant::now() < deadline, "{}", puts(&nrf));
+    while beats(&nrf) < 3 {
+        assert!(tokio::time::Instant::now() < deadline, "{}", beats(&nrf));
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     task.abort();
-    let put = nrf.seen().into_iter().find(|r| r.method == "PUT").unwrap();
+    let beat = nrf
+        .seen()
+        .into_iter()
+        .find(|r| r.method == "PATCH")
+        .unwrap();
+    let body: Value = serde_json::from_slice(&beat.body).unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!([{"op": "replace", "path": "/nfStatus", "value": "REGISTERED"}])
+    );
+    assert!(
+        !nrf.seen().iter().any(|r| r.method == "PUT"),
+        "a profile the NRF holds is beaten, not registered again"
+    );
+}
+
+/// #556, TS 29.510 §5.2.2.3.2 2b: a heart-beat answered 404 (the NRF no
+/// longer holds the profile, e.g. it restarted) registers the profile again.
+#[tokio::test]
+async fn a_profile_the_nrf_lost_is_registered_again_556() {
+    let nrf = StubEes::start().await; // holds no profile: PATCH is 404
+    let task = tokio::spawn(super::keep_registered(
+        nrf.api_root.clone(),
+        "3f6d7a8e-0000-4000-8000-000000000556".into(),
+        SbiClientConfig {
+            timeout: Duration::from_secs(1),
+            ..SbiClientConfig::default()
+        },
+        Duration::from_millis(30),
+    ));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let put = loop {
+        if let Some(p) = nrf.seen().into_iter().find(|r| r.method == "PUT") {
+            break p;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "no re-registration");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    task.abort();
     let body: Value = serde_json::from_slice(&put.body).unwrap();
     assert_eq!(body["nfType"], "AF");
     assert_eq!(body["heartBeatTimer"], super::HEARTBEAT_SECS);
+    let seen = nrf.seen();
+    let first_patch = seen.iter().position(|r| r.method == "PATCH");
+    let first_put = seen.iter().position(|r| r.method == "PUT");
+    assert!(
+        first_patch < first_put,
+        "the heart-beat came first: {seen:?}"
+    );
 }
 
 /// m4: the client re-registers at half the heartBeatTimer the NRF answers,
@@ -785,17 +832,17 @@ async fn the_nrf_s_heartbeat_timer_is_honoured_471() {
             .await
             .unwrap();
     assert_eq!(hb, 20);
-    assert_eq!(super::reregister_every(hb), Duration::from_secs(10));
+    assert_eq!(super::beat_every(hb), Duration::from_secs(10));
     assert_eq!(
-        super::reregister_every(super::HEARTBEAT_SECS),
+        super::beat_every(super::HEARTBEAT_SECS),
         Duration::from_secs(30)
     );
     assert_eq!(
-        super::reregister_every(1),
+        super::beat_every(1),
         Duration::from_secs(1),
         "never below 1 s"
     );
-    assert_eq!(super::reregister_every(0), Duration::from_secs(1));
+    assert_eq!(super::beat_every(0), Duration::from_secs(1));
 }
 
 /// m6: at most MAX_INFLIGHT jobs compute at once; one beyond is dropped.
