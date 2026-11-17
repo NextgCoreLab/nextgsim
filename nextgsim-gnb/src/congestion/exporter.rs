@@ -239,11 +239,14 @@ impl Exporter {
             "export: CCA public JWK {}",
             key.public_jwk(&c.nf_instance_id)
         );
+        // An https:// NRF (nextgcore#1617): the NEXTGCORE_NRF_TLS_* settings, so
+        // the registration presents this gNB's certificate.
         let base = SbiClientConfig {
             timeout: Duration::from_secs(2),
             retries: 0,
             ..SbiClientConfig::default()
-        };
+        }
+        .with_nrf_tls_from_env(&nrf);
         let client = SbiClient::new(SbiClientConfig {
             oauth2: Some(OAuth2Config::new(
                 nrf.clone(),

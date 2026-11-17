@@ -55,6 +55,8 @@ tokio = { workspace = true, features = ["test-util", "macros"] }
 h2 = "0.4"
 http = "1"
 bytes = { workspace = true }
+# The dev PKI and TLS front of the https NRF tests (nextgcore#1617).
+nextgsim-sbi-client = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true

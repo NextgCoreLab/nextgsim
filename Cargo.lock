@@ -1978,11 +1978,14 @@ dependencies = [
  "http",
  "p256",
  "rand 0.8.5",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "socket2 0.5.10",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
 ]
@@ -3271,6 +3274,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.112",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

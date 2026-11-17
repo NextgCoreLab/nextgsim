@@ -53,12 +53,17 @@ impl Sba {
     /// there is no `sba` domain at all.
     pub fn new(config: &NkefLiveConfig) -> Option<Self> {
         config.amf_sbi_uri.as_ref()?;
+        let mut client = SbiClientConfig {
+            timeout: Duration::from_secs(2),
+            retries: 0,
+            ..SbiClientConfig::default()
+        };
+        // An https:// NRF (nextgcore#1617): the NEXTGCORE_NRF_TLS_* settings.
+        if let Some(nrf) = &config.nrf_uri {
+            client = client.with_nrf_tls_from_env(nrf);
+        }
         Some(Self {
-            client: Arc::new(SbiClient::new(SbiClientConfig {
-                timeout: Duration::from_secs(2),
-                retries: 0,
-                ..SbiClientConfig::default()
-            })),
+            client: Arc::new(SbiClient::new(client)),
             config: config.clone(),
         })
     }
@@ -333,6 +338,75 @@ mod tests {
             ..NkefLiveConfig::default()
         };
         assert!(Sba::new(&config).is_some());
+    }
+
+    /// nextgcore#1617: NRF discovery toward an `https://` NRF goes over TLS
+    /// with the `NEXTGCORE_NRF_TLS_*` CA and server name, presenting the
+    /// configured certificate; the NRF's answer is read.
+    #[tokio::test]
+    async fn nrf_discovery_goes_over_https_with_the_env_settings_1617() {
+        use nextgsim_sbi_client::test_support::{NrfTlsEnv, Peer, TestPki, TlsFront};
+        use nextgsim_sbi_client::tls::{
+            NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV,
+            NRF_TLS_SERVER_NAME_ENV,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend = listener.local_addr().unwrap();
+        let paths = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let paths2 = paths.clone();
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let paths = paths2.clone();
+                tokio::spawn(async move {
+                    let Ok(mut conn) = h2::server::handshake(sock).await else {
+                        return;
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        paths.lock().unwrap().push(req.uri().path().to_string());
+                        let body = json!({"nfInstances": [{"nfInstanceId": "amf-1",
+                            "nfType": "AMF", "nfStatus": "REGISTERED"}]});
+                        let resp = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(())
+                            .unwrap();
+                        if let Ok(mut send) = respond.send_response(resp, false) {
+                            let _ = send.send_data(bytes::Bytes::from(body.to_string()), true);
+                        }
+                    }
+                });
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let pki = TestPki::new(dir.path());
+        let nrf = pki.issue("nrf", &["nrf"], &[], None);
+        let nkef = pki.issue(
+            "nkef",
+            &["gnb"],
+            &[],
+            Some("6b1d7e3c-0000-4000-8000-0000000006b0"),
+        );
+        let front = TlsFront::start(backend, &nrf, &pki.ca_cert).await;
+        let config = NkefLiveConfig {
+            amf_sbi_uri: Some("http://127.0.0.1:1".into()),
+            nrf_uri: Some(front.url()),
+            nf_types: vec!["AMF".into()],
+            ..NkefLiveConfig::default()
+        };
+        let sba = {
+            let _env = NrfTlsEnv::set(&[
+                (NRF_TLS_CA_ENV, &pki.ca_cert),
+                (NRF_TLS_CLIENT_CERT_ENV, &nkef.cert),
+                (NRF_TLS_CLIENT_KEY_ENV, &nkef.key),
+                (NRF_TLS_SERVER_NAME_ENV, std::path::Path::new("nrf")),
+            ])
+            .await;
+            Sba::new(&config).unwrap()
+        };
+        let facts = sba.discover().await.expect("the NRF answered");
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert_eq!(*paths.lock().unwrap(), vec!["/nnrf-disc/v1/nf-instances"]);
+        assert_eq!(front.peers(), vec![Peer::Verified(Some(nkef.der))]);
     }
 
     #[test]

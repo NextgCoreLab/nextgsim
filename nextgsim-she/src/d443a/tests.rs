@@ -864,3 +864,57 @@ async fn jobs_beyond_the_inflight_bound_are_dropped_471() {
     );
     assert_eq!(stats.dropped.load(Ordering::Relaxed), 1);
 }
+
+/// nextgcore#1617: toward an `https://` NRF, `ees_client` (the EAS sidecar and
+/// the UE EEC) registers its AF profile over TLS with the certificate that
+/// names its nfInstanceId, from the `NEXTGCORE_NRF_TLS_*` variables.
+#[tokio::test]
+async fn the_af_registers_over_https_with_its_certificate_1617() {
+    use nextgsim_common::config::NrfOAuth2Config;
+    use nextgsim_sbi_client::test_support::{NrfTlsEnv, Peer, TestPki, TlsFront};
+    use nextgsim_sbi_client::tls::{
+        NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV, NRF_TLS_SERVER_NAME_ENV,
+    };
+    const ID: &str = "3f6d7a8e-0000-4000-8000-000000001617";
+    let nrf = StubEes::start().await;
+    nrf.nrf_heartbeat(60);
+    let dir = std::env::temp_dir().join(format!(
+        "she-1617-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let pki = TestPki::new(&dir);
+    let nrf_cert = pki.issue("nrf", &["nrf"], &[], None);
+    let af = pki.issue("eas", &["eas"], &[], Some(ID));
+    let backend = nrf.api_root.trim_start_matches("http://").parse().unwrap();
+    let front = TlsFront::start(backend, &nrf_cert, &pki.ca_cert).await;
+    let oauth2 = NrfOAuth2Config {
+        nrf: front.url(),
+        nf_instance_id: ID.into(),
+        cca_key_file: dir.join("cca.key"),
+        public_jwk_dir: None,
+        register: true,
+    };
+    let result = {
+        let _env = NrfTlsEnv::set(&[
+            (NRF_TLS_CA_ENV, &pki.ca_cert),
+            (NRF_TLS_CLIENT_CERT_ENV, &af.cert),
+            (NRF_TLS_CLIENT_KEY_ENV, &af.key),
+            (NRF_TLS_SERVER_NAME_ENV, std::path::Path::new("nrf")),
+        ])
+        .await;
+        ees_client(Some(&oauth2), None, Duration::from_secs(2)).await
+    };
+    let peers = front.peers();
+    let _ = std::fs::remove_dir_all(&dir);
+    result.expect("registered over https");
+    assert!(nrf
+        .seen()
+        .iter()
+        .any(|r| r.method == "PUT" && r.path == format!("/nnrf-nfm/v1/nf-instances/{ID}")));
+    assert_eq!(peers, vec![Peer::Verified(Some(af.der))]);
+}

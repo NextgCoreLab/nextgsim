@@ -81,10 +81,13 @@ async fn run() -> Result<(), Fail> {
     let id = env("NF_INSTANCE_ID", DEFAULT_ID);
     // AF: TS 29.520 §4.3.1.3.2 lists the AF as an Nnwdaf_AnalyticsInfo consumer.
     let nf_type = env("NF_TYPE", "AF");
+    // An https:// NRF (nextgcore#1617) is dialled with the NEXTGCORE_NRF_TLS_*
+    // settings: the CA, this client's certificate, the NRF's server name.
     let base = SbiClientConfig {
         timeout: Duration::from_secs(5),
         ..Default::default()
-    };
+    }
+    .with_nrf_tls_from_env(&nrf);
     // NRF management is not token-protected in nextgcore's oauth2 profile
     // (nrf.sbi.oauth2.require_server is unset), so registration is tokenless by
     // design, on a client with no OAuth2 configured.
@@ -207,7 +210,7 @@ async fn run() -> Result<(), Fail> {
                  tokenless call",
                 error.as_deref().unwrap_or("-")
             );
-            return deregister(&nf_uri, &mode).await;
+            return deregister(&nf_uri, &mode, &nrf).await;
         }
         Err(e) => return Err(Fail("nwdaf-analytics", e.to_string())),
     };
@@ -223,11 +226,11 @@ async fn run() -> Result<(), Fail> {
         r.body.len()
     );
 
-    deregister(&nf_uri, &mode).await
+    deregister(&nf_uri, &mode, &nrf).await
 }
 
-async fn deregister(nf_uri: &str, mode: &str) -> Result<(), Fail> {
-    let r = SbiClient::new(SbiClientConfig::default())
+async fn deregister(nf_uri: &str, mode: &str, nrf: &str) -> Result<(), Fail> {
+    let r = SbiClient::new(SbiClientConfig::default().with_nrf_tls_from_env(nrf))
         .delete(nf_uri, None)
         .await
         .map_err(|e| Fail("nrf-deregister", e.to_string()))?;
