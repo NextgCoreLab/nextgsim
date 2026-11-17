@@ -1,0 +1,12 @@
+# Override for nextgcore's docker/rust/docker-compose.demo-n2ho.yml, used by
+# scripts/demo/d446a-check.sh (nextgsim#568). IPv6 is off in the UE container,
+# so the kernel sends no packet of its own as uesimtun0 comes up (a 48-byte
+# IPv6 packet that some runs sent and some did not). The harness's uplink burst
+# is then the only user-plane data, and the one thing that fires lb-1.
+# Nothing else changes; it publishes nothing (the check asserts the merged
+# model has no published port).
+services:
+  ue:
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+      net.ipv6.conf.default.disable_ipv6: 1
