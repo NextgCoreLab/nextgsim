@@ -5,7 +5,7 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "h2c SBI client for gNB/UE 6G tasks calling nextgcore NFs: JSON, timeouts, idempotent-only retries, optional fail-closed NRF OAuth2 (#457)"
+description = "h2c and https SBI client for gNB/UE 6G tasks calling nextgcore NFs: JSON, timeouts, idempotent-only retries, optional fail-closed NRF OAuth2 (#457), NRF TLS with a client certificate (nextgcore#1617)"
 
 [lints]
 workspace = true
@@ -14,6 +14,10 @@ workspace = true
 # Builds `sbi-roundtrip`, the nightly's NRF + NWDAF round trip (#457). Off by
 # default, so a workspace build compiles only the library.
 roundtrip = []
+# `test_support`: a dev PKI (rcgen), a TLS front with optional client auth that
+# records each client certificate, and a guard over the NEXTGCORE_NRF_TLS_*
+# variables, for the consumers' tests (nextgcore#1617). Never in a release build.
+test-support = ["dep:rcgen", "tokio/io-util"]
 
 [[bin]]
 name = "sbi-roundtrip"
@@ -33,8 +37,12 @@ hex.workspace = true
 rand.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
+rustls.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rcgen = { workspace = true, optional = true }
 
 [dev-dependencies]
+rcgen.workspace = true
 socket2.workspace = true
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber.workspace = true

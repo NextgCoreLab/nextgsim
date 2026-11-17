@@ -374,3 +374,65 @@ fn identifiers_are_spelled_as_ts_29571() {
         "2000-02-29T00:00:00Z"
     );
 }
+
+/// nextgcore#1617: an `https://` NRF (nrfd's TLS listener with optional client
+/// auth) sees this gNB's certificate, the one naming its `nf_instance_id`, on
+/// the registration, the discovery and the token request, all set from the
+/// `NEXTGCORE_NRF_TLS_*` variables the deployments set.
+#[tokio::test]
+async fn an_https_nrf_sees_the_gnb_certificate_on_every_call_1617() {
+    use nextgsim_sbi_client::test_support::{NrfTlsEnv, Peer, TestPki, TlsFront};
+    use nextgsim_sbi_client::tls::{
+        NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV, NRF_TLS_SERVER_NAME_ENV,
+    };
+    let stub = Stub::start(core(204)).await;
+    let dir = tempfile::tempdir().unwrap();
+    let pki = TestPki::new(dir.path());
+    let nrf_cert = pki.issue(
+        "nrf",
+        &["nrf"],
+        &[],
+        Some("6b1d7e3c-0000-4000-8000-0000000000f0"),
+    );
+    let id = config("http://unused", dir.path())
+        .congestion_export
+        .nf_instance_id;
+    let gnb = pki.issue("gnb", &["gnb"], &[], Some(&id));
+    let backend = stub.base.trim_start_matches("http://").parse().unwrap();
+    let front = TlsFront::start(backend, &nrf_cert, &pki.ca_cert).await;
+    let mut ex = {
+        let _env = NrfTlsEnv::set(&[
+            (NRF_TLS_CA_ENV, &pki.ca_cert),
+            (NRF_TLS_CLIENT_CERT_ENV, &gnb.cert),
+            (NRF_TLS_CLIENT_KEY_ENV, &gnb.key),
+            (NRF_TLS_SERVER_NAME_ENV, std::path::Path::new("nrf")),
+        ])
+        .await;
+        Exporter::with_demo(
+            config(&front.url(), dir.path()),
+            Some(demo("statistics")),
+            status(),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        ex.on_window(window(4800, 0)).await,
+        Some(Outcome::Status(204))
+    );
+    let seen = stub.seen();
+    assert!(seen.iter().any(|s| s.method == "PUT"), "{seen:?}");
+    assert!(seen.iter().any(|s| s.path.starts_with("/nnrf-disc/")));
+    assert!(seen
+        .iter()
+        .any(|s| s.path == nextgsim_sbi_client::TOKEN_PATH));
+    assert_eq!(stub.reports().len(), 1);
+    let peers = front.peers();
+    assert!(peers.len() >= 2, "{peers:?}");
+    assert!(
+        peers
+            .iter()
+            .all(|p| *p == Peer::Verified(Some(gnb.der.clone()))),
+        "{peers:?}"
+    );
+}

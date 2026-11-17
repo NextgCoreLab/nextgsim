@@ -1,10 +1,14 @@
 //! A small h2c SBI client for gNB and UE 6G tasks that call nextgcore NFs
 //! (nwdafd, NEF, eesd, amfd, NRF), nextgsim#457.
 //!
-//! - **Transport:** HTTP/2 with prior knowledge over cleartext TCP (h2c), the
-//!   way nextgcore's SBI listeners speak it. `https://` is refused: this client
-//!   has no TLS, and nextgcore SBI traffic stays on the private compose or
-//!   cluster network.
+//! - **Transport:** HTTP/2 with prior knowledge over cleartext TCP (h2c) for
+//!   `http://`, the way nextgcore's SBI listeners speak it; HTTP/2 over TLS
+//!   (ALPN `h2`) for `https://`, as nextgcore's NRF serves NF management
+//!   (nextgcore#1617). TLS trusts only the deployment's CA and presents a
+//!   client certificate when one is configured, from the
+//!   `NEXTGCORE_NRF_TLS_*` variables nextgcore's NFs read. See [`tls`]. An
+//!   `https://` URI without [`SbiClientConfig::tls`] is refused before
+//!   anything is dialled.
 //! - **JSON** bodies and a **timeout** on every attempt.
 //! - **Retries only on idempotent methods** (GET, HEAD, PUT, DELETE, OPTIONS;
 //!   RFC 9110 §9.2.2), on a transport error, a timeout, or a 502/503/504. A POST
@@ -26,6 +30,9 @@
 
 pub mod nrf;
 pub mod oauth;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,6 +47,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 pub use oauth::{AccessToken, CcaKey, OAuth2Config, TOKEN_PATH};
+pub use tls::NrfTls;
 
 /// Why an SBI call failed.
 #[derive(Debug, thiserror::Error)]
@@ -47,9 +55,18 @@ pub enum SbiError {
     /// The URI does not parse or has no authority.
     #[error("invalid SBI URI {0:?}")]
     InvalidUri(String),
-    /// Only `http://` (h2c) is supported.
-    #[error("unsupported URI scheme {0:?}: this client speaks h2c (http://) only")]
+    /// Only `http://` (h2c) and `https://` are supported.
+    #[error("unsupported URI scheme {0:?}: this client speaks http:// (h2c) and https:// only")]
     UnsupportedScheme(String),
+    /// An `https://` URI, but the client has no TLS settings
+    /// ([`SbiClientConfig::tls`]): refused, never sent in the clear or
+    /// against public roots.
+    #[error("https:// to {0} needs TLS settings (the NEXTGCORE_NRF_TLS_* variables); none are configured")]
+    TlsNotConfigured(String),
+    /// The TLS settings are unusable (half a client pair, an unreadable CA or
+    /// key), or the TLS handshake failed.
+    #[error("TLS: {0}")]
+    Tls(String),
     /// The TCP connection could not be made.
     #[error("connect to {authority} failed: {source}")]
     Connect {
@@ -151,6 +168,22 @@ pub struct SbiClientConfig {
     /// Bound, the URIs must name IP literals: name resolution would not go
     /// through the device, so a name is refused.
     pub bind_device: Option<String>,
+    /// TLS for `https://` URIs (nextgcore#1617). `None`: an `https://` call is
+    /// refused ([`SbiError::TlsNotConfigured`]). See
+    /// [`SbiClientConfig::with_nrf_tls_from_env`].
+    pub tls: Option<NrfTls>,
+}
+
+impl SbiClientConfig {
+    /// This configuration with the TLS settings of the environment for the
+    /// NRF at `nrf_uri` ([`NrfTls::from_env`]), logged when `nrf_uri` is
+    /// `https://`. Every NRF consumer builds its clients through this.
+    pub fn with_nrf_tls_from_env(mut self, nrf_uri: &str) -> Self {
+        let tls = NrfTls::from_env(nrf_uri);
+        tls.log(nrf_uri);
+        self.tls = Some(tls);
+        self
+    }
 }
 
 impl Default for SbiClientConfig {
@@ -162,6 +195,7 @@ impl Default for SbiClientConfig {
             max_body: 1 << 20,
             oauth2: None,
             bind_device: None,
+            tls: None,
         }
     }
 }
@@ -207,6 +241,9 @@ pub struct SbiClient {
     /// Held only to find or insert a slot, never across an await.
     conns: std::sync::Mutex<HashMap<String, ConnSlot>>,
     tokens: oauth::TokenCache,
+    /// The rustls configuration of [`SbiClientConfig::tls`], built on the
+    /// first `https://` call (or the error it gave, reported on every one).
+    tls: std::sync::OnceLock<Result<Arc<rustls::ClientConfig>, String>>,
 }
 
 impl std::fmt::Debug for SbiClient {
@@ -218,29 +255,52 @@ impl std::fmt::Debug for SbiClient {
 }
 
 struct Target {
+    /// `host:port` to dial.
     authority: String,
+    /// The host as written (IPv6 in brackets).
+    host: String,
+    port: u16,
+    https: bool,
     uri: Uri,
+}
+
+impl Target {
+    /// `host:port` with the host lower-cased, to compare authorities.
+    fn authority_key(&self) -> String {
+        format!("{}:{}", self.host.to_ascii_lowercase(), self.port)
+    }
+
+    /// The connection-pool key: scheme and authority, so an `http://` and an
+    /// `https://` call to one authority never share a connection.
+    fn pool_key(&self) -> String {
+        let scheme = if self.https { "https" } else { "http" };
+        format!("{scheme}://{}", self.authority_key())
+    }
 }
 
 fn parse_target(uri: &str) -> SbiResult<Target> {
     let parsed: Uri = uri
         .parse()
         .map_err(|_| SbiError::InvalidUri(uri.to_string()))?;
-    match parsed.scheme_str() {
-        Some("http") => {}
+    let https = match parsed.scheme_str() {
+        Some(s) if s.eq_ignore_ascii_case("http") => false,
+        Some(s) if s.eq_ignore_ascii_case("https") => true,
         Some(other) => return Err(SbiError::UnsupportedScheme(other.to_string())),
         None => return Err(SbiError::InvalidUri(uri.to_string())),
-    }
+    };
     let authority = parsed
         .authority()
         .ok_or_else(|| SbiError::InvalidUri(uri.to_string()))?;
-    let authority = if authority.port().is_some() {
-        authority.as_str().to_string()
-    } else {
-        format!("{}:80", authority.host())
-    };
+    let host = authority.host().to_string();
+    if host.is_empty() {
+        return Err(SbiError::InvalidUri(uri.to_string()));
+    }
+    let port = authority.port_u16().unwrap_or(if https { 443 } else { 80 });
     Ok(Target {
-        authority,
+        authority: format!("{host}:{port}"),
+        host,
+        port,
+        https,
         uri: parsed,
     })
 }
@@ -252,6 +312,7 @@ impl SbiClient {
             config,
             conns: std::sync::Mutex::new(HashMap::new()),
             tokens: oauth::TokenCache::default(),
+            tls: std::sync::OnceLock::new(),
         }
     }
 
@@ -407,14 +468,14 @@ impl SbiClient {
                 Ok(Ok(resp)) => return Ok(resp),
                 Ok(Err(e)) => {
                     // A transport failure may have left the connection unusable.
-                    self.evict(&target.authority).await;
+                    self.evict(&target.pool_key()).await;
                     if last || !transient(&e) {
                         return Err(e);
                     }
                     e.to_string()
                 }
                 Err(_) => {
-                    self.evict(&target.authority).await;
+                    self.evict(&target.pool_key()).await;
                     if last {
                         return Err(SbiError::Timeout(self.config.timeout));
                     }
@@ -444,13 +505,37 @@ impl SbiClient {
         *slot.lock().await = None;
     }
 
-    /// The pooled connection to `authority`, or a new one; `true` when pooled.
-    async fn connection(&self, authority: &str) -> SbiResult<(SendRequest<Bytes>, bool)> {
-        let slot = self.slot(authority);
+    /// The TLS connector and server name for `target`, checked before
+    /// anything is dialled.
+    fn tls_for(
+        &self,
+        target: &Target,
+    ) -> SbiResult<(
+        tokio_rustls::TlsConnector,
+        rustls::pki_types::ServerName<'static>,
+    )> {
+        let Some(settings) = &self.config.tls else {
+            return Err(SbiError::TlsNotConfigured(target.authority.clone()));
+        };
+        let config = self
+            .tls
+            .get_or_init(|| settings.client_config())
+            .clone()
+            .map_err(SbiError::Tls)?;
+        let name =
+            tls::server_name(settings.server_name_for(&target.authority_key(), &target.host))?;
+        Ok((tokio_rustls::TlsConnector::from(config), name))
+    }
+
+    /// The pooled connection to `target`, or a new one; `true` when pooled.
+    async fn connection(&self, target: &Target) -> SbiResult<(SendRequest<Bytes>, bool)> {
+        let slot = self.slot(&target.pool_key());
         let mut pooled = slot.lock().await;
         if let Some(c) = pooled.as_ref() {
             return Ok((c.clone(), true));
         }
+        let tls = target.https.then(|| self.tls_for(target)).transpose()?;
+        let authority = &target.authority;
         let tcp = connect(authority, self.config.bind_device.as_deref())
             .await
             .map_err(|source| SbiError::Connect {
@@ -458,12 +543,38 @@ impl SbiClient {
                 source,
             })?;
         let _ = tcp.set_nodelay(true);
-        let (send, conn) = h2::client::handshake(tcp).await?;
-        tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!("SBI h2c connection closed: {e}");
+        let send = match tls {
+            None => {
+                let (send, conn) = h2::client::handshake(tcp).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!("SBI h2c connection closed: {e}");
+                    }
+                });
+                send
             }
-        });
+            Some((connector, name)) => {
+                let stream = connector
+                    .connect(name, tcp)
+                    .await
+                    .map_err(|e| SbiError::Tls(format!("handshake with {authority}: {e}")))?;
+                if let Some(alpn) = stream.get_ref().1.alpn_protocol() {
+                    if alpn != b"h2" {
+                        return Err(SbiError::Tls(format!(
+                            "{authority} negotiated ALPN {:?}, not h2",
+                            String::from_utf8_lossy(alpn)
+                        )));
+                    }
+                }
+                let (send, conn) = h2::client::handshake(stream).await?;
+                tokio::spawn(async move {
+                    if let Err(e) = conn.await {
+                        tracing::debug!("SBI h2 (TLS) connection closed: {e}");
+                    }
+                });
+                send
+            }
+        };
         *pooled = Some(send.clone());
         Ok((send, false))
     }
@@ -476,7 +587,7 @@ impl SbiClient {
         content_type: Option<HeaderValue>,
         token: Option<&AccessToken>,
     ) -> SbiResult<SbiResponse> {
-        let (send, pooled) = self.connection(&target.authority).await?;
+        let (send, pooled) = self.connection(target).await?;
         let mut send = match send.ready().await {
             Ok(s) => s,
             // A pooled connection the peer has since closed: nothing was sent
@@ -486,8 +597,8 @@ impl SbiClient {
                     "SBI pooled connection to {} is gone ({e}); reconnecting",
                     target.authority
                 );
-                self.evict(&target.authority).await;
-                let (fresh, _) = self.connection(&target.authority).await?;
+                self.evict(&target.pool_key()).await;
+                let (fresh, _) = self.connection(target).await?;
                 fresh.ready().await?
             }
             Err(e) => return Err(e.into()),

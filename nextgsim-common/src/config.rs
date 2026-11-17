@@ -99,7 +99,8 @@ fn default_nrppa_trp_ids() -> Vec<u16> {
 /// - `amf_sbi_uri`: amfd's SBI root (`http://host:port`, h2c). Unset: no `sba`
 ///   domain at all, the NRF poll included.
 /// - `nrf_uri`: the NRF's SBI root, polled every `nrf_poll_secs` for
-///   `nf_types`.
+///   `nf_types`. `https://` uses the `NEXTGCORE_NRF_TLS_*` settings
+///   (nextgcore#1617, `nextgsim_sbi_client::tls`).
 /// - `budget_tokens`: the hard cap on one bundle.
 ///
 /// NKEF opens no listener: amfd's notify URI points at a closed loopback port,
@@ -151,7 +152,8 @@ impl Default for NkefLiveConfig {
 /// - `window_ms`: the measurement and export window.
 /// - `prediction_horizon_ms`: how far ahead mode `prediction` extrapolates.
 /// - `nrf_uri`: the NRF's SBI root; the exporter registers there as an AF and
-///   takes its access tokens from it.
+///   takes its access tokens from it. `https://` uses the `NEXTGCORE_NRF_TLS_*`
+///   settings and presents this gNB's certificate (nextgcore#1617).
 /// - `nwdaf_uri`: nwdafd's SBI root, skipping NRF discovery when set.
 /// - `nf_instance_id`: the AF instance id the exporter registers under.
 /// - `cca_key_file`: the ES256 client-assertion key (hex scalar), created when
@@ -2879,7 +2881,8 @@ pub struct UeConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NrfOAuth2Config {
-    /// The NRF's API root, e.g. `http://172.23.0.10:7777`.
+    /// The NRF's API root, e.g. `http://172.23.0.10:7777`, or `https://`
+    /// with the `NEXTGCORE_NRF_TLS_*` settings (nextgcore#1617).
     pub nrf: String,
     /// This client's nfInstanceId (the CCA's `sub`/`iss`).
     pub nf_instance_id: String,

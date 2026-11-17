@@ -99,7 +99,7 @@ pub fn ntp64(t: SystemTime) -> u64 {
     (secs << 32) | frac
 }
 
-/// An SBI client toward the EES: h2c, bound to `device` if given (the token
+/// An SBI client toward the EES: h2c (the NRF may be https), bound to `device` if given (the token
 /// requests too), with NRF OAuth2 if `oauth2` is set. With `oauth2.register`,
 /// registers `nfType: AF` at the NRF first (tokenless, as nextgcore's NRF
 /// management API is), on the same binding.
@@ -116,6 +116,9 @@ pub async fn ees_client(
     let Some(o) = oauth2 else {
         return Ok(SbiClient::new(base));
     };
+    // An https:// NRF (nextgcore#1617): the NEXTGCORE_NRF_TLS_* settings, so
+    // the registration presents this AF's certificate.
+    let base = base.with_nrf_tls_from_env(&o.nrf);
     let key = CcaKey::load_or_create(&o.cca_key_file).map_err(|e| e.to_string())?;
     if let Some(dir) = &o.public_jwk_dir {
         key.publish_jwk(dir, &o.nf_instance_id)

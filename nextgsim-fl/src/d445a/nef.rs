@@ -278,10 +278,15 @@ impl Nef {
     /// publishes the JWK and registers at the NRF if asked.
     pub async fn new(cfg: NefConfig) -> Result<Self, String> {
         cfg.validate()?;
-        let base = SbiClientConfig {
+        let mut base = SbiClientConfig {
             timeout: Duration::from_millis(cfg.timeout_ms.max(1)),
             ..Default::default()
         };
+        // An https:// NRF (nextgcore#1617): the NEXTGCORE_NRF_TLS_* settings, so
+        // the registration presents the AF's certificate.
+        if let Some(o) = &cfg.oauth2 {
+            base = base.with_nrf_tls_from_env(&o.nrf);
+        }
         let mut keepalive = None;
         let oauth2 = match &cfg.oauth2 {
             None => None,
@@ -1114,6 +1119,70 @@ mod tests {
         assert!(
             nrf.beats.load(Ordering::SeqCst) >= 2,
             "heart-beats, at half the 1 s heartBeatTimer"
+        );
+    }
+
+    /// nextgcore#1617: toward an `https://` NRF the AF registers, heart-beats
+    /// and takes its token over TLS, presenting the certificate that names its
+    /// nfInstanceId (from the `NEXTGCORE_NRF_TLS_*` variables); the NEF calls
+    /// stay h2c.
+    #[tokio::test]
+    async fn the_af_registers_and_takes_tokens_over_https_with_its_certificate_1617() {
+        use nextgsim_sbi_client::test_support::{NrfTlsEnv, Peer, TestPki, TlsFront};
+        use nextgsim_sbi_client::tls::{
+            NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV,
+            NRF_TLS_SERVER_NAME_ENV,
+        };
+        const ID: &str = "3f6d7a8e-0000-4000-8000-000000001617";
+        let nrf = StubNrf::start().await;
+        let dir = std::env::temp_dir().join(format!("fl-1617-{}", new_callback_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pki = TestPki::new(&dir);
+        let nrf_cert = pki.issue("nrf", &["nrf"], &[], None);
+        let af = pki.issue("af", &["fl-af"], &[], Some(ID));
+        let backend = nrf.api_root.trim_start_matches("http://").parse().unwrap();
+        let front = TlsFront::start(backend, &nrf_cert, &pki.ca_cert).await;
+        let cfg = NefConfig {
+            api_root: nrf.api_root.clone(),
+            scs_as_id: default_scs_as_id(),
+            ueid_path: default_ueid_path(),
+            ueid_scope: default_ueid_scope(),
+            monitoring_scope: default_monitoring_scope(),
+            oauth2: Some(OAuth2Settings {
+                nrf: front.url(),
+                nf_instance_id: ID.to_string(),
+                cca_key_file: dir.join("cca.key"),
+                public_jwk_dir: None,
+                register: true,
+            }),
+            timeout_ms: 2000,
+        };
+        let nef = {
+            let _env = NrfTlsEnv::set(&[
+                (NRF_TLS_CA_ENV, &pki.ca_cert),
+                (NRF_TLS_CLIENT_CERT_ENV, &af.cert),
+                (NRF_TLS_CLIENT_KEY_ENV, &af.key),
+                (NRF_TLS_SERVER_NAME_ENV, std::path::Path::new("nrf")),
+            ])
+            .await;
+            Nef::new(cfg).await.expect("registered over https")
+        };
+        let gpsi = nef.ue_id(Ipv4Addr::new(127, 0, 0, 10)).await;
+        assert_eq!(
+            gpsi.expect("a token from the https NRF").0,
+            "extid-ue010@fl.nextg"
+        );
+        let peers = front.peers();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !peers.is_empty(),
+            "the NRF calls went through the TLS front"
+        );
+        assert!(
+            peers
+                .iter()
+                .all(|p| *p == Peer::Verified(Some(af.der.clone()))),
+            "{peers:?}"
         );
     }
 

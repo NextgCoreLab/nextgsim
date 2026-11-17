@@ -167,3 +167,5 @@ h2 = "0.4"
 http = "1"
 bytes.workspace = true
 tempfile = "3"
+# The dev PKI and TLS front of the https NRF tests (nextgcore#1617).
+nextgsim-sbi-client = { workspace = true, features = ["test-support"] }

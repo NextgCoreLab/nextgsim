@@ -19,6 +19,16 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` repository secrets, and is skipped with a notice
   without them. A CI check fails when a binary, Dockerfile or deployed image is missing from the
   list. See `docs/ci-and-release.md`, "Docker Hub images".
+- `nextgsim-sbi-client` speaks `https://` toward the NRF (nextgcore #1617): HTTP/2 over TLS
+  (ALPN `h2`) with the deployment's CA as the only trust anchor (never public roots), a client
+  certificate, and a server-name override that applies only to the NRF's own authority. The
+  settings come from the variables nextgcore's NFs read: `NEXTGCORE_NRF_TLS_CA` (else
+  `NEXTGCORE_SBI_TLS_CA`, else `/etc/nextgcore/tls/ca.crt`), `NEXTGCORE_NRF_TLS_CLIENT_CERT` /
+  `_KEY` (else the `NEXTGCORE_SBI_TLS_CLIENT_*` pair) and `NEXTGCORE_NRF_TLS_SERVER_NAME`. Half a
+  client pair fails every `https` call before anything is dialled. Every NRF consumer uses them:
+  the D441A gNB congestion exporter, the D447A NKEF discovery, the D445A FL AF, the D443A EAS
+  sidecar and UE EEC, and `sbi-roundtrip`. `http://` (h2c) is unchanged; an `https://` URI on a
+  client without TLS settings is refused.
 
 ## [0.2.0] — Unreleased (draft for operator review)
 

@@ -382,12 +382,17 @@ async fn a_refused_connection_is_a_connect_error() {
 }
 
 #[tokio::test]
-async fn https_and_bad_uris_are_refused_before_anything_is_sent() {
+async fn https_without_tls_settings_and_bad_uris_are_refused_before_anything_is_sent() {
     let c = SbiClient::new(steady());
     assert!(matches!(
         c.get_json::<serde_json::Value>("https://127.0.0.1:1/x", None)
             .await,
-        Err(SbiError::UnsupportedScheme(s)) if s == "https"
+        Err(SbiError::TlsNotConfigured(a)) if a == "127.0.0.1:1"
+    ));
+    assert!(matches!(
+        c.get_json::<serde_json::Value>("ftp://127.0.0.1:1/x", None)
+            .await,
+        Err(SbiError::UnsupportedScheme(s)) if s == "ftp"
     ));
     assert!(matches!(
         c.get_json::<serde_json::Value>("/relative", None).await,
@@ -1082,5 +1087,232 @@ async fn a_response_before_the_whole_body_is_sent_is_the_answer() {
             .await
             .expect("the server's early 404 is the answer");
         assert_eq!(r.status, StatusCode::NOT_FOUND);
+    }
+}
+
+// ---- https toward the NRF (nextgcore#1617) -------------------------------
+
+mod https {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use super::*;
+    use crate::test_support::{Issued, NrfTlsEnv, Peer, TestPki, TlsFront};
+    use crate::tls::{
+        NRF_TLS_CA_ENV, NRF_TLS_CLIENT_CERT_ENV, NRF_TLS_CLIENT_KEY_ENV, NRF_TLS_SERVER_NAME_ENV,
+    };
+
+    const GNB_ID: &str = "6b1d7e3c-0000-4000-8000-0000000006b0";
+
+    struct Pki {
+        pki: TestPki,
+        /// The NRF's certificate: `DNS:nrf` only, so dialling 127.0.0.1
+        /// verifies only through the server-name override.
+        nrf: Issued,
+        gnb: Issued,
+    }
+
+    fn pki(tag: &str) -> Pki {
+        let pki = TestPki::new(&tmpdir(tag));
+        let nrf = pki.issue(
+            "nrf",
+            &["nrf"],
+            &[],
+            Some("6b1d7e3c-0000-4000-8000-0000000000f0"),
+        );
+        let gnb = pki.issue("gnb", &["gnb"], &[], Some(GNB_ID));
+        Pki { pki, nrf, gnb }
+    }
+
+    fn ok_stub() -> impl Fn(&Seen) -> Reply + Send + Sync + 'static {
+        |_| Reply::new(200, r#"{"ok":true}"#).header("content-type", "application/json")
+    }
+
+    fn client(tls: NrfTls) -> SbiClient {
+        SbiClient::new(SbiClientConfig {
+            tls: Some(tls),
+            ..steady()
+        })
+    }
+
+    #[tokio::test]
+    async fn https_presents_the_client_certificate_and_verifies_the_nrf_by_name_1617() {
+        let p = pki("tls-pair");
+        let stub = Stub::start(ok_stub()).await;
+        let front = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        let c = client(
+            NrfTls::with_ca(&p.pki.ca_cert)
+                .client_pair(&p.gnb.cert, &p.gnb.key)
+                .nrf_server_name(&front.url(), "nrf"),
+        );
+        let v: serde_json::Value = c
+            .get_json(&format!("{}/nnrf-disc/v1/nf-instances", front.url()), None)
+            .await
+            .unwrap();
+        assert_eq!(v["ok"], true);
+        // A second call reuses the TLS connection.
+        c.get_json::<serde_json::Value>(&format!("{}/again", front.url()), None)
+            .await
+            .unwrap();
+        assert_eq!(front.peers(), vec![Peer::Verified(Some(p.gnb.der.clone()))]);
+        assert_eq!(stub.count("/nnrf-disc/v1/nf-instances"), 1);
+        assert_eq!(stub.count("/again"), 1);
+    }
+
+    #[tokio::test]
+    async fn https_without_a_client_pair_presents_no_certificate_1617() {
+        let p = pki("tls-nopair");
+        let stub = Stub::start(ok_stub()).await;
+        let front = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        let c = client(NrfTls::with_ca(&p.pki.ca_cert).nrf_server_name(&front.url(), "nrf"));
+        c.get_json::<serde_json::Value>(&format!("{}/x", front.url()), None)
+            .await
+            .unwrap();
+        assert_eq!(front.peers(), vec![Peer::Verified(None)]);
+    }
+
+    #[tokio::test]
+    async fn a_server_certificate_from_another_ca_fails_the_handshake_1617() {
+        let p = pki("tls-ours");
+        let other = pki("tls-other");
+        let stub = Stub::start(ok_stub()).await;
+        // The server presents a certificate the configured CA did not issue:
+        // no public root or other anchor rescues it.
+        let front = TlsFront::start(stub.addr, &other.nrf, &other.pki.ca_cert).await;
+        let c = client(
+            NrfTls::with_ca(&p.pki.ca_cert)
+                .client_pair(&p.gnb.cert, &p.gnb.key)
+                .nrf_server_name(&front.url(), "nrf"),
+        );
+        let err = c
+            .get_json::<serde_json::Value>(&format!("{}/x", front.url()), None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, SbiError::Tls(e) if e.contains("handshake")),
+            "{err:?}"
+        );
+        assert!(stub.seen().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_server_name_applies_to_the_nrf_authority_only_1617() {
+        let p = pki("tls-scope");
+        let stub = Stub::start(ok_stub()).await;
+        let nrf = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        // Another authority presenting the NRF's certificate (DNS:nrf only).
+        let other = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        let c = client(NrfTls::with_ca(&p.pki.ca_cert).nrf_server_name(&nrf.url(), "nrf"));
+        c.get_json::<serde_json::Value>(&format!("{}/nrf", nrf.url()), None)
+            .await
+            .unwrap();
+        let err = c
+            .get_json::<serde_json::Value>(&format!("{}/other", other.url()), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, SbiError::Tls(_)), "{err:?}");
+        assert_eq!(stub.count("/nrf"), 1);
+        assert_eq!(stub.count("/other"), 0);
+        // Verified as itself, an authority whose certificate names its IP works.
+        let ip = p.pki.issue(
+            "ip",
+            &[],
+            &[IpAddr::V4(Ipv4Addr::LOCALHOST)],
+            Some("6b1d7e3c-0000-4000-8000-00000000fdaf"),
+        );
+        let by_ip = TlsFront::start(stub.addr, &ip, &p.pki.ca_cert).await;
+        c.get_json::<serde_json::Value>(&format!("{}/ip", by_ip.url()), None)
+            .await
+            .unwrap();
+        assert_eq!(stub.count("/ip"), 1);
+    }
+
+    #[tokio::test]
+    async fn half_a_client_pair_fails_before_dialling_1617() {
+        let p = pki("tls-half");
+        let stub = Stub::start(ok_stub()).await;
+        let front = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        let half = NrfTls::resolve(&front.url(), |v| match v {
+            NRF_TLS_CA_ENV => Some(p.pki.ca_cert.display().to_string()),
+            NRF_TLS_CLIENT_CERT_ENV => Some(p.gnb.cert.display().to_string()),
+            NRF_TLS_SERVER_NAME_ENV => Some("nrf".into()),
+            _ => None,
+        });
+        let c = client(half);
+        for _ in 0..2 {
+            let err = c
+                .get_json::<serde_json::Value>(&format!("{}/x", front.url()), None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, SbiError::Tls(e) if e.contains("without its private key")),
+                "{err:?}"
+            );
+        }
+        assert_eq!(front.accepted(), 0);
+        // Without TLS settings at all, the same: nothing is dialled.
+        let none = SbiClient::new(steady());
+        assert!(matches!(
+            none.get_json::<serde_json::Value>(&format!("{}/x", front.url()), None)
+                .await,
+            Err(SbiError::TlsNotConfigured(_))
+        ));
+        assert_eq!(front.accepted(), 0);
+    }
+
+    #[tokio::test]
+    async fn register_af_and_a_token_go_over_https_with_the_env_settings_1617() {
+        let p = pki("tls-env");
+        let stub = Stub::start(|s| {
+            if s.path == TOKEN_PATH {
+                Reply::new(
+                    200,
+                    r#"{"access_token":"t","token_type":"Bearer","expires_in":60}"#,
+                )
+            } else if s.path.starts_with("/nnrf-nfm/") {
+                Reply::new(201, r#"{"heartBeatTimer":30}"#)
+            } else {
+                Reply::new(200, "{}")
+            }
+        })
+        .await;
+        let front = TlsFront::start(stub.addr, &p.nrf, &p.pki.ca_cert).await;
+        let nrf = front.url();
+        let base = {
+            let _env = NrfTlsEnv::set(&[
+                (NRF_TLS_CA_ENV, &p.pki.ca_cert),
+                (NRF_TLS_CLIENT_CERT_ENV, &p.gnb.cert),
+                (NRF_TLS_CLIENT_KEY_ENV, &p.gnb.key),
+                (NRF_TLS_SERVER_NAME_ENV, std::path::Path::new("nrf")),
+            ])
+            .await;
+            steady().with_nrf_tls_from_env(&nrf)
+        };
+        let hb = crate::nrf::register_af(&nrf, GNB_ID, base.clone())
+            .await
+            .unwrap();
+        assert_eq!(hb, 30);
+        let key = CcaKey::load_or_create(&tmpdir("tls-env-cca").join("cca.key")).unwrap();
+        let c = SbiClient::new(SbiClientConfig {
+            oauth2: Some(OAuth2Config::new(nrf.clone(), GNB_ID, "AF", key)),
+            ..base
+        });
+        let r = c
+            .request(
+                Method::GET,
+                &format!("{nrf}/producer"),
+                None,
+                Some(&Scope::new("NWDAF", "nnwdaf-randata")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status, StatusCode::OK);
+        assert_eq!(stub.count("/nnrf-nfm/v1/nf-instances/"), 1);
+        assert_eq!(stub.count(TOKEN_PATH), 1);
+        let gnb = Peer::Verified(Some(p.gnb.der.clone()));
+        let peers = front.peers();
+        assert!(
+            !peers.is_empty() && peers.iter().all(|x| *x == gnb),
+            "{peers:?}"
+        );
     }
 }
