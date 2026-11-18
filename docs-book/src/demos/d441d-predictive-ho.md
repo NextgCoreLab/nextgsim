@@ -182,15 +182,84 @@ two-gNB stack (`docker/rust/docker-compose.demo-n2ho.yml`, #456). Use:
 For each seed, set `shadowing.seed` to the same value in both gNB configs. For
 each arm, change only `mode`. Both stacks publish no port.
 
-The seeded live harness (`scripts/demo/d441d-*.sh`, K seeds per arm, with the
-ping-pong and failure counts) and its CI job are the next PR. The EKS overlay
-is nextgcore's part, PR 4.
+### The seeded harness
+
+`scripts/demo/d441d-check.sh <arm>` does this for you, one fresh stack per
+seed:
+
+```bash
+NEXTGCORE_DIR=../nextgcore scripts/demo/d441d-check.sh lsq      # seeds 1-24
+NEXTGCORE_DIR=../nextgcore scripts/demo/d441d-check.sh a3       # the baseline, same seeds
+NEXTGCORE_DIR=../nextgcore D441D_ORT_LIB=/path/libonnxruntime.so.1.23.2 \
+  scripts/demo/d441d-check.sh onnx
+NEXTGCORE_DIR=../nextgcore scripts/demo/d441d-check.sh off      # also invalid, conflict, runtime-switch
+D441D_DRY_RUN=1 scripts/demo/d441d-check.sh lsq                 # stage and check the configs only
+```
+
+The gNB image must be built with
+`--features demo-d441d-predictive-ho,demo-d446a-agent-conflict`. That is one
+image for every arm, and the D446A key is set only in `conflict`.
+
+Per seed, the harness rewrites `shadowing.seed` to the same value in both gNB
+configs. It checks that both gNBs logged the same `RLS: seeded log-normal
+shadowing on:` line, and that `gnb-west` logged the banner. It waits for
+amfd's HandoverNotify, for at most 120 s after the UE's route starts. A
+`HandoverNotify ... rejected` line does not end that wait. It then waits
+15 s more and scores the episode with `scripts/demo/d441d_score.py`, which
+reads the timestamped logs of gnb-west, gnb-east, amfd and the UE:
+
+| Outcome | Meaning |
+|---|---|
+| `predictive` | `lsq` and `onnx`: the chain held, with `predictor=<arm>` (prediction → NWDAF-recommended → Sent Handover Required → amfd HandoverNotify and gnb-east Sent Handover Notify → `A3 would trigger` → `lead time`) |
+| `a3` | `a3`: the UE's A3 report triggered the handover, no predictor line was logged, and the report's time is inside the replica's range. `off`: the base A3 handover, with no demo line on either gNB |
+| `a3-outside`, `predicted` | `a3`: the report fell outside the replica's range by more than `D441D_A3_SLACK_MS` (250 ms), or a predictor line was logged |
+| `fallback`, `stranded` | predictive-arm failures: A3 moved the UE after the grace, or nothing moved it |
+| `predictor-mislabelled` | `onnx` served by the least-squares fallback |
+| `failed` | no HandoverNotify within 120 s of the route start, or a Preparation Failure, Handover Cancel, TNGRELOC expiry, re-establishment, amfd HandoverFailure or rejected HandoverNotify. A seed whose attempts ran out (`exhausted`, its own column) ends here too |
+| `broken` | the UE was handed over, but another link is missing. The `chain` column names it |
+
+A **ping-pong** is the UE handed back to gnb-west within 5 s of the first
+HandoverNotify. Every later hand-back is counted under `returns`.
+
+**Pass rule.** The operator decided it on 2026-11-18, and the coordinator ruled
+on K under that delegation. `lsq` and `onnx` need the chain on at least K−2 of
+K seeds when K ≥ 10, which covers the 24-seed table, and on all K below that,
+which covers the 3-seed EKS validation. `a3` needs it on all K, with the UE's
+report inside the replica's range. Every planned seed must have exactly one row.
+A missing, duplicated or unplanned seed fails the table, and so does
+`D441D_MIN_CHAINS` outside 1..K. The lead time is not asserted positive.
+
+The harness writes the rows to `rows.tsv` and the per-arm table to `table.md`,
+both under `$DEMO_ARTEFACTS/d441d/<arm>/`. Under GitHub Actions the table also
+goes to the job summary.
+
+The other arms:
+
+- `invalid` (`mode: bogus`) must refuse startup with
+  `unknown mode "bogus" for demo "d441d-predictive-ho"`.
+- `conflict` (D446A on the same gNB) must refuse startup with
+  `HandoverDemoConflict`.
+- `off` must log no demo line, and `demo show` must report `active=false`.
+- `runtime-switch` starts in `a3`. `set mode=bogus` is rejected and audited,
+  and the mode stays. `set mode=lsq` is audited, and the episode must then
+  score as `lsq`.
+
+`scripts/demo/d441d-reverts.sh` and the live revert arm patch the NWDAF tick
+out (`reverts/d441d-tick-off.patch`). The named unit test must then fail, and
+`d441d-check.sh lsq` must fail at `chain=prediction`.
+
+In CI, the `demo-d441d` job (schedule and dispatch, with the input
+`d441d_seeds`) runs one leg per arm (`a3`, `lsq`, `onnx`) and an `arms` leg for
+the rest. The EKS overlay is nextgcore's
+`deploy/eks/overlays/demo-d441d-predictive-ho/`. It checks the overlay on 3
+seeds per arm.
 
 ## Results
 
-**Not yet run** on the live stack or EKS. The table (≥ 20 seeds: median and
-p10 lead time, ping-pongs and failures per arm) and the captured log chain go
-here after the runs, as captured.
+**Not yet run** on the live stack or EKS. The table goes here after the runs,
+as captured: 24 seeds per arm from the compose job, with the median and p10 of
+the lead and the ping-pong, failure, fallback and stranded counts. So does the
+captured log chain.
 
 What exists now is an offline replay of the decision core:
 `nwdaf::d441d::tests::the_seeded_replay_leads_a3_on_most_seeds`. It replays
