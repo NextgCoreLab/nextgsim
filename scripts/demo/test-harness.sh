@@ -7,7 +7,8 @@
 # Covers assert_log_order (in order, missing step, out of order, GNU escape, literal
 # parentheses), demo_seed, demo_assert_private against a planted publish, every
 # revert-run.sh exit path (arm holds, arm broken, --expect mismatch, stale patch,
-# dirty tree, a TERM in the middle of the check), and that every committed patch
+# dirty tree, a TERM in the middle of the check), D441D's episode scorer and the
+# staging of every d441d-check.sh arm (dry run), and that every committed patch
 # under reverts/ still applies to this tree.
 # `cond && ok ... || not_ok ...` throughout: ok only prints and cannot fail.
 # shellcheck disable=SC2015
@@ -161,6 +162,77 @@ kill -TERM "$rpid"
 rc=0; wait "$rpid" || rc=$?
 [ "$rc" -eq 143 ] && clean && ok "revert-run: a TERM mid-check restores the tree (exit 143)" \
     || not_ok "TERM rc=$rc: $(cat "$work/rr.out")"
+
+# --- D441D (#467): the episode scorer and the check's dry run ------------------
+python3 -I "$here/test_d441d_score.py" >"$work/d441d-score.out" 2>&1 \
+    && ok "d441d_score.py: every outcome and every missing link (test_d441d_score.py)" \
+    || { cat "$work/d441d-score.out" >&2; not_ok "test_d441d_score.py"; }
+for arm in a3 lsq onnx off invalid conflict runtime-switch; do
+    D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d" "$here/d441d-check.sh" "$arm" \
+        >"$work/d441d-dry.out" 2>&1 || { cat "$work/d441d-dry.out" >&2; not_ok "d441d-check.sh $arm dry run"; }
+done
+# R14 MINOR 6: a pass bar outside 1..K is refused before anything runs.
+for bad in 0 25 x; do
+    rc=0; D441D_MIN_CHAINS="$bad" D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-mc" \
+        "$here/d441d-check.sh" lsq >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 2 ] || not_ok "D441D_MIN_CHAINS=$bad was accepted (rc $rc)"
+done
+D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-mc" D441D_SEEDS="1 2 3" "$here/d441d-check.sh" lsq \
+    | grep -q 'pass needs 3 chained' && ok "d441d-check.sh: D441D_MIN_CHAINS outside 1..K is refused; lsq at K=3 needs 3/3" \
+    || not_ok "the K=3 lsq bar is not 3"
+grep -qx '  seed: 24' "$work/d441d/d441d/lsq/seed-24/config/gnb-n2ho-target.yaml" \
+    && grep -qx '    mode: a3' "$work/d441d/d441d/a3/seed-1/config/gnb.yaml" \
+    && ok "d441d-check.sh: every arm stages (dry run), seeds 1-24 on both gNBs" \
+    || not_ok "d441d staging"
+# A config that drifted from the harness's expectations fails, never runs unseeded.
+mkdir -p "$work/d441d-drift/scripts/demo" "$work/d441d-drift/config"
+cp "$here"/d441d-check.sh "$here"/lib.sh "$work/d441d-drift/scripts/demo/"
+cp -r "$repo/config/demo-predictive-ho" "$work/d441d-drift/config/"
+sed -i 's/^  seed: 1$/  seed: 1\n  seed: 2/' "$work/d441d-drift/config/demo-predictive-ho/gnb-east.yaml"
+if D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-drift/out" \
+    "$work/d441d-drift/scripts/demo/d441d-check.sh" lsq >"$work/d441d-dry.out" 2>&1; then
+    not_ok "a config with two seed lines staged"
+fi
+grep -q 'matches 2 line(s), expected 1' "$work/d441d-dry.out" \
+    && ok "d441d-check.sh: a drifted config fails staging" || not_ok "drift: $(cat "$work/d441d-dry.out")"
+# Staging that changes more than the arm's keys fails the dry run's diff check.
+cp "$repo/config/demo-predictive-ho/gnb-east.yaml" "$work/d441d-drift/config/demo-predictive-ho/"
+# shellcheck disable=SC2016  # the planted line is shell text for the copied script
+sed -i 's|^    # The staged mode and seed are what the gNBs read.*|    printf "tac: 2\\n" >> "$dir/config/gnb.yaml"|' \
+    "$work/d441d-drift/scripts/demo/d441d-check.sh"
+grep -q '"tac: 2' "$work/d441d-drift/scripts/demo/d441d-check.sh" || not_ok "the planted staging change did not land"
+if D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-drift/out2" \
+    "$work/d441d-drift/scripts/demo/d441d-check.sh" lsq >"$work/d441d-dry.out" 2>&1; then
+    not_ok "staging with an extra change passed the dry run"
+fi
+grep -q "changed beyond the arm's keys" "$work/d441d-dry.out" \
+    && ok "d441d-check.sh: staging that changes more than the arm's keys fails the dry run" \
+    || not_ok "extra change: $(cat "$work/d441d-dry.out")"
+
+# A TERM mid-episode tears the stack down (`compose down`), against a fake docker.
+mkdir -p "$work/fakebin"
+cat > "$work/fakebin/docker" <<'FAKE'
+#!/bin/sh
+echo "$*" >> "$FAKE_DOCKER_LOG"
+case "$*" in
+    *" config --format json"*) echo '{"services":{"amf":{"image":"a"}}}' ;;
+esac
+exit 0
+FAKE
+chmod +x "$work/fakebin/docker"
+: > "$work/fake-docker.log"
+mkdir -p "$work/core/docker/rust"
+: > "$work/core/docker/rust/docker-compose.demo-n2ho.yml"
+PATH="$work/fakebin:$PATH" FAKE_DOCKER_LOG="$work/fake-docker.log" NEXTGCORE_DIR="$work/core" \
+    DEMO_ARTEFACTS="$work/d441d-term" D441D_SEEDS=1 "$here/d441d-check.sh" a3 >"$work/d441d-term.out" 2>&1 &
+cpid=$!
+for _ in $(seq 1 100); do grep -q ' up -d' "$work/fake-docker.log" && break; sleep 0.1; done
+grep -q ' up -d' "$work/fake-docker.log" || not_ok "the fake stack never came up: $(cat "$work/d441d-term.out")"
+kill -TERM "$cpid"
+rc=0; wait "$cpid" || rc=$?
+[ "$rc" -eq 143 ] && grep -q ' down -v --remove-orphans' "$work/fake-docker.log" \
+    && ok "d441d-check.sh: a TERM mid-episode takes the stack down (exit 143)" \
+    || not_ok "TERM rc=$rc: $(cat "$work/fake-docker.log")"
 
 # --- the committed revert patches still apply --------------------------------
 n=0
