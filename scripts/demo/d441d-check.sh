@@ -31,13 +31,17 @@
 # seed (the replica needs both blocks equal; #534 review m4).
 #
 # Pass (operator decision 2026-11-18, specs/demo-d441d-pr3b-pr4-harness-467.md):
-#   lsq, onnx   the chain on >= K-2 of K seeds: prediction -> NWDAF-recommended
+#   lsq, onnx   the chain on >= K-2 of K seeds when K >= 10, else on all K: prediction -> NWDAF-recommended
 #               -> Sent Handover Required -> amfd HandoverNotify (and gnb-east's
 #               Sent Handover Notify) -> A3 would trigger -> lead time, with
 #               predictor=<arm>. Lead time is not asserted positive.
 #   a3          the chain on all K: measurement-triggered N2 handover to PCI 32
 #               -> Sent Handover Required -> HandoverNotify, no predictor line,
-#               and the UE's real report inside the replica's range.
+#               and the UE's real report inside the replica's range
+#               (+-D441D_A3_SLACK_MS): this validates the replica the lead is
+#               measured against.
+#   every seed  a HandoverNotify more than D441D_EPISODE_S after the route start,
+#               or none, is a failure (decision Q4), counted in `failures`.
 #   off         the base A3 handover, no DEMO MODE ACTIVE or [demo: line on
 #               either gNB, and `demo d441d-predictive-ho show` active=false.
 #   invalid     gnb-west logs UnknownMode for d441d-predictive-ho/bogus and
@@ -59,10 +63,14 @@
 #   DEMO_ARTEFACTS     where logs are captured (default /tmp/demo-artefacts)
 #   D441D_SEEDS        seeds as "A-B" or a space list (default 1-24; one-seed arms take the first)
 #   D441D_SIGMA_DB     shadowing sigma (default 4, as committed)
-#   D441D_MIN_CHAINS   seeds that must hold the chain (default: K-2 for lsq/onnx, K for a3)
-#   D441D_EPISODE_S    wait for HandoverNotify after the PDU session (default 120)
+#   D441D_MIN_CHAINS   seeds that must hold the chain, 1..K (default: lsq/onnx K-2
+#                      when K >= 10, else K; a3 K)
+#   D441D_EPISODE_S    the episode window: HandoverNotify within this many
+#                      seconds of the UE's route start (default 120, decision Q4)
 #   D441D_SETTLE_S     then wait this long before scoring (default 15)
 #   D441D_PINGPONG_MS  ping-pong window after HandoverNotify (default 5000)
+#   D441D_A3_SLACK_MS  a3: the UE's report may fall this far outside the
+#                      replica's range and still count (default 250)
 #   D441D_ORT_LIB      libonnxruntime.so.1.23.2 for the onnx arm (required there)
 #   NR_CLI             nr-cli to copy into gnb-west (default binaries/nr-cli;
 #                      required by off and runtime-switch)
@@ -92,7 +100,8 @@ sigma="${D441D_SIGMA_DB:-4}"
 episode_s="${D441D_EPISODE_S:-120}"
 settle_s="${D441D_SETTLE_S:-15}"
 pingpong_ms="${D441D_PINGPONG_MS:-5000}"
-for v in "$sigma" "$episode_s" "$settle_s" "$pingpong_ms"; do
+a3_slack_ms="${D441D_A3_SLACK_MS:-250}"
+for v in "$sigma" "$episode_s" "$settle_s" "$pingpong_ms" "$a3_slack_ms"; do
     case "$v" in '' | *[!0-9]*) echo "numeric knobs must be decimal integers, got '$v'" >&2; exit 2 ;; esac
 done
 
@@ -110,10 +119,17 @@ fi
 [ "${#seeds[@]}" -gt 0 ] || { echo "D441D_SEEDS names no seed" >&2; exit 2; }
 case "$arm" in a3|lsq|onnx) ;; *) seeds=("${seeds[0]}") ;; esac
 k="${#seeds[@]}"
+# The pass bar (operator decision 2026-11-18; the coordinator's ruling on R14):
+# lsq and onnx need K-2 of K for a table of at least 10 seeds, else all K; a3
+# always all K. An override must be within 1..K, never a vacuous 0.
 case "$arm" in
-    lsq|onnx) min_chains="${D441D_MIN_CHAINS:-$(( k > 2 ? k - 2 : 1 ))}" ;;
+    lsq|onnx) min_chains="${D441D_MIN_CHAINS:-$(( k >= 10 ? k - 2 : k ))}" ;;
     *) min_chains="${D441D_MIN_CHAINS:-$k}" ;;
 esac
+case "$min_chains" in '' | *[!0-9]*) echo "D441D_MIN_CHAINS must be a decimal integer" >&2; exit 2 ;; esac
+if [ "$min_chains" -lt 1 ] || [ "$min_chains" -gt "$k" ]; then
+    echo "D441D_MIN_CHAINS=$min_chains is outside 1..$k" >&2; exit 2
+fi
 # A dry run stages an empty stand-in for the library and needs no nr-cli.
 if [ "${D441D_DRY_RUN:-0}" = 1 ]; then D441D_ORT_LIB="${D441D_ORT_LIB:-/dev/null}"; nr_cli=/bin/true; fi
 if [ "$arm" = onnx ]; then
@@ -210,6 +226,7 @@ start_stack() {
     local seed="$1" mode="$2" files
     stage="$(mktemp -d -t d441d-XXXXXX)"
     stage_configs "$stage" "$seed" "$mode"
+    rm -rf "$DEMO_ARTEFACTS/config"
     cp -r "$stage/config" "$DEMO_ARTEFACTS/config"
     rm -rf "$DEMO_ARTEFACTS/config/ort"   # the runtime library is not an artefact
     export NEXTGSIM_DIR="$stage"
@@ -315,6 +332,8 @@ invalid|conflict)
 esac
 
 for seed in "${seeds[@]}"; do
+    # A rerun into the same DEMO_ARTEFACTS starts each seed from an empty directory.
+    rm -rf "$root_artefacts/seed-$seed"
     demo_artefacts "$root_artefacts/seed-$seed"
     demo_seed "$seed" >/dev/null
     case "$arm" in
@@ -342,8 +361,11 @@ for seed in "${seeds[@]}"; do
         demo_info "runtime switch a3 -> lsq applied; bogus was rejected"
     fi
 
-    demo_wait_log amf 'HandoverNotify from association' "$episode_s" 2>/dev/null \
-        || demo_info "seed $seed: no HandoverNotify within ${episode_s}s (scored as a failure)"
+    # Decision Q4: the window runs from the route start. The full amfd line, so
+    # a `HandoverNotify ... rejected` does not end the wait (it scores as a failure).
+    demo_wait_log ue 'Simulated motion started' 90
+    demo_wait_log amf 'HandoverNotify from association [0-9]+ \(amf_ue_ngap_id=' "$episode_s" 2>/dev/null \
+        || demo_info "seed $seed: no HandoverNotify within ${episode_s}s of the route start (scored as a failure)"
     sleep "$settle_s"
     capture "$DEMO_ARTEFACTS"
     if [ -x "$nr_cli" ]; then
@@ -376,7 +398,8 @@ for seed in "${seeds[@]}"; do
     [ -s "$rows" ] || header=(--header)
     python3 -I "$score_py" score --arm "$score_arm" --seed "$seed" "${header[@]}" \
         --west "$DEMO_ARTEFACTS/gnb-west.log" --east "$DEMO_ARTEFACTS/gnb-east.log" \
-        --amf "$DEMO_ARTEFACTS/amf.log" --pingpong-ms "$pingpong_ms" | tee -a "$rows"
+        --amf "$DEMO_ARTEFACTS/amf.log" --ue "$DEMO_ARTEFACTS/ue.log" --window-ms "$((episode_s * 1000))" \
+        --pingpong-ms "$pingpong_ms" --a3-slack-ms "$a3_slack_ms" | tee -a "$rows"
     # The seed's verdict in words (the revert arm expects "chain=prediction").
     awk -F'\t' -v s="$seed" '$1 == s { printf "[demo] seed %s: outcome=%s chain=%s\n", s, $3, $4 }' "$rows"
     cleanup_stack
@@ -386,7 +409,7 @@ DEMO_ARTEFACTS="$root_artefacts"
 score_arm="$arm"
 [ "$arm" = runtime-switch ] && score_arm=lsq
 rc=0
-python3 -I "$score_py" table --arm "$score_arm" --min-chains "$min_chains" "$rows" \
+python3 -I "$score_py" table --arm "$score_arm" --seeds "${seeds[*]}" --min-chains "$min_chains" "$rows" \
     > "$root_artefacts/table.md" || rc=$?
 cat "$root_artefacts/table.md"
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then

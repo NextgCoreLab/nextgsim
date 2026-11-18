@@ -9,22 +9,26 @@ Each log line starts with a timestamp, either `<RFC 3339> <text>`
 are the ones the code emits (nextgsim-gnb nwdaf/task.rs, rrc/task.rs,
 ngap/task.rs; nextgcore amfd).
 
-    d441d_score.py score --arm lsq --seed 3 --west W --east E --amf A
+    d441d_score.py score --arm lsq --seed 3 --west W --east E --amf A [--ue U]
         One TSV row on stdout (the columns are COLUMNS below). The `chain`
         column is `ok` or the first missing link, so a failed seed names its
-        reason.
-    d441d_score.py table --arm lsq --min-chains 22 ROWS.tsv
+        reason. With --ue, the episode's window (--window-ms, 120 s) starts at
+        the UE's `Simulated motion started` line: a HandoverNotify after it
+        does not count (decision Q4).
+    d441d_score.py table --arm lsq --seeds 1-24 --min-chains 22 ROWS.tsv
         The per-arm summary (median and p10 of the lead's bounds, ping-pongs,
         returns, failures, fallbacks, stranded, exhausted) as Markdown. Exit 1
-        when fewer than --min-chains seeds held the chain, or when a row is
-        malformed.
+        when fewer than --min-chains seeds held the chain, when a planned seed
+        has no row, when a seed has two rows or a row is not planned, or when
+        a row is malformed.
 
 Outcomes, per arm:
   lsq, onnx  predictive (the predictor's chain held), fallback (A3 moved the
-             UE after the grace), stranded, exhausted, predictor-mislabelled
-             (for onnx: `predictor=fallback`, no verified model served it),
-             failed (a handover failure, or no HandoverNotify), broken (a link
-             of the chain is missing for another reason).
+             UE after the grace), stranded, predictor-mislabelled (for onnx:
+             `predictor=fallback`, no verified model served it), failed (no
+             HandoverNotify in the window, or a handover failure; exhausted
+             attempts end here too), broken (a link of the chain is missing
+             although the UE was handed over).
   a3         a3 (the UE's A3 report triggered it, the replica's range holds
              the report's time), a3-outside (the range does not), predicted
              (a predictor line in the A3 arm), failed, broken.
@@ -77,7 +81,8 @@ RE_ANY_DEMO = re.compile(r"DEMO MODE ACTIVE|\[demo:")
 RE_GNB_FAILURE = re.compile(
     r"Handover Preparation Failure: |Sent Handover Cancel: |TNGRELOC(prep|overall) expired for UE"
     r"|RRCReestablishmentComplete verified")
-RE_AMF_FAILURE = re.compile(r"HandoverFailure from association [0-9]+ ")
+RE_AMF_FAILURE = re.compile(r"HandoverFailure from association [0-9]+ |HandoverNotify from association [0-9]+ rejected")
+RE_ROUTE_START = re.compile(r"Simulated motion started")
 
 
 def parse_ms(stamp, frac, zone):
@@ -116,13 +121,28 @@ def count(lines, rx, after_ms=None):
     return sum(1 for ms, text in lines if (after_ms is None or ms >= after_ms) and rx.search(text))
 
 
-def score(arm, seed, west, east, amf, pingpong_ms, a3_slack_ms):
+def score(arm, seed, west, east, amf, pingpong_ms, a3_slack_ms, ue=None, window_ms=120_000):
+    """One episode's row. `ue` (the UE's log) starts the window; None: no window."""
     row = dict.fromkeys(COLUMNS, "-")
     row.update(seed=str(seed), arm=arm)
     if not west or not amf:
         row.update(outcome="broken", chain="empty-log")
         return row
-    failures = count(west, RE_GNB_FAILURE) + count(east, RE_GNB_FAILURE) + count(amf, RE_AMF_FAILURE)
+    deadline = None
+    if ue is not None:
+        start = first(ue, RE_ROUTE_START)
+        if not start:
+            row.update(outcome="broken", chain="route-start")
+            return row
+        deadline = start[1] + window_ms
+
+    def in_window(hit):
+        return hit if hit and (deadline is None or hit[1] <= deadline) else None
+
+    # Decision Q4: no HandoverNotify in the window is a failure, whatever else.
+    no_notify = not in_window(first(amf, RE_AMF_NOTIFY))
+    failures = (count(west, RE_GNB_FAILURE) + count(east, RE_GNB_FAILURE) + count(amf, RE_AMF_FAILURE)
+                + (1 if no_notify else 0))
     fallbacks, stranded, exhausted = (count(west, rx) for rx in (RE_FALLBACK, RE_STRANDED, RE_EXHAUSTED))
     row.update(failures=str(failures), fallbacks=str(fallbacks), stranded=str(stranded),
                exhausted=str(exhausted), pingpong="0", returns="0")
@@ -148,7 +168,7 @@ def score(arm, seed, west, east, amf, pingpong_ms, a3_slack_ms):
     notify = None
     if chain is None:
         required = first(west, RE_REQUIRED, after_idx=trigger[0])
-        notify = required and first(amf, RE_AMF_NOTIFY, after_ms=required[1])
+        notify = required and in_window(first(amf, RE_AMF_NOTIFY, after_ms=required[1]))
         if not required:
             chain = "handover-required"
         elif not notify:
@@ -180,8 +200,6 @@ def score(arm, seed, west, east, amf, pingpong_ms, a3_slack_ms):
             outcome = "fallback"
         elif stranded:
             outcome = "stranded"
-        elif exhausted and chain != "ok":
-            outcome = "exhausted"
         elif failures or chain in ("amf-handover-notify", "east-handover-notify"):
             outcome = "failed"
         elif chain != "ok":
@@ -222,9 +240,24 @@ def p10(values):
     return s[max(0, -(-len(s) // 10) - 1)]
 
 
-def table(arm, rows, min_chains):
-    """Markdown summary of one arm, and whether it passes."""
+def parse_seeds(spec):
+    """"A-B" or a list separated by spaces or commas, as d441d-check.sh takes it."""
+    m = re.fullmatch(r"\s*(\d+)-(\d+)\s*", spec)
+    if m:
+        return list(range(int(m.group(1)), int(m.group(2)) + 1))
+    return [int(s) for s in re.split(r"[\s,]+", spec.strip()) if s]
+
+
+def table(arm, rows, min_chains, seeds):
+    """Markdown summary of one arm, and whether it passes.
+
+    Every planned seed needs exactly one row, and no row may be unplanned: a
+    seed that never ran must not pass as a short table."""
     n = len(rows)
+    got = [int(r["seed"]) for r in rows]
+    missing = sorted(set(seeds) - set(got))
+    dupes = sorted({s for s in got if got.count(s) > 1})
+    extra = sorted(set(got) - set(seeds))
     chained = sum(1 for r in rows if r["outcome"] in CHAINED[arm])
     los = [int(r["lead_lo_ms"]) for r in rows if r["lead_lo_ms"] != "-"]
     his = [int(r["lead_hi_ms"]) for r in rows if r["lead_hi_ms"] != "-"]
@@ -250,8 +283,12 @@ def table(arm, rows, min_chains):
     positive = sum(1 for v in los if v > 0)
     if los:
         lines.append(f"lead lower bound positive on {positive}/{len(los)} scored seeds")
-    ok = n > 0 and chained >= min_chains
-    lines.append(f"VERDICT {arm}: {'PASS' if ok else 'FAIL'} ({chained}/{n} chained, need {min_chains})")
+    plan_ok = not (missing or dupes or extra)
+    if not plan_ok:
+        lines.append(f"seed plan broken: missing {missing}, duplicated {dupes}, unplanned {extra}")
+    ok = plan_ok and n > 0 and chained >= min_chains
+    lines.append(f"VERDICT {arm}: {'PASS' if ok else 'FAIL'} ({chained}/{n} chained, need {min_chains};"
+                 f" {len(seeds)} seed(s) planned)")
     return "\n".join(lines), ok
 
 
@@ -278,17 +315,20 @@ def main(argv):
     s.add_argument("--west", required=True)
     s.add_argument("--east", required=True)
     s.add_argument("--amf", required=True)
+    s.add_argument("--ue", help="the UE log: the window starts at its route start")
+    s.add_argument("--window-ms", type=int, default=120_000)
     s.add_argument("--pingpong-ms", type=int, default=5000)
     s.add_argument("--a3-slack-ms", type=int, default=250)
     s.add_argument("--header", action="store_true", help="print the column header first")
     t = sub.add_parser("table")
     t.add_argument("--arm", required=True, choices=sorted(CHAINED))
     t.add_argument("--min-chains", required=True, type=int)
+    t.add_argument("--seeds", required=True, help='the planned seeds, "A-B" or a list')
     t.add_argument("rows")
     a = ap.parse_args(argv)
     if a.cmd == "score":
         row = score(a.arm, a.seed, read_log(a.west), read_log(a.east), read_log(a.amf),
-                    a.pingpong_ms, a.a3_slack_ms)
+                    a.pingpong_ms, a.a3_slack_ms, read_log(a.ue) if a.ue else None, a.window_ms)
         if a.header:
             print("\t".join(COLUMNS))
         print("\t".join(row[c] for c in COLUMNS))
@@ -302,7 +342,15 @@ def main(argv):
     if bad:
         print(f"DEMO CHECK FAILED: {len(bad)} row(s) of another arm in {a.rows}", file=sys.stderr)
         return 1
-    text, ok = table(a.arm, rows, a.min_chains)
+    try:
+        seeds = parse_seeds(a.seeds)
+    except ValueError:
+        print(f"DEMO CHECK FAILED: --seeds {a.seeds!r} is not a seed list", file=sys.stderr)
+        return 1
+    if not seeds or not 1 <= a.min_chains <= len(seeds):
+        print(f"DEMO CHECK FAILED: --min-chains {a.min_chains} outside 1..{len(seeds)}", file=sys.stderr)
+        return 1
+    text, ok = table(a.arm, rows, a.min_chains, seeds)
     print(text)
     if not ok:
         print(f"DEMO CHECK FAILED: [{a.arm}] too few seeds held the chain", file=sys.stderr)

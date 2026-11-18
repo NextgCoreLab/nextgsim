@@ -55,7 +55,7 @@ class Episode:
         self.logs[which].append(at(T0 + ms, text, self.compose, svc))
         return self
 
-    def score(self, arm, **kw):
+    def score(self, arm, ue=None, **kw):
         d = tempfile.mkdtemp()
         paths = {}
         for k, lines in self.logs.items():
@@ -63,7 +63,8 @@ class Episode:
             with open(paths[k], "w") as f:
                 f.write("\n".join(lines) + ("\n" if lines else ""))
         return s.score(arm, 7, s.read_log(paths["west"]), s.read_log(paths["east"]),
-                       s.read_log(paths["amf"]), kw.get("pingpong_ms", 5000), kw.get("a3_slack_ms", 250))
+                       s.read_log(paths["amf"]), kw.get("pingpong_ms", 5000), kw.get("a3_slack_ms", 250),
+                       ue, kw.get("window_ms", 120_000))
 
 
 def predictive(p="lsq", compose=True, lead=(2400, 5000)):
@@ -147,7 +148,8 @@ class PredictiveArm(unittest.TestCase):
         e = Episode().add("west", 0, BANNER).add("west", 9000, STRANDED).add("amf", 1, "x")
         self.assertEqual(e.score("lsq")["outcome"], "stranded")
         e = Episode().add("west", 0, BANNER).add("west", 9000, EXHAUSTED).add("amf", 1, "x")
-        self.assertEqual(e.score("lsq")["outcome"], "exhausted")
+        r = e.score("lsq")
+        self.assertEqual((r["outcome"], r["exhausted"], r["failures"]), ("failed", "1", "1"))
         e = predictive().add("west", 1200, PREP_FAIL)
         r = e.score("lsq")
         self.assertEqual((r["outcome"], r["failures"]), ("failed", "1"))
@@ -169,6 +171,40 @@ class PredictiveArm(unittest.TestCase):
     def test_an_empty_log_is_broken_not_clean(self):
         e = Episode()
         self.assertEqual(e.score("lsq")["chain"], "empty-log")
+
+
+class Q4Failures(unittest.TestCase):
+    """Decision Q4: no HandoverNotify within 120 s of the route start is a failure."""
+
+    def ue(self, start_ms):
+        return [(T0 + start_ms, "INFO nextgsim_ue::rls::task: Simulated motion started: sim_route from (20, 17, 0) at 40.0 s after start-up")]
+
+    def test_nothing_handed_over_is_failed_not_broken(self):
+        e = predictive()
+        e.logs["west"] = [l for l in e.logs["west"] if "handover prediction" not in l]
+        e.logs["amf"] = [l for l in e.logs["amf"] if "HandoverNotify" not in l]
+        r = e.score("lsq")
+        self.assertEqual((r["outcome"], r["chain"], r["failures"]), ("failed", "prediction", "1"), r)
+        e = a3_episode()
+        e.logs["west"] = [l for l in e.logs["west"] if "measurement-triggered" not in l]
+        e.logs["amf"] = [l for l in e.logs["amf"] if "HandoverNotify" not in l]
+        r = e.score("a3")
+        self.assertEqual((r["outcome"], r["chain"], r["failures"]), ("failed", "a3-report", "1"), r)
+
+    def test_a_notify_after_the_window_is_a_failure(self):
+        # The notify lands at +1350 ms; the route started 130 s before it.
+        r = predictive().score("lsq", ue=self.ue(1350 - 130_000))
+        self.assertEqual((r["outcome"], r["chain"], r["failures"]), ("failed", "amf-handover-notify", "1"), r)
+        r = predictive().score("lsq", ue=self.ue(1350 - 110_000))
+        self.assertEqual((r["outcome"], r["failures"]), ("predictive", "0"), r)
+
+    def test_no_route_start_is_broken(self):
+        self.assertEqual(predictive().score("lsq", ue=[])["chain"], "route-start")
+
+    def test_a_rejected_notify_is_a_failure(self):
+        e = predictive().add("amf", 1340, "WARN amfd::ngap_path: HandoverNotify from association 2 rejected: NoUeContext")
+        r = e.score("lsq")
+        self.assertEqual((r["outcome"], r["failures"]), ("failed", "1"), r)
 
 
 class A3Arm(unittest.TestCase):
@@ -224,20 +260,40 @@ class Table(unittest.TestCase):
 
     def test_median_p10_and_verdict(self):
         leads = [1000 * i for i in range(1, 21)]
-        text, ok = s.table("lsq", self.rows(["predictive"] * 20, leads), 18)
+        text, ok = s.table("lsq", self.rows(["predictive"] * 20, leads), 18, list(range(1, 21)))
         self.assertTrue(ok)
         self.assertIn("| lsq | 20 | 20 | 10000 / 2000 | 12600 |", text)
         self.assertIn("lead lower bound positive on 20/20", text)
 
     def test_too_few_chains_fail(self):
         outcomes = ["predictive"] * 17 + ["fallback", "stranded", "failed"]
-        text, ok = s.table("lsq", self.rows(outcomes, [1000] * 17 + [None] * 3), 18)
+        text, ok = s.table("lsq", self.rows(outcomes, [1000] * 17 + [None] * 3), 18, list(range(1, 21)))
         self.assertFalse(ok)
-        self.assertIn("VERDICT lsq: FAIL (17/20 chained, need 18)", text)
+        self.assertIn("VERDICT lsq: FAIL (17/20 chained, need 18;", text)
         self.assertIn("fallback=1", text)
 
     def test_no_rows_fail(self):
-        self.assertFalse(s.table("lsq", [], 0)[1])
+        self.assertFalse(s.table("lsq", [], 1, [1])[1])
+
+    def test_the_seed_plan_is_enforced(self):
+        plan = list(range(1, 25))
+        rows = self.rows(["predictive"] * 22, [1000] * 22)       # seeds 1..22 of 24
+        text, ok = s.table("lsq", rows, 22, plan)
+        self.assertFalse(ok)
+        self.assertIn("missing [23, 24]", text)
+        twice = self.rows(["predictive"] * 12, [1000] * 12) * 2   # seeds 1..12, twice
+        text, ok = s.table("lsq", twice, 22, plan)
+        self.assertFalse(ok)
+        self.assertIn("duplicated [1, 2, 3", text)
+        rows = self.rows(["predictive"] * 3, [1000] * 3)
+        text, ok = s.table("lsq", rows, 1, [1, 2])
+        self.assertFalse(ok)
+        self.assertIn("unplanned [3]", text)
+        self.assertTrue(s.table("lsq", rows, 1, [1, 2, 3])[1])
+
+    def test_parse_seeds(self):
+        self.assertEqual(s.parse_seeds("1-4"), [1, 2, 3, 4])
+        self.assertEqual(s.parse_seeds("1 2,3"), [1, 2, 3])
 
     def test_cli_round_trip_and_malformed_rows(self):
         d = tempfile.mkdtemp()
@@ -258,13 +314,17 @@ class Table(unittest.TestCase):
         with open(out, "w") as f:
             f.write(buf.getvalue())
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(s.main(["table", "--arm", "lsq", "--min-chains", "1", out]), 0)
-            self.assertEqual(s.main(["table", "--arm", "lsq", "--min-chains", "2", out]), 1)
+            self.assertEqual(s.main(["table", "--arm", "lsq", "--seeds", "3", "--min-chains", "1", out]), 0)
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            # MINOR 6: --min-chains outside 1..K is refused, never a vacuous pass.
+            self.assertEqual(s.main(["table", "--arm", "lsq", "--seeds", "3", "--min-chains", "0", out]), 1)
+            self.assertEqual(s.main(["table", "--arm", "lsq", "--seeds", "3", "--min-chains", "2", out]), 1)
+            self.assertEqual(s.main(["table", "--arm", "lsq", "--seeds", "2", "--min-chains", "1", out]), 1)
         with open(out, "a") as f:
             f.write("1\tlsq\tpredictive\n")
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            self.assertEqual(s.main(["table", "--arm", "lsq", "--min-chains", "1", out]), 1)
-            self.assertEqual(s.main(["table", "--arm", "a3", "--min-chains", "0", out]), 1)
+            self.assertEqual(s.main(["table", "--arm", "lsq", "--seeds", "3", "--min-chains", "1", out]), 1)
+            self.assertEqual(s.main(["table", "--arm", "a3", "--seeds", "3", "--min-chains", "1", out]), 1)
 
 
 if __name__ == "__main__":

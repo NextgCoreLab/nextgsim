@@ -40,6 +40,14 @@ on:
         description: "nextgcore ref for EVERY demo job (demo-n2ho, demo-d446a, demo-d440a-m0) at once; empty: each job's own pinned NEXTGCORE_DEMO_REF"
         required: false
         default: ""
+      only_job:
+        # #467: run ONE of the dispatch-only jobs below (docker-build,
+        # interop-e2e, sixg-live-e2e, demo-n2ho, demo-d446a, demo-d441d,
+        # demo-d440a-m0), by job id. Empty: every one, as before. The fast
+        # gate jobs (check, test, clippy, ...) run on every dispatch either way.
+        description: "only this dispatch-only job (e.g. demo-d441d); empty: all of them"
+        required: false
+        default: ""
       d441d_seeds:
         # #467: the seeds of every demo-d441d leg, "A-B" or a space list. Empty:
         # 1-24, the committed set (DECISIONS 2026-11-18-083000).
@@ -842,7 +850,7 @@ jobs:
     name: Docker Build
     # Nightly OR on demand (#206). A disjunction, not a replacement: the dispatch
     # path is unchanged.
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'docker-build') }}
     runs-on: ubuntu-latest
     needs: test
     steps:
@@ -962,7 +970,7 @@ jobs:
   # ====================================================================
   interop-e2e:
     name: Interop E2E (registers a real UE against nextgcore)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'interop-e2e') }}
     runs-on: ubuntu-latest
     needs: test
     env:
@@ -1319,7 +1327,7 @@ jobs:
   # ====================================================================
   sixg-live-e2e:
     name: 6G live E2E (6G-featured gNB and UE against nextgcore)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'sixg-live-e2e') }}
     runs-on: ubuntu-latest
     needs: test
     env:
@@ -1535,7 +1543,7 @@ jobs:
   # ====================================================================
   demo-n2ho:
     name: Demo N2 handover (two gNBs against pinned nextgcore)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'demo-n2ho') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
@@ -1680,7 +1688,7 @@ jobs:
   # ====================================================================
   demo-d446a:
     name: Demo D446A agent conflict (two gNBs against pinned nextgcore)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'demo-d446a') }}
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
@@ -1845,7 +1853,7 @@ jobs:
   # ====================================================================
   demo-d441d:
     name: Demo D441D predictive handover vs A3 (${{ matrix.arm }})
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'demo-d441d') }}
     runs-on: ubuntu-latest
     timeout-minutes: 200
     strategy:
@@ -1984,6 +1992,7 @@ jobs:
           scripts/demo/d441d-reverts.sh
           # Live: the gNB rebuilt under the patch, one lsq seed; the check must
           # fail at its first link. revert-run.sh restores the tree.
+          # shellcheck disable=SC2016  # expanded by the inner sh -c, on purpose
           scripts/demo/revert-run.sh --expect 'chain=prediction' scripts/demo/reverts/d441d-tick-off.patch -- \
             sh -c 'docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
                      "apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
@@ -2031,7 +2040,7 @@ jobs:
   # ====================================================================
   demo-d440a-m0:
     name: Demo D440A M0 (idle reselection + MT Service Request via another gNB)
-    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (!inputs.only_job || inputs.only_job == 'demo-d440a-m0') }}
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:

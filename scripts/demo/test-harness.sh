@@ -171,6 +171,15 @@ for arm in a3 lsq onnx off invalid conflict runtime-switch; do
     D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d" "$here/d441d-check.sh" "$arm" \
         >"$work/d441d-dry.out" 2>&1 || { cat "$work/d441d-dry.out" >&2; not_ok "d441d-check.sh $arm dry run"; }
 done
+# R14 MINOR 6: a pass bar outside 1..K is refused before anything runs.
+for bad in 0 25 x; do
+    rc=0; D441D_MIN_CHAINS="$bad" D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-mc" \
+        "$here/d441d-check.sh" lsq >/dev/null 2>&1 || rc=$?
+    [ "$rc" -eq 2 ] || not_ok "D441D_MIN_CHAINS=$bad was accepted (rc $rc)"
+done
+D441D_DRY_RUN=1 NEXTGCORE_DIR="$work" DEMO_ARTEFACTS="$work/d441d-mc" D441D_SEEDS="1 2 3" "$here/d441d-check.sh" lsq \
+    | grep -q 'pass needs 3 chained' && ok "d441d-check.sh: D441D_MIN_CHAINS outside 1..K is refused; lsq at K=3 needs 3/3" \
+    || not_ok "the K=3 lsq bar is not 3"
 grep -qx '  seed: 24' "$work/d441d/d441d/lsq/seed-24/config/gnb-n2ho-target.yaml" \
     && grep -qx '    mode: a3' "$work/d441d/d441d/a3/seed-1/config/gnb.yaml" \
     && ok "d441d-check.sh: every arm stages (dry run), seeds 1-24 on both gNBs" \

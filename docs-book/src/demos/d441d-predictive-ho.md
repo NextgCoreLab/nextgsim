@@ -203,26 +203,31 @@ image for every arm, and the D446A key is set only in `conflict`.
 Per seed, the harness rewrites `shadowing.seed` to the same value in both gNB
 configs. It checks that both gNBs logged the same `RLS: seeded log-normal
 shadowing on:` line, and that `gnb-west` logged the banner. It waits for
-amfd's HandoverNotify, for at most 120 s after the PDU session, then waits
-15 s more. It then scores the episode with `scripts/demo/d441d_score.py`,
-which reads the three timestamped logs (gnb-west, gnb-east, amfd):
+amfd's HandoverNotify, for at most 120 s after the UE's route starts. A
+`HandoverNotify ... rejected` line does not end that wait. It then waits
+15 s more and scores the episode with `scripts/demo/d441d_score.py`, which
+reads the timestamped logs of gnb-west, gnb-east, amfd and the UE:
 
 | Outcome | Meaning |
 |---|---|
 | `predictive` | `lsq` and `onnx`: the chain held, with `predictor=<arm>` (prediction → NWDAF-recommended → Sent Handover Required → amfd HandoverNotify and gnb-east Sent Handover Notify → `A3 would trigger` → `lead time`) |
 | `a3` | `a3`: the UE's A3 report triggered the handover, no predictor line was logged, and the report's time is inside the replica's range. `off`: the base A3 handover, with no demo line on either gNB |
-| `a3-outside`, `predicted` | `a3`: the report fell outside the replica's range, or a predictor line was logged |
-| `fallback`, `stranded`, `exhausted` | predictive-arm failures: A3 moved the UE after the grace, nothing moved it, or the attempts ran out |
+| `a3-outside`, `predicted` | `a3`: the report fell outside the replica's range by more than `D441D_A3_SLACK_MS` (250 ms), or a predictor line was logged |
+| `fallback`, `stranded` | predictive-arm failures: A3 moved the UE after the grace, or nothing moved it |
 | `predictor-mislabelled` | `onnx` served by the least-squares fallback |
-| `failed` | no HandoverNotify, or a Preparation Failure, Handover Cancel, TNGRELOC expiry, re-establishment or amfd HandoverFailure |
-| `broken` | another link is missing. The `chain` column names it |
+| `failed` | no HandoverNotify within 120 s of the route start, or a Preparation Failure, Handover Cancel, TNGRELOC expiry, re-establishment, amfd HandoverFailure or rejected HandoverNotify. A seed whose attempts ran out (`exhausted`, its own column) ends here too |
+| `broken` | the UE was handed over, but another link is missing. The `chain` column names it |
 
 A **ping-pong** is the UE handed back to gnb-west within 5 s of the first
 HandoverNotify. Every later hand-back is counted under `returns`.
 
-**Pass rule** (operator decision, 2026-11-18): `lsq` and `onnx` need the chain
-on at least K−2 of K seeds, and `a3` on all K. The lead time is not asserted
-positive.
+**Pass rule.** The operator decided it on 2026-11-18, and the coordinator ruled
+on K under that delegation. `lsq` and `onnx` need the chain on at least K−2 of
+K seeds when K ≥ 10, which covers the 24-seed table, and on all K below that,
+which covers the 3-seed EKS validation. `a3` needs it on all K, with the UE's
+report inside the replica's range. Every planned seed must have exactly one row.
+A missing, duplicated or unplanned seed fails the table, and so does
+`D441D_MIN_CHAINS` outside 1..K. The lead time is not asserted positive.
 
 The harness writes the rows to `rows.tsv` and the per-arm table to `table.md`,
 both under `$DEMO_ARTEFACTS/d441d/<arm>/`. Under GitHub Actions the table also
