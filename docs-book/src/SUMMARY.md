@@ -37,6 +37,7 @@
 - [D445A: network-assisted federated learning over PDU sessions](demos/d445a-fl-t8.md)
 - [D441D: predictive N2 handover vs A3](demos/d441d-predictive-ho.md)
 - [D440C: NWDAF UE-mobility analytics steer AMF paging](demos/d440c-nwdaf-paging.md)
+- [D440A: gNB-predicted paging, recommended RAN nodes first](demos/d440a-ai-paging.md)
 - [D444C: task-oriented classification vs raw under an emulated AWGN sweep](demos/d444c-task-vs-raw.md)
 - [D443A: the EES picks the edge server on a UPF-measured budget](demos/d443a-edge-budget.md)
 
