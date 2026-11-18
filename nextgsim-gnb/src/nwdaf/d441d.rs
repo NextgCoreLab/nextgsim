@@ -347,6 +347,7 @@ pub fn lsq_prediction(
         waypoints: out.waypoints,
         confidence: out.confidence,
         horizon_ms,
+        origin: out.origin,
     })
 }
 
@@ -635,7 +636,11 @@ impl Engine {
             let Some((prediction, predictor)) = predict(ue_id) else {
                 continue;
             };
-            if !is_predicted_mobility(prediction.confidence, &prediction.waypoints) {
+            if !is_predicted_mobility(
+                prediction.confidence,
+                prediction.origin,
+                &prediction.waypoints,
+            ) {
                 continue;
             }
             let Some((end, _)) = prediction.waypoints.last() else {
@@ -760,6 +765,47 @@ mod tests {
     /// after a predictive trigger it is handed away (no longer served) and keeps
     /// heartbeating, as it does over RLS.
     fn replay(config: &GnbConfig, predictive: bool) -> Run {
+        replay_with(config, predictive, Predictor::Lsq)
+    }
+
+    /// The D440B reference model (`2 * last - prev`, one waypoint) without an
+    /// ONNX Runtime: its output tensor computed here and turned into the
+    /// prediction by the product's own [`model_trajectory`], as
+    /// `NwdafManager::predict_trajectory` does for the loaded model (current
+    /// time = the newest sample).
+    ///
+    /// [`model_trajectory`]: nextgsim_nwdaf::predictor::model_trajectory
+    fn one_step_model(nwdaf: &NwdafManager, ue_id: i32) -> Option<TrajectoryPrediction> {
+        let history = nwdaf.data_collector().get_ue_history(ue_id)?;
+        let positions = history.position_sequence();
+        let timestamps: Vec<u64> = history.all().iter().map(|m| m.timestamp_ms).collect();
+        let [.., prev, last] = positions.as_slice() else {
+            return None;
+        };
+        let tensor = [
+            (2.0 * last.x - prev.x) as f32,
+            (2.0 * last.y - prev.y) as f32,
+            (2.0 * last.z - prev.z) as f32,
+        ];
+        let out = nextgsim_nwdaf::predictor::model_trajectory(
+            &tensor,
+            &positions,
+            &timestamps,
+            HORIZON_MS,
+            *timestamps.last()?,
+        )
+        .ok()?;
+        Some(TrajectoryPrediction {
+            ue_id,
+            waypoints: out.waypoints,
+            confidence: out.confidence,
+            horizon_ms: HORIZON_MS,
+            origin: out.origin,
+        })
+    }
+
+    /// [`replay`] with the arm's predictor: `Lsq` or `Onnx` ([`one_step_model`]).
+    fn replay_with(config: &GnbConfig, predictive: bool, arm: Predictor) -> Run {
         let mut engine = Engine::from_config(config).unwrap();
         let mut nwdaf = NwdafManager::new(100);
         let (ue, t0) = (1, 1_000_000u64);
@@ -781,13 +827,19 @@ mod tests {
                 timestamp_ms: now,
             });
             let mut events = engine.on_measurement(ue, dbm, coord(p), now);
-            events.extend(engine.tick(now, predictive, |id| {
-                lsq_prediction(&nwdaf, id, HORIZON_MS, now).map(|p| (p, Predictor::Lsq))
+            events.extend(engine.tick(now, predictive, |id| match arm {
+                Predictor::Onnx => one_step_model(&nwdaf, id).map(|p| (p, Predictor::Onnx)),
+                _ => lsq_prediction(&nwdaf, id, HORIZON_MS, now).map(|p| (p, Predictor::Lsq)),
             }));
             for e in events {
                 match e {
-                    Event::Prediction { target_nci, .. } => {
+                    Event::Prediction {
+                        target_nci,
+                        predictor,
+                        ..
+                    } => {
                         assert_eq!(target_nci, EAST);
+                        assert_eq!(predictor, arm);
                         run.predictions += 1;
                         run.predictive_ms.get_or_insert(now);
                         engine.set_served(&[], now); // handed over
@@ -936,6 +988,7 @@ mod tests {
                         .collect(),
                     confidence: 0.95,
                     horizon_ms: HORIZON_MS,
+                    origin: None,
                 },
                 Predictor::Lsq,
             ))
@@ -1300,5 +1353,37 @@ mod tests {
         assert!(a3_times.len() > 1, "the A3 time must move with the seed");
         assert!(positive >= 20, "{positive}/24 positive: {leads:?}");
         assert!(leads[12].0 > 0, "median {leads:?}");
+    }
+
+    /// nextgsim#587: the onnx arm, with the D440B reference model's one
+    /// waypoint, chains on most seeds. Before the fix its speed was measured
+    /// between its waypoints (one, so 0), it was never mobility, and A3 acted
+    /// on every seed (0/24 on compose, 0/3 on devtest1).
+    ///
+    /// The model predicts one sample step (1 s) ahead, not lsq's 2 s, so it
+    /// names the neighbour later than lsq does; the bar is that it chains (one
+    /// prediction, to east) on at least 20 of 24 seeds and leads A3 on at least
+    /// 20 (the replay gives 24/24 chained, every lead positive, each about 1 s
+    /// shorter than lsq's).
+    #[test]
+    fn the_seeded_replay_onnx_arm_chains_on_most_seeds() {
+        let base = replay_with(&west(0.0, 1), true, Predictor::Onnx);
+        assert_eq!(base.predictions, 1, "{base:?}");
+        let mut chained = 0;
+        let mut leads = Vec::new();
+        for seed in 1..=24u64 {
+            let run = replay_with(&west(4.0, seed), true, Predictor::Onnx);
+            if run.predictions == 1 {
+                chained += 1;
+            }
+            if let Some(lead) = run.lead_ms {
+                leads.push(lead);
+            }
+        }
+        leads.sort_unstable();
+        let positive = leads.iter().filter(|l| l.0 > 0).count();
+        eprintln!("D441D onnx replay: {chained}/24 chained, leads {leads:?}");
+        assert!(chained >= 20, "{chained}/24 chained: {leads:?}");
+        assert!(positive >= 20, "{positive}/24 positive: {leads:?}");
     }
 }
