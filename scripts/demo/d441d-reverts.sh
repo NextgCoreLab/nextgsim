@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # scripts/demo/d441d-reverts.sh: the D441D revert arm, docker-free (nextgsim#467).
 #
-# scripts/demo/reverts/d441d-tick-off.patch patches the NWDAF tick out (the
-# ticket's revert arm). Through revert-run.sh it must make the named unit test
-# FAIL, and the tree is restored after:
+# scripts/demo/reverts/d441d-tick-off.patch makes the NWDAF tick do nothing
+# (an early return in NwdafTask::d441d_tick, the ticket's revert arm). Through
+# revert-run.sh it must make the named unit test FAIL, and the tree is restored
+# after:
 #
 #   d441d-tick-off  -> a_predictive_tick_recommends_the_neighbour_to_rrc
+#                      (mode_a3_predicts_nothing_until_switched and
+#                      onnx_without_a_verified_model_is_labelled_fallback fail too;
+#                      the other 35 d441d tests, the RRC A3 ones included, pass)
 #
+# A first form of the patch, the run loop's call to the tick replaced, left
+# that test green: the task tests drive d441d_tick directly, not the loop.
 # The same patch is the LIVE revert arm of ci.yml's demo-d441d job: the gNB
 # rebuilt under it, `d441d-check.sh lsq` on one seed must fail at its first
 # link (`chain=prediction`). The A3 tests stay green under it: they do not

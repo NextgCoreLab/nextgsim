@@ -1,15 +1,15 @@
 diff --git a/nextgsim-gnb/src/nwdaf/task.rs b/nextgsim-gnb/src/nwdaf/task.rs
-index 8dfae1f..9fd57c1 100644
+index 8dfae1f..0d645e8 100644
 --- a/nextgsim-gnb/src/nwdaf/task.rs
 +++ b/nextgsim-gnb/src/nwdaf/task.rs
-@@ -828,8 +828,9 @@ impl Task for NwdafTask {
-             #[cfg(not(feature = "event-bus"))]
-             let msg = Self::recv_or_tick(&mut rx, &mut tick).await;
-             let Some(msg) = msg else {
-+                // REVERT d441d-tick-off: the NWDAF tick never runs.
-                 #[cfg(feature = "demo-d441d-predictive-ho")]
--                let _ = self.d441d_tick(now_ms());
-+                let _ = if now_ms() == 0 { self.d441d_tick(0) } else { Vec::new() };
-                 continue;
-             };
+@@ -629,6 +629,10 @@ impl NwdafTask {
+         use crate::nwdaf::d441d::{lsq_prediction, Predictor, HORIZON_MS};
+         use nextgsim_demo::demo_log;
  
++        // REVERT d441d-tick-off: the NWDAF tick does nothing.
++        if now > 0 {
++            return Vec::new();
++        }
+         let Some(mut st) = self.d441d.take() else {
+             return Vec::new();
+         };
