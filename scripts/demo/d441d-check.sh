@@ -223,7 +223,7 @@ trap teardown EXIT
 
 # start_stack SEED MODE: stage, assert private, `up`.
 start_stack() {
-    local seed="$1" mode="$2" files
+    local seed="$1" mode="$2" refusal="${3:-}" files
     stage="$(mktemp -d -t d441d-XXXXXX)"
     stage_configs "$stage" "$seed" "$mode"
     rm -rf "$DEMO_ARTEFACTS/config"
@@ -235,7 +235,14 @@ start_stack() {
     demo_compose_init "${files[@]}"
     demo_assert_private
     stack_up=true
-    demo_compose up -d
+    if [ "$refusal" = refusal ]; then
+        # gnb-west is meant to refuse its config, so it never turns healthy and
+        # `up -d` fails on the services that wait for it (ue). refused_at_startup
+        # is the check; a missing refusal still fails there.
+        demo_compose up -d || demo_info "compose up -d failed, as it must when gnb-west refuses its config"
+    else
+        demo_compose up -d
+    fi
 }
 
 # Timestamped logs (`docker compose logs -t`): the scorer compares times across
@@ -315,7 +322,7 @@ case "$arm" in
 invalid|conflict)
     seed="${seeds[0]}"
     if [ "$arm" = invalid ]; then mode=bogus; else mode=lsq; fi
-    start_stack "$seed" "$mode"
+    start_stack "$seed" "$mode" refusal
     if [ "$arm" = invalid ]; then
         refused_at_startup 'unknown mode "bogus" for demo "d441d-predictive-ho"'
     else
