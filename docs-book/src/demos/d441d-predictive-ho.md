@@ -256,12 +256,70 @@ seeds per arm.
 
 ## Results
 
-**Not yet run** on the live stack or EKS. The table goes here after the runs,
-as captured: 24 seeds per arm from the compose job, with the median and p10 of
-the lead and the ping-pong, failure, fallback and stranded counts. So does the
-captured log chain.
+Pass bars (DECISIONS 2026-11-18-100000):
+- At K = 24 (compose), `lsq` and `onnx` must hold the chain on at least K−2 seeds, and `a3` on all K.
+- At K = 3 (EKS), every arm needs 3/3.
+- The scorer fails a missing or duplicated seed.
 
-What exists now is an offline replay of the decision core:
+**`onnx` fails on both stacks.** It falls back to A3 on every seed, because a
+one-waypoint model prediction scores a speed of 0. So `is_predicted_mobility`
+never passes (nextgsim#587). That is a product defect, not a harness one, and
+#467 stays open on it.
+
+### Compose, 24 seeds per arm
+Dispatch [44331944869](https://github.com/NextgCoreLab/nextgsim/actions/runs/44331944869)
+on main 6ff00e4, with nextgcore pinned at a7917ba3, 2026-11-18. Seeds 1..=24 at σ 4 dB.
+
+| arm | seeds | chain held | bar | lead lower bound: median / p10 | lead upper bound: median | ping-pongs | returns | failures | A3 fallbacks | stranded | exhausted | verdict |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| lsq | 24 | 24 | 22 | 4070 / 3081 ms | 6670 ms | 0 | 0 | 0 | 0 | 0 | 0 | PASS |
+| a3 | 24 | 24 | 24 | — | — | 0 | 0 | 0 | 0 | 0 | 0 | PASS |
+| onnx | 24 | 0 | 22 | — | — | 0 | 0 | 0 | 24 | 0 | 0 | FAIL (#587) |
+
+The lead's lower bound was positive on 24/24 lsq seeds. The same dispatch's
+`arms` job (off, invalid, conflict, runtime-switch) passed `off` and then
+stopped on a harness defect in the `invalid` arm: `compose up` fails when
+gnb-west refuses its config. The fix is nextgsim#586.
+
+### devtest1 EKS, 3 seeds per arm
+nextgcore 36f2b6b0 (the D441D overlay), plus the harness fixes of
+nextgcore#1806 cherry-picked. Images
+`demo-d441d-predictive-ho-36f2b6b0-20c21bf2`: core from 36f2b6b0, gnb and ue
+from nextgsim 20c21bf. Run under `flock /tmp/eks-nextg-demo.lock`, one arm per
+hold. Teardown was ok on every arm.
+
+| arm | run | chain held | lead lower bound: median / p10 | lead upper bound: median | ping-pongs / failures / fallbacks / stranded | verdict |
+|---|---|---|---|---|---|---|
+| lsq | 20261118T161612Z | 3/3 | 2649 / 2588 ms | 5249 ms | 0 / 0 / 0 / 0 | PASS |
+| a3 | 20261118T181602Z | 3/3 | — | — | 0 / 0 / 0 / 0 | PASS |
+| onnx | 20261118T164725Z | 0/3 | — | — | 0 / 0 / 3 / 0 | FAIL (#587) |
+| off | 20261118T170330Z | 1/1 (A3, `active=false`) | — | — | 0 / 0 / 0 / 0 | PASS |
+| lsq + invalid | 20261118T183340Z | gnb-west refused `mode: bogus` (UnknownMode), never Ready, restored | — | — | — | PASS |
+| lsq + conflict | 20261118T184152Z | gnb-west refused with HandoverDemoConflict, never Ready, restored | — | — | — | PASS |
+| a3 + runtime-switch | 20261118T174659Z | `set mode=bogus` rejected and audited, `set mode=lsq` audited, seed scored as lsq: 1/1 | 2789 ms | 5389 ms | 0 / 0 / 0 / 0 | PASS |
+
+The per-seed restart re-registers the same SUPI against the running core.
+This was the open risk of the EKS harness, and it held on every seed. Each lsq
+seed's handover had a new `amf_ue_ngap_id` and a HandoverNotify.
+
+Captured chain, lsq seed 1 on devtest1 (kubelet timestamps, abridged):
+
+```text
+16:20:23.610 gnb-west RLS: seeded log-normal shadowing on: sigma=4 dB seed=1 decorrelation=20 m
+16:22:06.612 gnb-west [demo:d441d-predictive-ho] NWDAF: handover prediction ue=1 predictor=lsq target=32 conf=0.98 attempt=1/3
+16:22:06.612 gnb-west Sent Handover Required: amf_ue_ngap_id=3, ran_ue_ngap_id=2
+16:22:06.612 amf      HandoverRequired (amf_ue_ngap_id=3, ran_ue_ngap_id=2, type=Intra5gs) source_gnb_id=1 cause=RadioNetwork(HandoverDesirableForRadioReason)
+16:22:06.625 gnb-west Handover Command received: amf_ue_ngap_id=3, ran_ue_ngap_id=2, type=Intra5gs
+16:22:06.625 amf      HandoverNotify from association 3 (amf_ue_ngap_id=3, ran_ue_ngap_id=1)
+16:22:08.659 gnb-west UE Context Release Command: ... cause=RadioNetwork(SuccessfulHandover)
+16:22:11.702 gnb-west [demo:d441d-predictive-ho] A3 would trigger t=1795018929200..1795018931800 ue=1 target=32 serving=-78 dBm neighbour=-52 dBm
+```
+
+The shadow A3 would have triggered 2.6 to 5.2 s after the predictive handover.
+That range is this seed's lead.
+
+### Offline replay (positive control)
+Also on record: an offline replay of the decision core:
 `nwdaf::d441d::tests::the_seeded_replay_leads_a3_on_most_seeds`. It replays
 the committed route at heartbeat cadence through gnb-west's engine, with the
 UE handed away at the prediction, on seeds 1..=24 at σ 4 dB. It is a positive
