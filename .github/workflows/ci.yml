@@ -37,9 +37,15 @@ on:
         # #456: the demo-n2ho job builds its 5GC images from a PINNED nextgcore
         # commit (NEXTGCORE_DEMO_REF in that job), not main, so a demo result
         # names the image pair it ran. A dispatch may point it at a branch or sha.
-        description: "nextgcore ref for EVERY demo job (demo-n2ho, demo-d446a, demo-d440a-m0) at once; empty: each job's own pinned NEXTGCORE_DEMO_REF"
+        description: "nextgcore ref for EVERY demo job (demo-n2ho, demo-d446a, demo-d440a) at once; empty: each job's own pinned NEXTGCORE_DEMO_REF"
         required: false
         default: ""
+      d440a_seeds:
+        # #462 PR 3c: the live seeds the demo-d440a job's six-gNB arms run, each
+        # in every mode. Nightly runs seed 1; a dispatch may run all five.
+        description: "demo-d440a: space-separated live seeds of config/demo-ai-paging/d440a-scenario.yaml (default 1)"
+        required: false
+        default: "1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -1832,14 +1838,28 @@ jobs:
   # check must fail at ue step 4/9), then page-all (the gNBs built with
   # --features demo-d440a-ai-paging, the demo on in its predictor-off mode, with
   # a paging grid: same chain, plus the banner and the grid). Private: the
-  # merged stack publishes no port (asserted before `up`). Scheduled and
-  # dispatch only; the default nightly jobs and the other demo jobs are unchanged.
+  # merged stack publishes no port (asserted before `up`).
+  #
+  # Then the six-gNB live arms (#462 PR 3c), on the same images: one builder
+  # run for every arm, which is most of the job's time (#525 r2 MINOR 3: folded
+  # into this job, not a second one). scripts/demo/d440a-check.sh <mode> <seed>
+  # runs the committed grid (config/demo-ai-paging/gnb-{1..6}.yaml, amfd
+  # paging.strategy recommended-first) and the seed's UE, whose route is the
+  # replay's route for that seed. Modes off, page-all, last-served, ct, lsq on
+  # each seed of the d440a_seeds input (nightly: seed 1), then two revert arms:
+  # amfd back on registration-area, and a gNB that sends no IE (rebuilt with
+  # reverts/d440a-no-ie.patch, so it runs last). Each must fail at amf step 1/2.
+  # The onnx mode has no live arm: its row comes from the model-verify job's
+  # replay, and a live onnx gNB needs the ORT runtime in the image.
+  #
+  # Scheduled (nightly) and dispatch only; the default nightly jobs and the
+  # other demo jobs are unchanged.
   # ====================================================================
-  demo-d440a-m0:
-    name: Demo D440A M0 (idle reselection + MT Service Request via another gNB)
+  demo-d440a:
+    name: Demo D440A (M0 gate, six-gNB live arms)
     if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     env:
       # nextgcore main at #1448's merge (amfd paging.strategy, which #462's later
       # arms use; the default strategy this gate runs is today's paging).
@@ -1970,11 +1990,83 @@ jobs:
           NR_CLI: ${{ github.workspace }}/nextgsim/binaries/nr-cli
         run: nextgsim/scripts/demo/d440a-m0-check.sh page-all
 
+      - name: The six-gNB stack publishes no port (docker compose config)
+        run: |
+          set -euo pipefail
+          . nextgsim/scripts/demo/lib.sh
+          export NEXTGSIM_DIR="$GITHUB_WORKSPACE/nextgsim"
+          demo_compose_init nextgcore/docker/rust/docker-compose.demo-n2ho.yml \
+            nextgsim/scripts/demo/d440a.compose.yml
+          demo_assert_private
+
+      - name: D440A six-gNB live arms (every mode on each seed)
+        timeout-minutes: 90
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          NR_CLI: ${{ github.workspace }}/nextgsim/binaries/nr-cli
+          D440A_SEEDS: ${{ inputs.d440a_seeds || '1' }}
+        run: |
+          set -euo pipefail
+          for seed in $D440A_SEEDS; do
+            for mode in off page-all last-served ct lsq; do
+              DEMO_ARTEFACTS="$RUNNER_TEMP/demo" nextgsim/scripts/demo/d440a-check.sh "$mode" "$seed"
+              cat "$RUNNER_TEMP/demo/d440a/$mode-$seed/result.txt" >> "$RUNNER_TEMP/demo/d440a-results.txt" 2>/dev/null || true
+            done
+          done
+          {
+            echo "### D440A live arms"
+            echo '```'
+            cat "$RUNNER_TEMP/demo/d440a-results.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Revert arm (amfd on registration-area -> fails at amf step 1/2)
+        timeout-minutes: 15
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          NR_CLI: ${{ github.workspace }}/nextgsim/binaries/nr-cli
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo
+        run: |
+          set -euo pipefail
+          if out="$(nextgsim/scripts/demo/d440a-check.sh ct 1 revert-amf 2>&1)"; then
+            printf '%s\n' "$out"; echo "::error::the revert-amf arm passed"; exit 1
+          fi
+          printf '%s\n' "$out"
+          grep -qF 'DEMO CHECK FAILED: [amf] step 1/2 missing' <<<"$out" \
+            || { echo "::error::the revert-amf arm failed for another reason"; exit 1; }
+
+      - name: Revert arm (the gNB sends no IE -> fails at amf step 1/2; runs last)
+        timeout-minutes: 30
+        env:
+          NEXTGCORE_DIR: ${{ github.workspace }}/nextgcore
+          NR_CLI: ${{ github.workspace }}/nextgsim/binaries/nr-cli
+          DEMO_ARTEFACTS: ${{ runner.temp }}/demo/revert-no-ie
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          scripts/demo/revert-run.sh --expect '[amf] step 1/2 missing' \
+            scripts/demo/reverts/d440a-no-ie.patch -- bash -c '
+              set -euo pipefail
+              docker run --rm -v "$PWD":/src -w /src -e CARGO_TARGET_DIR=/src/target rust:1-bookworm sh -c \
+                "apt-get update -qq && apt-get install -y -qq libsctp-dev >/dev/null && \
+                 cargo build --release -p nextgsim-gnb --features demo-d440a-ai-paging"
+              sudo chown -R "$(id -u):$(id -g)" target
+              cp target/release/nr-gnb binaries/
+              docker build -f Dockerfile.gnb-local -t nextgsim-gnb:latest .
+              scripts/demo/d440a-check.sh ct 1'
+
+      - name: The revert arms left the checkout clean
+        if: always()
+        run: |
+          set -euo pipefail
+          cd nextgsim
+          git diff --quiet HEAD -- || { echo "::error::tracked files differ from HEAD"; git status --short; exit 1; }
+
       - name: Upload the captured logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: demo-d440a-m0-logs
+          name: demo-d440a-logs
           path: ${{ runner.temp }}/demo
           if-no-files-found: warn
           retention-days: 14

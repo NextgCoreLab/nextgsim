@@ -1,0 +1,132 @@
+# Override for nextgcore's docker/rust/docker-compose.demo-n2ho.yml, used by
+# scripts/demo/d440a-check.sh (nextgsim#462 PR 3c, demo d440a-ai-paging): the
+# six-gNB one-TAC grid of config/demo-ai-paging/d440a-scenario.yaml on the n2ho
+# stack's private network, and one live seed's UE. Publishes nothing (the check
+# asserts the merged model has no published port).
+#
+#   service   config (config/demo-ai-paging/)  NCI    gNB ID  position    address
+#   gnb-west  gnb-1.yaml                       0x010  1       (0, 0)      172.23.0.100
+#   gnb-east  gnb-2.yaml                       0x020  2       (120, 0)    172.23.0.102
+#   gnb-3     gnb-3.yaml                       0x030  3       (240, 0)    172.23.0.103
+#   gnb-4     gnb-4.yaml                       0x040  4       (0, 120)    172.23.0.104
+#   gnb-5     gnb-5.yaml                       0x050  5       (120, 120)  172.23.0.105
+#   gnb-6     gnb-6.yaml                       0x060  6       (240, 120)  172.23.0.106
+#   ue        ue-seed-${D440A_SEED}.yaml                                  172.23.0.101
+#
+# The run's settings, set by the check:
+#   D440A_MODE          off | page-all | last-served | ct | lsq. Each gNB's
+#                       entrypoint cuts its config at `demo:` and appends the
+#                       D440A block in this mode, or nothing for `off`.
+#   D440A_SEED          the live seed; the UE runs ue-seed-<seed>.yaml.
+#   D440A_AMF_STRATEGY  amfd's paging.strategy (TS 23.502 §4.2.3.3), inserted
+#                       under `amf:` in a copy of its config: recommended-first,
+#                       or registration-area for the revert arm.
+#
+# Images (built by the check's caller): nextgsim-gnb:latest built with
+# --features demo-d440a-ai-paging; everything else from the n2ho stack.
+x-gnb-start: &gnb-start |
+  set -eu
+  sed '/^demo:/,$$d' "/etc/nextgsim/demo-ai-paging/$$GNB_CONFIG" > /tmp/gnb.yaml
+  if [ "$$D440A_MODE" != off ]; then
+    printf 'demo:\n  enabled: true\n  d440a-ai-paging:\n    enabled: true\n    mode: %s\n' "$$D440A_MODE" >> /tmp/gnb.yaml
+  fi
+  exec nr-gnb -c /tmp/gnb.yaml
+
+x-gnb-extra: &gnb-extra
+  image: nextgsim-gnb:latest
+  restart: on-failure:5
+  entrypoint: ["/bin/sh", "-c"]
+  command: [*gnb-start]
+  volumes:
+    - ${NEXTGSIM_DIR:-../../../nextgsim}/config:/etc/nextgsim:ro
+  healthcheck:
+    test: ["CMD-SHELL", "kill -0 1"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 10s
+  depends_on:
+    amf:
+      condition: service_healthy
+    upf:
+      condition: service_healthy
+
+services:
+  amf:
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      D440A_AMF_STRATEGY: ${D440A_AMF_STRATEGY:-recommended-first}
+    command:
+      - |
+        set -eu
+        sed "s/^amf:$$/amf:\n  paging:\n    strategy: $$D440A_AMF_STRATEGY/" /etc/nextgcore/amf.yaml > /tmp/amf.yaml
+        grep -q "^    strategy: $$D440A_AMF_STRATEGY$$" /tmp/amf.yaml
+        exec /usr/local/bin/nf-binary -c /tmp/amf.yaml --ngap-addr 0.0.0.0:38412
+
+  gnb-west:
+    entrypoint: ["/bin/sh", "-c"]
+    command: [*gnb-start]
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-1.yaml
+
+  gnb-east:
+    entrypoint: ["/bin/sh", "-c"]
+    command: [*gnb-start]
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-2.yaml
+
+  gnb-3:
+    <<: *gnb-extra
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-3.yaml
+    networks:
+      core:
+        ipv4_address: 172.23.0.103
+
+  gnb-4:
+    <<: *gnb-extra
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-4.yaml
+    networks:
+      core:
+        ipv4_address: 172.23.0.104
+
+  gnb-5:
+    <<: *gnb-extra
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-5.yaml
+    networks:
+      core:
+        ipv4_address: 172.23.0.105
+
+  gnb-6:
+    <<: *gnb-extra
+    environment:
+      RUST_LOG: info
+      D440A_MODE: ${D440A_MODE:-ct}
+      GNB_CONFIG: gnb-6.yaml
+    networks:
+      core:
+        ipv4_address: 172.23.0.106
+
+  ue:
+    command: ["-c", "/etc/nextgsim/demo-ai-paging/ue-seed-${D440A_SEED:-1}.yaml"]
+    depends_on:
+      gnb-3:
+        condition: service_healthy
+      gnb-4:
+        condition: service_healthy
+      gnb-5:
+        condition: service_healthy
+      gnb-6:
+        condition: service_healthy

@@ -1,0 +1,24 @@
+Revert arm of scripts/demo/d440a-check.sh (#462 PR 3c): the gNB still asks its
+NWDAF for the recommendation and logs it, but sends the UE Context Release
+Complete without the Information on Recommended Cells and RAN Nodes for Paging
+IE (TS 38.413 §9.3.1.100). amfd, under paging.strategy recommended-first, then
+has nothing to page first and pages the whole registration area, so the check
+must fail at amf step 1/2 (the recommended gNBs paged first). Needs a gNB
+rebuilt with the patch applied (ci.yml demo-d440a runs it last).
+
+  scripts/demo/revert-run.sh --expect "[amf] step 1/2 missing" \
+      scripts/demo/reverts/d440a-no-ie.patch -- <rebuild the gNB> && scripts/demo/d440a-check.sh ct 1
+
+diff --git a/nextgsim-gnb/src/ngap/task.rs b/nextgsim-gnb/src/ngap/task.rs
+index 167ffd7..f4567cf 100644
+--- a/nextgsim-gnb/src/ngap/task.rs
++++ b/nextgsim-gnb/src/ngap/task.rs
+@@ -2874,7 +2874,7 @@ impl NgapTask {
+         let mut complete_params = UeContextReleaseCompleteParams {
+             amf_ue_ngap_id,
+             ran_ue_ngap_id,
+-            recommended_paging,
++            recommended_paging: { let _ = recommended_paging; None },
+         };
+ 
+         let mut encoded = encode_ue_context_release_complete(&complete_params);
