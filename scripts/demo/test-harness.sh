@@ -13,6 +13,11 @@
 # `cond && ok ... || not_ok ...` throughout: ok only prints and cannot fail.
 # shellcheck disable=SC2015
 set -euo pipefail
+# The self-test runs with d441d-check.sh's defaults. A CI job that exports a knob
+# (the demo-d441d job sets D441D_SEEDS from its dispatch input) must not leak
+# into it: with D441D_SEEDS=1, the staging check found no seed-24 and failed
+# (dispatch 44348931667).
+while read -r v; do unset "$v"; done < <(compgen -e | grep '^D441D_' || true)
 
 here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "$here/../.." && pwd)"
