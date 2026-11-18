@@ -1,0 +1,15 @@
+diff --git a/nextgsim-gnb/src/nwdaf/task.rs b/nextgsim-gnb/src/nwdaf/task.rs
+index 8dfae1f..0d645e8 100644
+--- a/nextgsim-gnb/src/nwdaf/task.rs
++++ b/nextgsim-gnb/src/nwdaf/task.rs
+@@ -629,6 +629,10 @@ impl NwdafTask {
+         use crate::nwdaf::d441d::{lsq_prediction, Predictor, HORIZON_MS};
+         use nextgsim_demo::demo_log;
+ 
++        // REVERT d441d-tick-off: the NWDAF tick does nothing.
++        if now > 0 {
++            return Vec::new();
++        }
+         let Some(mut st) = self.d441d.take() else {
+             return Vec::new();
+         };

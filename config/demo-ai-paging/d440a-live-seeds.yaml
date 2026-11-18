@@ -1,0 +1,58 @@
+# D440A live seeds (nextgsim#462 PR 3c). GENERATED from
+# config/demo-ai-paging/d440a-scenario.yaml by nextgsim-gnb
+# nwdaf::d440a::replay::live; do not edit by hand.
+#
+# For each live seed: its UE config, and the route's clock in seconds after
+# the UE logs `Simulated motion started`: the harness releases the UE at
+# release_at_s and sends it downlink data at page_at_s. `replay` is what the
+# in-process replay gives the same route in each model-free mode (gNB IDs).
+# It is recorded next to the live result and is NOT asserted against it:
+# the live run has heartbeat jitter, connected-mode handovers and real NGAP
+# timing, none of which the replay models.
+start_after_secs: 60
+seeds:
+  - seed: 1
+    ue_config: ue-seed-1.yaml
+    release_at_s: 15
+    page_at_s: 35
+    replay:
+      page-all: { serving: 0x6, recommended: [0x1, 0x2, 0x3, 0x4, 0x5, 0x6], answering: 0x6, first_attempt_hit: true, pagings: 6 }
+      last-served: { serving: 0x6, recommended: [0x6], answering: 0x6, first_attempt_hit: true, pagings: 1 }
+      ct: { serving: 0x6, recommended: [0x6], answering: 0x6, first_attempt_hit: true, pagings: 1 }
+      lsq: { serving: 0x6, recommended: [0x6], answering: 0x6, first_attempt_hit: true, pagings: 1 }
+  - seed: 2
+    ue_config: ue-seed-2.yaml
+    release_at_s: 15
+    page_at_s: 30
+    replay:
+      page-all: { serving: 0x5, recommended: [0x1, 0x2, 0x3, 0x4, 0x5, 0x6], answering: 0x4, first_attempt_hit: true, pagings: 6 }
+      last-served: { serving: 0x5, recommended: [0x5], answering: 0x4, first_attempt_hit: false, pagings: 7 }
+      ct: { serving: 0x5, recommended: [0x5, 0x4], answering: 0x4, first_attempt_hit: true, pagings: 2 }
+      lsq: { serving: 0x5, recommended: [0x5, 0x4], answering: 0x4, first_attempt_hit: true, pagings: 2 }
+  - seed: 3
+    ue_config: ue-seed-3.yaml
+    release_at_s: 15
+    page_at_s: 35
+    replay:
+      page-all: { serving: 0x2, recommended: [0x1, 0x2, 0x3, 0x4, 0x5, 0x6], answering: 0x2, first_attempt_hit: true, pagings: 6 }
+      last-served: { serving: 0x2, recommended: [0x2], answering: 0x2, first_attempt_hit: true, pagings: 1 }
+      ct: { serving: 0x2, recommended: [0x2], answering: 0x2, first_attempt_hit: true, pagings: 1 }
+      lsq: { serving: 0x2, recommended: [0x2], answering: 0x2, first_attempt_hit: true, pagings: 1 }
+  - seed: 4
+    ue_config: ue-seed-4.yaml
+    release_at_s: 15
+    page_at_s: 31
+    replay:
+      page-all: { serving: 0x4, recommended: [0x1, 0x2, 0x3, 0x4, 0x5, 0x6], answering: 0x4, first_attempt_hit: true, pagings: 6 }
+      last-served: { serving: 0x4, recommended: [0x4], answering: 0x4, first_attempt_hit: true, pagings: 1 }
+      ct: { serving: 0x4, recommended: [0x4], answering: 0x4, first_attempt_hit: true, pagings: 1 }
+      lsq: { serving: 0x4, recommended: [0x4], answering: 0x4, first_attempt_hit: true, pagings: 1 }
+  - seed: 5
+    ue_config: ue-seed-5.yaml
+    release_at_s: 15
+    page_at_s: 35
+    replay:
+      page-all: { serving: 0x2, recommended: [0x1, 0x2, 0x3, 0x4, 0x5, 0x6], answering: 0x6, first_attempt_hit: true, pagings: 6 }
+      last-served: { serving: 0x2, recommended: [0x2], answering: 0x6, first_attempt_hit: false, pagings: 7 }
+      ct: { serving: 0x2, recommended: [0x2, 0x6], answering: 0x6, first_attempt_hit: true, pagings: 2 }
+      lsq: { serving: 0x2, recommended: [0x2, 0x6], answering: 0x6, first_attempt_hit: true, pagings: 2 }
