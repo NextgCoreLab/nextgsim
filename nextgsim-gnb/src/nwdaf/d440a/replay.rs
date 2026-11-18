@@ -667,7 +667,7 @@ pub(crate) fn table_lines(
 mod tests {
     use super::*;
 
-    const MODES: [(&str, Option<Predictor>); 4] = [
+    pub(super) const MODES: [(&str, Option<Predictor>); 4] = [
         ("page-all", None),
         ("last-served", Some(Predictor::LastServed)),
         ("ct", Some(Predictor::ConstantTurn)),
@@ -954,3 +954,6 @@ mod tests {
         }
     }
 }
+
+/// The live harness configs, generated from the same scenario (#462 PR 3c).
+mod live;

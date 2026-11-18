@@ -243,4 +243,23 @@ for p in "$here"/reverts/*.patch; do
 done
 [ "$n" -gt 0 ] && ok "every patch under reverts/ applies ($n)" || not_ok "no revert patch found"
 
+# --- d440a-check.sh refuses a bad run before it touches docker (#462 PR 3c) ---
+# Only the refusal on stderr is kept (stdout is dropped), hence the order.
+# shellcheck disable=SC2069
+d440a() { NR_CLI=/nonexistent "$here/d440a-check.sh" "$@" 2>&1 >/dev/null; }
+for bad in "bogus 1|usage:" "onnx 1|usage:" "ct 999|is not a live seed" \
+    "page-all 1 revert-amf|needs a predictor mode" "ct 1 sideways|unknown variant"; do
+    args="${bad%%|*}"; want="${bad#*|}"
+    # shellcheck disable=SC2086 # the arguments are meant to split
+    if err="$(d440a $args)"; then not_ok "d440a-check.sh $args passed"; fi
+    case "$err" in *"$want"*) ok "d440a-check.sh $args: refused ($want)" ;; *) not_ok "d440a-check.sh $args: $err" ;; esac
+done
+# Every live seed resolves to its clock; nr-cli is the first missing thing.
+for seed in $(python3 -c "import yaml,sys; print(' '.join(str(s['seed']) for s in yaml.safe_load(open(sys.argv[1]))['seeds']))" \
+    "$repo/config/demo-ai-paging/d440a-live-seeds.yaml"); do
+    err="$(d440a ct "$seed" || true)"
+    case "$err" in *"no nr-cli at /nonexistent"*) ;; *) not_ok "d440a-check.sh ct $seed: $err" ;; esac
+done
+ok "d440a-check.sh: every live seed resolves to its release and page times"
+
 echo "all ${pass} harness checks passed"
