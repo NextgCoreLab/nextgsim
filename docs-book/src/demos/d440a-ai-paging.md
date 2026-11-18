@@ -182,20 +182,33 @@ This is one seed, so it is one data point per mode, not a rate. ct live also nam
 heartbeat jitter and real NGAP timing, which the replay does not model.
 
 ### Live, devtest1 EKS (seed 1)
-*To be filled in from the operator's run.*
+The operator authorized this run on 2026-11-18. It ran from nextgcore 5d5460fb
+(#1783) and nextgsim 88d6b9c (#584), under `flock /tmp/eks-nextg-demo.lock`,
+one arm per hold. Every arm met its expectation, and every chain holds. The
+revert arm fails at `[amf] step 1/2` only.
 - Source: `/tmp/eks-val/demos/d440a-ai-paging/<arm>/latest/verdict.txt` and `scenario/result.txt`.
-- Base core tag: `demo-d441d-predictive-ho-36f2b6b0-20c21bf2`, with amf, gnb and ue built by `build-images.sh`.
+- Images: `demo-d440a-ai-paging-5d5460fb-88d6b9c1`. amf, gnb and ue were built by
+  `build-images.sh`. The other core NFs carry the base tag
+  `demo-d441d-predictive-ho-36f2b6b0-20c21bf2`.
+- The UE was released 22.1–23.5 s into each run (`release_offset_s`).
 
-| arm | verdict | serving | recommended | attempt-1 targets | answered | attempt-1 hit | PAGINGs |
-|---|---|---|---|---|---|---|---|
-| ct | | | | | | | |
-| last-served | | | | | | | |
-| lsq | | | | | | | |
-| page-all | | | | | | | |
-| off | | | | | | | |
-| ct + revert (must FAIL at `[amf]`) | | | | | | | |
+| arm | run | verdict | serving | recommended | attempt-1 targets | answered | attempt-1 hit | PAGINGs |
+|---|---|---|---|---|---|---|---|---|
+| ct | 20261118T185021Z | PASS | gnb-6 | [6] | [6] | 0x6 | yes | 1 |
+| last-served | 20261118T185958Z | PASS | gnb-6 | [6] | [6] | 0x6 | yes | 1 |
+| lsq | 20261118T190932Z | PASS | gnb-6 | [6] | [6] | 0x6 | yes | 1 |
+| page-all | 20261118T191915Z | PASS | gnb-6 | (no IE) | [3, 4, 6, 5, 1, 2] | 0x6 | yes | 6 |
+| off | 20261118T192954Z | PASS | gnb-6 | (no IE) | (demo off) | — | — | 6 |
+| ct + revert (must FAIL at `[amf]`) | 20261118T193934Z | FAIL, as required | gnb-6 | (no IE) | (demo off) | — | — | 6 |
 
-Images: `core_image=` / `sim_image=` from each `verdict.txt`. Run stamp: ____. Teardown: ____.
+The revert arm's record: `scenario/analyze.txt` says "VERDICT: REVERT HOLDS:
+fails at [amf] step 1/2 only, every other check holds". demo-check's only FAIL
+line is `no nextg_demo_enabled{demo=d440a-ai-paging,mode=ct} series`, because
+amfd's demo is off. Teardown was ok on every arm.
+
+This is one seed, so one data point per mode, not a rate. On EKS, ct
+recommended only 0x6, where compose ct also named 0x5. Both still hit on
+attempt 1.
 
 ## Honesty labels and limitations
 - **Non-normative inputs.** The positions the predictors use are simulator ground truth carried on RLS heartbeats. The prediction is this simulator's research layer, not a 3GPP procedure. Only the IE, its storage and its use by the AMF are standard (TS 38.413 §9.3.1.100, TS 23.502 §4.2.3.3).
