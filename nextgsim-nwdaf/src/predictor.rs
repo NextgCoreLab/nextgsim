@@ -33,6 +33,12 @@ pub struct PredictionOutput {
     pub confidence: f32,
     /// Which method produced this prediction
     pub method: PredictionMethod,
+    /// The newest observed sample, `(position, timestamp_ms)`, a model
+    /// prediction extends (nextgsim#587). `Some` for a model prediction, whose
+    /// waypoints may be a single point and so carry no speed of their own;
+    /// `None` for the least-squares fit, whose waypoints lie on the fitted
+    /// line and are measured among themselves. See [`prediction_speed_mps`].
+    pub origin: Option<(Vector3, u64)>,
 }
 
 /// Predictor with optional ONNX support; linear extrapolation is operational.
@@ -215,7 +221,8 @@ impl OnnxPredictor {
     ///
     /// If an ONNX model is loaded, flattens the position history into a
     /// tensor `[1, num_points, 3]` and runs inference. The model is expected
-    /// to output `[1, num_waypoints, 3]` predicted positions.
+    /// to output `[1, num_waypoints, 3]` predicted positions, one sample step
+    /// apart after the newest sample ([`model_trajectory`]).
     ///
     /// If no model is loaded, falls back to linear extrapolation using the
     /// last two positions in the history.
@@ -251,7 +258,7 @@ impl OnnxPredictor {
         }
 
         if self.has_model() {
-            match self.predict_with_model(positions, horizon_ms, current_time_ms) {
+            match self.predict_with_model(positions, timestamps, horizon_ms, current_time_ms) {
                 Ok(output) => return Ok(output),
                 Err(e) => {
                     warn!(
@@ -271,6 +278,7 @@ impl OnnxPredictor {
     fn predict_with_model(
         &self,
         positions: &[Vector3],
+        timestamps: &[u64],
         horizon_ms: u32,
         current_time_ms: u64,
     ) -> Result<PredictionOutput, PredictionError> {
@@ -304,41 +312,13 @@ impl OnnxPredictor {
                     reason: "Model output is not Float32".to_string(),
                 })?;
 
-        if output_data.len() % 3 != 0 {
-            return Err(PredictionError::InferenceFailed {
-                reason: format!(
-                    "Model output length {} is not divisible by 3",
-                    output_data.len()
-                ),
-            });
-        }
-
-        let num_waypoints = output_data.len() / 3;
-        let step_ms = if num_waypoints > 0 {
-            horizon_ms / num_waypoints as u32
-        } else {
-            horizon_ms
-        };
-
-        let waypoints: Vec<(Vector3, u64)> = output_data
-            .chunks(3)
-            .enumerate()
-            .map(|(i, chunk)| {
-                let pos = Vector3::new(
-                    f64::from(chunk[0]),
-                    f64::from(chunk[1]),
-                    f64::from(chunk[2]),
-                );
-                let ts = current_time_ms + ((i as u64 + 1) * u64::from(step_ms));
-                (pos, ts)
-            })
-            .collect();
-
-        Ok(PredictionOutput {
-            waypoints,
-            confidence: 0.9, // ML model predictions get high base confidence
-            method: PredictionMethod::OnnxModel,
-        })
+        model_trajectory(
+            output_data,
+            positions,
+            timestamps,
+            horizon_ms,
+            current_time_ms,
+        )
     }
 
     /// OPERATIONAL ALGORITHM: least-squares linear extrapolation (the path that
@@ -443,6 +423,103 @@ pub const LSQ_WINDOW: usize = 10;
 /// R² scaled by `(n - 2) / (LSQ_FULL_CONFIDENCE_SAMPLES - 2)`, capped at 1: two
 /// samples give 0, three a third, five or more the full R².
 pub const LSQ_FULL_CONFIDENCE_SAMPLES: usize = 5;
+
+/// A trajectory model's output tensor as a prediction (nextgsim#587): the
+/// waypoints, their timestamps and the observed sample they extend.
+///
+/// `output` is the model's `[1, num_waypoints, 3]` positions, flattened. The
+/// model's input is the position history alone, with no times, so the only
+/// time step a model can predict in is the history's own sample step: output
+/// `i` (from 0) is stamped `newest + (i + 1) * step`, where `newest` is the
+/// newest sample's timestamp and `step` the interval between the last two
+/// samples. The D440B reference model (`next = 2 * last - prev`) predicts
+/// exactly one such step: at the 1 s RLS heartbeat its one waypoint is 1 s
+/// after the newest sample, not at `current_time_ms + horizon_ms`. When the
+/// timestamps cannot give a step (not one per position, or the last two equal)
+/// the waypoints are spread over `horizon_ms` from `current_time_ms`, as before.
+///
+/// The prediction's `origin` is the newest sample (its timestamp, or
+/// `current_time_ms` without one per position), so its speed is measured from
+/// where the UE was last seen ([`prediction_speed_mps`]); a one-waypoint
+/// output has no speed of its own.
+///
+/// # Errors
+///
+/// `InferenceFailed` if `output` is not a whole number of positions.
+pub fn model_trajectory(
+    output: &[f32],
+    positions: &[Vector3],
+    timestamps: &[u64],
+    horizon_ms: u32,
+    current_time_ms: u64,
+) -> Result<PredictionOutput, PredictionError> {
+    if !output.len().is_multiple_of(3) {
+        return Err(PredictionError::InferenceFailed {
+            reason: format!("Model output length {} is not divisible by 3", output.len()),
+        });
+    }
+    let num_waypoints = output.len() / 3;
+    let aligned = timestamps.len() == positions.len();
+    let sample_step = match (aligned, timestamps) {
+        (true, [.., prev, last]) if last > prev => Some((*last, last - prev)),
+        _ => None,
+    };
+    let (base_ms, step_ms) = sample_step.unwrap_or_else(|| {
+        let spread = if num_waypoints > 0 {
+            horizon_ms / num_waypoints as u32
+        } else {
+            horizon_ms
+        };
+        (current_time_ms, u64::from(spread))
+    });
+
+    let waypoints: Vec<(Vector3, u64)> = output
+        .chunks(3)
+        .enumerate()
+        .map(|(i, chunk)| {
+            let pos = Vector3::new(
+                f64::from(chunk[0]),
+                f64::from(chunk[1]),
+                f64::from(chunk[2]),
+            );
+            (pos, base_ms + (i as u64 + 1) * step_ms)
+        })
+        .collect();
+
+    let origin_ms = match (aligned, timestamps.last()) {
+        (true, Some(&t)) => t,
+        _ => current_time_ms,
+    };
+    Ok(PredictionOutput {
+        waypoints,
+        confidence: 0.9, // ML model predictions get high base confidence
+        method: PredictionMethod::OnnxModel,
+        origin: positions.last().map(|p| (*p, origin_ms)),
+    })
+}
+
+/// The speed in m/s a prediction implies (nextgsim#587): from `origin`, the
+/// newest observed sample, to the last waypoint when there is one; otherwise
+/// [`waypoint_speed_mps`] between the waypoints. 0 for no waypoints, a last
+/// waypoint not after the origin, or a non-finite result.
+pub fn prediction_speed_mps(origin: Option<(Vector3, u64)>, waypoints: &[(Vector3, u64)]) -> f64 {
+    let Some((o, to)) = origin else {
+        return waypoint_speed_mps(waypoints);
+    };
+    let Some((b, tb)) = waypoints.last() else {
+        return 0.0;
+    };
+    let dt_s = tb.saturating_sub(to) as f64 / 1000.0;
+    if dt_s <= 0.0 {
+        return 0.0;
+    }
+    let speed = o.distance_to(b) / dt_s;
+    if speed.is_finite() {
+        speed
+    } else {
+        0.0
+    }
+}
 
 /// The speed in m/s a list of waypoints implies: the straight-line distance
 /// from the first to the last waypoint over the time between them. 0 for fewer
@@ -579,6 +656,7 @@ pub fn least_squares_trajectory(
         waypoints,
         confidence,
         method: PredictionMethod::LinearExtrapolation,
+        origin: None,
     }
 }
 
@@ -848,6 +926,77 @@ mod tests {
             (Vector3::new(9.0, 0.0, 0.0), 5),
         ];
         assert_eq!(waypoint_speed_mps(&same_time), 0.0);
+    }
+
+    /// What the D440B reference model computes, `2 * last - prev`, as its f32
+    /// output tensor: one waypoint.
+    fn one_step_model(p: &[Vector3]) -> Vec<f32> {
+        let (l, q) = (p[p.len() - 1], p[p.len() - 2]);
+        vec![
+            (2.0 * l.x - q.x) as f32,
+            (2.0 * l.y - q.y) as f32,
+            (2.0 * l.z - q.z) as f32,
+        ]
+    }
+
+    /// nextgsim#587: a one-waypoint model prediction is measured from the
+    /// newest observed sample, so a UE walking 5 m/s is mobility. Between its
+    /// waypoints alone (first = last) the speed is 0, which is what kept the
+    /// D441D onnx arm from ever predicting.
+    #[test]
+    fn a_one_waypoint_model_prediction_moves_from_the_newest_sample() {
+        let (p, t) = track(|i| (20.0 + 5.0 * i, 0.0), 6);
+        let out = model_trajectory(&one_step_model(&p), &p, &t, 2000, t[5]).unwrap();
+        assert_eq!(out.waypoints.len(), 1);
+        assert_eq!(out.method, PredictionMethod::OnnxModel);
+        assert_eq!(out.origin, Some((p[5], t[5])));
+        assert_eq!(waypoint_speed_mps(&out.waypoints), 0.0, "no span alone");
+        let v = prediction_speed_mps(out.origin, &out.waypoints);
+        assert!((v - 5.0).abs() < 1e-9, "{v}");
+        assert!(crate::is_predicted_mobility(
+            out.confidence,
+            out.origin,
+            &out.waypoints
+        ));
+        // A parked UE is still not mobility.
+        let (p, t) = track(|_| (40.0, 7.0), 6);
+        let out = model_trajectory(&one_step_model(&p), &p, &t, 2000, t[5]).unwrap();
+        assert_eq!(prediction_speed_mps(out.origin, &out.waypoints), 0.0);
+        assert!(!crate::is_predicted_mobility(
+            out.confidence,
+            out.origin,
+            &out.waypoints
+        ));
+        // Without an origin the speed is between the waypoints, as before.
+        let (p, t) = track(|i| (35.0 + 2.5 * i, 0.0), 10);
+        let lsq = least_squares_trajectory(&p, &t, 1000, t[9]);
+        assert_eq!(lsq.origin, None);
+        assert_eq!(
+            prediction_speed_mps(None, &lsq.waypoints),
+            waypoint_speed_mps(&lsq.waypoints)
+        );
+    }
+
+    /// nextgsim#587: `2 * last - prev` is one sample step after the newest
+    /// sample, so that is where its waypoint is stamped (1 s at the RLS
+    /// heartbeat), not at `current + horizon` (2 s for D441D). A history whose
+    /// timestamps give no step keeps the old spread over the horizon.
+    #[test]
+    fn the_model_waypoint_is_stamped_one_sample_step_ahead() {
+        let (p, t) = track(|i| (20.0 + 5.0 * i, 0.0), 6);
+        let out = model_trajectory(&one_step_model(&p), &p, &t, 2000, t[5]).unwrap();
+        assert_eq!(out.waypoints[0].1, t[5] + 1000);
+        assert_eq!(out.waypoints[0].0, Vector3::new(50.0, 0.0, 0.0));
+        // Two outputs are two steps.
+        let two = [1.0f32, 0.0, 0.0, 2.0, 0.0, 0.0];
+        let out = model_trajectory(&two, &p, &t, 2000, t[5]).unwrap();
+        let ts: Vec<u64> = out.waypoints.iter().map(|w| w.1).collect();
+        assert_eq!(ts, [t[5] + 1000, t[5] + 2000]);
+        // No usable step: spread over the horizon from current_time_ms.
+        let out = model_trajectory(&one_step_model(&p), &p, &[], 2000, 9_000).unwrap();
+        assert_eq!(out.waypoints[0].1, 11_000);
+        assert_eq!(out.origin, Some((p[5], 9_000)));
+        assert!(model_trajectory(&[1.0, 2.0], &p, &t, 2000, t[5]).is_err());
     }
 
     /// The predictor's fallback is exactly this fit.

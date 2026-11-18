@@ -180,12 +180,21 @@ pub const MIN_PREDICTED_MOBILITY_SPEED_MPS: f64 = 0.5;
 pub const SIGNAL_BASED_HANDOVER_CONFIDENCE: f32 = 0.85;
 
 /// Whether a trajectory prediction is evidence of mobility (nextgsim#467): its
-/// confidence is finite and above [`PREDICTED_MOBILITY_CONFIDENCE`], and its
-/// waypoints move at least [`MIN_PREDICTED_MOBILITY_SPEED_MPS`].
-pub fn is_predicted_mobility(confidence: f32, waypoints: &[(Vector3, u64)]) -> bool {
+/// confidence is finite and above [`PREDICTED_MOBILITY_CONFIDENCE`], and it
+/// moves at least [`MIN_PREDICTED_MOBILITY_SPEED_MPS`].
+///
+/// The speed is [`predictor::prediction_speed_mps`]: from `origin`, the newest
+/// observed sample, to the last waypoint for a model prediction (nextgsim#587:
+/// the D440B model emits one waypoint, which alone has no speed), and between
+/// the waypoints for the least-squares fit (`origin` `None`).
+pub fn is_predicted_mobility(
+    confidence: f32,
+    origin: Option<(Vector3, u64)>,
+    waypoints: &[(Vector3, u64)],
+) -> bool {
     confidence.is_finite()
         && confidence > PREDICTED_MOBILITY_CONFIDENCE
-        && predictor::waypoint_speed_mps(waypoints) >= MIN_PREDICTED_MOBILITY_SPEED_MPS
+        && predictor::prediction_speed_mps(origin, waypoints) >= MIN_PREDICTED_MOBILITY_SPEED_MPS
 }
 
 /// UE measurement data
@@ -243,6 +252,11 @@ pub struct TrajectoryPrediction {
     pub confidence: f32,
     /// Prediction horizon in milliseconds
     pub horizon_ms: u32,
+    /// The newest observed sample a model prediction extends
+    /// ([`predictor::PredictionOutput::origin`], nextgsim#587); `None` for the
+    /// least-squares fit.
+    #[serde(default)]
+    pub origin: Option<(Vector3, u64)>,
 }
 
 impl TrajectoryPrediction {
@@ -548,6 +562,7 @@ impl NwdafManager {
                         waypoints: output.waypoints,
                         confidence: output.confidence,
                         horizon_ms,
+                        origin: output.origin,
                     },
                     by_model,
                 ));
@@ -571,6 +586,7 @@ impl NwdafManager {
                 waypoints,
                 confidence,
                 horizon_ms,
+                origin: None,
             },
             false,
         ))
@@ -601,7 +617,7 @@ impl NwdafManager {
         // SIGNAL_BASED_HANDOVER_CONFIDENCE.
         let prediction = self.predict_trajectory(ue_id, 1000);
         let (reason, confidence) = match prediction {
-            Some(p) if is_predicted_mobility(p.confidence, &p.waypoints) => {
+            Some(p) if is_predicted_mobility(p.confidence, p.origin, &p.waypoints) => {
                 (HandoverReason::PredictedMobility, p.confidence)
             }
             _ => (
@@ -1262,11 +1278,17 @@ mod tests {
                 )
             })
             .collect(); // 0.4 m/s
-        assert!(is_predicted_mobility(0.9, &moving));
-        assert!(!is_predicted_mobility(0.7, &moving), "0.7 is not above 0.7");
-        assert!(!is_predicted_mobility(f32::NAN, &moving));
-        assert!(!is_predicted_mobility(0.9, &slow), "below the speed floor");
-        assert!(!is_predicted_mobility(0.9, &[]));
+        assert!(is_predicted_mobility(0.9, None, &moving));
+        assert!(
+            !is_predicted_mobility(0.7, None, &moving),
+            "0.7 is not above 0.7"
+        );
+        assert!(!is_predicted_mobility(f32::NAN, None, &moving));
+        assert!(
+            !is_predicted_mobility(0.9, None, &slow),
+            "below the speed floor"
+        );
+        assert!(!is_predicted_mobility(0.9, None, &[]));
     }
 
     #[test]

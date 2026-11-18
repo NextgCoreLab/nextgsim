@@ -536,6 +536,7 @@ impl Anlf {
             waypoints: prediction_output.waypoints,
             confidence: prediction_output.confidence,
             horizon_ms,
+            origin: prediction_output.origin,
         };
 
         let result = AnalyticsResult {
@@ -608,7 +609,13 @@ impl Anlf {
             pred.predict_trajectory(&positions, &timestamps, 1000, current_time)
                 .ok()
         }) {
-            Some(output) if crate::is_predicted_mobility(output.confidence, &output.waypoints) => {
+            Some(output)
+                if crate::is_predicted_mobility(
+                    output.confidence,
+                    output.origin,
+                    &output.waypoints,
+                ) =>
+            {
                 (HandoverReason::PredictedMobility, output.confidence)
             }
             _ => (
