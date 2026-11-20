@@ -1,9 +1,9 @@
-//! #139 — sidelink ranging end to end, from an SL-PRS occasion to the bytes that
-//! leave the UE.
+//! #139, moved onto SLPP by nextgcore #557: sidelink ranging end to end, from an
+//! SL-PRS occasion to the bytes that leave the UE.
 //!
-//! Runs the REAL sidelink and ranging tasks and the REAL LPP endpoint in one
-//! process, and asserts the **range recovered from the UL NAS TRANSPORT the UE
-//! emits** — not a log line, and not an in-process value read out of a task:
+//! Runs the REAL sidelink and ranging tasks and the REAL SLPP endpoint in one
+//! process, and asserts the **SL Rx-Tx value recovered from the UL NAS TRANSPORT
+//! the UE emits**, not a log line and not an in-process value read out of a task:
 //!
 //! ```text
 //! SidelinkMessage::SlPrsOccasion
@@ -11,11 +11,11 @@
 //!   → RangingMessage::{StartRanging, RttMeasurement, CarrierPhaseMeasurement}
 //!   → ranging task: RTT distance, widelane ambiguity resolution
 //!   → RangingMessage::ReportToLmf
-//!   → NasMessage::SidelinkRangingReport
-//!   → the LPP endpoint holds it (in production: MmOrchestrator caches it)
-//!   → an LMF's LPP RequestLocationInformation arrives
-//!   → UL NAS TRANSPORT (payload container type LPP) carrying
-//!     ProvideLocationInformation with the report in addition group 4
+//!   → NasMessage::SidelinkRttMeasurements
+//!   → the SLPP endpoint holds them (in production: MmOrchestrator caches them)
+//!   → the LMF's SLPP RequestLocationInformation arrives (nextgcore's golden octets)
+//!   → UL NAS TRANSPORT (payload container type 12, SLPP) carrying
+//!     ProvideLocationInformation with sl-RTT measurements (TS 38.355)
 //! ```
 //!
 //! **This file only compiles under `--features sidelink`**, and the ranging pipeline
@@ -24,32 +24,28 @@
 //!
 //! # What this does NOT assert, and why
 //!
-//! The issue asks for "the range or position result **held at the LMF**". The LMF is
-//! `nextgcore`'s `lmfd` — a different product, in a different repository, with **no
-//! build-time link to this one** (neither workspace depends on the other; the only
-//! mention is a comment about SCTP wire compatibility). CI checks out one repository,
-//! so a test here cannot reach lmfd's context, and the Docker jobs that could run
-//! both binaries are `workflow_dispatch`-only.
+//! That the LMF turns the measurement into a range. The LMF is nextgcore's `lmfd`, a
+//! different product in a different repository with no build-time link to this one,
+//! so the chain is asserted in two halves that meet at the bytes:
 //!
-//! So the chain is asserted in two halves that meet at the bytes:
+//! * **here**, the UE answers nextgcore's own `REQUEST_LOCATION_INFORMATION` golden
+//!   and the measurement leaves in a real NAS message of container type 12;
+//! * **in nextgcore** (#557), `lmfd` decodes this UE's hand-derived reply octets
+//!   (`nas::slpp`'s `UE_PROVIDE_LOCATION_INFORMATION`) and pairs the Rx-Tx halves.
 //!
-//! * **here** — the UE produces a report and it leaves in a real NAS message, with
-//!   the range read back out of that message;
-//! * **nextgcore #138** — `lmfd` files the range against the UE, and its LPP codec is
-//!   held against *this* UE's hand-derived golden vector, decoding it to the same
-//!   values and re-encoding to the same bytes.
-//!
-//! That is as far as an automated test can go without a cross-process harness. It is
-//! stated rather than papered over, and it is why the startup wording below still
-//! names what is not exercised.
+//! It also cannot tell a carrier-phase range from an RTT-only one any more: at the
+//! k = 2 reporting step (4 Tc, about 0.6 m of one-way flight) 50.00 m and 49.95 m map
+//! to the same report value. That is TS 38.133's resolution, not a loss here.
 
 #![cfg(feature = "sidelink")]
 
 use nextgsim_common::config::{RangingAnchor, RangingConfig, UeConfig};
-use nextgsim_ue::nas::lpp::{
-    LppBody, LppEndpoint, LppMessage, LppTransactionId, LppUplink, ServingCellMeasurements,
-    SidelinkRangingMethod,
+use nextgsim_slpp::generated::{
+    ProvideLocationInformationCriticalExtensions, SLPP_MessageBody, SLPP_MessageBody_c1,
+    SL_PRS_RxTxTimeDiffMeasResult, SL_PRS_RxTxTimeDiffResultSl_PRS_RxTxTimeDiffResult,
+    SL_RTT_ProvideLocationInformation,
 };
+use nextgsim_ue::nas::slpp::{application_layer_id, SlppEndpoint, SlppUplink};
 use nextgsim_ue::tasks::{
     NasMessage, RangingMessage, SidelinkMessage, Task, TaskHandle, TaskMessage, UeRel18Handles,
     UeTaskBase,
@@ -65,25 +61,14 @@ const ANCHOR_UE_ID: u64 = 0x00A5_A5A5;
 const ANCHOR_POSITION: [f64; 3] = [30.0, 40.0, 0.0];
 const EXPECTED_RANGE_M: f64 = 50.0;
 
-/// An LMF's `RequestLocationInformation`, from the peer's own hand-derived reference
-/// vector (see `nextgsim-ue/src/nas/lpp`'s `LMF_REQUEST_LOCATION_INFORMATION`):
-/// `transactionID { locationServer, 0 }, endTransaction TRUE, ecid
-/// requestedMeasurements '11000'B`.
-const LMF_REQUEST_LOCATION_INFORMATION: &[u8] = &[0x90, 0x01, 0x20, 0x09, 0x30];
+/// nextgcore lmfd's SLPP `RequestLocationInformation`, the golden
+/// `REQUEST_LOCATION_INFORMATION` of `nextgcore-slpp-gen`: transaction 2,
+/// rangeMeasurementsRequired, SL-RTT.
+const LMF_REQUEST_LOCATION_INFORMATION: &[u8] =
+    &[0x44, 0x04, 0x22, 0x40, 0x08, 0x00, 0xA0, 0x08, 0x40, 0x00];
 
-/// The serving-cell measurements an E-CID report is made of. The LPP layer has no
-/// radio of its own, so these are supplied rather than measured -- the same
-/// arrangement the UE's RRC layer uses in production.
-fn serving_cell() -> ServingCellMeasurements {
-    ServingCellMeasurements {
-        phys_cell_id: 7,
-        arfcn: 1850,
-        system_frame_number: None,
-        rsrp_result: Some(60),
-        rsrq_result: None,
-        ..Default::default()
-    }
-}
+/// TS 38.133 table 10.4A.4.1.1-1 (k = 2) for 50 m of one-way flight.
+const EXPECTED_RX_TX_K2: u32 = 246_338;
 
 fn ranging_config() -> UeConfig {
     UeConfig {
@@ -174,68 +159,84 @@ async fn an_sl_prs_occasion_becomes_a_range_in_the_ul_nas_transport_the_ue_sends
 
     let mut reported = None;
     while let Ok(msg) = h.nas_rx.try_recv() {
-        if let TaskMessage::Message(NasMessage::SidelinkRangingReport { results }) = msg {
-            reported = Some(results);
+        if let TaskMessage::Message(NasMessage::SidelinkRttMeasurements { measurements }) = msg {
+            reported = Some(measurements);
         }
     }
-    let reported = reported.expect("the report must reach the NAS task");
+    let reported = reported.expect("the measurements must reach the NAS task");
 
-    // 3. The LPP endpoint on the NAS plane answers an LMF's request with what it
+    // 3. The SLPP endpoint on the NAS plane answers the LMF's request with what it
     //    holds. Driven directly rather than through `MmOrchestrator`, which only
-    //    caches the report and delegates here -- that boundary has its own test in
-    //    the orchestrator (issue #137).
-    let mut endpoint = LppEndpoint::new();
-    let LppUplink::Send(pdu) =
-        endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, &serving_cell(), &reported)
+    //    caches the measurements and delegates here; that boundary has its own test.
+    let mut endpoint = SlppEndpoint::new(application_layer_id(1));
+    let SlppUplink::Send(pdu) =
+        endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, None, &reported)
     else {
-        panic!("an LPP location request must be answered");
+        panic!("an SLPP location request must be answered");
     };
 
-    // 4. The assertion that matters: the range, read out of the bytes that left.
+    // 4. The assertion that matters: the measurement, read out of the bytes that left.
     let ul = nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &pdu[3..])
         .expect("the UE emits a decodable UL NAS TRANSPORT");
     assert_eq!(
         ul.payload_container_type,
-        nextgsim_nas::ies::ie1::PayloadContainerType::LppMessage,
+        nextgsim_nas::ies::ie1::PayloadContainerType::SlppMessage,
         "an AMF routes on the container type, so a report in the wrong one reaches \
          the wrong consumer"
     );
-    let reply = LppMessage::decode(&ul.payload_container).expect("a decodable LPP message");
+    let reply = nextgsim_slpp::decode(&ul.payload_container).expect("a decodable SLPP message");
     assert_eq!(
-        reply.transaction_id,
-        Some(LppTransactionId {
-            initiator: nextgsim_ue::nas::lpp::Initiator::LocationServer,
-            transaction_number: 0,
-        }),
-        "the reply must echo the server's transaction so it can be matched"
+        reply.transaction_id.map(|t| t.0),
+        Some(2),
+        "the reply must echo the LMF's transaction so it can be matched"
     );
-
-    let Some(LppBody::ProvideLocationInformation { sidelink, .. }) = reply.body else {
+    let Some(SLPP_MessageBody::C1(SLPP_MessageBody_c1::ProvideLocationInformation(p))) =
+        reply.slpp_message_body
+    else {
         panic!("expected a ProvideLocationInformation");
     };
-    let report = sidelink.expect("the ranging report must be in the message that left the UE");
-    assert_eq!(report.results.len(), 1, "one anchor, one range");
-    let result = report.results[0];
+    let ProvideLocationInformationCriticalExtensions::ProvideLocationInformation(ies) =
+        p.critical_extensions
+    else {
+        panic!("criticalExtensionsFuture");
+    };
+    let report: SL_RTT_ProvideLocationInformation = nextgsim_slpp::decode_ie(
+        &ies.sl_rtt_provide_location_information
+            .expect("the SL-RTT report must be in the message that left the UE")
+            .0,
+    )
+    .expect("a decodable SL-RTT report");
+    let list = report
+        .sl_rtt_signal_measurement_information
+        .expect("measurements, not an error")
+        .sl_rtt_meas_list
+        .0;
+    assert_eq!(list.len(), 1, "one anchor, one measurement");
+    let element = &list[0].0[0];
     assert_eq!(
-        result.peer_layer2_id, ANCHOR_UE_ID as u32,
-        "the range must name the peer it was measured against"
+        element.application_layer_id.as_ref().map(|a| a.0.clone()),
+        application_layer_id(ANCHOR_UE_ID),
+        "the measurement must name the peer it was made against"
     );
-    assert_eq!(
-        result.range_cm,
-        (EXPECTED_RANGE_M * 100.0) as u32,
-        "the 30/40/50 m geometry must arrive as 5000 cm; the RTT-only estimate for \
-         the same geometry is 4995 cm, so this also says the widelane resolved"
-    );
-    assert_eq!(
-        result.method,
-        SidelinkRangingMethod::CarrierPhase,
-        "two carrier frequencies are configured by default, so the widelane \
-         combination must be what produced this range"
-    );
-    assert!(
-        result.measurement_count >= 1,
-        "and it must rest on at least one measurement"
-    );
+    let SL_PRS_RxTxTimeDiffMeasResult::Single_SL_PRS_RxTxTimeDiff(result) =
+        &element.sl_prs_rx_tx_time_diff_meas_result
+    else {
+        panic!("a single Rx-Tx result");
+    };
+    match &result.sl_prs_rx_tx_time_diff_result {
+        Some(SL_PRS_RxTxTimeDiffResultSl_PRS_RxTxTimeDiffResult::K2(v)) => {
+            assert_eq!(
+                nextgsim_ue::nas::slpp::rx_tx_report_value_k2(EXPECTED_RANGE_M / 299_792_458.0),
+                Some(EXPECTED_RX_TX_K2),
+                "the expected value is the table mapping of the geometry"
+            );
+            assert_eq!(
+                v.0, EXPECTED_RX_TX_K2,
+                "the 30/40/50 m geometry must arrive as its one-way flight time"
+            );
+        }
+        other => panic!("expected the k2 arm, got {other:?}"),
+    }
 }
 
 /// The negative control. Without it, "the range arrived" could mean the UE reports a
@@ -291,27 +292,38 @@ async fn a_ue_with_ranging_disabled_sends_no_range_at_all() {
         assert!(
             !matches!(
                 msg,
-                TaskMessage::Message(NasMessage::SidelinkRangingReport { .. })
+                TaskMessage::Message(NasMessage::SidelinkRttMeasurements { .. })
             ),
-            "a disabled ranging config must produce no report"
+            "a disabled ranging config must produce no measurement"
         );
     }
 
-    // And the LPP reply carries no report either, so the encoding is what a UE
-    // without sidelink ranging has always sent.
-    let mut endpoint = LppEndpoint::new();
-    let LppUplink::Send(pdu) =
-        endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, &serving_cell(), &[])
+    // And the SLPP reply says so rather than inventing a measurement.
+    let mut endpoint = SlppEndpoint::new(application_layer_id(1));
+    let SlppUplink::Send(pdu) =
+        endpoint.handle_nas_container(LMF_REQUEST_LOCATION_INFORMATION, None, &[])
     else {
         panic!("answered");
     };
     let ul = nextgsim_nas::messages::mm::UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
-    let reply = LppMessage::decode(&ul.payload_container).expect("decodes");
-    assert!(
-        matches!(
-            reply.body,
-            Some(LppBody::ProvideLocationInformation { sidelink: None, .. })
-        ),
-        "no report, not an empty one"
+    let reply = nextgsim_slpp::decode(&ul.payload_container).expect("decodes");
+    let Some(SLPP_MessageBody::C1(SLPP_MessageBody_c1::ProvideLocationInformation(p))) =
+        reply.slpp_message_body
+    else {
+        panic!("expected a ProvideLocationInformation");
+    };
+    let ProvideLocationInformationCriticalExtensions::ProvideLocationInformation(ies) =
+        p.critical_extensions
+    else {
+        panic!("criticalExtensionsFuture");
+    };
+    let report: SL_RTT_ProvideLocationInformation =
+        nextgsim_slpp::decode_ie(&ies.sl_rtt_provide_location_information.expect("sl-RTT").0)
+            .expect("decodes");
+    assert!(report.sl_rtt_signal_measurement_information.is_none());
+    assert_eq!(
+        report.sl_rtt_error.map(|e| e.0),
+        Some(2),
+        "notAllRequestedMeasurementsPossible, not an empty list"
     );
 }

@@ -1,0 +1,20 @@
+[package]
+name = "nextgsim-slpp"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SLPP codec for nextgsim, generated from the TS 38.355 ASN.1 (nextgcore #557)"
+
+[lints]
+workspace = true
+
+[dependencies]
+asn1-codecs.workspace = true
+asn1_codecs_derive.workspace = true
+bitvec.workspace = true
+log.workspace = true
+
+[build-dependencies]
+asn1-compiler.workspace = true

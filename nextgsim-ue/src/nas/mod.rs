@@ -17,6 +17,7 @@
 
 pub mod lpp;
 pub mod mm;
+pub mod slpp;
 pub mod sm;
 
 /// The SM timers of a subscription with its own NAS signalling connection

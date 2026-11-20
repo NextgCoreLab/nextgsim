@@ -65,7 +65,8 @@ use super::deregistration::DeregistrationProcedure;
 use super::persistence::{SecurityContextSnapshot, UeStateSnapshot};
 use super::state::{CmState, MmStateMachine, MmSubState, UpdateStatus};
 use super::uuaa::{UuaaProcedure, UuaaReaction, UuaaState};
-use crate::nas::lpp::{LppEndpoint, LppUplink, ServingCellMeasurements, SidelinkRangingResult};
+use crate::nas::lpp::{LppEndpoint, LppUplink, ServingCellMeasurements};
+use crate::nas::slpp::{SlRttMeasurement, SlppEndpoint, SlppUplink};
 use crate::uav::{UavAuthorizationState, UavContext, UavIdentity};
 
 /// Maximum registration attempts before falling back to T3502
@@ -798,10 +799,14 @@ pub struct MmOrchestrator {
     /// RRC cycle (`RRC_CYCLE_INTERVAL_MS`, 2500 ms) -- a real E-CID report is a
     /// snapshot too, and one that old is still a measurement rather than a guess.
     serving_cell_measurements: ServingCellMeasurements,
-    /// The sidelink ranging results the LPP endpoint reports to the LMF, pushed by
-    /// the ranging task (issue #137). Empty until it has measured something, which
-    /// is what a UE with no sidelink peers honestly holds.
-    sidelink_ranging_results: Vec<SidelinkRangingResult>,
+    // -- SLPP sidelink positioning (TS 38.355, payload container type 12) --
+    /// The UE's SLPP endpoint, which answers the LMF's SL-RTT transactions
+    /// (nextgcore #557).
+    slpp: SlppEndpoint,
+    /// The SL-RTT measurements the SLPP endpoint reports to the LMF, pushed by
+    /// the ranging task. Empty until it has measured something, which is what a
+    /// UE with no sidelink peers honestly holds.
+    sl_rtt_measurements: Vec<SlRttMeasurement>,
 
     // -- UAS service-level authentication (UUAA-MM, TS 23.256 §5.2.2) --
     /// The UE half of the UUAA exchange over UL/DL NAS TRANSPORT.
@@ -870,7 +875,8 @@ impl MmOrchestrator {
             updp_pti: 0,
             state_file: None,
             lpp: LppEndpoint::new(),
-            sidelink_ranging_results: Vec::new(),
+            slpp: SlppEndpoint::new(None),
+            sl_rtt_measurements: Vec::new(),
             // Zero until RRC reports a camped cell. A location request answered
             // before then carries no RSRP at all rather than a made-up one -- see
             // `ServingCellMeasurements`.
@@ -993,26 +999,45 @@ impl MmOrchestrator {
     /// to the SM orchestrator, which owns N1 SM information and returns nothing for
     /// anything else -- so the LMF's transaction timed out with no reply and no error.
     pub fn handle_lpp_container(&mut self, container: &[u8]) -> LppUplink {
-        self.lpp.handle_nas_container(
-            container,
-            &self.serving_cell_measurements,
-            &self.sidelink_ranging_results,
-        )
+        self.lpp
+            .handle_nas_container(container, &self.serving_cell_measurements)
     }
 
-    /// Record the sidelink ranging results, as reported by the ranging task
-    /// (TS 23.586 §5.3.3, issue #137).
+    /// Handle an SLPP payload container that arrived in DL NAS TRANSPORT (payload
+    /// container type `1100`, TS 24.501 §5.4.5.3.3 c1) and return the UL NAS
+    /// TRANSPORT that answers it (nextgcore #557). `additional_info` is the DL
+    /// message's Additional information, echoed as the reply's routing information.
+    pub fn handle_slpp_container(
+        &mut self,
+        container: &[u8],
+        additional_info: Option<&[u8]>,
+    ) -> SlppUplink {
+        self.slpp
+            .handle_nas_container(container, additional_info, &self.sl_rtt_measurements)
+    }
+
+    /// Set this UE's SLPP application layer ID (see `nas::slpp`).
+    pub fn set_slpp_application_layer_id(&mut self, id: Option<Vec<u8>>) {
+        self.slpp.set_application_layer_id(id);
+    }
+
+    /// Record the SL-RTT measurements, as reported by the ranging task.
     ///
     /// Held rather than fetched for the same reason the serving-cell measurements
-    /// are: the LPP endpoint is synchronous, and a location request has to be
+    /// are: the SLPP endpoint is synchronous, and a location request has to be
     /// answered from what has already arrived.
-    pub fn set_sidelink_ranging_results(&mut self, results: Vec<SidelinkRangingResult>) {
-        self.sidelink_ranging_results = results;
+    pub fn set_sl_rtt_measurements(&mut self, measurements: Vec<SlRttMeasurement>) {
+        self.sl_rtt_measurements = measurements;
     }
 
-    /// The sidelink ranging results this UE would report to the LMF.
-    pub fn sidelink_ranging_results(&self) -> &[SidelinkRangingResult] {
-        &self.sidelink_ranging_results
+    /// The SL-RTT measurements this UE would report to the LMF.
+    pub fn sl_rtt_measurements(&self) -> &[SlRttMeasurement] {
+        &self.sl_rtt_measurements
+    }
+
+    /// How many SLPP messages this UE has sent.
+    pub fn slpp_messages_sent(&self) -> u32 {
+        self.slpp.messages_sent()
     }
 
     /// Record the serving cell's measurements, as reported by the RRC layer.
@@ -11789,15 +11814,48 @@ mod tests {
         }
     }
 
-    /// The sidelink ranging report LEAVES THE UE (issue #137): it rides the LPP
-    /// payload container of a real UL NAS TRANSPORT, which is what replaced the
-    /// in-process `oneshot` behind `RangingMessage::ReportToLmf`.
+    /// The SL-RTT measurement LEAVES THE UE in an SLPP container (nextgcore
+    /// #557). The request is nextgcore's LMF golden REQUEST_LOCATION_INFORMATION,
+    /// wrapped in DL NAS TRANSPORT type 12, and the reply must be announced as
+    /// container type 12: an AMF routes on that type, so a reply in the LPP
+    /// container would reach the wrong consumer.
     #[test]
-    fn a_sidelink_ranging_report_leaves_the_ue_in_an_ul_nas_transport() {
-        use crate::nas::lpp::{
-            LppBody, LppMessage, LppUplink, ServingCellMeasurements, SidelinkRangingMethod,
-            SidelinkRangingReport, SidelinkRangingResult,
+    fn a_sidelink_measurement_leaves_the_ue_in_an_slpp_container() {
+        use crate::nas::slpp::{SlRttMeasurement, SlppUplink};
+        use nextgsim_nas::ies::ie1::PayloadContainerType;
+        use nextgsim_nas::messages::mm::UlNasTransport;
+        const LMF_REQUEST_LOCATION_INFORMATION: [u8; 10] =
+            [0x44, 0x04, 0x22, 0x40, 0x08, 0x00, 0xA0, 0x08, 0x40, 0x00];
+
+        let mut orch = new_orch();
+        orch.set_slpp_application_layer_id(Some(vec![0xA5, 0xA5, 0xA5]));
+        orch.set_sl_rtt_measurements(vec![SlRttMeasurement::from_range(
+            vec![0x5A, 0x5A, 0x5A],
+            50.0,
+        )]);
+        let SlppUplink::Send(pdu) =
+            orch.handle_slpp_container(&LMF_REQUEST_LOCATION_INFORMATION, Some(b"corr-1"))
+        else {
+            panic!("an SLPP location request must be answered");
         };
+        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
+        assert_eq!(ul.payload_container_type, PayloadContainerType::SlppMessage);
+        assert_eq!(ul.additional_info.as_deref(), Some(&b"corr-1"[..]));
+        let msg = nextgsim_slpp::decode(&ul.payload_container).expect("SLPP decodes");
+        assert_eq!(
+            msg.transaction_id.map(|t| t.0),
+            Some(2),
+            "the LMF's transaction is echoed"
+        );
+        assert_eq!(orch.slpp_messages_sent(), 1);
+    }
+
+    /// An LPP location reply carries no sidelink payload any more, whatever
+    /// SL-RTT measurements the UE holds: sidelink ranging is SLPP's.
+    #[test]
+    fn an_lpp_location_reply_carries_no_sidelink_payload() {
+        use crate::nas::lpp::{LppBody, LppMessage, LppUplink, ServingCellMeasurements};
+        use crate::nas::slpp::SlRttMeasurement;
         use nextgsim_nas::ies::ie1::PayloadContainerType;
         use nextgsim_nas::messages::mm::UlNasTransport;
 
@@ -11810,81 +11868,21 @@ mod tests {
             rsrq_result: None,
             ..Default::default()
         });
-        let measured = SidelinkRangingResult {
-            peer_layer2_id: 0x00A5_A5A5,
-            range_cm: 5_000,
-            accuracy_cm: 1,
-            method: SidelinkRangingMethod::CarrierPhase,
-            measurement_count: 3,
-        };
-        orch.set_sidelink_ranging_results(vec![measured]);
-
-        let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
-            panic!("an LPP location request must be answered");
-        };
-
-        // A real NAS message, announced as an LPP container: an AMF routes on that
-        // type, so a report in the wrong container would reach the wrong consumer.
-        let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
-        assert_eq!(ul.payload_container_type, PayloadContainerType::LppMessage);
-        match LppMessage::decode(&ul.payload_container)
-            .expect("decodes")
-            .body
-        {
-            Some(LppBody::ProvideLocationInformation {
-                measurements: Some(measurements),
-                sidelink,
-                ..
-            }) => {
-                assert_eq!(
-                    sidelink,
-                    Some(SidelinkRangingReport {
-                        results: vec![measured]
-                    }),
-                    "the measured range must survive the whole transport"
-                );
-                // And the E-CID half is still there: a UE that ranges over sidelink
-                // also has a serving cell.
-                assert_eq!(measurements.primary_cell.expect("primary").phys_cell_id, 7);
-            }
-            other => panic!("expected ProvideLocationInformation, got {other:?}"),
-        }
-    }
-
-    /// With nothing measured the reply carries no report at all, rather than an empty
-    /// one -- and the encoding is what it was before sidelink existed.
-    #[test]
-    fn a_ue_with_no_ranging_results_sends_the_same_report_it_always_did() {
-        use crate::nas::lpp::{LppBody, LppMessage, LppUplink, ServingCellMeasurements};
-        use nextgsim_nas::messages::mm::UlNasTransport;
-
-        let mut orch = new_orch();
-        orch.set_serving_cell_measurements(ServingCellMeasurements {
-            phys_cell_id: 7,
-            arfcn: 1850,
-            system_frame_number: None,
-            rsrp_result: Some(60),
-            rsrq_result: None,
-            ..Default::default()
-        });
-        assert!(
-            orch.sidelink_ranging_results().is_empty(),
-            "precondition: nothing measured"
-        );
-
+        orch.set_sl_rtt_measurements(vec![SlRttMeasurement::from_range(vec![1, 2, 3], 50.0)]);
         let LppUplink::Send(pdu) = orch.handle_lpp_container(LMF_LOCATION_REQUEST) else {
             panic!("answered");
         };
         let ul = UlNasTransport::decode(&mut &pdu[3..]).expect("decodes");
-        assert!(
-            matches!(
-                LppMessage::decode(&ul.payload_container)
-                    .expect("decodes")
-                    .body,
-                Some(LppBody::ProvideLocationInformation { sidelink: None, .. })
-            ),
-            "no report, not an empty one"
-        );
+        assert_eq!(ul.payload_container_type, PayloadContainerType::LppMessage);
+        assert!(matches!(
+            LppMessage::decode(&ul.payload_container)
+                .expect("decodes")
+                .body,
+            Some(LppBody::ProvideLocationInformation {
+                measurements: Some(_),
+                nr_measurements: None,
+            })
+        ));
     }
 
     #[test]

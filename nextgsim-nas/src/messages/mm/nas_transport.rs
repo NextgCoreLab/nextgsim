@@ -60,6 +60,8 @@ mod ul_nas_transport_iei {
     pub const S_NSSAI: u8 = 0x22;
     /// DNN
     pub const DNN: u8 = 0x25;
+    /// Additional information (TS 24.501 Table 8.2.10.1.1)
+    pub const ADDITIONAL_INFO: u8 = 0x24;
 }
 
 // ============================================================================
@@ -280,6 +282,9 @@ pub struct UlNasTransport {
     pub s_nssai: Option<Vec<u8>>,
     /// DNN (optional, Type 4, IEI 0x25)
     pub dnn: Option<Vec<u8>>,
+    /// Additional information (optional, Type 4, IEI 0x24, §9.11.2.1): the
+    /// routing information of an LPP or SLPP container (§5.4.5.2.2 c, c1)
+    pub additional_info: Option<Vec<u8>>,
 }
 
 impl Default for UlNasTransport {
@@ -292,6 +297,7 @@ impl Default for UlNasTransport {
             request_type: None,
             s_nssai: None,
             dnn: None,
+            additional_info: None,
         }
     }
 }
@@ -397,6 +403,19 @@ impl UlNasTransport {
                     buf.copy_to_slice(&mut data);
                     msg.dnn = Some(data);
                 }
+                ul_nas_transport_iei::ADDITIONAL_INFO => {
+                    buf.advance(1);
+                    if buf.remaining() < 1 {
+                        break;
+                    }
+                    let len = buf.get_u8() as usize;
+                    if buf.remaining() < len {
+                        break;
+                    }
+                    let mut data = vec![0u8; len];
+                    buf.copy_to_slice(&mut data);
+                    msg.additional_info = Some(data);
+                }
                 _ => {
                     // Skip unknown IEs
                     buf.advance(1);
@@ -453,6 +472,12 @@ impl UlNasTransport {
             buf.put_u8(ul_nas_transport_iei::DNN);
             buf.put_u8(dnn.len() as u8);
             buf.put_slice(dnn);
+        }
+
+        if let Some(ref info) = self.additional_info {
+            buf.put_u8(ul_nas_transport_iei::ADDITIONAL_INFO);
+            buf.put_u8(info.len() as u8);
+            buf.put_slice(info);
         }
     }
 
@@ -750,5 +775,53 @@ mod tests {
             PayloadContainerType::try_from(0b1001u8),
             Ok(PayloadContainerType::ServiceLevelAa)
         );
+    }
+
+    /// SLPP message container is §9.11.3.40 value 1100 (Rel-18). Pinned on the
+    /// primitive, with the live neighbours as a control, for the same reason as
+    /// the Service-level-AA case: both ends here share the enum.
+    #[test]
+    fn slpp_message_container_is_type_twelve_on_the_wire() {
+        assert_eq!(u8::from(PayloadContainerType::SlppMessage), 0b1100);
+        assert_eq!(
+            PayloadContainerType::try_from(0b1100u8),
+            Ok(PayloadContainerType::SlppMessage)
+        );
+        assert_eq!(u8::from(PayloadContainerType::LppMessage), 0b0011);
+        assert_eq!(u8::from(PayloadContainerType::MultiplePayloads), 0b1111);
+    }
+
+    /// An UL NAS TRANSPORT carrying a 2-octet SLPP payload, derived by hand from
+    /// TS 24.501 §8.2.10: EPD `7E` | security header `00` | message type `67` |
+    /// spare and payload container type `0C` | payload container length `00 02`
+    /// (LV-E) | the payload.
+    #[test]
+    fn an_slpp_container_encodes_to_the_reference_octets() {
+        let msg = UlNasTransport::new(PayloadContainerType::SlppMessage, vec![0x44, 0x02]);
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert_eq!(buf, [0x7E, 0x00, 0x67, 0x0C, 0x00, 0x02, 0x44, 0x02]);
+        let decoded = UlNasTransport::decode(&mut &buf[3..]).expect("decodes");
+        assert_eq!(
+            decoded.payload_container_type,
+            PayloadContainerType::SlppMessage
+        );
+        assert_eq!(decoded.payload_container, [0x44, 0x02]);
+    }
+
+    /// The routing information an SLPP container carries (§5.4.5.2.2 c1) is
+    /// the Additional information IE, IEI `24`, length, value (§9.11.2.1).
+    #[test]
+    fn an_slpp_container_carries_its_routing_information_as_iei_24() {
+        let mut msg = UlNasTransport::new(PayloadContainerType::SlppMessage, vec![0x44]);
+        msg.additional_info = Some(b"c1".to_vec());
+        let mut buf = Vec::new();
+        msg.encode(&mut buf);
+        assert_eq!(
+            buf,
+            [0x7E, 0x00, 0x67, 0x0C, 0x00, 0x01, 0x44, 0x24, 0x02, b'c', b'1']
+        );
+        let decoded = UlNasTransport::decode(&mut &buf[3..]).expect("decodes");
+        assert_eq!(decoded.additional_info.as_deref(), Some(&b"c1"[..]));
     }
 }

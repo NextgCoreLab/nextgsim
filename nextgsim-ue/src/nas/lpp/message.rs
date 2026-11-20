@@ -569,6 +569,18 @@ fn read_capability_request_root(r: &mut UperReader<'_>) -> UperResult<(bool, boo
     Ok((additions, opts[3]))
 }
 
+/// An X.691 §11.9 unconstrained length determinant (single octet or two
+/// octets; fragmentation is refused).
+fn read_unconstrained_length(r: &mut UperReader<'_>) -> UperResult<usize> {
+    if !r.read_bit()? {
+        return Ok(r.read_bits(7)? as usize);
+    }
+    if !r.read_bit()? {
+        return Ok(r.read_bits(14)? as usize);
+    }
+    Err(UperError::Unsupported("a fragmented EPDU-Body"))
+}
+
 /// Reads past an `EPDU-Sequence` (TS 37.355 §6.4.1): 1..16 `EPDU`s, each an
 /// extensible `EPDU-Identifier` (an id, an optional name) and an OCTET STRING body.
 fn skip_epdu_sequence(r: &mut UperReader<'_>) -> UperResult<()> {
@@ -630,23 +642,8 @@ enum CommonIes {
 ///
 /// Returns `(additions_follow, ecid_present)`.
 fn read_r9_body_preamble(r: &mut UperReader<'_>, common: CommonIes) -> UperResult<(bool, bool)> {
-    let (additions, ecid, epdu) = read_r9_body_preamble_with_epdu(r, common)?;
-    if epdu {
-        return Err(UperError::Unsupported(
-            "LPP body for a positioning method other than E-CID",
-        ));
-    }
-    Ok((additions, ecid))
-}
-
-/// [`read_r9_body_preamble`] for the one body that may carry nextg's EPDU
-/// (`ProvideLocationInformation`), returning `(additions, ecid, epdu)`.
-fn read_r9_body_preamble_with_epdu(
-    r: &mut UperReader<'_>,
-    common: CommonIes,
-) -> UperResult<(bool, bool, bool)> {
     let (additions, opts) = r.read_sequence_preamble(true, 5)?;
-    if opts[1] || opts[2] {
+    if opts[1] || opts[2] || opts[4] {
         // A-GNSS, OTDOA or an EPDU. Each has its own content, so continuing would
         // read later fields at the wrong offsets.
         return Err(UperError::Unsupported(
@@ -670,7 +667,7 @@ fn read_r9_body_preamble_with_epdu(
             }
         }
     }
-    Ok((additions, opts[3], opts[4]))
+    Ok((additions, opts[3]))
 }
 
 /// The `criticalExtensions` wrapper every LPP body carries: a 2-alternative CHOICE
@@ -691,283 +688,6 @@ fn read_critical_extensions(r: &mut UperReader<'_>) -> UperResult<()> {
         ));
     }
     Ok(())
-}
-
-/// How a sidelink range was measured (issue #137).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidelinkRangingMethod {
-    /// Round-trip time over SL-PRS. Metre-level.
-    Rtt,
-    /// Multi-frequency carrier phase, ambiguity resolved against the RTT.
-    /// Centimetre-level.
-    CarrierPhase,
-}
-
-impl SidelinkRangingMethod {
-    /// Root index in the extensible ENUMERATED.
-    const ROOT_MAX: i64 = 1;
-
-    fn index(self) -> i64 {
-        match self {
-            Self::Rtt => 0,
-            Self::CarrierPhase => 1,
-        }
-    }
-
-    fn from_index(index: i64) -> UperResult<Self> {
-        match index {
-            0 => Ok(Self::Rtt),
-            1 => Ok(Self::CarrierPhase),
-            _ => Err(UperError::Unsupported("sidelink ranging method")),
-        }
-    }
-}
-
-/// One measured range to one sidelink peer (TS 23.586 §5.3.3, issue #137).
-///
-/// ## Why the units are centimetres
-///
-/// The carrier-phase estimate this carries is centimetre-level, so a range in
-/// whole metres would throw away the precision the whole widelane combination
-/// exists to produce, and an LMF could not tell an RTT fix from a carrier-phase one
-/// by looking at the number. Encoding a float was rejected: PER has no IEEE-754
-/// primitive here, and a scaled integer is what every other distance IE in this
-/// tree uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SidelinkRangingResult {
-    /// The peer's PC5 Layer-2 identity, `INTEGER (0..16777215)` — 24 bits, which is
-    /// what TS 23.303 §8.2 gives a Layer-2 ID. A UE id wider than that is refused
-    /// rather than truncated onto another peer's identity.
-    pub peer_layer2_id: u32,
-    /// Range in centimetres, `INTEGER (0..1000000)`: 0..10 km at 1 cm resolution.
-    pub range_cm: u32,
-    /// Reported accuracy in centimetres, `INTEGER (0..65535)`.
-    pub accuracy_cm: u16,
-    /// How it was measured.
-    pub method: SidelinkRangingMethod,
-    /// How many measurements the estimate rests on, `INTEGER (0..65535)`.
-    ///
-    /// Carried because it is the difference between a range from one occasion and
-    /// one from fifty, and an LMF weighing two reports has nothing else to go on.
-    pub measurement_count: u16,
-}
-
-impl SidelinkRangingResult {
-    const PEER_ID_MAX: i64 = 16_777_215;
-    const RANGE_CM_MAX: i64 = 1_000_000;
-    const ACCURACY_CM_MAX: i64 = 65_535;
-    const COUNT_MAX: i64 = 65_535;
-
-    fn write(&self, w: &mut UperWriter) -> UperResult<()> {
-        w.write_sequence_preamble(Some(false), &[]);
-        w.write_constrained(i64::from(self.peer_layer2_id), 0, Self::PEER_ID_MAX)?;
-        w.write_constrained(i64::from(self.range_cm), 0, Self::RANGE_CM_MAX)?;
-        w.write_constrained(i64::from(self.accuracy_cm), 0, Self::ACCURACY_CM_MAX)?;
-        w.write_extensible_enumerated(self.method.index(), SidelinkRangingMethod::ROOT_MAX)?;
-        w.write_constrained(i64::from(self.measurement_count), 0, Self::COUNT_MAX)
-    }
-
-    fn read(r: &mut UperReader<'_>) -> UperResult<Self> {
-        let (additions, _) = r.read_sequence_preamble(true, 0)?;
-        let peer_layer2_id = r.read_constrained(0, Self::PEER_ID_MAX)? as u32;
-        let range_cm = r.read_constrained(0, Self::RANGE_CM_MAX)? as u32;
-        let accuracy_cm = r.read_constrained(0, Self::ACCURACY_CM_MAX)? as u16;
-        let method = SidelinkRangingMethod::from_index(
-            r.read_extensible_enumerated(SidelinkRangingMethod::ROOT_MAX)?,
-        )?;
-        let measurement_count = r.read_constrained(0, Self::COUNT_MAX)? as u16;
-        if additions {
-            r.skip_extension_additions()?;
-        }
-        Ok(Self {
-            peer_layer2_id,
-            range_cm,
-            accuracy_cm,
-            method,
-            measurement_count,
-        })
-    }
-}
-
-/// `EPDU-ID` nextg uses for its sidelink ranging payload (nextgcore #542). Not
-/// 3GPP-assigned: TS 37.355 §6.5.7 leaves EPDU-ID values to the external protocol.
-pub const EPDU_ID_NEXTG_SIDELINK_RANGING: i64 = 256;
-
-/// `EPDU-Name` that must accompany [`EPDU_ID_NEXTG_SIDELINK_RANGING`], so a foreign
-/// EPDU that happens to use the same number is never read as a range report.
-pub const EPDU_NAME_NEXTG_SIDELINK_RANGING: &str = "nextg-sidelink-ranging";
-
-/// Write the `EPDU-Sequence` (TS 37.355 §6.5.7) carrying `report`:
-/// `SEQUENCE (SIZE(1..16)) OF EPDU`, one entry, `EPDU-Identifier` with ID and name,
-/// `EPDU-Body` the report's own UPER octets.
-fn write_sidelink_epdu(w: &mut UperWriter, report: &SidelinkRangingReport) -> UperResult<()> {
-    let body = report.encode()?;
-    w.write_constrained(1, 1, 16)?;
-    // EPDU ::= SEQUENCE { ePDU-Identifier, ePDU-Body } -- not extensible, no optionals.
-    // EPDU-Identifier ::= SEQUENCE { ePDU-ID, ePDU-Name OPTIONAL, ... }
-    w.write_sequence_preamble(Some(false), &[true]);
-    w.write_constrained(EPDU_ID_NEXTG_SIDELINK_RANGING, 1, 256)?;
-    // EPDU-Name ::= VisibleString (SIZE (1..32)): length, then 7 bits per character
-    // (X.691 §30.5.3: 95 printable characters, ISO 646 values fit 7 bits).
-    let name = EPDU_NAME_NEXTG_SIDELINK_RANGING.as_bytes();
-    w.write_constrained(name.len() as i64, 1, 32)?;
-    for &c in name {
-        w.write_bits(u64::from(c), 7);
-    }
-    // EPDU-Body ::= OCTET STRING, unconstrained: X.691 §11.9 length determinant.
-    write_unconstrained_length(w, body.len())?;
-    for b in body {
-        w.write_bits(u64::from(b), 8);
-    }
-    Ok(())
-}
-
-fn write_unconstrained_length(w: &mut UperWriter, len: usize) -> UperResult<()> {
-    if len < 128 {
-        w.write_bits(len as u64, 8);
-    } else if len < 16_384 {
-        w.write_bits(0x8000 | len as u64, 16);
-    } else {
-        return Err(UperError::InvalidLength(len));
-    }
-    Ok(())
-}
-
-fn read_unconstrained_length(r: &mut UperReader<'_>) -> UperResult<usize> {
-    if !r.read_bit()? {
-        return Ok(r.read_bits(7)? as usize);
-    }
-    if !r.read_bit()? {
-        return Ok(r.read_bits(14)? as usize);
-    }
-    Err(UperError::Unsupported("a fragmented EPDU-Body"))
-}
-
-/// Read an `EPDU-Sequence` and return nextg's sidelink ranging report if one of its
-/// EPDUs carries it. Other EPDUs are consumed and ignored.
-/// Test access to [`write_sidelink_epdu`].
-#[cfg(test)]
-pub(crate) fn write_sidelink_epdu_for_test(
-    w: &mut UperWriter,
-    report: &SidelinkRangingReport,
-) -> UperResult<()> {
-    write_sidelink_epdu(w, report)
-}
-
-/// Test access to [`read_sidelink_epdu`].
-#[cfg(test)]
-pub(crate) fn read_sidelink_epdu_for_test(
-    r: &mut UperReader<'_>,
-) -> UperResult<Option<SidelinkRangingReport>> {
-    read_sidelink_epdu(r)
-}
-
-fn read_sidelink_epdu(r: &mut UperReader<'_>) -> UperResult<Option<SidelinkRangingReport>> {
-    let count = r.read_constrained(1, 16)?;
-    let mut report = None;
-    for _ in 0..count {
-        let (ext, opts) = r.read_sequence_preamble(true, 1)?;
-        let id = r.read_constrained(1, 256)?;
-        let name = if opts[0] {
-            let len = r.read_constrained(1, 32)? as usize;
-            let mut name = String::with_capacity(len);
-            for _ in 0..len {
-                name.push(char::from(r.read_bits(7)? as u8));
-            }
-            Some(name)
-        } else {
-            None
-        };
-        if ext {
-            r.skip_extension_additions()?;
-        }
-        let len = read_unconstrained_length(r)?;
-        let mut body = Vec::with_capacity(len);
-        for _ in 0..len {
-            body.push(r.read_bits(8)? as u8);
-        }
-        let ours = id == EPDU_ID_NEXTG_SIDELINK_RANGING
-            && name
-                .as_deref()
-                .is_none_or(|n| n == EPDU_NAME_NEXTG_SIDELINK_RANGING);
-        if ours && report.is_none() {
-            report = Some(SidelinkRangingReport::decode(&body)?);
-        }
-    }
-    Ok(report)
-}
-
-/// The sidelink ranging report a UE sends to the LMF (issue #137).
-///
-/// A payload of nextg's own design (3GPP's protocol for this is SLPP, TS 38.355,
-/// not implemented yet -- nextgcore #557). It rides LPP's EPDU
-/// (`epdu-ProvideLocationInformation`, TS 37.355 §6.5.7), the extension point LPP
-/// defines for non-3GPP data, under [`EPDU_ID_NEXTG_SIDELINK_RANGING`]; before
-/// nextgcore #542 it sat in an invented fourth extension-addition group that a
-/// conformant LPP codec skips.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SidelinkRangingReport {
-    /// One entry per ranged peer, `SEQUENCE (SIZE(1..32))`.
-    pub results: Vec<SidelinkRangingResult>,
-}
-
-impl SidelinkRangingReport {
-    const MIN_RESULTS: usize = 1;
-    /// `SEQUENCE (SIZE(1..32))`. Public because the caller building a report has to
-    /// bound its own list to it: 33 results encode to bytes that then fail to
-    /// decode, and the sender would see no error.
-    pub const MAX_RESULTS: usize = 32;
-
-    /// Encode as a standalone payload: a complete UPER encoding padded to whole
-    /// octets, which becomes the `EPDU-Body`.
-    pub fn encode(&self) -> UperResult<Vec<u8>> {
-        if self.results.len() < Self::MIN_RESULTS || self.results.len() > Self::MAX_RESULTS {
-            return Err(UperError::InvalidLength(self.results.len()));
-        }
-        let mut w = UperWriter::new();
-        w.write_sequence_preamble(Some(false), &[]);
-        w.write_constrained(
-            self.results.len() as i64,
-            Self::MIN_RESULTS as i64,
-            Self::MAX_RESULTS as i64,
-        )?;
-        for result in &self.results {
-            result.write(&mut w)?;
-        }
-        Ok(w.into_bytes())
-    }
-
-    /// Build a report from `results`, keeping at most [`Self::MAX_RESULTS`] (the
-    /// `SIZE(1..32)` bound -- the binding one now that the report is an EPDU body,
-    /// whose length determinant carries far more than 32 results), and say how many
-    /// were dropped. `None` for an empty input.
-    pub fn fitting_an_epdu(results: &[SidelinkRangingResult]) -> Option<(Self, usize)> {
-        let kept = results.len().min(Self::MAX_RESULTS);
-        if kept == 0 {
-            return None;
-        }
-        let candidate = Self {
-            results: results[..kept].to_vec(),
-        };
-        candidate.encode().ok()?;
-        Some((candidate, results.len() - kept))
-    }
-
-    /// Decode an `EPDU-Body` produced by [`Self::encode`].
-    pub fn decode(bytes: &[u8]) -> UperResult<Self> {
-        let mut r = UperReader::new(bytes);
-        let (additions, _) = r.read_sequence_preamble(true, 0)?;
-        let count =
-            r.read_constrained(Self::MIN_RESULTS as i64, Self::MAX_RESULTS as i64)? as usize;
-        let mut results = Vec::with_capacity(count);
-        for _ in 0..count {
-            results.push(SidelinkRangingResult::read(&mut r)?);
-        }
-        if additions {
-            r.skip_extension_additions()?;
-        }
-        Ok(Self { results })
-    }
 }
 
 /// The LPP message bodies this UE handles.
@@ -1002,9 +722,6 @@ pub enum LppBody {
         measurements: Option<EcidSignalMeasurementInformation>,
         /// The NR E-CID measurement report (#330).
         nr_measurements: Option<NrEcidSignalMeasurementInformation>,
-        /// The sidelink ranging report, when this UE has ranges to report
-        /// (issue #137). `None` leaves the EPDU bit clear.
-        sidelink: Option<SidelinkRangingReport>,
     },
 }
 
@@ -1106,7 +823,6 @@ impl LppBody {
             Self::ProvideLocationInformation {
                 measurements,
                 nr_measurements,
-                sidelink,
             } => {
                 if measurements.is_none() && nr_measurements.is_none() {
                     return Err(UperError::Unsupported(
@@ -1117,25 +833,17 @@ impl LppBody {
                 write_critical_extensions(w)?;
                 // Root presence bits [commonIEs, a-gnss, otdoa, ecid, epdu]; the
                 // extension bit announces the Rel-16 group carrying NR E-CID.
+                // Sidelink ranging is SLPP's (TS 38.355, `nas::slpp`), so no EPDU
+                // is ever written (nextgcore #557).
                 w.write_sequence_preamble(
                     Some(nr_measurements.is_some()),
-                    &[
-                        false,
-                        false,
-                        false,
-                        measurements.is_some(),
-                        sidelink.is_some(),
-                    ],
+                    &[false, false, false, measurements.is_some(), false],
                 );
                 if let Some(m) = measurements {
                     // ECID-ProvideLocationInformation: [signalMeasurementInformation,
                     // ecid-Error], and only the measurements are produced here.
                     w.write_sequence_preamble(Some(false), &[true, false]);
                     m.write(w)?;
-                }
-                // epdu-ProvideLocationInformation follows ecid in root order.
-                if let Some(report) = sidelink {
-                    write_sidelink_epdu(w, report)?;
                 }
                 if let Some(nr) = nr_measurements {
                     // NR-ECID-ProvideLocationInformation-r16: extensible, optionals
@@ -1236,8 +944,7 @@ impl LppBody {
             }
             c1::PROVIDE_LOCATION_INFORMATION => {
                 read_critical_extensions(r)?;
-                let (additions, ecid, epdu) =
-                    read_r9_body_preamble_with_epdu(r, CommonIes::Unmodelled)?;
+                let (additions, ecid) = read_r9_body_preamble(r, CommonIes::Unmodelled)?;
                 let measurements = if ecid {
                     let (inner_additions, opts) = r.read_sequence_preamble(true, 2)?;
                     let m = if opts[0] {
@@ -1254,7 +961,6 @@ impl LppBody {
                 } else {
                     None
                 };
-                let sidelink = if epdu { read_sidelink_epdu(r)? } else { None };
                 let mut nr_measurements = None;
                 if additions {
                     if let Some(group) = read_r16_group(r)? {
@@ -1282,7 +988,6 @@ impl LppBody {
                 Ok(Self::ProvideLocationInformation {
                     measurements,
                     nr_measurements,
-                    sidelink,
                 })
             }
             other => Err(match other {
