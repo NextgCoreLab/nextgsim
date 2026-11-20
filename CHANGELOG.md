@@ -16,7 +16,9 @@ and the project aims to follow [Semantic Versioning](https://semver.org/spec/v2.
   from the verbatim TS 38.355 V19.2.0 ASN.1, and the UE's SLPP endpoint (`nas/slpp.rs`) answers
   the LMF over UL/DL NAS TRANSPORT payload container type 12 (TS 24.501 §9.11.3.40). It handles
   SL-RTT capability transfer, assistance data, location information transfer, errors and aborts,
-  as well as sequence numbers and acknowledgements. The ranging task now reports SL-RTT
+  as well as sequence numbers and acknowledgements per location session (the LCS correlation id,
+  forgotten after 10 minutes idle, TS 38.355 §4.3.2). The UE never requests acknowledgements or
+  retransmits, a stated deviation from §4.3.4. The ranging task now reports SL-RTT
   measurements. The simulator-defined sidelink ranging report has been removed from LPP's EPDU,
   so LPP no longer carries any simulator-defined payload.
 - Releases publish the `nextgsim-nr-gnb`, `nextgsim-nr-ue`, `nextgsim-lte-enb` and

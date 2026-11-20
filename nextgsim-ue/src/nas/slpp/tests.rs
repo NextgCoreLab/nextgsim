@@ -427,6 +427,10 @@ fn a_message_asking_for_an_acknowledgement_gets_one_even_when_repeated() {
         let msg = decode(&reply).expect("decodes");
         assert!(msg.slpp_message_body.is_none(), "ack-only, round {round}");
         assert_eq!(
+            msg.sequence_number, None,
+            "§6.2: no sequenceNumber without a body, round {round}"
+        );
+        assert_eq!(
             msg.acknowledgement.and_then(|a| a.ack_indicator),
             Some(SequenceNumber(7)),
             "§4.3.3 ackIndicator, round {round}"
@@ -496,4 +500,192 @@ fn an_error_is_never_answered() {
     assert!(ue
         .handle_downlink(&with_body(err, 2, None, false), &[])
         .is_none());
+}
+
+/// [`LMF_REQUEST_CAPABILITIES`] with sequence number `seq` and, when given,
+/// sessionID `session` and transactionID `tid`.
+fn capability_request(seq: u8, session: Option<[u8; 6]>, tid: Option<u8>) -> Vec<u8> {
+    let mut req = decode(&LMF_REQUEST_CAPABILITIES).expect("decodes");
+    req.sequence_number = Some(SequenceNumber(seq));
+    req.session_id = session.map(|s| SessionID(s.to_vec()));
+    req.transaction_id = tid.map(SLPP_MessageTransactionID);
+    encode(&req).expect("encodes")
+}
+
+fn answered(uplink: SlppUplink) -> bool {
+    matches!(uplink, SlppUplink::Send(_))
+}
+
+/// §4.3.2: the last received sequence number is per location session. Over
+/// NAS the LCS correlation identifier names the session, so seq 0 of a new
+/// session is answered. A repeat within the old session is still discarded.
+#[test]
+fn a_new_location_session_starts_its_own_sequence_numbers() {
+    let mut ue = endpoint();
+    let t0 = Instant::now();
+    let seq0 = via_dl_nas(&capability_request(0, None, Some(1)));
+    assert!(answered(ue.handle_nas_container_at(
+        &seq0,
+        Some(b"corr-1"),
+        &[],
+        t0
+    )));
+    assert!(
+        answered(ue.handle_nas_container_at(&seq0, Some(b"corr-2"), &[], t0)),
+        "seq 0 of a new session is not a duplicate"
+    );
+    assert!(
+        !answered(ue.handle_nas_container_at(&seq0, Some(b"corr-1"), &[], t0)),
+        "a repeat within corr-1 is discarded"
+    );
+    // The sessionID also tells sessions apart.
+    let in_session = via_dl_nas(&capability_request(0, Some([1, 2, 3, 4, 5, 6]), Some(1)));
+    assert!(answered(ue.handle_nas_container_at(
+        &in_session,
+        Some(b"corr-1"),
+        &[],
+        t0
+    )));
+}
+
+/// §4.3.2: the UE deletes a session's sequence numbers after 10 minutes with
+/// no activity, so the same number is then processed again.
+#[test]
+fn a_session_idle_for_ten_minutes_is_forgotten() {
+    let seq0 = via_dl_nas(&capability_request(0, None, Some(1)));
+    let t0 = Instant::now();
+
+    let mut ue = endpoint();
+    assert!(answered(ue.handle_nas_container_at(
+        &seq0,
+        Some(b"c"),
+        &[],
+        t0
+    )));
+    let just_before = t0 + SESSION_INACTIVITY - Duration::from_secs(1);
+    assert!(
+        !answered(ue.handle_nas_container_at(&seq0, Some(b"c"), &[], just_before)),
+        "still the same session"
+    );
+
+    let mut ue = endpoint();
+    assert!(answered(ue.handle_nas_container_at(
+        &seq0,
+        Some(b"c"),
+        &[],
+        t0
+    )));
+    assert!(
+        answered(ue.handle_nas_container_at(&seq0, Some(b"c"), &[], t0 + SESSION_INACTIVITY)),
+        "10 minutes idle: the session was deleted"
+    );
+    assert_eq!(ue.sessions_tracked(), 1);
+}
+
+/// The session table is bounded; the session idle longest is dropped first.
+#[test]
+fn the_session_table_is_bounded() {
+    let mut ue = endpoint();
+    let t0 = Instant::now();
+    let seq0 = via_dl_nas(&capability_request(0, None, Some(1)));
+    for i in 0..MAX_SESSIONS + 10 {
+        let corr = format!("corr-{i}");
+        let at = t0 + Duration::from_millis(i as u64);
+        ue.handle_nas_container_at(&seq0, Some(corr.as_bytes()), &[], at);
+    }
+    assert_eq!(ue.sessions_tracked(), MAX_SESSIONS);
+}
+
+/// §6.2: a bare acknowledgement carries no sequence number, so it does not
+/// use one up. The next message with a body carries 0.
+#[test]
+fn a_bare_acknowledgement_uses_no_sequence_number() {
+    let mut ue = endpoint();
+    let ack = ue
+        .handle_downlink(&with_body(assistance_data(), 3, Some(7), true), &[])
+        .expect("an acknowledgement");
+    assert_eq!(decode(&ack).expect("decodes").sequence_number, None);
+    let reply = ue
+        .handle_downlink(&capability_request(8, None, Some(1)), &[])
+        .expect("ProvideCapabilities");
+    assert_eq!(
+        decode(&reply).expect("decodes").sequence_number,
+        Some(SequenceNumber(0))
+    );
+}
+
+/// §5.1.5 and §5.3.5: the response echoes the received sessionID. An Error
+/// carries it only over PC5-U (§5.4.3), and this endpoint is reached over NAS.
+#[test]
+fn replies_echo_the_session_id() {
+    let session = [1, 2, 3, 4, 5, 6];
+    let mut ue = endpoint();
+    let reply = ue
+        .handle_downlink(&capability_request(0, Some(session), Some(1)), &[])
+        .expect("ProvideCapabilities");
+    assert_eq!(
+        decode(&reply).expect("decodes").session_id,
+        Some(SessionID(session.to_vec())),
+        "§5.1.5"
+    );
+
+    let mut req = decode(&LMF_REQUEST_LOCATION_INFORMATION).expect("decodes");
+    req.session_id = Some(SessionID(session.to_vec()));
+    req.sequence_number = Some(SequenceNumber(1));
+    let reply = ue
+        .handle_downlink(&encode(&req).expect("encodes"), &peer_at_50_m())
+        .expect("ProvideLocationInformation");
+    assert_eq!(
+        decode(&reply).expect("decodes").session_id,
+        Some(SessionID(session.to_vec())),
+        "§5.3.5"
+    );
+
+    let req = SLPP_MessageBody_c1::RequestAssistanceData(RequestAssistanceData {
+        critical_extensions: RequestAssistanceDataCriticalExtensions::CriticalExtensionsFuture(
+            RequestAssistanceDataCriticalExtensions_criticalExtensionsFuture {},
+        ),
+    });
+    let mut msg = decode(&with_body(req, 6, Some(2), false)).expect("decodes");
+    msg.session_id = Some(SessionID(session.to_vec()));
+    let reply = ue
+        .handle_downlink(&encode(&msg).expect("encodes"), &[])
+        .expect("an Error");
+    assert_eq!(decode(&reply).expect("decodes").session_id, None, "§5.4.3");
+}
+
+/// A request without a transactionID gets a reply without one, not one with
+/// an invented 0 that could match a real transaction 0 at the LMF.
+#[test]
+fn a_request_without_a_transaction_id_gets_a_reply_without_one() {
+    let mut ue = endpoint();
+    let reply = ue
+        .handle_downlink(&capability_request(0, None, None), &[])
+        .expect("ProvideCapabilities");
+    assert_eq!(decode(&reply).expect("decodes").transaction_id, None);
+}
+
+/// §5.5.3: an Abort marks its transaction. transactionIDs are reused, so a
+/// new request on the same ID starts a transaction that is not aborted.
+#[test]
+fn a_reused_transaction_id_is_no_longer_aborted() {
+    let mut ue = endpoint();
+    let abort = SLPP_MessageBody_c1::Abort(Abort {
+        critical_extensions: AbortCriticalExtensions::Abort(Abort_IEs {
+            common_i_es_abort: None,
+            late_non_critical_extension: None,
+            non_critical_extension: None,
+        }),
+    });
+    for tid in [0u8, 63, 64, 255] {
+        ue.handle_downlink(&with_body(abort.clone(), tid, None, false), &[]);
+        assert!(ue.was_aborted(tid), "tid {tid}");
+    }
+    assert!(!ue.was_aborted(1));
+    ue.handle_downlink(&capability_request(9, None, Some(255)), &[]);
+    assert!(
+        !ue.was_aborted(255),
+        "a new request on 255 is a new transaction"
+    );
+    assert!(ue.was_aborted(64), "the others stay aborted");
 }

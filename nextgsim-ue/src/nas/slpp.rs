@@ -25,10 +25,30 @@
 //! The DL message's Additional information (the LCS correlation identifier)
 //! is echoed in the reply's UL NAS TRANSPORT as its routing information.
 //!
-//! Transport (§4.3): every message the UE sends carries a sequence number
-//! (§4.3.2), a duplicate of the last received sequence number is discarded,
-//! and a message asking for an acknowledgement gets one (§4.3.3), duplicates
-//! included.
+//! Transport (§4.3):
+//! - Every message with a body that the UE sends carries a sequence number. A
+//!   bare acknowledgement carries none, since the sequenceNumber field
+//!   description in §6.2 says it "shall be omitted" when there is no body.
+//! - The last received sequence number is held per location session (§4.3.2).
+//!   Over NAS, the session is named by the LCS correlation identifier in the DL
+//!   message's Additional information, together with the sessionID when one is
+//!   received. A repeat of that session's last number is discarded. A session
+//!   with no activity for 10 minutes is forgotten.
+//! - A message asking for an acknowledgement gets one (§4.3.3), duplicates
+//!   included.
+//! - **Deviation: the UE never asks for an acknowledgement and never
+//!   retransmits.** §4.3.1 says a UE "shall support" SLPP reliable transport,
+//!   including retransmission (§4.3.4). Over NAS, the UL NAS TRANSPORT is
+//!   already carried reliably by NAS and the lower layers, and the LMF waits
+//!   for its answer with its own timeout. If an UL reply is lost anyway, the
+//!   LMF's retransmitted request finds a duplicate here. It then gets a bare
+//!   acknowledgement and no body, and the LMF's transaction times out.
+//!
+//! Replies echo the received sessionID (§5.1.5, §5.3.5). An Error carries the
+//! sessionID only "if PC5-U is used as transport layer" (§5.4.3). This
+//! endpoint is reached over NAS, so its Errors carry none. A reply carries the
+//! received transactionID (§5.3.5). When the request had none, the reply has
+//! none either, rather than an invented 0.
 //!
 //! **Application layer IDs.** TS 38.355 names UEs by their application layer
 //! ID (TS 23.287). This simulator has no application layer above ProSe, so it
@@ -43,7 +63,28 @@ use nextgsim_nas::ies::ie1::PayloadContainerType;
 use nextgsim_nas::messages::mm::UlNasTransport;
 use nextgsim_slpp::generated::*;
 use nextgsim_slpp::{decode, decode_ie, encode, encode_ie};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
+
+/// A location session with no activity for this long is forgotten by the UE,
+/// along with its last received sequence number (TS 38.355 §4.3.2).
+pub const SESSION_INACTIVITY: Duration = Duration::from_secs(10 * 60);
+
+/// At most this many location sessions are tracked. Beyond that, the one
+/// with the oldest activity is forgotten first.
+pub const MAX_SESSIONS: usize = 64;
+
+/// A location session (§4.3.2): the LCS correlation identifier the SLPP
+/// message arrived with over NAS, and the sessionID when the message had one.
+type SessionKey = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+/// What §4.3.2 records per location session.
+#[derive(Debug, Clone)]
+struct SessionState {
+    last_received_sequence_number: Option<u8>,
+    last_activity: Instant,
+}
 
 /// Tc, the NR basic time unit (TS 38.211 §4.1): 1 / (480000 * 4096) s.
 pub const TC_SECONDS: f64 = 1.0 / (480_000.0 * 4096.0);
@@ -144,12 +185,13 @@ pub struct SlppEndpoint {
     application_layer_id: Option<Vec<u8>>,
     /// The next sequence number this UE sends (§4.3.2).
     next_sequence_number: u8,
-    /// The last sequence number received from the LMF (§4.3.2).
-    last_received_sequence_number: Option<u8>,
+    /// The last sequence number received, per location session (§4.3.2).
+    sessions: HashMap<SessionKey, SessionState>,
     /// The most recent ProvideAssistanceData IEs, for the ranging layer.
     assistance_data: Option<ProvideAssistanceData_IEs>,
-    /// Transactions the LMF aborted (§5.5.3).
-    aborted: Vec<u8>,
+    /// Transactions the LMF aborted (§5.5.3), one bit per transactionID. A
+    /// new request on a transactionID clears its bit.
+    aborted: [u64; 4],
     /// How many messages this endpoint has sent.
     sent: u32,
 }
@@ -175,7 +217,21 @@ impl SlppEndpoint {
 
     /// Whether the LMF aborted transaction `tid`.
     pub fn was_aborted(&self, tid: u8) -> bool {
-        self.aborted.contains(&tid)
+        self.aborted[usize::from(tid / 64)] & (1 << (tid % 64)) != 0
+    }
+
+    fn set_aborted(&mut self, tid: u8, aborted: bool) {
+        let word = &mut self.aborted[usize::from(tid / 64)];
+        if aborted {
+            *word |= 1 << (tid % 64);
+        } else {
+            *word &= !(1 << (tid % 64));
+        }
+    }
+
+    /// How many location sessions this endpoint is tracking.
+    pub fn sessions_tracked(&self) -> usize {
+        self.sessions.len()
     }
 
     /// How many SLPP messages this endpoint has sent.
@@ -196,7 +252,19 @@ impl SlppEndpoint {
         additional_info: Option<&[u8]>,
         measurements: &[SlRttMeasurement],
     ) -> SlppUplink {
-        match self.handle_downlink(container, measurements) {
+        self.handle_nas_container_at(container, additional_info, measurements, Instant::now())
+    }
+
+    /// [`Self::handle_nas_container`] at the instant `now`, which times the
+    /// §4.3.2 session inactivity.
+    pub fn handle_nas_container_at(
+        &mut self,
+        container: &[u8],
+        additional_info: Option<&[u8]>,
+        measurements: &[SlRttMeasurement],
+        now: Instant,
+    ) -> SlppUplink {
+        match self.handle_downlink_in(container, additional_info, measurements, now) {
             Some(slpp) => {
                 let mut pdu = Vec::new();
                 let mut ul = UlNasTransport::new(PayloadContainerType::SlppMessage, slpp);
@@ -212,12 +280,29 @@ impl SlppEndpoint {
         }
     }
 
-    /// Handle one SLPP message and return the SLPP reply, if any.
+    /// Handle one SLPP message that arrived without an LCS correlation
+    /// identifier and return the SLPP reply, if any.
     pub fn handle_downlink(
         &mut self,
         bytes: &[u8],
         measurements: &[SlRttMeasurement],
     ) -> Option<Vec<u8>> {
+        self.handle_downlink_in(bytes, None, measurements, Instant::now())
+    }
+
+    /// Handle one SLPP message of the location session named by
+    /// `correlation_id` (the LCS correlation identifier, over NAS) and return
+    /// the SLPP reply, if any.
+    fn handle_downlink_in(
+        &mut self,
+        bytes: &[u8],
+        correlation_id: Option<&[u8]>,
+        measurements: &[SlRttMeasurement],
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        // §4.3.2: the UE forgets a session after 10 minutes without activity.
+        self.sessions
+            .retain(|_, s| now.saturating_duration_since(s.last_activity) < SESSION_INACTIVITY);
         let msg = match decode(bytes) {
             Ok(msg) => msg,
             Err(e) => {
@@ -228,6 +313,7 @@ impl SlppEndpoint {
             }
         };
         let tid = msg.transaction_id.as_ref().map(|t| t.0);
+        let session_id = msg.session_id.clone();
 
         // §4.3.3: acknowledge every message that asks, duplicates included.
         let ack_for = msg
@@ -237,17 +323,45 @@ impl SlppEndpoint {
             .and(msg.sequence_number.as_ref())
             .map(|s| s.0);
 
-        // §4.3.2: a repeat of the last received sequence number is discarded.
+        // §4.3.2: a repeat of the session's last received sequence number is
+        // discarded. Any message is activity on its session.
+        let key: SessionKey = (
+            correlation_id.map(<[u8]>::to_vec),
+            session_id.as_ref().map(|s| s.0.clone()),
+        );
+        if !self.sessions.contains_key(&key) && self.sessions.len() >= MAX_SESSIONS {
+            if let Some(oldest) = self
+                .sessions
+                .iter()
+                .min_by_key(|(_, s)| s.last_activity)
+                .map(|(k, _)| k.clone())
+            {
+                self.sessions.remove(&oldest);
+            }
+        }
+        let session = self.sessions.entry(key).or_insert(SessionState {
+            last_received_sequence_number: None,
+            last_activity: now,
+        });
+        session.last_activity = now;
         if let Some(seq) = msg.sequence_number.as_ref().map(|s| s.0) {
-            if self.last_received_sequence_number == Some(seq) {
+            if session.last_received_sequence_number == Some(seq) {
                 debug!("SLPP: duplicate sequence number {seq} discarded");
                 return ack_for.and_then(|n| self.send(self.ack_only(n)));
             }
-            self.last_received_sequence_number = Some(seq);
+            session.last_received_sequence_number = Some(seq);
         }
 
         let reply = match msg.slpp_message_body {
-            Some(SLPP_MessageBody::C1(body)) => self.handle_body(body, tid, measurements),
+            Some(SLPP_MessageBody::C1(body)) => {
+                let mut reply = self.handle_body(body, tid, measurements);
+                // §5.1.5, §5.3.5: the response carries the received sessionID.
+                // An Error carries it only over PC5-U (§5.4.3), not over NAS.
+                if let Some(r) = reply.as_mut().filter(|r| !is_error(r)) {
+                    r.session_id = session_id;
+                }
+                reply
+            }
             Some(SLPP_MessageBody::MessageClassExtension(_)) => {
                 Some(self.error(tid, ERROR_CAUSE_BODY))
             }
@@ -273,6 +387,18 @@ impl SlppEndpoint {
         tid: Option<u8>,
         measurements: &[SlRttMeasurement],
     ) -> Option<SLPP_Message> {
+        if let (Some(tid), true) = (
+            tid,
+            matches!(
+                body,
+                SLPP_MessageBody_c1::RequestCapabilities(_)
+                    | SLPP_MessageBody_c1::RequestLocationInformation(_)
+            ),
+        ) {
+            // A transactionID is reused across 0..255: a new request on it
+            // starts a new transaction, which is not aborted.
+            self.set_aborted(tid, false);
+        }
         match body {
             SLPP_MessageBody_c1::RequestCapabilities(req) => Some(match req.critical_extensions {
                 RequestCapabilitiesCriticalExtensions::RequestCapabilities(ies) => {
@@ -310,7 +436,7 @@ impl SlppEndpoint {
             SLPP_MessageBody_c1::Abort(_) => {
                 if let Some(tid) = tid {
                     info!("SLPP: transaction {tid} aborted by the LMF");
-                    self.aborted.push(tid);
+                    self.set_aborted(tid, true);
                 }
                 None
             }
@@ -411,7 +537,7 @@ impl SlppEndpoint {
     }
 
     fn error(&self, tid: Option<u8>, cause: u8) -> SLPP_Message {
-        let mut msg = self.message(
+        self.message(
             tid,
             SLPP_MessageBody_c1::Error(Error::CriticalExtensions(Error_criticalExtensions::Error(
                 Error_IEs {
@@ -422,11 +548,7 @@ impl SlppEndpoint {
                     non_critical_extension: None,
                 },
             ))),
-        );
-        if tid.is_none() {
-            msg.transaction_id = None;
-        }
-        msg
+        )
     }
 
     fn ack_only(&self, acknowledged: u8) -> SLPP_Message {
@@ -448,14 +570,15 @@ impl SlppEndpoint {
         }
     }
 
-    /// A reply that ends the transaction `tid` (§5.1.2, §5.3).
+    /// A reply that ends the transaction `tid` (§5.1.2, §5.3). It carries the
+    /// received transactionID (§5.3.5), and none when none was received.
     fn message(&self, tid: Option<u8>, body: SLPP_MessageBody_c1) -> SLPP_Message {
         SLPP_Message {
             application_layer_id: self
                 .application_layer_id
                 .clone()
                 .map(SLPP_MessageApplicationLayerID),
-            transaction_id: Some(SLPP_MessageTransactionID(tid.unwrap_or(0))),
+            transaction_id: tid.map(SLPP_MessageTransactionID),
             end_transaction: SLPP_MessageEndTransaction(true),
             sequence_number: None,
             session_id: None,
@@ -465,12 +588,17 @@ impl SlppEndpoint {
         }
     }
 
-    /// Stamp the sequence number (§4.3.2) and encode.
+    /// Stamp the sequence number (§4.3.2) on a message with a body and encode.
+    /// A bare acknowledgement gets none: sequenceNumber "may be included when
+    /// an slpp-MessageBody is included but shall be omitted otherwise" (§6.2).
     fn send(&mut self, mut msg: SLPP_Message) -> Option<Vec<u8>> {
-        msg.sequence_number = Some(SequenceNumber(self.next_sequence_number));
+        let stamped = msg.slpp_message_body.is_some();
+        msg.sequence_number = stamped.then_some(SequenceNumber(self.next_sequence_number));
         match encode(&msg) {
             Ok(bytes) => {
-                self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
+                if stamped {
+                    self.next_sequence_number = self.next_sequence_number.wrapping_add(1);
+                }
                 self.sent += 1;
                 Some(bytes)
             }
@@ -480,6 +608,13 @@ impl SlppEndpoint {
             }
         }
     }
+}
+
+fn is_error(msg: &SLPP_Message) -> bool {
+    matches!(
+        msg.slpp_message_body,
+        Some(SLPP_MessageBody::C1(SLPP_MessageBody_c1::Error(_)))
+    )
 }
 
 /// This UE's SL-RTT capabilities: UE-assisted only, one band, and one Rx-Tx
