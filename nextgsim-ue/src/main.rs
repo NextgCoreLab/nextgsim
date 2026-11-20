@@ -437,6 +437,18 @@ impl UeApp {
         // instead of running a fresh authentication. With no `state_file` this
         // is `MmOrchestrator::new` and nothing touches the filesystem.
         let mut orch = MmOrchestrator::from_config(identity, &task_base.config);
+        // SLPP names this UE by its application layer ID; the simulator uses the
+        // ProSe Layer-2 ID for it (see `nas::slpp`, nextgcore #557).
+        orch.set_slpp_application_layer_id(nextgsim_ue::nas::slpp::application_layer_id(
+            u64::from(
+                task_base
+                    .config
+                    .prose_config
+                    .clone()
+                    .unwrap_or_default()
+                    .local_l2_id,
+            ),
+        ));
         // A restored snapshot may already carry a 5G-GUTI, so the AS can have a
         // paging identity before the first NAS procedure runs (TS 38.331
         // §5.3.2.3). A no-op when there is no stored GUTI.
@@ -612,7 +624,7 @@ impl UeApp {
                         .await;
                     // Then ask the ranging task to publish what it holds toward the
                     // LMF (issue #137). No response channel: the report goes to the
-                    // NAS task, which is where the LPP endpoint lives. It therefore
+                    // NAS task, which is where the SLPP endpoint lives. It therefore
                     // reflects the measurements that have ARRIVED, so it lags this
                     // occasion's by one interval -- the two travel different channels
                     // and a report cannot wait for them without blocking this loop.
@@ -964,17 +976,16 @@ impl UeApp {
                                 nr_arfcn: task_base.config.dl_arfcn,
                             });
                         }
-                        NasMessage::SidelinkRangingReport { results } => {
-                            // The ranging task's report reaching the LPP endpoint
-                            // (TS 23.586 §5.3.3, issue #137). Held until an LMF asks
-                            // for location information, which is the direction the
-                            // procedure runs: the UE does not push a position at the
-                            // LMF unsolicited.
+                        NasMessage::SidelinkRttMeasurements { measurements } => {
+                            // The ranging task's SL-RTT measurements reaching the SLPP
+                            // endpoint (nextgcore #557). Held until an LMF asks for
+                            // location information, which is the direction the
+                            // procedure runs (TS 38.355 §5.3).
                             debug!(
-                                "Sidelink ranging report: {} range(s) available to the LMF",
-                                results.len()
+                                "SL-RTT: {} measurement(s) available to the LMF",
+                                measurements.len()
                             );
-                            orch.set_sidelink_ranging_results(results);
+                            orch.set_sl_rtt_measurements(measurements);
                         }
                         NasMessage::RrcFallbackIndication => {
                             info!("RRC fallback indication");
@@ -1987,6 +1998,36 @@ async fn handle_unmanaged_mm_message(
                             }
                             LppUplink::Nothing => {
                                 debug!("LPP: container needed no reply or could not be answered");
+                            }
+                        }
+                    } else if dl.payload_container_type == PayloadContainerType::SlppMessage {
+                        // SLPP sidelink positioning (TS 38.355 over TS 24.501
+                        // §5.4.5.3.3 c1, nextgcore #557). The Additional information
+                        // (the LMF's LCS correlation id) is echoed as the reply's
+                        // routing information (§5.4.5.2.2 c1).
+                        use nextgsim_ue::nas::slpp::SlppUplink;
+                        match orch.handle_slpp_container(
+                            &dl.payload_container,
+                            dl.additional_info.as_deref(),
+                        ) {
+                            SlppUplink::Send(nas_pdu) => {
+                                let nas_pdu = orch.protect_if_active(nas_pdu);
+                                info!(
+                                    "SLPP: sending UL NAS TRANSPORT, len={} (message {} for this UE)",
+                                    nas_pdu.len(),
+                                    orch.slpp_messages_sent()
+                                );
+                                *pdu_counter += 1;
+                                let _ = task_base
+                                    .rrc_tx
+                                    .send(RrcMessage::UplinkNasDelivery {
+                                        pdu_id: *pdu_counter,
+                                        pdu: nas_pdu.into(),
+                                    })
+                                    .await;
+                            }
+                            SlppUplink::Nothing => {
+                                debug!("SLPP: container needed no reply");
                             }
                         }
                     } else {

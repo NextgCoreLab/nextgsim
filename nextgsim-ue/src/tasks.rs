@@ -408,16 +408,17 @@ pub enum NasMessage {
         /// message carries the measurement and not an encoding of it.
         rsrp_dbm: i32,
     },
-    /// The sidelink ranging results this UE currently holds (TS 23.586 §5.3.3,
-    /// issue #137), for the LPP endpoint to report to the LMF.
+    /// The SL-RTT measurements this UE currently holds, one per ranged peer
+    /// (TS 38.305 §8.15.2), for the SLPP endpoint to report to the LMF
+    /// (nextgcore #557).
     ///
-    /// Pushed by the ranging task rather than pulled by the LPP layer, exactly as
-    /// `ServingCellMeasurement` is: the LPP endpoint is synchronous and cannot await
-    /// another task, and a report built from whatever last arrived is what a real UE
-    /// would send.
-    SidelinkRangingReport {
-        /// One entry per ranged peer, already in the units the LPP IE carries.
-        results: Vec<crate::nas::lpp::SidelinkRangingResult>,
+    /// Pushed by the ranging task rather than pulled by the SLPP layer, exactly
+    /// as `ServingCellMeasurement` is: the endpoint is synchronous and cannot
+    /// await another task, and a report built from whatever last arrived is what
+    /// a real UE would send.
+    SidelinkRttMeasurements {
+        /// One entry per ranged peer.
+        measurements: Vec<crate::nas::slpp::SlRttMeasurement>,
     },
     /// RRC fallback indication (from RRC)
     RrcFallbackIndication,

@@ -10,6 +10,7 @@ members = [
     "nextgsim-lte-rrc",
     "nextgsim-lte-ue",
     "nextgsim-rrc",
+    "nextgsim-slpp",
     "nextgsim-rls",
     "nextgsim-rlc",
     "nextgsim-pdcp",
@@ -137,6 +138,7 @@ nextgsim-s1ap = { path = "nextgsim-s1ap" }
 nextgsim-lte-rrc = { path = "nextgsim-lte-rrc" }
 nextgsim-lte-ue = { path = "nextgsim-lte-ue" }
 nextgsim-rrc = { path = "nextgsim-rrc" }
+nextgsim-slpp = { path = "nextgsim-slpp" }
 nextgsim-rls = { path = "nextgsim-rls" }
 nextgsim-rlc = { path = "nextgsim-rlc" }
 nextgsim-pdcp = { path = "nextgsim-pdcp" }

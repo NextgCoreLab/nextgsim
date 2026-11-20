@@ -279,6 +279,10 @@ pub enum PayloadContainerType {
     /// §9.11.2.10) — see [`crate::ies::service_level_aa`] — and this is the
     /// transport UUAA-MM uses (TS 23.256 §5.2.2).
     ServiceLevelAa = 0b1001,
+    /// SLPP message container (TS 24.501 Table 9.11.3.40.1, Rel-18): an SLPP
+    /// message (TS 38.355) between the UE and the LMF (§5.4.5.2.2 case c1,
+    /// §5.4.5.3.3 case c1).
+    SlppMessage = 0b1100,
     /// Multiple payloads
     MultiplePayloads = 0b1111,
 }

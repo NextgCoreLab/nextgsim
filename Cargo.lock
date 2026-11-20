@@ -1786,6 +1786,7 @@ dependencies = [
  "nextgsim-sctp",
  "nextgsim-semantic",
  "nextgsim-she",
+ "nextgsim-slpp",
  "nextgsim-ue",
  "serde",
  "serde_yaml",
@@ -2049,6 +2050,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nextgsim-slpp"
+version = "0.1.0"
+dependencies = [
+ "asn1-codecs",
+ "asn1-compiler",
+ "asn1_codecs_derive",
+ "bitvec",
+ "log",
+]
+
+[[package]]
 name = "nextgsim-ue"
 version = "0.1.0"
 dependencies = [
@@ -2074,6 +2086,7 @@ dependencies = [
  "nextgsim-sbi-client",
  "nextgsim-semantic",
  "nextgsim-she",
+ "nextgsim-slpp",
  "rand 0.8.5",
  "serde",
  "serde_json",

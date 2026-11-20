@@ -7,9 +7,11 @@
 //! **Wired end to end on the UE side, and exercised in CI** (issues #136, #137,
 //! #139): an SL-PRS occasion from the sidelink task produces `RttMeasurement` and
 //! `CarrierPhaseMeasurement`, the session maths below resolves a range from them, and
-//! `ReportToLmf` hands it to the NAS plane, which carries it to the LMF in the LPP
-//! payload container of an UL NAS TRANSPORT. `tests/src/ranging_report_e2e.rs` asserts
-//! the range recovered from the bytes that leave the UE.
+//! `ReportToLmf` hands it to the NAS plane as one SL-RTT measurement per peer. The
+//! SLPP endpoint (`nas::slpp`, TS 38.355) reports those measurements to the LMF in the
+//! SLPP payload container (type 12) of an UL NAS TRANSPORT, when the LMF asks
+//! (nextgcore #557). `tests/src/ranging_report_e2e.rs` asserts the Rx-Tx value recovered
+//! from the bytes that leave the UE.
 //!
 //! ## What is modelled rather than measured
 //!
@@ -23,15 +25,15 @@
 //! A **two-process** run. The LMF is nextgcore's `lmfd`, a separate product with no
 //! build-time link to this one, and CI checks out one repository; the Docker jobs that
 //! could run both binaries are `workflow_dispatch`-only. The LMF half is covered in
-//! its own repository (nextgcore, issue #138), where its LPP codec is held against
-//! this UE's hand-derived golden vector. So the two halves are proven against the same
+//! its own repository (nextgcore #557), where its SLPP codec is held against the
+//! same hand-derived golden vectors this UE answers with. So the two halves are proven against the same
 //! bytes, not against each other in flight — which is why the startup lines below name
 //! that limit instead of claiming a working end-to-end feature.
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::nas::lpp::{SidelinkRangingMethod, SidelinkRangingResult};
+use crate::nas::slpp::{application_layer_id, SlRttMeasurement};
 use crate::tasks::{NasMessage, RangingMessage, Task, TaskMessage, UeTaskBase};
 
 /// Accuracy reported for a carrier-phase estimate, in metres.
@@ -45,12 +47,6 @@ const CARRIER_PHASE_ACCURACY_M: f64 = 0.01;
 /// quantised to whole nanoseconds, which is 15 cm of range per count.
 const RTT_ACCURACY_M: f64 = 1.0;
 
-/// The widest PC5 Layer-2 identity the LPP IE can carry (TS 23.303 §8.2: 24 bits).
-const LAYER2_ID_MAX: u32 = 0x00FF_FFFF;
-
-/// The longest range the LPP IE can carry, in centimetres (10 km).
-const RANGE_CM_MAX: u32 = 1_000_000;
-
 /// The line the UE binary emits when it spawns the ranging task.
 ///
 /// A constant rather than a literal at the `info!` site because the site is in
@@ -62,12 +58,12 @@ const RANGE_CM_MAX: u32 = 1_000_000;
 /// It must name what has NOT run. The measurement and reporting path is wired and
 /// tested (see the module docs), but no two-process run against a real LMF has ever
 /// happened, so a bare capability claim would overstate it. Issues #55, #139.
-pub const SPAWN_LOG: &str = "Ranging task spawned (SL-PRS measurement and LPP \
+pub const SPAWN_LOG: &str = "Ranging task spawned (SL-PRS measurement and SLPP \
      reporting wired; range modelled from configured geometry, no two-process LMF run)";
 
 /// The line [`RangingTask::run`] emits on entry. Same contract as [`SPAWN_LOG`], and
 /// unlike it this one is reached by a test.
-pub const START_LOG: &str = "Ranging task started (SL-PRS measurement and LPP reporting \
+pub const START_LOG: &str = "Ranging task started (SL-PRS measurement and SLPP reporting \
      wired; range modelled from configured geometry, no two-process LMF run)";
 
 /// Carrier phase measurement for a single frequency.
@@ -262,18 +258,17 @@ impl RangingTask {
         results
     }
 
-    /// Hand the report to the NAS task, which is where the LPP endpoint that
-    /// reports to the LMF lives (TS 23.586 §5.3.3, issue #137).
+    /// Hand the measurements to the NAS task, which is where the SLPP endpoint
+    /// that reports to the LMF lives (nextgcore #557).
     ///
-    /// A result that cannot be represented in the LPP IE is DROPPED with a warning
-    /// rather than clamped: a range clamped to 10 km or a peer identity truncated to
-    /// 24 bits would be reported as a measurement, and a wrong range is worse than a
-    /// missing one.
+    /// A result that cannot be represented is DROPPED with a warning rather than
+    /// clamped: a peer identity truncated to 24 bits would name another UE, and
+    /// a non-finite range is no measurement.
     async fn publish_to_nas(&self, results: &[RangingResult]) {
-        let encodable: Vec<SidelinkRangingResult> = results
+        let measurements: Vec<SlRttMeasurement> = results
             .iter()
-            .filter_map(|result| match sidelink_ranging_result(result) {
-                Ok(encoded) => Some(encoded),
+            .filter_map(|result| match sl_rtt_measurement(result) {
+                Ok(m) => Some(m),
                 Err(reason) => {
                     warn!(
                         "Ranging: not reporting peer {} to the LMF: {reason}",
@@ -283,69 +278,38 @@ impl RangingTask {
                 }
             })
             .collect();
-        if encodable.is_empty() {
+        if measurements.is_empty() {
             return;
         }
         if let Err(e) = self
             .task_base
             .nas_tx
-            .send(NasMessage::SidelinkRangingReport { results: encodable })
+            .send(NasMessage::SidelinkRttMeasurements { measurements })
             .await
         {
-            warn!("Ranging: could not hand the report to the NAS task: {e}");
+            warn!("Ranging: could not hand the measurements to the NAS task: {e}");
         }
     }
 }
 
-/// Convert a ranging result into the LPP IE's units and bounds (issue #137).
+/// Convert a ranging result into this UE's SL-RTT measurement against the peer.
 ///
 /// # Errors
 /// The reason the result cannot be carried, for the caller to log against the peer.
-fn sidelink_ranging_result(result: &RangingResult) -> Result<SidelinkRangingResult, String> {
-    let peer_layer2_id = u32::try_from(result.peer_ue_id)
-        .ok()
-        .filter(|id| *id <= LAYER2_ID_MAX)
-        .ok_or_else(|| {
-            format!(
-                "the peer id {} does not fit a 24-bit PC5 Layer-2 identity",
-                result.peer_ue_id
-            )
-        })?;
+fn sl_rtt_measurement(result: &RangingResult) -> Result<SlRttMeasurement, String> {
+    let peer = application_layer_id(result.peer_ue_id).ok_or_else(|| {
+        format!(
+            "the peer id {} does not fit a 24-bit ProSe Layer-2 identity",
+            result.peer_ue_id
+        )
+    })?;
     if !result.distance_m.is_finite() || result.distance_m < 0.0 {
         return Err(format!(
             "the range {} m is not a distance",
             result.distance_m
         ));
     }
-    let range_cm_f = (result.distance_m * 100.0).round();
-    if range_cm_f > f64::from(RANGE_CM_MAX) {
-        return Err(format!(
-            "the range {:.2} m is beyond the {} m the IE can carry",
-            result.distance_m,
-            RANGE_CM_MAX / 100
-        ));
-    }
-    let accuracy_cm_f = (result.accuracy_m * 100.0).round();
-    let accuracy_cm = if accuracy_cm_f.is_finite() && (0.0..=65_535.0).contains(&accuracy_cm_f) {
-        accuracy_cm_f as u16
-    } else {
-        return Err(format!(
-            "the accuracy {} m is beyond the IE's range",
-            result.accuracy_m
-        ));
-    };
-    let method = match result.method.as_str() {
-        "carrier_phase" => SidelinkRangingMethod::CarrierPhase,
-        "rtt" => SidelinkRangingMethod::Rtt,
-        other => return Err(format!("unknown ranging method {other:?}")),
-    };
-    Ok(SidelinkRangingResult {
-        peer_layer2_id,
-        range_cm: range_cm_f as u32,
-        accuracy_cm,
-        method,
-        measurement_count: u16::try_from(result.measurement_count).unwrap_or(u16::MAX),
-    })
+    Ok(SlRttMeasurement::from_range(peer, result.distance_m))
 }
 
 #[async_trait::async_trait]
@@ -646,7 +610,7 @@ mod tests {
     /// caller invoked.
     #[cfg(feature = "sidelink")]
     #[test]
-    fn a_measured_range_reaches_the_nas_task_in_the_lpp_ies_units() {
+    fn a_measured_range_reaches_the_nas_task_as_an_sl_rtt_measurement() {
         use crate::sidelink::SidelinkTask;
         use crate::tasks::{SidelinkMessage, TaskHandle, UeRel18Handles};
         use crate::test_support::{hold_capture_lock, task_base_with_config};
@@ -712,29 +676,34 @@ mod tests {
 
             let mut last = None;
             while let Ok(msg) = nas_rx.try_recv() {
-                if let TaskMessage::Message(NasMessage::SidelinkRangingReport { results }) = msg {
-                    last = Some(results);
+                if let TaskMessage::Message(NasMessage::SidelinkRttMeasurements { measurements }) =
+                    msg
+                {
+                    last = Some(measurements);
                 }
             }
             last.expect("the report must reach the NAS task")
         });
 
         assert_eq!(reported.len(), 1);
-        let result = reported[0];
-        assert_eq!(result.peer_layer2_id, 0x00A5_A5A5);
+        let m = &reported[0];
         assert_eq!(
-            result.range_cm, 5_000,
-            "50.00 m in centimetres -- metres would have thrown away the \
-             centimetre-level estimate the widelane produced"
+            m.peer_application_layer_id,
+            [0xA5, 0xA5, 0xA5],
+            "the peer's L2 ID"
         );
-        assert_eq!(result.method, SidelinkRangingMethod::CarrierPhase);
-        assert_eq!(result.accuracy_cm, 1);
+        // The 50 m geometry, as the one-way flight time: TS 38.133's k2 value
+        // 246338 (324 <= T < 328 Tc), the value both repos' goldens carry.
+        assert_eq!(
+            crate::nas::slpp::rx_tx_report_value_k2(m.rx_tx_time_difference_s),
+            Some(246_338)
+        );
     }
 
-    /// A result the IE cannot represent is DROPPED, not clamped: a range clamped to
-    /// 10 km or an identity truncated to 24 bits would be reported as a measurement.
+    /// A result that cannot be represented is DROPPED, not clamped: an identity
+    /// truncated to 24 bits would name another UE.
     #[test]
-    fn a_result_the_lpp_ie_cannot_carry_is_refused_rather_than_clamped() {
+    fn a_result_slpp_cannot_carry_is_refused_rather_than_clamped() {
         let ok = RangingResult {
             peer_ue_id: 7,
             distance_m: 12.34,
@@ -742,22 +711,15 @@ mod tests {
             measurement_count: 2,
             method: "carrier_phase".to_string(),
         };
-        let converted = sidelink_ranging_result(&ok).expect("a plain result converts");
-        assert_eq!(converted.range_cm, 1_234);
-        assert_eq!(converted.peer_layer2_id, 7);
+        let converted = sl_rtt_measurement(&ok).expect("a plain result converts");
+        assert_eq!(converted.peer_application_layer_id, [0, 0, 7]);
+        assert!((converted.rx_tx_time_difference_s - 12.34 / 299_792_458.0).abs() < 1e-15);
 
         for (label, bad) in [
             (
                 "a peer id wider than 24 bits",
                 RangingResult {
-                    peer_ue_id: u64::from(LAYER2_ID_MAX) + 1,
-                    ..ok.clone()
-                },
-            ),
-            (
-                "a range beyond 10 km",
-                RangingResult {
-                    distance_m: 10_001.0,
+                    peer_ue_id: 0x0100_0000,
                     ..ok.clone()
                 },
             ),
@@ -775,16 +737,9 @@ mod tests {
                     ..ok.clone()
                 },
             ),
-            (
-                "an unknown method",
-                RangingResult {
-                    method: "otdoa".to_string(),
-                    ..ok.clone()
-                },
-            ),
         ] {
             assert!(
-                sidelink_ranging_result(&bad).is_err(),
+                sl_rtt_measurement(&bad).is_err(),
                 "{label} must be refused, not carried"
             );
         }

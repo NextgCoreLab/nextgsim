@@ -118,6 +118,7 @@ nextgsim-sbi-client = { workspace = true, optional = true }
 nextgsim-demo.workspace = true
 nextgsim-crypto.workspace = true
 nextgsim-nas.workspace = true
+nextgsim-slpp.workspace = true
 nextgsim-rrc.workspace = true
 nextgsim-rls.workspace = true
 nextgsim-rlc.workspace = true

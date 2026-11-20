@@ -102,7 +102,7 @@ placeholder). "Drives a live path?" is answered for a *default* build/run.
 | Service Hosting Env (SHE) | `nextgsim-she` + gNB `she/task.rs`, UE `she_client/` | partial (placement scheduler, no orchestration) | No — off by default | unit tests |
 | UE ambient IoT | `nextgsim-ue/src/ambient_iot/` | illustrative stub (fleet + energy model) | No — sim-internal | unit tests |
 | UE ProSe / sidelink | `nextgsim-ue/src/sidelink/` | partial (real PC5-S messages and SRAP over an in-process medium; no PC5 radio) | No — `sidelink` feature and `prose_enabled` | unit tests + `sidelink_pc5_e2e` |
-| UE ranging | `nextgsim-ue/src/ranging/` | partial (range from configured geometry, carried to the LMF over LPP) | No — `sidelink` feature and `ranging_config.enabled` | unit tests + `ranging_report_e2e` |
+| UE ranging | `nextgsim-ue/src/ranging/` | partial (range from configured geometry, reported to the LMF as SL-RTT over SLPP, TS 38.355) | No — `sidelink` feature and `ranging_config.enabled` | unit tests + `ranging_report_e2e` |
 | UE MINT / UAV | `nextgsim-ue/src/mint/`, `src/uav.rs` | integrated with NextGCore (see note below) | Task spawned but idle by default | unit tests + nextgcore feature E2E |
 | gNB energy saving | `nextgsim-gnb/src/energy/` | prototype (cell sleep model) | No — `energy_saving_enabled=false` | unit tests |
 | gNB MBS (NGAP) | `nextgsim-gnb/src/mbs_ngap.rs` | partial (Rel-17 MBS session procedures decoded and answered) | Yes — when the AMF sends MBS procedures | unit tests |

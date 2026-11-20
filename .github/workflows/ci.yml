@@ -749,6 +749,7 @@ jobs:
         run: |
           cargo test -p nextgsim-ue --features sidelink ranging
           cargo test -p nextgsim-ue --features sidelink nas::lpp
+          cargo test -p nextgsim-ue --features sidelink nas::slpp
       - name: cargo clippy
         run: |
           cargo clippy -p nextgsim-integration-tests --features sidelink --all-targets -- -D warnings
