@@ -2088,6 +2088,7 @@ dependencies = [
  "nextgsim-she",
  "nextgsim-slpp",
  "rand 0.8.5",
+ "remoteid",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2667,6 +2668,12 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "remoteid"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "212a4b231e5b2a71fd5c1fb52a103d2ec345d1e55676a4508c866505b71a4807"
 
 [[package]]
 name = "rfc6979"
