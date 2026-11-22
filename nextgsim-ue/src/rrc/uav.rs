@@ -182,6 +182,41 @@ impl RemoteIdBroadcast {
         self.operator_position = Some(position);
         self
     }
+
+    /// Encodes this broadcast into its ASTM F3411-22a wire form: a message pack
+    /// carrying a Basic ID message and a Location/Vector message, as a real
+    /// Remote ID receiver decodes it off the sidelink.
+    ///
+    /// The frame is built with the `remoteid` crate's spec-validated encoder
+    /// rather than by hand, so the bytes (the quarter-metre speed quantisation,
+    /// the big-angle east/west direction flag, the 1e-7 degree lat/lon scaling
+    /// and the seconds-after-the-hour timestamp) match what deployed receivers
+    /// parse. Returns an error if a field is outside the range F3411 allows for
+    /// it, for example a ground speed above 254.25 m/s.
+    pub fn encode_astm_f3411(&self) -> Result<Vec<u8>, remoteid::Error> {
+        let basic_id = remoteid::BasicId::new(
+            remoteid::IdType::SerialNumber,
+            remoteid::UaType::Unspecified,
+            &self.serial_number,
+        )?;
+
+        let location = remoteid::Location {
+            status: remoteid::Status::Airborne,
+            direction: Some(self.heading_deg as f32),
+            speed_horizontal: Some(self.ground_speed_ms as f32),
+            latitude: self.position.latitude,
+            longitude: self.position.longitude,
+            altitude_geo: Some(self.position.altitude_msl as f32),
+            // Time of the position in seconds after the full UTC hour (F3411).
+            timestamp: Some(((self.timestamp_ms / 1000) % 3600) as f32),
+            ..remoteid::Location::default()
+        };
+
+        let mut pack = remoteid::MessagePackBuilder::new();
+        pack.push(&remoteid::Message::BasicId(basic_id))?;
+        pack.push(&remoteid::Message::Location(location))?;
+        Ok(pack.as_bytes().to_vec())
+    }
 }
 
 /// Command and control (C2) link quality metrics.
@@ -522,6 +557,43 @@ mod tests {
         assert_eq!(broadcast.serial_number, "UAV-12345");
         assert_eq!(broadcast.heading_deg, 90);
         assert!((broadcast.ground_speed_ms - 15.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_remote_id_broadcast_decodes_on_a_receiver() {
+        // A broadcast the UE emits must come back off the wire the way a real
+        // ASTM F3411 receiver reads it. Encode it, then decode the pack with
+        // the same spec codec a receiver runs.
+        let position = GeoPosition::new(37.7749, -122.4194, 100.0);
+        let broadcast = RemoteIdBroadcast::new("UAV-12345".to_string(), position, 15.0, 90);
+
+        let frame = broadcast.encode_astm_f3411().expect("encodes to F3411");
+        let pack = remoteid::MessagePack::parse(&frame).expect("receiver parses the pack");
+
+        let mut saw_serial = false;
+        let mut saw_position = false;
+        for msg in pack.messages() {
+            match msg.expect("each message decodes") {
+                remoteid::Message::BasicId(id) => {
+                    assert_eq!(id.id_type, remoteid::IdType::SerialNumber);
+                    assert_eq!(id.uas_id_str(), Some("UAV-12345"));
+                    saw_serial = true;
+                }
+                remoteid::Message::Location(loc) => {
+                    let (lat, lon) = loc.position().expect("position present");
+                    // F3411 quantises lat/lon to 1e-7 degrees.
+                    assert!((lat - 37.7749).abs() < 1e-5, "lat {lat}");
+                    assert!((lon - (-122.4194)).abs() < 1e-5, "lon {lon}");
+                    assert_eq!(loc.direction, Some(90.0));
+                    saw_position = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_serial && saw_position,
+            "pack carries Basic ID and Location"
+        );
     }
 
     #[test]

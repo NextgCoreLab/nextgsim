@@ -109,6 +109,10 @@ async-trait = "0.1"
 asn1-codecs = { git = "https://github.com/NextgCoreLab/asn1-codegen.git", rev = "6d75c4962d09dcdb75eee7e4b8c03b14def2f123" }
 asn1_codecs_derive = { git = "https://github.com/NextgCoreLab/asn1-codegen.git", rev = "6d75c4962d09dcdb75eee7e4b8c03b14def2f123" }
 bitvec = "1"
+# ASTM F3411-22a / EN 4709-002 Remote ID codec: spec-validated encode/decode of
+# the Basic ID and Location/Vector broadcast messages the UAV UE transmits over
+# sidelink (TS 23.256). Maintained by Matthew Busel.
+remoteid = "0.3.3"
 log = "0.4"
 env_logger = "0.11"
 # #185: Upstream 0.7.2 silently DROPS an

@@ -185,6 +185,31 @@ impl UavContext {
         self.last_broadcast_at = Some(now);
     }
 
+    /// Emits one Direct Remote ID broadcast for the current state and records it.
+    ///
+    /// Builds the ASTM F3411 message pack from this UE's identity and latest
+    /// position fix with [`RemoteIdBroadcast::encode_astm_f3411`], so the bytes
+    /// returned are what a Direct Remote ID receiver parses off the sidelink.
+    /// Returns `None` when no position fix is available yet (nothing to
+    /// broadcast); otherwise the spec-encoded frame, or an error if a field is
+    /// outside the range F3411 allows.
+    pub fn broadcast_frame(
+        &mut self,
+        ground_speed_ms: f64,
+        heading_deg: u16,
+    ) -> Option<Result<Vec<u8>, remoteid::Error>> {
+        let position = self.current_position?;
+        let broadcast = RemoteIdBroadcast::new(
+            self.identity.serial_number.clone(),
+            position,
+            ground_speed_ms,
+            heading_deg,
+        );
+        let frame = broadcast.encode_astm_f3411();
+        self.record_broadcast();
+        Some(frame)
+    }
+
     /// Adds a geofence
     pub fn add_geofence(&mut self, gf: CylindricalGeofence) {
         self.geofences.push(gf);
@@ -286,6 +311,30 @@ mod tests {
         ctx.record_broadcast();
         // Just broadcast — should not broadcast again immediately
         assert!(!ctx.should_broadcast_remote_id());
+    }
+
+    #[test]
+    fn test_broadcast_frame_encodes_and_records() {
+        let mut ctx = UavContext::new(test_identity());
+        ctx.remote_id_active = true;
+        // No fix yet: nothing to broadcast.
+        assert!(ctx.broadcast_frame(15.0, 90).is_none());
+        assert!(ctx.last_broadcast_at.is_none());
+
+        ctx.update_position(GeoPosition {
+            latitude: 37.7749,
+            longitude: -122.4194,
+            altitude_msl: 100.0,
+        });
+        let frame = ctx
+            .broadcast_frame(15.0, 90)
+            .expect("fix present")
+            .expect("encodes to F3411");
+        // A real receiver parses the pack the UE put on the wire.
+        let pack = remoteid::MessagePack::parse(&frame).expect("receiver parses the pack");
+        assert!(pack.messages().count() >= 2);
+        // Emitting the frame recorded the broadcast.
+        assert!(ctx.last_broadcast_at.is_some());
     }
 
     #[test]
